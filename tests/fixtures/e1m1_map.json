@@ -1,0 +1,28 @@
+{
+  "entities": [
+    {
+      "classname": "info_player_start",
+      "origin": "0 0 0"
+    },
+    {
+      "classname": "info_player_deathmatch",
+      "origin": "64 64 0"
+    },
+    {
+      "classname": "item_health",
+      "origin": "256 0 0"
+    },
+    {
+      "classname": "item_shells",
+      "origin": "512 0 0"
+    },
+    {
+      "classname": "item_key1",
+      "origin": "768 0 0"
+    },
+    {
+      "classname": "trigger_changelevel",
+      "origin": "1024 0 0"
+    }
+  ]
+}

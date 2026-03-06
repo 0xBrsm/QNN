@@ -1,0 +1,40 @@
+services:
+  trainer-amd:
+    image: ${TRAINING_IMAGE_TAG:-quake-ai-trainer-amd:local}
+    build:
+      context: ../..
+      dockerfile: docker/training/amd-rocm/Dockerfile
+    working_dir: /workspace
+    environment:
+      HOST_WORKSPACE: /workspace
+      PYTHONUNBUFFERED: "1"
+      QUAKE_AI_DEVICE: ${QUAKE_AI_DEVICE:-gpu}
+      QUAKE_AI_ARTIFACT_ROOT: /artifacts
+    volumes:
+      - type: bind
+        source: ${HOST_SRC_ROOT}
+        target: /workspace
+        read_only: true
+      - type: bind
+        source: ${HOST_ARTIFACT_ROOT}
+        target: /artifacts
+      - type: volume
+        source: quake-ai-pip-cache
+        target: /home/trainer/.cache/pip
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    ipc: host
+    shm_size: 8gb
+    stdin_open: true
+    tty: true
+
+volumes:
+  quake-ai-pip-cache:

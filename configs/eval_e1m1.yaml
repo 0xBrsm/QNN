@@ -1,0 +1,9 @@
+{
+  "map_features_path": "../artifacts/runs/collect/map_features.json",
+  "checkpoint_path": "../artifacts/runs/ppo/ppo_model.npz",
+  "output_dir": "../artifacts/runs/eval",
+  "seed": 19,
+  "num_episodes": 100,
+  "max_steps_per_episode": 256,
+  "device": "auto"
+}

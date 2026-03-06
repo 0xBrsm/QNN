@@ -1,0 +1,846 @@
+{
+  "episode_id": "episode_00",
+  "map_id": "E1M1",
+  "ticks": [
+    {
+      "tick": 0,
+      "player_pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 0.0,
+      "health": 100,
+      "armor": 50,
+      "ammo": 30,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.0,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 2,
+        "fire": 1,
+        "use": 0,
+        "jump": 1
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 0,
+        "direction": "client_to_server",
+        "seq": 0,
+        "ack": 0,
+        "payload_hex": "01ab00"
+      }
+    },
+    {
+      "tick": 1,
+      "player_pos": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 10.0,
+      "health": 99,
+      "armor": 50,
+      "ammo": 30,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.05263157894736842,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 1,
+        "direction": "client_to_server",
+        "seq": 1,
+        "ack": 0,
+        "payload_hex": "01ab01"
+      }
+    },
+    {
+      "tick": 2,
+      "player_pos": [
+        104.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 20.0,
+      "health": 98,
+      "armor": 49,
+      "ammo": 30,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.10526315789473684,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 2,
+        "direction": "client_to_server",
+        "seq": 2,
+        "ack": 1,
+        "payload_hex": "01ab02"
+      }
+    },
+    {
+      "tick": 3,
+      "player_pos": [
+        156.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 30.0,
+      "health": 97,
+      "armor": 49,
+      "ammo": 29,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.15789473684210525,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 2,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 3,
+        "direction": "client_to_server",
+        "seq": 3,
+        "ack": 2,
+        "payload_hex": "01ab03"
+      }
+    },
+    {
+      "tick": 4,
+      "player_pos": [
+        208.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 40.0,
+      "health": 96,
+      "armor": 48,
+      "ammo": 29,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.21052631578947367,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 1,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 4,
+        "direction": "client_to_server",
+        "seq": 4,
+        "ack": 3,
+        "payload_hex": "01ab04"
+      }
+    },
+    {
+      "tick": 5,
+      "player_pos": [
+        260.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 50.0,
+      "health": 95,
+      "armor": 48,
+      "ammo": 29,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.2631578947368421,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 5,
+        "direction": "client_to_server",
+        "seq": 5,
+        "ack": 4,
+        "payload_hex": "01ab05"
+      }
+    },
+    {
+      "tick": 6,
+      "player_pos": [
+        312.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 60.0,
+      "health": 94,
+      "armor": 47,
+      "ammo": 28,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.3157894736842105,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 2,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 6,
+        "direction": "client_to_server",
+        "seq": 6,
+        "ack": 5,
+        "payload_hex": "01ab06"
+      }
+    },
+    {
+      "tick": 7,
+      "player_pos": [
+        364.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 70.0,
+      "health": 93,
+      "armor": 47,
+      "ammo": 28,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.3684210526315789,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 1
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 7,
+        "direction": "client_to_server",
+        "seq": 7,
+        "ack": 6,
+        "payload_hex": "01ab07"
+      }
+    },
+    {
+      "tick": 8,
+      "player_pos": [
+        416.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 80.0,
+      "health": 92,
+      "armor": 46,
+      "ammo": 28,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.42105263157894735,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 1,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 8,
+        "direction": "client_to_server",
+        "seq": 8,
+        "ack": 7,
+        "payload_hex": "01ab08"
+      }
+    },
+    {
+      "tick": 9,
+      "player_pos": [
+        468.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 90.0,
+      "health": 91,
+      "armor": 46,
+      "ammo": 27,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.47368421052631576,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 2,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 9,
+        "direction": "client_to_server",
+        "seq": 9,
+        "ack": 8,
+        "payload_hex": "01ab09"
+      }
+    },
+    {
+      "tick": 10,
+      "player_pos": [
+        520.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 100.0,
+      "health": 90,
+      "armor": 45,
+      "ammo": 27,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.5263157894736842,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 10,
+        "direction": "client_to_server",
+        "seq": 10,
+        "ack": 9,
+        "payload_hex": "01ab0a"
+      }
+    },
+    {
+      "tick": 11,
+      "player_pos": [
+        572.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 110.0,
+      "health": 89,
+      "armor": 45,
+      "ammo": 27,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.5789473684210527,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 11,
+        "direction": "client_to_server",
+        "seq": 11,
+        "ack": 10,
+        "payload_hex": "01ab0b"
+      }
+    },
+    {
+      "tick": 12,
+      "player_pos": [
+        624.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 120.0,
+      "health": 88,
+      "armor": 44,
+      "ammo": 26,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.631578947368421,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 2,
+        "fire": 1,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 12,
+        "direction": "client_to_server",
+        "seq": 12,
+        "ack": 11,
+        "payload_hex": "01ab0c"
+      }
+    },
+    {
+      "tick": 13,
+      "player_pos": [
+        676.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 130.0,
+      "health": 87,
+      "armor": 44,
+      "ammo": 26,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.6842105263157895,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 13,
+        "direction": "client_to_server",
+        "seq": 13,
+        "ack": 12,
+        "payload_hex": "01ab0d"
+      }
+    },
+    {
+      "tick": 14,
+      "player_pos": [
+        728.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 140.0,
+      "health": 86,
+      "armor": 43,
+      "ammo": 26,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.7368421052631579,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 1
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 14,
+        "direction": "client_to_server",
+        "seq": 14,
+        "ack": 13,
+        "payload_hex": "01ab0e"
+      }
+    },
+    {
+      "tick": 15,
+      "player_pos": [
+        780.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 150.0,
+      "health": 85,
+      "armor": 43,
+      "ammo": 25,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.7894736842105263,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 2,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 15,
+        "direction": "client_to_server",
+        "seq": 15,
+        "ack": 14,
+        "payload_hex": "01ab0f"
+      }
+    },
+    {
+      "tick": 16,
+      "player_pos": [
+        832.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 160.0,
+      "health": 84,
+      "armor": 42,
+      "ammo": 25,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.8421052631578947,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 1,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 16,
+        "direction": "client_to_server",
+        "seq": 16,
+        "ack": 15,
+        "payload_hex": "01ab10"
+      }
+    },
+    {
+      "tick": 17,
+      "player_pos": [
+        884.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 170.0,
+      "health": 83,
+      "armor": 42,
+      "ammo": 25,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.8947368421052632,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 17,
+        "direction": "client_to_server",
+        "seq": 17,
+        "ack": 16,
+        "payload_hex": "01ab11"
+      }
+    },
+    {
+      "tick": 18,
+      "player_pos": [
+        936.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 180.0,
+      "health": 82,
+      "armor": 41,
+      "ammo": 24,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 0.9473684210526315,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 2,
+        "fire": 0,
+        "use": 0,
+        "jump": 0
+      },
+      "done": false,
+      "done_reason": "",
+      "packet": {
+        "tick_estimate": 18,
+        "direction": "client_to_server",
+        "seq": 18,
+        "ack": 17,
+        "payload_hex": "01ab12"
+      }
+    },
+    {
+      "tick": 19,
+      "player_pos": [
+        988.0,
+        0.0,
+        0.0
+      ],
+      "player_vel": [
+        52.0,
+        0.0,
+        0.0
+      ],
+      "yaw": 190.0,
+      "health": 81,
+      "armor": 41,
+      "ammo": 24,
+      "weapon_id": 1,
+      "nearby_item_flags": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "goal_progress": 1.0,
+      "action_label": {
+        "move": 1,
+        "strafe": 0,
+        "turn": 0,
+        "fire": 0,
+        "use": 1,
+        "jump": 0
+      },
+      "done": true,
+      "done_reason": "goal_reached",
+      "packet": {
+        "tick_estimate": 19,
+        "direction": "client_to_server",
+        "seq": 19,
+        "ack": 18,
+        "payload_hex": "01ab13"
+      }
+    }
+  ]
+}

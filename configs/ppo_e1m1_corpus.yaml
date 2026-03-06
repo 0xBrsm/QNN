@@ -1,0 +1,18 @@
+{
+  "map_features_path": "../artifacts/runs/e1m1_corpus/collect/map_features.json",
+  "output_dir": "../artifacts/runs/e1m1_corpus/ppo",
+  "init_ckpt": "../artifacts/runs/e1m1_corpus/bc/bc_best_model.npz",
+  "seed": 11,
+  "num_envs": 16,
+  "max_steps_per_episode": 256,
+  "rollout_steps": 128,
+  "total_steps": 100000,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_ratio": 0.2,
+  "policy_lr": 0.01,
+  "value_lr": 0.02,
+  "ppo_epochs": 4,
+  "minibatch_size": 512,
+  "device": "auto"
+}

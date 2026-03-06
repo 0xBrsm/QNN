@@ -1,0 +1,13 @@
+{
+  "map_features_path": "../artifacts/runs/e1m1_corpus/collect/map_features.json",
+  "checkpoint_path": "../artifacts/runs/e1m1_corpus/ppo/ppo_model.npz",
+  "output_dir": "../artifacts/runs/e1m1_corpus/eval",
+  "seed": 19,
+  "num_episodes": 100,
+  "max_steps_per_episode": 256,
+  "policy_modes": ["greedy", "sampled"],
+  "start_mode": "randomized",
+  "holdout_seed_offset": 10000,
+  "sample_seed_offset": 20000,
+  "device": "auto"
+}

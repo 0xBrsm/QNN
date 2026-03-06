@@ -1,0 +1,18 @@
+{
+  "map_features_path": "../artifacts/runs/collect/map_features.json",
+  "output_dir": "../artifacts/runs/ppo_smoke",
+  "init_ckpt": "../artifacts/runs/bc/bc_best_model.npz",
+  "seed": 11,
+  "num_envs": 4,
+  "max_steps_per_episode": 128,
+  "rollout_steps": 32,
+  "total_steps": 1024,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_ratio": 0.2,
+  "policy_lr": 0.01,
+  "value_lr": 0.02,
+  "ppo_epochs": 2,
+  "minibatch_size": 64,
+  "device": "auto"
+}
