@@ -50,11 +50,15 @@ def test_collect_writes_expected_artifacts(tmp_path: Path, demo_dir: Path, map_f
     out = tmp_path / "collect"
     artifacts = collect_from_demos(map_id="E1M1", demo_dir=demo_dir, out_dir=out, map_path=map_fixture)
 
-    for key in ["telemetry", "packets", "summaries", "map_features", "failures"]:
+    for key in ["telemetry", "packets", "summaries", "map_features", "failures", "world_map", "world_ticks"]:
         assert Path(artifacts[key]).exists()
 
     map_payload = json.loads(Path(artifacts["map_features"]).read_text(encoding="utf-8"))
     assert map_payload["records"]
+
+    world_payload = json.loads(Path(artifacts["world_map"]).read_text(encoding="utf-8"))
+    assert world_payload["regions"]
+    assert world_payload["static_objects"]
 
 
 def test_collect_without_map_path_uses_observed_regions(tmp_path: Path, demo_dir: Path) -> None:
@@ -67,6 +71,14 @@ def test_collect_without_map_path_uses_observed_regions(tmp_path: Path, demo_dir
 
     assert telemetry_regions.issubset(feature_regions)
     assert (out / "observed_map.json").exists()
+
+
+def test_world_tick_count_matches_telemetry_count(collected_artifacts) -> None:
+    telemetry_rows = list(read_ndjson(collected_artifacts["telemetry"]))
+    world_rows = list(read_ndjson(collected_artifacts["world_ticks"]))
+
+    assert len(world_rows) == len(telemetry_rows)
+    assert world_rows[0]["reset"] is True
 
 
 def test_collect_skips_bad_demo_and_records_failure(tmp_path: Path, demo_dir: Path, map_fixture: Path) -> None:

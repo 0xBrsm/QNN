@@ -1,0 +1,52 @@
+# host_cmd.c - save/load path overflows and Host_Say buffer overflow
+#
+# These are stock WinQuake hardening fixes from the NexQuake bugfix catalog.
+#
+--- host_cmd.c
++++ host_cmd.c
+@@ -818,11 +818,15 @@
+ void Host_SavegameComment (char *text)
+ {
+ 	int		i;
+-	char	kills[20];
++	char	kills[20];
++	int		len;
+ 
+ 	for (i=0 ; i<SAVEGAME_COMMENT_LENGTH ; i++)
+ 		text[i] = ' ';
+-	memcpy (text, cl.levelname, strlen(cl.levelname));
++	len = strlen(cl.levelname);
++	if (len > SAVEGAME_COMMENT_LENGTH)
++		len = SAVEGAME_COMMENT_LENGTH;
++	memcpy (text, cl.levelname, len);
+ 	sprintf (kills,"kills:%3i/%3i", cl.stats[STAT_MONSTERS], cl.stats[STAT_TOTALMONSTERS]);
+ 	memcpy (text+22, kills, strlen(kills));
+ // convert space to _ to make stdio happy
+@@ -862,7 +866,7 @@
+ 		return;
+ 	}
+ 
+-	sprintf (name, "%s/%s", com_gamedir, Cmd_Argv(1));
++	snprintf (name, sizeof(name), "%s/%s", com_gamedir, Cmd_Argv(1));
+ 	COM_DefaultExtension (name, ".sav");
+ 	
+ 	Con_Printf ("Saving game to %s...\n", name);
+@@ -917,7 +921,7 @@
+ 
+ 	cls.demonum = -1;		// stop demo loop in case this fails
+ 
+-	sprintf (name, "%s/%s", com_gamedir, Cmd_Argv(1));
++	snprintf (name, sizeof(name), "%s/%s", com_gamedir, Cmd_Argv(1));
+ 	COM_DefaultExtension (name, ".sav");
+ 	
+ // we can't call SCR_BeginLoadingPlaque, because too much stack space has
+@@ -1046,9 +1050,9 @@
+ // turn on color set 1
+ 	if (!fromServer)
+-		sprintf (text, "%c%s: ", 1, save->name);
++		snprintf (text, sizeof(text), "%c%s: ", 1, save->name);
+ 	else
+-		sprintf (text, "%c<%s> ", 1, hostname.string);
++		snprintf (text, sizeof(text), "%c<%s> ", 1, hostname.string);
+ 
+ 	j = sizeof(text) - 2 - Q_strlen(text);  // -2 for /n and null terminator

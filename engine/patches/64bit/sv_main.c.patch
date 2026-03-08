@@ -1,0 +1,29 @@
+# sv_main.c — keep worldmodel/mapname strings inside the progs heap on 64-bit
+#
+# SV_SpawnServer() stores several strings in QuakeC globals by subtracting
+# pr_strings from pointers outside the progs string heap. Copy them into the
+# progs heap first.
+#
+--- sv_main.c
++++ sv_main.c
+@@ -1157,7 +1157,7 @@
+ 	ent = EDICT_NUM(0);
+ 	memset (&ent->v, 0, progs->entityfields * 4);
+ 	ent->free = false;
+-	ent->v.model = sv.worldmodel->name - pr_strings;
++	ent->v.model = ED_NewString (sv.worldmodel->name) - pr_strings;
+ 	ent->v.modelindex = 1;		// world model
+ 	ent->v.solid = SOLID_BSP;
+ 	ent->v.movetype = MOVETYPE_PUSH;
+@@ -1167,9 +1167,9 @@
+ 	else
+ 		pr_global_struct->deathmatch = deathmatch.value;
+ 
+-	pr_global_struct->mapname = sv.name - pr_strings;
++	pr_global_struct->mapname = ED_NewString (sv.name) - pr_strings;
+ #ifdef QUAKE2
+-	pr_global_struct->startspot = sv.startspot - pr_strings;
++	pr_global_struct->startspot = ED_NewString (sv.startspot) - pr_strings;
+ #endif
+ 
+ // serverflags are for cross level information (sigils)

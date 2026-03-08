@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 from pathlib import Path
@@ -9,6 +10,9 @@ from typing import Dict, Iterable, List, Mapping, Tuple
 
 from quake_ai.utils.io import read_json
 
+PAK_MAGIC = b"PACK"
+PAK_DIR_ENTRY_SIZE = 64
+PAK_DIR_ENTRY = struct.Struct("<56sii")
 QUAKE_BSP_VERSION = 29
 NUM_LUMPS = 15
 ENTITY_LUMP_INDEX = 0
@@ -26,10 +30,9 @@ def parse_entities_text(text: str) -> List[Dict[str, str]]:
     return entities
 
 
-def _parse_bsp_entities(path: Path) -> List[Dict[str, str]]:
-    raw = path.read_bytes()
+def _parse_bsp_entities_bytes(raw: bytes, source_name: str) -> List[Dict[str, str]]:
     if len(raw) < 4 + NUM_LUMPS * 8:
-        raise ValueError(f"Invalid BSP file {path}: too small")
+        raise ValueError(f"Invalid BSP file {source_name}: too small")
 
     version = struct.unpack_from("<i", raw, 0)[0]
     if version != QUAKE_BSP_VERSION:
@@ -42,6 +45,97 @@ def _parse_bsp_entities(path: Path) -> List[Dict[str, str]]:
 
     text = raw[entity_ofs : entity_ofs + entity_len].decode("latin-1", errors="ignore")
     return parse_entities_text(text)
+
+
+def _parse_bsp_entities(path: Path) -> List[Dict[str, str]]:
+    return _parse_bsp_entities_bytes(path.read_bytes(), str(path))
+
+
+def _resolve_id1_dir(path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.name.lower() == "id1" and candidate.is_dir():
+        return candidate
+
+    id1_dir = candidate / "id1"
+    if id1_dir.is_dir():
+        return id1_dir
+
+    raise FileNotFoundError(f"Could not resolve id1 directory under {candidate}")
+
+
+def is_quake_asset_root(path: str | Path) -> bool:
+    try:
+        id1_dir = _resolve_id1_dir(path)
+    except FileNotFoundError:
+        return False
+    return any(candidate.exists() for candidate in _iter_pak_paths(id1_dir))
+
+
+def _pak_index(path: Path) -> int:
+    stem = path.stem.lower()
+    if stem.startswith("pak") and stem[3:].isdigit():
+        return int(stem[3:])
+    return -1
+
+
+def _iter_pak_paths(id1_dir: Path) -> List[Path]:
+    candidates = sorted(
+        [path for path in id1_dir.iterdir() if path.is_file() and path.suffix.lower() == ".pak" and path.stem.lower().startswith("pak")],
+        key=lambda path: path.name.lower(),
+    )
+    deduped: Dict[str, Path] = {}
+    for candidate in candidates:
+        deduped.setdefault(candidate.name.lower(), candidate)
+    return sorted(deduped.values(), key=lambda path: (_pak_index(path), path.name.lower()), reverse=True)
+
+
+def _iter_pak_directory_entries(pak_path: Path) -> List[Tuple[str, int, int]]:
+    raw = pak_path.read_bytes()
+    if len(raw) < 12:
+        raise ValueError(f"Invalid PAK file {pak_path}: too small")
+    if raw[:4] != PAK_MAGIC:
+        raise ValueError(f"Invalid PAK file {pak_path}: missing PACK header")
+
+    dir_offset, dir_length = struct.unpack_from("<ii", raw, 4)
+    if dir_offset < 0 or dir_length < 0 or dir_offset + dir_length > len(raw):
+        raise ValueError(f"Invalid PAK file {pak_path}: bad directory bounds")
+    if dir_length % PAK_DIR_ENTRY_SIZE != 0:
+        raise ValueError(f"Invalid PAK file {pak_path}: directory length is not aligned")
+
+    entries: List[Tuple[str, int, int]] = []
+    for offset in range(dir_offset, dir_offset + dir_length, PAK_DIR_ENTRY_SIZE):
+        raw_name, file_offset, file_length = PAK_DIR_ENTRY.unpack_from(raw, offset)
+        if file_offset < 0 or file_length < 0 or file_offset + file_length > len(raw):
+            raise ValueError(f"Invalid PAK file {pak_path}: bad entry bounds")
+        name = raw_name.split(b"\0", 1)[0].decode("latin-1", errors="ignore").replace("\\", "/")
+        entries.append((name, file_offset, file_length))
+    return entries
+
+
+def load_quake_asset_bytes(path: str | Path, asset_name: str) -> bytes:
+    id1_dir = _resolve_id1_dir(path)
+    normalized = asset_name.replace("\\", "/").lstrip("/").lower()
+
+    unpacked = id1_dir / normalized
+    if unpacked.exists():
+        return unpacked.read_bytes()
+
+    for pak_path in _iter_pak_paths(id1_dir):
+        pak_bytes = pak_path.read_bytes()
+        for entry_name, file_offset, file_length in _iter_pak_directory_entries(pak_path):
+            if entry_name.lower() != normalized:
+                continue
+            return pak_bytes[file_offset : file_offset + file_length]
+
+    raise FileNotFoundError(f"Could not find asset {asset_name} under {id1_dir}")
+
+
+def parse_map_entities_from_quake_assets(path: str | Path, map_name: str) -> List[Dict[str, str]]:
+    normalized = map_name.lower()
+    if normalized.endswith(".bsp"):
+        normalized = normalized[:-4]
+    raw = load_quake_asset_bytes(path, f"maps/{normalized}.bsp")
+    return _parse_bsp_entities_bytes(raw, f"{path}/id1/maps/{normalized}.bsp")
 
 
 def parse_map_entities(path: str | Path) -> List[Dict[str, str]]:
@@ -64,8 +158,8 @@ def parse_origin(origin: str) -> Tuple[float, float, float]:
 
 def region_for_point(point: Tuple[float, float, float], grid_size: float = 256.0) -> int:
     x, y, _ = point
-    gx = int(round(x / grid_size))
-    gy = int(round(y / grid_size))
+    gx = int(math.floor((x / grid_size) + 0.5))
+    gy = int(math.floor((y / grid_size) + 0.5))
     # Deterministic packed region ID.
     return (gx + 1024) * 2048 + (gy + 1024)
 

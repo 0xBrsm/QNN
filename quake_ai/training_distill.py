@@ -47,6 +47,32 @@ class DistillConfig:
     device: str = "auto"
 
 
+def _evaluate_supervised_split(
+    model: MLPGRUPolicy,
+    obs: np.ndarray | None,
+    actions: Dict[str, np.ndarray] | None,
+    batch_size: int,
+) -> Dict[str, float]:
+    if obs is None or actions is None or len(obs) == 0:
+        return {"loss": 0.0, "accuracy": 0.0}
+
+    total_rows = 0
+    total_loss = 0.0
+    total_accuracy = 0.0
+    for start in range(0, len(obs), batch_size):
+        stop = min(start + batch_size, len(obs))
+        metrics = model.evaluate_supervised(obs[start:stop], {head: values[start:stop] for head, values in actions.items()})
+        rows = stop - start
+        total_rows += rows
+        total_loss += float(metrics["loss"]) * rows
+        total_accuracy += float(metrics["accuracy"]) * rows
+
+    return {
+        "loss": total_loss / max(total_rows, 1),
+        "accuracy": total_accuracy / max(total_rows, 1),
+    }
+
+
 def _teacher_action(
     teacher: MLPGRUPolicy,
     obs: np.ndarray,
@@ -60,10 +86,7 @@ def _teacher_action(
         selected, _, _ = teacher.sample_actions(logits, rng)
     else:
         raise ValueError(f"Unsupported teacher_mode {mode}")
-    action = {head: int(selected[head][0]) for head in ACTION_HEADS}
-    if float(obs[-2]) > 0.5:
-        action["use"] = 1
-    return action
+    return {head: int(selected[head][0]) for head in ACTION_HEADS}
 
 
 def _collect_rollouts(config: DistillConfig) -> tuple[List[Sample], Dict[str, float]]:
@@ -147,31 +170,19 @@ def run_distillation(config: DistillConfig) -> Dict[str, float]:
 
     obs_dim = split.train[0].obs.shape[0]
     student = MLPGRUPolicy(obs_dim=obs_dim, trunk_hidden=config.trunk_hidden, seed=config.seed, device=config.device)
-    weights = {
-        head: torch.as_tensor(values, dtype=torch.float32, device=student.device)
-        for head, values in class_weights(split.train).items()
-    }
-    train_obs = torch.as_tensor(stack_observations(split.train), dtype=torch.float32, device=student.device)
-    train_actions = {
-        head: torch.as_tensor(values, dtype=torch.long, device=student.device)
-        for head, values in stack_actions(split.train).items()
-    }
+    weights = {head: torch.as_tensor(values, dtype=torch.float32, device=student.device) for head, values in class_weights(split.train).items()}
+    train_obs = stack_observations(split.train).astype(np.float32, copy=False)
+    train_actions = stack_actions(split.train)
     val_obs = None
     val_actions = None
     if split.val:
-        val_obs = torch.as_tensor(stack_observations(split.val), dtype=torch.float32, device=student.device)
-        val_actions = {
-            head: torch.as_tensor(values, dtype=torch.long, device=student.device)
-            for head, values in stack_actions(split.val).items()
-        }
+        val_obs = stack_observations(split.val).astype(np.float32, copy=False)
+        val_actions = stack_actions(split.val)
     test_obs = None
     test_actions = None
     if split.test:
-        test_obs = torch.as_tensor(stack_observations(split.test), dtype=torch.float32, device=student.device)
-        test_actions = {
-            head: torch.as_tensor(values, dtype=torch.long, device=student.device)
-            for head, values in stack_actions(split.test).items()
-        }
+        test_obs = stack_observations(split.test).astype(np.float32, copy=False)
+        test_actions = stack_actions(split.test)
     rng = np.random.default_rng(config.seed)
 
     best_val_acc = -1.0
@@ -184,16 +195,13 @@ def run_distillation(config: DistillConfig) -> Dict[str, float]:
         train_accs: List[float] = []
 
         for batch_idx in batch_index_iter(len(split.train), config.batch_size, rng):
-            mb_idx = torch.as_tensor(batch_idx, dtype=torch.long, device=student.device)
-            obs = train_obs.index_select(0, mb_idx)
-            actions = {head: values.index_select(0, mb_idx) for head, values in train_actions.items()}
+            obs = train_obs[batch_idx]
+            actions = {head: values[batch_idx] for head, values in train_actions.items()}
             metrics = student.supervised_step(obs, actions, weights, lr=config.lr)
             train_losses.append(metrics["loss"])
             train_accs.append(metrics["accuracy"])
 
-        val_metrics = {"loss": 0.0, "accuracy": 0.0}
-        if val_obs is not None and val_actions is not None:
-            val_metrics = student.evaluate_supervised(val_obs, val_actions)
+        val_metrics = _evaluate_supervised_split(student, val_obs, val_actions, batch_size=config.batch_size)
 
         proxy = success_proxy(split.val if split.val else split.train)
         epoch_metrics = {
@@ -221,9 +229,7 @@ def run_distillation(config: DistillConfig) -> Dict[str, float]:
         student.save(output / "distill_best_model.npz")
 
     final_model = MLPGRUPolicy.load(output / "distill_best_model.npz", device=config.device)
-    test_metrics = {"loss": 0.0, "accuracy": 0.0}
-    if test_obs is not None and test_actions is not None:
-        test_metrics = final_model.evaluate_supervised(test_obs, test_actions)
+    test_metrics = _evaluate_supervised_split(final_model, test_obs, test_actions, batch_size=config.batch_size)
 
     summary = {
         "best_epoch": float(best_epoch),

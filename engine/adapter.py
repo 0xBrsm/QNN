@@ -7,14 +7,15 @@ without a full Quake engine checkout during v0 development.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Mapping, Tuple
 
 from quake_ai.actions import ActionLabels
 from quake_ai.data.netquake_demo import parse_netquake_demo
+from quake_ai.data.world_stream import world_ticks_from_demo_episode
 from quake_ai.maps.bsp_parser import region_for_point
-from quake_ai.schemas import PacketEventV1, TelemetryTickV1
+from quake_ai.schemas import MapStateV2, PacketEventV1, TelemetryTickV1, WorldTickV2
 
 PAYLOAD_TYPE_MAP = {
     0x01: "move_cmd",
@@ -41,6 +42,9 @@ class DemoTick:
     done: bool
     done_reason: str
     packet: Dict[str, object]
+    view_angles: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    visible_entities: List[Dict[str, object]] = field(default_factory=list)
+    events: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -48,6 +52,7 @@ class DemoEpisode:
     episode_id: str
     map_id: str
     ticks: List[DemoTick]
+    metadata: Dict[str, object] = field(default_factory=dict)
 
 
 def decode_packet_hex(packet_hex: str) -> Tuple[str, Dict[str, int]]:
@@ -78,6 +83,7 @@ def _load_json_demo(path: Path) -> DemoEpisode:
                 player_pos=[float(v) for v in row["player_pos"]],
                 player_vel=[float(v) for v in row["player_vel"]],
                 yaw=float(row["yaw"]),
+                view_angles=[float(v) for v in row.get("view_angles", [0.0, float(row["yaw"]), 0.0])],
                 health=int(row["health"]),
                 armor=int(row["armor"]),
                 ammo=int(row["ammo"]),
@@ -88,6 +94,8 @@ def _load_json_demo(path: Path) -> DemoEpisode:
                 done=bool(row.get("done", False)),
                 done_reason=str(row.get("done_reason", "")),
                 packet=dict(row.get("packet", {})),
+                visible_entities=[dict(item) for item in row.get("visible_entities", [])],
+                events=[dict(item) for item in row.get("events", [])],
             )
         )
 
@@ -95,6 +103,7 @@ def _load_json_demo(path: Path) -> DemoEpisode:
         episode_id=str(payload["episode_id"]),
         map_id=str(payload.get("map_id", "E1M1")),
         ticks=ticks,
+        metadata=dict(payload.get("metadata", {})),
     )
 
 
@@ -109,6 +118,7 @@ def _load_binary_demo(path: Path, map_id: str) -> DemoEpisode:
                 player_pos=[float(v) for v in row.player_pos],
                 player_vel=[float(v) for v in row.player_vel],
                 yaw=float(row.yaw),
+                view_angles=[float(v) for v in row.view_angles],
                 health=int(row.health),
                 armor=int(row.armor),
                 ammo=int(row.ammo),
@@ -119,12 +129,25 @@ def _load_binary_demo(path: Path, map_id: str) -> DemoEpisode:
                 done=bool(row.done),
                 done_reason=str(row.done_reason),
                 packet=dict(row.packet),
+                visible_entities=[dict(item) for item in row.visible_entities],
+                events=[dict(item) for item in row.events],
             )
         )
     return DemoEpisode(
         episode_id=str(payload.episode_id),
         map_id=str(payload.map_id),
         ticks=ticks,
+        metadata={
+            "serverinfo": dict(payload.serverinfo),
+            "cvars": dict(payload.cvars),
+            "player_names": dict(payload.player_names),
+            "player_colors": dict(payload.player_colors),
+            "frag_updates": list(payload.frag_updates),
+            "text_flags": dict(payload.text_flags),
+            "maxclients": int(payload.maxclients),
+            "duration_s": float(payload.duration_s),
+            "tick_count": int(payload.tick_count),
+        },
     )
 
 
@@ -141,8 +164,10 @@ class DemoPlaybackHarness:
     def __init__(self, map_id: str) -> None:
         self.map_id = map_id
 
-    def replay(self, demo_path: str | Path) -> Iterator[Tuple[TelemetryTickV1, PacketEventV1]]:
-        episode = load_demo(demo_path, map_id=self.map_id)
+    def load_episode(self, demo_path: str | Path) -> DemoEpisode:
+        return load_demo(demo_path, map_id=self.map_id)
+
+    def replay_episode(self, episode: DemoEpisode) -> Iterator[Tuple[TelemetryTickV1, PacketEventV1]]:
         for tick in episode.ticks:
             region = region_for_point(tuple(tick.player_pos))
             telemetry = TelemetryTickV1(
@@ -176,6 +201,17 @@ class DemoPlaybackHarness:
                 decoded_fields=decoded_fields,
             )
             yield telemetry, packet
+
+    def replay(self, demo_path: str | Path) -> Iterator[Tuple[TelemetryTickV1, PacketEventV1]]:
+        episode = self.load_episode(demo_path)
+        yield from self.replay_episode(episode)
+
+    def replay_world_episode(self, episode: DemoEpisode, map_state: MapStateV2) -> Iterator[WorldTickV2]:
+        yield from world_ticks_from_demo_episode(episode, map_state)
+
+    def replay_world_ticks(self, demo_path: str | Path, map_state: MapStateV2) -> Iterator[WorldTickV2]:
+        episode = self.load_episode(demo_path)
+        yield from self.replay_world_episode(episode, map_state)
 
 
 class SyntheticQuakeAdapter:

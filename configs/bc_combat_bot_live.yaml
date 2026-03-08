@@ -1,0 +1,22 @@
+{
+  "map_id": "dm6",
+  "world_ticks_path": "../artifacts/runs/competitive_materialized_competitive_all51/collect/world_ticks.ndjson",
+  "map_state_path": "../artifacts/runs/competitive_materialized_competitive_all51/collect/world_map.json",
+  "metadata_path": "../artifacts/runs/competitive_materialized_competitive_all51/collect/demo_metadata.ndjson",
+  "observation_format": "world_v2_competitive",
+  "output_dir": "../artifacts/runs/competitive_bot_combat_live/bc",
+  "seed": 11,
+  "train_ratio": 0.72,
+  "val_ratio": 0.14,
+  "batch_size": 1024,
+  "epochs": 8,
+  "lr": 0.008,
+  "patience": 3,
+  "use_gru": false,
+  "gru_hidden": 0,
+  "trunk_hidden": 192,
+  "class_weight_power": 0.6,
+  "class_weight_min": 0.5,
+  "class_weight_max": 2.5,
+  "device": "auto"
+}

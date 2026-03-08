@@ -1,0 +1,31 @@
+{
+  "map_features_path": "../artifacts/runs/e1m1_corpus_world/collect/map_features.json",
+  "checkpoint_path": "../artifacts/runs/campaign_combat_live/ppo/ppo_model.npz",
+  "output_dir": "../artifacts/runs/campaign_combat_live/eval",
+  "observation_format": "world_v2_competitive",
+  "reward_mode": "combat_survival",
+  "map_id": "E1M1",
+  "native_executable": "../artifacts/bin/quake_worker",
+  "fixed_tick_hz": 20,
+  "native_args": [],
+  "native_options": {
+    "maxplayers": 1,
+    "skill": 0,
+    "deathmatch": 0,
+    "coop": 0,
+    "teamplay": 0,
+    "fraglimit": 0,
+    "timelimit": 0,
+    "samelevel": 1,
+    "pre_map_commands": "",
+    "post_map_commands": ""
+  },
+  "seed": 23,
+  "num_episodes": 32,
+  "max_steps_per_episode": 1024,
+  "policy_modes": ["greedy", "sampled"],
+  "start_mode": "randomized",
+  "holdout_seed_offset": 10000,
+  "sample_seed_offset": 20000,
+  "device": "auto"
+}

@@ -1,0 +1,67 @@
+# pr_cmds.c — keep temporary progs strings inside the Hunk on 64-bit
+#
+# PF_ftos(), PF_vtos(), and PF_etos() return offsets relative to pr_strings.
+# The original temporary buffer lives in BSS, so the pointer difference
+# truncates on 64-bit. Allocate it from the Hunk instead.
+#
+--- pr_cmds.c
++++ pr_cmds.c
+@@ -920,18 +920,28 @@
+ 	Con_DPrintf ("%s",PF_VarString(0));
+ }
+ 
+-char	pr_string_temp[128];
++static char	*pr_string_temp;
++
++static char *PF_TempStringBuffer (void)
++{
++	if (!pr_string_temp)
++		pr_string_temp = Hunk_Alloc (128);
++	return pr_string_temp;
++}
+ 
+ void PF_ftos (void)
+ {
+ 	float	v;
++	char	*buf;
++	
+ 	v = G_FLOAT(OFS_PARM0);
++	buf = PF_TempStringBuffer ();
+ 	
+ 	if (v == (int)v)
+-		sprintf (pr_string_temp, "%d",(int)v);
++		sprintf (buf, "%d",(int)v);
+ 	else
+-		sprintf (pr_string_temp, "%5.1f",v);
+-	G_INT(OFS_RETURN) = pr_string_temp - pr_strings;
++		sprintf (buf, "%5.1f",v);
++	G_INT(OFS_RETURN) = buf - pr_strings;
+ }
+ 
+ void PF_fabs (void)
+@@ -943,15 +953,21 @@
+ 
+ void PF_vtos (void)
+ {
+-	sprintf (pr_string_temp, "'%5.1f %5.1f %5.1f'", G_VECTOR(OFS_PARM0)[0], G_VECTOR(OFS_PARM0)[1], G_VECTOR(OFS_PARM0)[2]);
+-	G_INT(OFS_RETURN) = pr_string_temp - pr_strings;
++	char	*buf;
++
++	buf = PF_TempStringBuffer ();
++	sprintf (buf, "'%5.1f %5.1f %5.1f'", G_VECTOR(OFS_PARM0)[0], G_VECTOR(OFS_PARM0)[1], G_VECTOR(OFS_PARM0)[2]);
++	G_INT(OFS_RETURN) = buf - pr_strings;
+ }
+ 
+ #ifdef QUAKE2
+ void PF_etos (void)
+ {
+-	sprintf (pr_string_temp, "entity %i", G_EDICTNUM(OFS_PARM0));
+-	G_INT(OFS_RETURN) = pr_string_temp - pr_strings;
++	char	*buf;
++
++	buf = PF_TempStringBuffer ();
++	sprintf (buf, "entity %i", G_EDICTNUM(OFS_PARM0));
++	G_INT(OFS_RETURN) = buf - pr_strings;
+ }
+ #endif
+ 

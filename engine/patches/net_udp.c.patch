@@ -1,0 +1,24 @@
+# net_udp.c — support ephemeral listen ports
+#
+# Multiple local worker processes need `listen 1` without colliding on a fixed
+# UDP port. When `net_hostport` is 0, let the OS pick a port and then query it
+# back from the socket.
+#
+--- net_udp.c
++++ net_udp.c
+@@ -111,7 +111,15 @@
+ 		if (net_acceptsocket != -1)
+ 			return;
+ 		if ((net_acceptsocket = UDP_OpenSocket (net_hostport)) == -1)
+ 			Sys_Error ("UDP_Listen: Unable to open accept socket\n");
++		if (net_hostport == 0)
++		{
++			struct qsockaddr addr;
++
++			UDP_GetSocketAddr (net_acceptsocket, &addr);
++			net_hostport = UDP_GetSocketPort (&addr);
++			((struct sockaddr_in *)&broadcastaddr)->sin_port = htons(net_hostport);
++		}
+ 		return;
+ 	}
+ 

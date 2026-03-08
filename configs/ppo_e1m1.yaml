@@ -10,9 +10,13 @@
   "gamma": 0.99,
   "gae_lambda": 0.95,
   "clip_ratio": 0.2,
-  "policy_lr": 0.01,
-  "value_lr": 0.02,
+  "policy_lr": 0.0005,
+  "value_lr": 0.001,
   "ppo_epochs": 4,
   "minibatch_size": 256,
+  "value_coef": 0.5,
+  "entropy_coef": 0.01,
+  "target_kl": 0.02,
+  "max_grad_norm": 0.5,
   "device": "auto"
 }

@@ -1,0 +1,27 @@
+# common.c - COM_Parse buffer overflow
+#
+# COM_Parse() writes tokens into the global com_token buffer (1024 bytes)
+# with no length check. Both the quoted-string path and the regular-word path
+# will happily write past the end of the buffer. Add bounds checks to both
+# code paths.
+#
+--- common.c
++++ common.c
+@@ -944,6 +944,8 @@
+ 	while (1)
+ 		{
+ 			c = *data++;
++			if (len >= sizeof(com_token) - 1)
++				break;
+ 			if (c=='\"' || !c)
+ 			{
+ 				com_token[len] = 0;
+@@ -968,6 +970,8 @@
+ 		com_token[len] = c;
+ 		data++;
+ 		len++;
++		if (len >= sizeof(com_token) - 1)
++			break;
+ 		c = *data;
+ 	if (c=='{' || c=='}'|| c==')'|| c=='(' || c=='\'' || c==':')
+ 			break;

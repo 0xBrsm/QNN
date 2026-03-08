@@ -1,89 +1,133 @@
-# Quake AI V0 (E1M1 Imitation -> RL)
+# Quake AI
 
-This repository implements a runnable V0 baseline to train a small discrete-control policy for original Quake-style E1M1 navigation.
+This repo targets an engine-backed Quake policy trained on shared `MapStateV2` and `WorldTickV2` contracts. The current live direction is combat-survival training on `world_v2_competitive`, warm-started from competitive BC. The old symbolic and E1M1-only paths remain in-tree for regression and worker-health checks.
 
-## What is implemented
-- Deterministic demo replay harness for JSON fixture demos and real NetQuake binary `.dem` files.
-- Telemetry/packet collection to NDJSON:
-  - `TelemetryTickV1`
-  - `PacketEventV1`
-  - `EpisodeSummaryV1`
-- Map feature extraction (`MapFeaturesV1`) from BSP entity lump, JSON map metadata, or observed telemetry transitions.
-- Corpus materialization from `download_manifest.ndjson` for map-specific training subsets.
-- Behavior cloning with a PyTorch-backed 2-layer MLP policy trunk.
-- PPO fine-tuning initialized from the BC checkpoint.
-- Held-out greedy/sampled evaluation and model card/manifest outputs.
-- Packet/telemetry alignment validation report.
-- Native engine process boundary scaffolding with a JSON-over-stdio bridge and C stub server for contract testing.
-- Explicit torch device selection plus GPU-friendly BC/PPO/distill batching when an accelerator is visible.
+## Current Status
+
+| Item | Status |
+|------|--------|
+| Active live target | `world_v2_competitive` plus `combat_survival` reward on the real Quake worker |
+| Competitive BC warm start | `artifacts/runs/competitive_materialized_competitive_all51/`: `50` replayable demos, `1,300,465` ticks, `best_val_accuracy=0.8306`, `test_accuracy=0.8040` |
+| Retained worker regression baseline | `artifacts/runs/e1m1_corpus_world/`: BC sampled `stuck_rate=0.9099`; PPO sampled `stuck_rate=0.0906`; completion still `0.0` |
+| Live combat profiles | `combat-verify` and `combat` are wired through `quake_ai.live_training` |
+| Bot-backed live profiles | Named `combat-bot-<scenario>[-verify]` ladder profiles use `FrikBotNex` through `-game frikbotnex` |
+| Retained ladder evidence | `open-dm4` verify/live, `pressure-dm6` verify, and an `open-dm4` feed-forward verification comparison are now retained in `artifacts/runs/competitive_bot_*` |
+| Worker control boundary | `native_args` and reset options support `-game` mods, match settings, and pre/post-map commands |
+| Current blockers | No second retained live ladder scenario yet, and the campaign comparison lane still relies on the older retained artifact surface |
+
+If you are doing training work, start with [Training Quality Plan](../agents/training-quality-plan.md).
+
+## What Matters Now
+
+- `world_v2_competitive` is the active live training path.
+- Compare worker stability and contract health against `artifacts/runs/e1m1_corpus_world/`, but do not treat E1M1 completion as the main optimization target.
+- Use competitive BC as the practical warm start, not as the final product.
+- `quake_ai.live_training` now falls back to the profile-local BC checkpoint when the configured PPO warm start metadata does not match the current `world_v2_competitive` observation shape.
+- Keep opponent and mod setup at the worker boundary rather than baking Quake-specific startup rules into Python.
+- Use the named bot ladder profiles for verify/live promotion work instead of the legacy single-profile aliases.
+
+## Action Contract
+
+| Head | Live meaning |
+|------|--------------|
+| `move` | `0` idle, `1` forward, `2` back |
+| `strafe` | `0` idle, `1` left, `2` right |
+| `look_yaw` | 25 discrete sensitivity-3 mouse-count bins for left and right look |
+| `look_pitch` | 25 discrete sensitivity-3 mouse-count bins for up and down look |
+| `fire` | `0` off, `1` on |
+| `jump` | `0` off, `1` on |
+| `weapon` | `0` no switch, `1..8` direct weapon-slot switch |
+
+`move` and `strafe` stay as separate 3-way heads, so diagonal movement comes from combining them rather than from a single analog movement head.
 
 ## Install
+
+From `src/`:
+
 ```bash
 python -m pip install -e .
 python -m pip install -e .[dev]
 ```
 
-For AMD GPUs, use the isolated ROCm trainer with `scripts/train-container.sh` rather than trying to layer ROCm into your editor environment.
+For AMD GPUs, use the isolated ROCm trainer with `src/scripts/train-container.sh` rather than trying to layer ROCm into the editor environment.
 
-## End-to-end quickstart
-From `src/`:
+## Current Commands
 
-```bash
-python -m quake_ai.collect --map E1M1 --demo_dir tests/demo_data --out ../artifacts/runs/collect --map_path tests/fixtures/e1m1_map.json
-python -m quake_ai.validate_packets --telemetry ../artifacts/runs/collect/telemetry.ndjson --packets ../artifacts/runs/collect/packets.ndjson --out ../artifacts/runs/collect/packet_report.json
-python -m quake_ai.train_bc --config configs/bc_e1m1.yaml
-python -m quake_ai.train_rl --config configs/ppo_e1m1.yaml --init_ckpt ../artifacts/runs/bc/bc_best_model.npz
-python -m quake_ai.eval --config configs/eval_e1m1.yaml --ckpt ../artifacts/runs/ppo/ppo_model.npz
-python -m quake_ai.check_accelerator
-```
-
-## Isolated training container
 From the repo root:
 
 ```bash
-scripts/train-container.sh build
-scripts/train-container.sh target
-scripts/train-container.sh check
-scripts/train-container.sh e1m1-corpus all
+src/scripts/train-container.sh check
+src/scripts/train-container.sh install-frikbotnex
+src/scripts/train-container.sh live-check
+src/scripts/train-container.sh e1m1-world report
+src/scripts/train-container.sh run -- python -m quake_ai.live_training --profile combat-verify --action check --device gpu
+src/scripts/train-container.sh run -- python -m quake_ai.live_training --profile combat-verify --action ppo --device gpu
+src/scripts/train-container.sh run -- python -m quake_ai.live_training --profile combat-verify --action eval --device gpu
+src/scripts/train-container.sh combat-bot-open-dm4-verify check
+src/scripts/train-container.sh combat-bot-open-dm4-verify all
+src/scripts/train-container.sh combat-bot-pressure-dm6-verify all
+src/scripts/train-container.sh combat-bot-open-dm4 all
 ```
 
-The trainer:
-- auto-selects `docker/training/compose.amd-wsl.yaml` on Windows 11 + WSL hosts that expose `/dev/dxg`
-- otherwise falls back to `docker/training/compose.amd-rocm.yaml` for native Linux ROCm hosts that expose `/dev/kfd` and `/dev/dri`
-- uses AMD's ROCm PyTorch base image
-- mounts the repo read-only at `/workspace`
-- mounts a writable sibling host artifact directory at `/artifacts`
-- keeps training outputs and corpus state outside the code repo while preserving the existing config paths
+The shell wrapper exposes `combat-verify`, `combat`, the named `combat-bot-<scenario>[-verify]` ladder shortcuts, the legacy `combat-bot-verify` and `combat-bot` aliases, and `install-frikbotnex`. `run -- python -m quake_ai.live_training --profile ...` remains available for ad hoc profile work.
 
-## Corpus quickstart
-From the `src/` repo root, with an optional `dzip` binary available for classic SDA `.dz` files:
+## Bot Ladder
+
+The current FrikBotNex ladder lives in `configs/combat_bot_scenarios.json`.
+
+| Scenario | Map | Purpose | Verify profile | Live profile |
+|----------|-----|---------|----------------|--------------|
+| `duel-dm2` | `dm2` | Short-horizon duel aim and fast re-engagements | `combat-bot-duel-dm2-verify` | `combat-bot-duel-dm2` |
+| `open-dm4` | `dm4` | Open pursuit, long sightlines, and visibility changes | `combat-bot-open-dm4-verify` | `combat-bot-open-dm4` |
+| `vertical-dm3` | `dm3` | Vertical pickup pressure and route choice | `combat-bot-vertical-dm3-verify` | `combat-bot-vertical-dm3` |
+| `pressure-dm6` | `dm6` | Opening pressure, spawn variance, and repeated weapon trades | `combat-bot-pressure-dm6-verify` | `combat-bot-pressure-dm6` |
+
+Recent retained evidence:
+
+- `artifacts/runs/competitive_bot_open_dm4_verify/`: recurrent retained verify run with non-zero outgoing combat metrics.
+- `artifacts/runs/competitive_bot_pressure_dm6_verify/`: retained verify run that trades combat output for higher survival/return than `open-dm4`.
+- `artifacts/runs/competitive_bot_open_dm4_verify_ff/`: feed-forward retained verify comparison against the recurrent `open-dm4` run.
+- `artifacts/runs/competitive_bot_open_dm4_live/`: first retained live bot-backed promotion, with sampled eval return improving from `-5.7744` in `eval_bc` to `13.9230`.
+
+## Manual Combat Loop
+
+From `src/`:
 
 ```bash
-DZIP_BIN=/path/to/dzip python scripts/materialize_corpus_subset.py --map E1M1 --manifest ../artifacts/corpus/netquake/meta/download_manifest.ndjson --out ../artifacts/runs/e1m1_corpus/demos
-python -m quake_ai.collect --map E1M1 --demo_dir ../artifacts/runs/e1m1_corpus/demos --out ../artifacts/runs/e1m1_corpus/collect
-python -m quake_ai.train_bc --config configs/bc_e1m1_corpus.yaml
-python -m quake_ai.train_rl --config configs/ppo_e1m1_corpus.yaml --init_ckpt ../artifacts/runs/e1m1_corpus/bc/bc_best_model.npz
-python -m quake_ai.eval --config configs/eval_e1m1_corpus.yaml --ckpt ../artifacts/runs/e1m1_corpus/ppo/ppo_model.npz
+export QUAKE_BASEDIR=/assets
+engine/build/build_quake_worker.sh ../artifacts/bin/quake_worker
+python -m quake_ai.install_frikbotnex --asset-root "$QUAKE_BASEDIR"
+python -m quake_ai.train_bc --config configs/bc_combat_bootstrap_verify.yaml
+python -m quake_ai.live_training --profile combat-verify --action check --device cpu
+python -m quake_ai.live_training --profile combat-verify --action ppo --device cpu
+python -m quake_ai.live_training --profile combat-verify --action eval --device cpu
 ```
 
-## Outputs
-- `../artifacts/runs/collect/`: telemetry, packets, summaries, map features.
-- `../artifacts/runs/bc/`: BC model checkpoint, split manifest, history, summary, experiment manifest.
-- `../artifacts/runs/ppo/`: PPO checkpoint/history/summary/manifest.
-- `../artifacts/runs/eval/`: eval summary, model card, eval manifest.
-- `../artifacts/runs/e1m1_corpus/`: materialized demos plus corpus-scale collect/BC/PPO/eval artifacts.
-- `../artifacts/corpus/`: crawler manifests, raw payloads, extracted demos, and corpus worker logs.
+If a bot-capable mod is available, pass it through the config-driven worker boundary with `native_args` and `native_options` instead of custom Python glue.
+To use the bundled FrikBotNex path, install it once under the asset root and then run one of the named ladder profiles such as `combat-bot-open-dm4-verify` or `combat-bot-open-dm4`.
 
-## Notes
-- Config files in `configs/*.yaml` are JSON-compatible YAML to avoid runtime parser dependencies.
-- Packet traces are used for validation/alignment in V0, not as primary model inputs.
-- The symbolic environment now uses heading-aware movement and requires `use` on the exit trigger to complete an episode.
-- `materialize_corpus_subset.py` reads the crawl manifest and can extract classic `.dz` payloads when `dzip` is available via `PATH` or `DZIP_BIN`.
-- The policy/training core now runs on PyTorch while preserving the existing CLI and artifact layout.
-- Set `--device gpu` or `--device cuda`/`--device rocm` on training and evaluation CLIs once the container can actually see an accelerator.
-- `python -m quake_ai.check_accelerator` is the fastest way to verify whether the current container has usable CUDA/ROCm/MPS access.
-- `scripts/train-container.sh` defaults the host artifact root to a sibling `../artifacts` directory so heavy training outputs stay outside the repo checkout.
-- `scripts/train-container.sh target` prints the selected AMD runtime path: `wsl` for `/dev/dxg` hosts, `rocm` for native Linux ROCm hosts, or use `TRAINING_AMD_TARGET=wsl|rocm` to override auto-detection.
-- On AMD WSL hosts, the trainer bind-mounts `libdxcore.so` and `libhsa-runtime64.so.1` into the container so the ROCm runtime can bridge into the Windows driver stack.
-- `scripts/train-container.sh migrate-legacy` will move old in-repo `runs/` and `corpus/` trees into the external artifact root if you are migrating an older checkout.
-- `engine.native_bridge` is the start of the engine-backed architecture: Python remains the control plane, while a native worker process owns real-time simulation.
+## Outputs That Matter
+
+| Path | Purpose |
+|------|---------|
+| `artifacts/runs/competitive_materialized_competitive_all51/` | Current mixed-mode competitive BC warm start |
+| `artifacts/runs/campaign_combat_verify/` | Bounded combat live profile outputs |
+| `artifacts/runs/campaign_combat_live/` | Retained combat live profile outputs |
+| `artifacts/runs/competitive_bot_open_dm4_verify/` | Example bounded bot-backed ladder verify output root |
+| `artifacts/runs/competitive_bot_pressure_dm6_verify/` | Retained bot-backed ladder verify output root for the secondary pressure scenario |
+| `artifacts/runs/competitive_bot_open_dm4_verify_ff/` | Retained feed-forward verify comparison output root for `open-dm4` |
+| `artifacts/runs/competitive_bot_open_dm4_live/` | Example retained bot-backed ladder live output root |
+| `artifacts/runs/e1m1_corpus_world/` | Retained worker-regression baseline |
+| `artifacts/runs/e1m1_corpus_world_baseline_20260307_fail/` | Archived collapse kept for historical comparison |
+
+## Regression-Only Paths
+
+- The symbolic configs under `configs/bc_e1m1.yaml`, `configs/ppo_e1m1.yaml`, and `configs/eval_e1m1.yaml` remain for fast regression checks only.
+- The old `e1m1-world` profiles remain useful for worker-health and deterministic-behavior checks, not as the main training target.
+
+## Related Docs
+
+- [Training Quality Plan](../agents/training-quality-plan.md)
+- [Status](../agents/status.md)
+- [Competitive Path Plan](../COMPETITIVE_BC_REENGINEERING_PLAN.md)
+- [Architecture](docs/architecture.md)

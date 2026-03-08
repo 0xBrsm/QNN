@@ -1,0 +1,36 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "duel-dm2",
+      "map_id": "dm2",
+      "skill_note": "Compact duel map for short-horizon aim, close-range frag loops, and quick re-engagements.",
+      "retained_role": "verify_ladder",
+      "verify_output_root": "../artifacts/runs/competitive_bot_duel_dm2_verify",
+      "live_output_root": "../artifacts/runs/competitive_bot_duel_dm2_live"
+    },
+    {
+      "scenario_id": "open-dm4",
+      "map_id": "dm4",
+      "skill_note": "Open pursuit scenario with long sightlines, delayed re-peeks, and visibility changes across height shifts.",
+      "retained_role": "main_retained",
+      "verify_output_root": "../artifacts/runs/competitive_bot_open_dm4_verify",
+      "live_output_root": "../artifacts/runs/competitive_bot_open_dm4_live"
+    },
+    {
+      "scenario_id": "vertical-dm3",
+      "map_id": "dm3",
+      "skill_note": "Vertical weapon-pressure map that stresses armor timing, pickups, and route choice across stacked floors.",
+      "retained_role": "verify_ladder",
+      "verify_output_root": "../artifacts/runs/competitive_bot_vertical_dm3_verify",
+      "live_output_root": "../artifacts/runs/competitive_bot_vertical_dm3_live"
+    },
+    {
+      "scenario_id": "pressure-dm6",
+      "map_id": "dm6",
+      "skill_note": "Spawn-variance and opening-pressure scenario with contested power positions and repeated rocket trades.",
+      "retained_role": "secondary_retained",
+      "verify_output_root": "../artifacts/runs/competitive_bot_pressure_dm6_verify",
+      "live_output_root": "../artifacts/runs/competitive_bot_pressure_dm6_live"
+    }
+  ]
+}

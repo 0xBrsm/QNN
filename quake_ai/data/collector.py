@@ -2,46 +2,83 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Mapping, TextIO, Tuple
 
 from engine.adapter import DemoPlaybackHarness
+from quake_ai.data.demo_classifier import classify_competitive
+from quake_ai.data.demo_metadata import DemoMetadata, build_demo_metadata
 from quake_ai.maps.features import write_map_features
-from quake_ai.schemas import EpisodeSummaryV1, MapFeaturesV1, PacketEventV1, TelemetryTickV1
+from quake_ai.maps.world_model import build_world_model, write_world_model
+from quake_ai.schemas import EpisodeSummaryV1, MapFeaturesV1, MapStateV2, PacketEventV1, TelemetryTickV1
 from quake_ai.utils.io import write_json, write_ndjson
+from quake_ai.data.world_stream import iter_world_ticks_from_demo_episode
 
 from .demo import find_demo_files
 
 
-def _summaries_from_telemetry(rows: List[TelemetryTickV1], tick_hz: int = 20) -> List[EpisodeSummaryV1]:
-    by_episode: Dict[str, List[TelemetryTickV1]] = defaultdict(list)
-    for row in rows:
-        by_episode[row.episode_id].append(row)
+@dataclass(slots=True)
+class _EpisodeSummaryAccumulator:
+    episode_id: str
+    steps: int = 0
+    goal_reached: bool = False
+    items_collected: int = 0
+    last_tick: int = 0
+    return_value: float = 0.0
+    previous_flags: List[int] = field(default_factory=lambda: [0, 0, 0, 0])
 
-    summaries: List[EpisodeSummaryV1] = []
-    for episode_id, ticks in sorted(by_episode.items()):
-        ticks.sort(key=lambda x: x.tick)
-        goal_reached = bool(ticks and ticks[-1].goal_progress >= 1.0)
-        items_collected = 0
-        previous_flags: List[int] = [0, 0, 0, 0]
-        for tick in ticks:
-            current_flags = tick.nearby_item_flags[:4] + [0] * max(0, 4 - len(tick.nearby_item_flags[:4]))
-            items_collected += sum(1 for prev, cur in zip(previous_flags, current_flags) if prev == 0 and cur == 1)
-            previous_flags = current_flags
-        time_to_goal = (ticks[-1].tick / tick_hz) if ticks else 0.0
-        total_return = sum(float(t.goal_progress) for t in ticks)
-        summaries.append(
-            EpisodeSummaryV1(
-                episode_id=episode_id,
-                steps=len(ticks),
-                goal_reached=goal_reached,
-                items_collected=items_collected,
-                time_to_goal=time_to_goal,
-                return_value=total_return,
-            )
+    def add(self, telemetry: TelemetryTickV1) -> None:
+        flags = telemetry.nearby_item_flags[:4] + [0] * max(0, 4 - len(telemetry.nearby_item_flags[:4]))
+        self.items_collected += sum(1 for prev, cur in zip(self.previous_flags, flags) if prev == 0 and cur == 1)
+        self.previous_flags = flags
+        self.steps += 1
+        self.goal_reached = bool(telemetry.goal_progress >= 1.0)
+        self.last_tick = telemetry.tick
+        self.return_value += float(telemetry.goal_progress)
+
+    def finalize(self, tick_hz: int = 20) -> EpisodeSummaryV1:
+        return EpisodeSummaryV1(
+            episode_id=self.episode_id,
+            steps=self.steps,
+            goal_reached=self.goal_reached,
+            items_collected=self.items_collected,
+            time_to_goal=(self.last_tick / tick_hz) if self.steps else 0.0,
+            return_value=self.return_value,
         )
-    return summaries
+
+
+@dataclass(slots=True)
+class _ObservedMapAccumulator:
+    region_ids: set[int] = field(default_factory=set)
+    edge_counts: Dict[Tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
+    item_counts: Dict[int, Dict[str, int]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(int)))
+    spawn_points: List[List[float]] = field(default_factory=list)
+    goal_regions: List[int] = field(default_factory=list)
+
+    def begin_episode(self, telemetry: TelemetryTickV1) -> int:
+        self.spawn_points.append(list(telemetry.player_pos))
+        return int(telemetry.region_id)
+
+    def add_tick(self, telemetry: TelemetryTickV1, previous_region: int | None) -> int:
+        region_id = int(telemetry.region_id)
+        self.region_ids.add(region_id)
+        if telemetry.nearby_item_flags[:4]:
+            labels = ("item_health", "item_armor", "item_ammo", "item_weapon")
+            for idx, flag in enumerate(telemetry.nearby_item_flags[:4]):
+                if int(flag) == 1:
+                    self.item_counts[region_id][labels[idx]] += 1
+        if previous_region is not None and region_id != previous_region:
+            self.edge_counts[(previous_region, region_id)] += 1
+            self.edge_counts[(region_id, previous_region)] += 1
+        return region_id
+
+    def end_episode(self, last_region: int | None) -> None:
+        if last_region is not None:
+            self.goal_regions.append(int(last_region))
 
 
 def _region_center(region_id: int) -> List[float]:
@@ -78,45 +115,6 @@ def _distance_to_goal(region_ids: Iterable[int], edges: Iterable[Tuple[int, int]
     return distances
 
 
-def _connect_observed_regions(rows: List[TelemetryTickV1]) -> Tuple[List[List[int]], Dict[int, Dict[str, int]], List[List[float]], List[int]]:
-    by_episode: Dict[str, List[TelemetryTickV1]] = defaultdict(list)
-    for row in rows:
-        by_episode[row.episode_id].append(row)
-
-    edge_counts: Dict[Tuple[int, int], int] = defaultdict(int)
-    item_counts: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    spawn_points: List[List[float]] = []
-    goal_regions: List[int] = []
-
-    for ticks in by_episode.values():
-        ticks.sort(key=lambda row: row.tick)
-        if not ticks:
-            continue
-
-        spawn_points.append(list(ticks[0].player_pos))
-        goal_regions.append(int(ticks[-1].region_id))
-
-        previous_region = int(ticks[0].region_id)
-        for tick in ticks:
-            region_id = int(tick.region_id)
-            if tick.nearby_item_flags[:4]:
-                labels = ("item_health", "item_armor", "item_ammo", "item_weapon")
-                for idx, flag in enumerate(tick.nearby_item_flags[:4]):
-                    if int(flag) == 1:
-                        item_counts[region_id][labels[idx]] += 1
-            if region_id != previous_region:
-                edge_counts[(previous_region, region_id)] += 1
-                edge_counts[(region_id, previous_region)] += 1
-                previous_region = region_id
-
-    return (
-        [[src, dst] for src, dst in sorted(edge_counts.keys())],
-        item_counts,
-        spawn_points,
-        sorted(set(goal_regions)),
-    )
-
-
 def _fallback_edges(region_ids: List[int], existing_edges: List[List[int]], k: int = 2) -> List[List[int]]:
     adjacency: Dict[int, set[int]] = defaultdict(set)
     for src, dst in existing_edges:
@@ -143,16 +141,16 @@ def _fallback_edges(region_ids: List[int], existing_edges: List[List[int]], k: i
     return [[src, dst] for src, neighbors in sorted(adjacency.items()) for dst in sorted(neighbors)]
 
 
-def _map_features_from_telemetry(map_id: str, rows: List[TelemetryTickV1]) -> Tuple[List[MapFeaturesV1], Dict[str, object]]:
-    region_ids = sorted({int(row.region_id) for row in rows})
+def _map_features_from_observed(map_id: str, observed: _ObservedMapAccumulator) -> Tuple[List[MapFeaturesV1], Dict[str, object]]:
+    region_ids = sorted(observed.region_ids)
     if not region_ids:
         region_ids = [0]
 
-    edges, item_counts, spawn_points, goal_regions = _connect_observed_regions(rows)
+    edges = [[src, dst] for src, dst in sorted(observed.edge_counts.keys())]
     edges = _fallback_edges(region_ids, edges)
 
     item_nodes = []
-    for region_id, counts in sorted(item_counts.items()):
+    for region_id, counts in sorted(observed.item_counts.items()):
         classname = max(sorted(counts.keys()), key=lambda key: counts[key])
         item_nodes.append(
             {
@@ -163,6 +161,8 @@ def _map_features_from_telemetry(map_id: str, rows: List[TelemetryTickV1]) -> Tu
             }
         )
 
+    spawn_points = list(observed.spawn_points)
+    goal_regions = sorted(set(observed.goal_regions))
     if not spawn_points:
         spawn_points = [_region_center(region_ids[0])]
     if not goal_regions:
@@ -193,29 +193,47 @@ def _map_features_from_telemetry(map_id: str, rows: List[TelemetryTickV1]) -> Tu
     return records, summary
 
 
-def _replay_demo_files(demos: List[Path], map_id: str) -> Tuple[List[TelemetryTickV1], List[PacketEventV1], List[Dict[str, str]]]:
-    harness = DemoPlaybackHarness(map_id=map_id)
-    telemetry_rows: List[TelemetryTickV1] = []
-    packet_rows: List[PacketEventV1] = []
-    failures: List[Dict[str, str]] = []
+def _write_ndjson_row(handle: TextIO, row: Mapping[str, object]) -> None:
+    handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
 
-    for demo_path in demos:
-        try:
-            for telemetry, packet in harness.replay(demo_path):
-                telemetry_rows.append(telemetry)
-                packet_rows.append(packet)
-        except Exception as exc:
-            failures.append({"demo_path": str(demo_path), "error": str(exc)})
 
-    return telemetry_rows, packet_rows, failures
+def _stream_demo_episode(
+    *,
+    episode: object,
+    map_state: MapStateV2 | None,
+    telemetry_handle: TextIO,
+    packet_handle: TextIO,
+    world_handle: TextIO | None,
+    observed: _ObservedMapAccumulator | None,
+) -> EpisodeSummaryV1:
+    summary = _EpisodeSummaryAccumulator(episode_id=str(getattr(episode, "episode_id")))
+    previous_region: int | None = None
+    last_region: int | None = None
+
+    harness = DemoPlaybackHarness(map_id=str(getattr(episode, "map_id", "E1M1")))
+    for telemetry, packet in harness.replay_episode(episode):
+        if previous_region is None and observed is not None:
+            previous_region = observed.begin_episode(telemetry)
+        if observed is not None:
+            last_region = observed.add_tick(telemetry, previous_region)
+            previous_region = last_region
+        summary.add(telemetry)
+        _write_ndjson_row(telemetry_handle, telemetry.to_dict())
+        _write_ndjson_row(packet_handle, packet.to_dict())
+
+    if observed is not None:
+        observed.end_episode(last_region)
+
+    if map_state is not None and world_handle is not None:
+        for world_tick in iter_world_ticks_from_demo_episode(episode, map_state):
+            _write_ndjson_row(world_handle, world_tick.to_dict())
+
+    return summary.finalize()
 
 
 def collect_from_demos(map_id: str, demo_dir: str | Path, out_dir: str | Path, map_path: str | Path | None = None) -> Dict[str, str]:
     demos = find_demo_files(demo_dir)
-    telemetry_rows, packet_rows, failures = _replay_demo_files(demos, map_id=map_id)
-    if not telemetry_rows:
-        raise RuntimeError("No telemetry rows were collected from the provided demos")
-    summaries = _summaries_from_telemetry(telemetry_rows)
+    map_state = build_world_model(map_path, map_id=map_id) if map_path is not None else None
 
     output = Path(out_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -224,14 +242,57 @@ def collect_from_demos(map_id: str, demo_dir: str | Path, out_dir: str | Path, m
     packets_path = output / "packets.ndjson"
     summaries_path = output / "episode_summaries.ndjson"
     failures_path = output / "replay_failures.ndjson"
+    world_ticks_path = output / "world_ticks.ndjson"
+    metadata_path = output / "demo_metadata.ndjson"
 
-    write_ndjson(telemetry_path, (row.to_dict() for row in telemetry_rows))
-    write_ndjson(packets_path, (row.to_dict() for row in packet_rows))
+    harness = DemoPlaybackHarness(map_id=map_id)
+    observed = _ObservedMapAccumulator() if map_path is None else None
+    summaries: List[EpisodeSummaryV1] = []
+    failures: List[Dict[str, str]] = []
+    metadata_rows: List[Dict[str, object]] = []
+    saw_telemetry = False
+
+    with (
+        telemetry_path.open("w", encoding="utf-8") as telemetry_handle,
+        packets_path.open("w", encoding="utf-8") as packet_handle,
+        (world_ticks_path.open("w", encoding="utf-8") if map_state is not None else nullcontext(None)) as world_handle,
+    ):
+        for demo_path in demos:
+            try:
+                episode = harness.load_episode(demo_path)
+                meta = classify_competitive(build_demo_metadata(episode, source_path=demo_path))
+                summaries.append(
+                    _stream_demo_episode(
+                        episode=episode,
+                        map_state=map_state,
+                        telemetry_handle=telemetry_handle,
+                        packet_handle=packet_handle,
+                        world_handle=world_handle,
+                        observed=observed,
+                    )
+                )
+                metadata_rows.append(meta.to_dict())
+                saw_telemetry = True
+            except Exception as exc:
+                failures.append({"demo_path": str(demo_path), "error": str(exc)})
+                stub_meta = DemoMetadata(
+                    episode_id=Path(demo_path).stem,
+                    map_id=map_id,
+                    source_path=str(demo_path),
+                )
+                fallback = classify_competitive(stub_meta)
+                metadata_rows.append(fallback.to_dict())
+
+    if not saw_telemetry and not metadata_rows:
+        raise RuntimeError("No telemetry rows were collected from the provided demos")
+
     write_ndjson(summaries_path, (row.to_dict() for row in summaries))
     write_ndjson(failures_path, failures)
+    write_ndjson(metadata_path, metadata_rows)
 
     if map_path is None:
-        map_features, map_summary = _map_features_from_telemetry(map_id=map_id, rows=telemetry_rows)
+        assert observed is not None
+        map_features, map_summary = _map_features_from_observed(map_id=map_id, observed=observed)
         write_json(output / "observed_map.json", map_summary)
     else:
         from quake_ai.maps.features import build_map_features
@@ -240,13 +301,20 @@ def collect_from_demos(map_id: str, demo_dir: str | Path, out_dir: str | Path, m
     map_features_path = output / "map_features.json"
     write_map_features(map_features_path, map_features)
 
-    return {
+    artifacts = {
         "telemetry": str(telemetry_path),
         "packets": str(packets_path),
         "summaries": str(summaries_path),
         "map_features": str(map_features_path),
         "failures": str(failures_path),
+        "metadata": str(metadata_path),
     }
+    if map_state is not None:
+        map_state_path = output / "world_map.json"
+        write_world_model(map_state_path, map_state)
+        artifacts["world_map"] = str(map_state_path)
+        artifacts["world_ticks"] = str(world_ticks_path)
+    return artifacts
 
 
 def load_packets(path: str | Path) -> List[PacketEventV1]:

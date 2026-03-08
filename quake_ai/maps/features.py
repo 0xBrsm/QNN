@@ -6,7 +6,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
-from quake_ai.maps.bsp_parser import extract_map_nodes, parse_map_entities
+from quake_ai.maps.bsp_parser import extract_map_nodes, is_quake_asset_root, parse_map_entities, parse_map_entities_from_quake_assets
 from quake_ai.schemas import MapFeaturesV1
 from quake_ai.utils.io import write_json
 
@@ -66,7 +66,11 @@ def _distance_to_goal(region_ids: Iterable[int], edges: Iterable[List[int]], goa
 
 
 def build_map_features(map_path: str | Path, map_id: str) -> List[MapFeaturesV1]:
-    entities = parse_map_entities(map_path)
+    source = Path(map_path)
+    if source.is_dir() and is_quake_asset_root(source):
+        entities = parse_map_entities_from_quake_assets(source, map_id)
+    else:
+        entities = parse_map_entities(source)
     nodes = extract_map_nodes(entities)
 
     region_points = nodes["region_points"]

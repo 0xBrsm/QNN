@@ -1,0 +1,56 @@
+# common.c — COM_FileBase undefined behavior
+#
+# The original COM_FileBase() walks a pointer backward through the input string
+# looking for a '/' separator, but the loop condition (*s2 && *s2 != '/') tests
+# for null while decrementing — it can walk before the start of the string,
+# producing undefined behavior or a crash. There is also an off-by-one in the
+# strncpy length calculation. The fix replaces the hand-rolled pointer
+# arithmetic with strrchr() calls and adds a null/empty input guard.
+#
+--- common.c
++++ common.c
+@@ -855,22 +855,29 @@
+ */
+ void COM_FileBase (char *in, char *out)
+ {
+-	char *s, *s2;
+-	
+-	s = in + strlen(in) - 1;
+-	
+-	while (s != in && *s != '.')
+-		s--;
+-	
+-	for (s2 = s ; *s2 && *s2 != '/' ; s2--)
+-	;
+-	
+-	if (s-s2 < 2)
+-		strcpy (out,"?model?");
++	char		*slash;
++	char		*dot;
++	char		*start;
++	char		*end;
++	size_t		len;
++
++	if (!in || !*in)
++	{
++		strcpy (out, "?model?");
++		return;
++	}
++
++	slash = strrchr(in, '/');
++	start = slash ? (slash + 1) : in;
++	dot = strrchr(start, '.');
++	end = dot ? dot : (in + strlen(in));
++	len = (size_t)(end - start);
++
++	if (len < 2)
++		strcpy (out, "?model?");
+ 	else
+ 	{
+-		s--;
+-		strncpy (out,s2+1, s-s2);
+-		out[s-s2] = 0;
++		memcpy (out, start, len);
++		out[len] = 0;
+ 	}
+ }

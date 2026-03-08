@@ -1,0 +1,23 @@
+# sv_main.c - format string hardening in SV_SendServerinfo
+#
+# These are stock WinQuake hardening fixes from the NexQuake bugfix catalog.
+#
+--- sv_main.c
++++ sv_main.c
+@@ -192,7 +192,7 @@
+ 	char			message[2048];
+ 
+ 	MSG_WriteByte (&client->message, svc_print);
+-	sprintf (message, "%c\nVERSION %4.2f SERVER (%i CRC)", 2, VERSION, pr_crc);
++	snprintf (message, sizeof(message), "%c\nVERSION %4.2f SERVER (%i CRC)", 2, VERSION, pr_crc);
+ 	MSG_WriteString (&client->message,message);
+ 
+ 	MSG_WriteByte (&client->message, svc_serverinfo);
+@@ -204,6 +204,6 @@
+ 	else
+ 		MSG_WriteByte (&client->message, GAME_COOP);
+ 
+-	sprintf (message, pr_strings+sv.edicts->v.message);
++	snprintf (message, sizeof(message), "%s", pr_strings+sv.edicts->v.message);
+ 
+ 	MSG_WriteString (&client->message,message);

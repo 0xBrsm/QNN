@@ -1,0 +1,23 @@
+# net.h - htonl/ntohl declaration conflict with standard headers
+#
+# The fallback declarations for htonl/htons/ntohl/ntohs conflict with modern
+# <arpa/inet.h> declarations once the POSIX socket headers are included.
+#
+--- net.h
++++ net.h
+@@ -241,13 +241,2 @@
+-#if !defined(_WIN32 ) && !defined (__linux__) && !defined (__sun__)
+-#ifndef htonl
+-extern unsigned long htonl (unsigned long hostlong);
+-#endif
+-#ifndef htons
+-extern unsigned short htons (unsigned short hostshort);
+-#endif
+-#ifndef ntohl
+-extern unsigned long ntohl (unsigned long netlong);
+-#endif
+-#ifndef ntohs
+-extern unsigned short ntohs (unsigned short netshort);
+-#endif
++#if !defined(_WIN32)
++#include <arpa/inet.h>

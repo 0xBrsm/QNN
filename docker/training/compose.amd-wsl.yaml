@@ -6,10 +6,14 @@ services:
       dockerfile: docker/training/amd-rocm/Dockerfile
     working_dir: /workspace
     environment:
-      HOST_WORKSPACE: /workspace
-      PYTHONUNBUFFERED: "1"
-      QUAKE_AI_DEVICE: ${QUAKE_AI_DEVICE:-gpu}
-      QUAKE_AI_ARTIFACT_ROOT: /artifacts
+      - HOST_WORKSPACE=/workspace
+      - PYTHONUNBUFFERED=1
+      - QUAKE_AI_DEVICE=${QUAKE_AI_DEVICE:-gpu}
+      - QUAKE_AI_ARTIFACT_ROOT=/artifacts
+      - ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-0}
+      - HSA_ENABLE_DXG_DETECTION=${HSA_ENABLE_DXG_DETECTION:-1}
+      - HIP_VISIBLE_DEVICES
+      - ROCR_VISIBLE_DEVICES
     volumes:
       - type: bind
         source: ${HOST_SRC_ROOT}
@@ -23,8 +27,8 @@ services:
         target: /usr/lib/libdxcore.so
         read_only: true
       - type: bind
-        source: ${WSL_HSA_RUNTIME_PATH:-/opt/rocm/lib/libhsa-runtime64.so.1}
-        target: /opt/rocm/lib/libhsa-runtime64.so.1
+        source: ${WSL_LIBROCDXG_PATH:-/opt/rocm/lib/librocdxg.so}
+        target: /usr/lib/librocdxg.so
         read_only: true
       - type: volume
         source: quake-ai-pip-cache
@@ -35,8 +39,13 @@ services:
       - SYS_PTRACE
     security_opt:
       - seccomp=unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
     ipc: host
-    shm_size: 8gb
+    shm_size: ${TRAINING_SHM_SIZE:-16gb}
     stdin_open: true
     tty: true
 

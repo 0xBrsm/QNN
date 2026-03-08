@@ -1,0 +1,72 @@
+# net_dgrm.c - POSIX networking headers and oversize packet guards
+#
+# The original file carries hand-rolled socket structs that are not 64-bit
+# safe, and the datagram reassembly path lacks bounds checks.
+#
+--- net_dgrm.c
++++ net_dgrm.c
+@@ -29,26 +29,9 @@
+ #include <sys/socket.h>
+ #include <arpa/inet.h>
+ #else
+-#define AF_INET 		2	/* internet */
+-struct in_addr
+-{
+-	union
+-	{
+-		struct { unsigned char s_b1,s_b2,s_b3,s_b4; } S_un_b;
+-		struct { unsigned short s_w1,s_w2; } S_un_w;
+-		unsigned long S_addr;
+-	} S_un;
+-};
+-#define	s_addr	S_un.S_addr	/* can be used for most tcp & ip code */
+-struct sockaddr_in
+-{
+-    short			sin_family;
+-    unsigned short	sin_port;
+-	struct in_addr	sin_addr;
+-    char			sin_zero[8];
+-};
+-char *inet_ntoa(struct in_addr in);
+-unsigned long inet_addr(const char *cp);
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
+ #endif
+ #endif	// BAN_TEST
+ 
+@@ -438,9 +421,21 @@
+ 			sock->receiveSequence++;
+ 
+ 			length -= NET_HEADERSIZE;
++			if (length > NET_MAXMESSAGE)
++			{
++				Con_Printf("Datagram_GetMessage: oversize packet (%u)\n", length);
++				sock->receiveMessageLength = 0;
++				continue;
++			}
+ 
+ 			if (flags & NETFLAG_EOM)
+ 			{
++				if (sock->receiveMessageLength + (int)length > NET_MAXMESSAGE)
++				{
++					Con_Printf("Datagram_GetMessage: oversize message (%d)\n", sock->receiveMessageLength + (int)length);
++					sock->receiveMessageLength = 0;
++					continue;
++				}
+ 				SZ_Clear(&net_message);
+ 				SZ_Write(&net_message, sock->receiveMessage, sock->receiveMessageLength);
+ 				SZ_Write(&net_message, packetBuffer.data, length);
+@@ -450,6 +445,12 @@
+ 				break;
+ 			}
+ 
++			if (sock->receiveMessageLength + (int)length > NET_MAXMESSAGE)
++			{
++				Con_Printf("Datagram_GetMessage: oversize message (%d)\n", sock->receiveMessageLength + (int)length);
++				sock->receiveMessageLength = 0;
++				continue;
++			}
+ 			Q_memcpy(sock->receiveMessage + sock->receiveMessageLength, packetBuffer.data, length);
+ 			sock->receiveMessageLength += length;
+ 			continue;

@@ -6,10 +6,13 @@ services:
       dockerfile: docker/training/amd-rocm/Dockerfile
     working_dir: /workspace
     environment:
-      HOST_WORKSPACE: /workspace
-      PYTHONUNBUFFERED: "1"
-      QUAKE_AI_DEVICE: ${QUAKE_AI_DEVICE:-gpu}
-      QUAKE_AI_ARTIFACT_ROOT: /artifacts
+      - HOST_WORKSPACE=/workspace
+      - PYTHONUNBUFFERED=1
+      - QUAKE_AI_DEVICE=${QUAKE_AI_DEVICE:-gpu}
+      - QUAKE_AI_ARTIFACT_ROOT=/artifacts
+      - ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-0}
+      - HIP_VISIBLE_DEVICES
+      - ROCR_VISIBLE_DEVICES
     volumes:
       - type: bind
         source: ${HOST_SRC_ROOT}
@@ -31,8 +34,13 @@ services:
       - SYS_PTRACE
     security_opt:
       - seccomp=unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
     ipc: host
-    shm_size: 8gb
+    shm_size: ${TRAINING_SHM_SIZE:-16gb}
     stdin_open: true
     tty: true
 

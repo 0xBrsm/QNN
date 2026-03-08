@@ -68,7 +68,8 @@ def resolve_torch_device(requested: str | None = None) -> TorchDeviceSpec:
 
 
 def configure_torch_runtime(spec: TorchDeviceSpec) -> None:
-    torch.set_float32_matmul_precision("high")
+    if spec.backend != "rocm":
+        torch.set_float32_matmul_precision("high")
     if spec.backend == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -87,6 +88,8 @@ def describe_torch_runtime(requested: str | None = None) -> Dict[str, Any]:
         "requested_device": spec.requested,
         "resolved_device": spec.resolved,
         "backend": spec.backend,
+        "cpu_count": int(os.cpu_count() or 1),
+        "cpu_affinity_count": int(len(os.sched_getaffinity(0))) if hasattr(os, "sched_getaffinity") else int(os.cpu_count() or 1),
         "cuda_available": bool(torch.cuda.is_available()),
         "cuda_device_count": int(torch.cuda.device_count()),
         "cuda_version": torch.version.cuda,
@@ -100,6 +103,8 @@ def describe_torch_runtime(requested: str | None = None) -> Dict[str, Any]:
             {
                 "index": idx,
                 "name": torch.cuda.get_device_name(idx),
+                "total_memory": int(getattr(torch.cuda.get_device_properties(idx), "total_memory", 0)),
+                "multi_processor_count": int(getattr(torch.cuda.get_device_properties(idx), "multi_processor_count", 0)),
             }
             for idx in range(torch.cuda.device_count())
         ]
