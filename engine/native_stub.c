@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 static int step_count = 0;
@@ -17,13 +18,39 @@ static int reset_teamplay = 0;
 static int current_frags = 0;
 static int current_monster_kills = 0;
 static int kill_event_step = -1;
-static int damage_event_step = -1;
 static int total_damage_dealt = 0;
 static int total_hit_count = 0;
 static int total_shots_fired = 0;
 static int weapon_damage_dealt[9] = {0};
 static int weapon_hits_landed[9] = {0};
 static int weapon_shots_fired[9] = {0};
+static int binary_step_enabled = 0;
+
+#define STEP_BINARY_MAGIC "QWLD"
+#define STEP_BINARY_VERSION 1
+
+#define STEP_FLAG_DONE 0x0001
+#define STEP_FLAG_GOAL_REACHED 0x0002
+
+#define EVENT_FLAG_HAS_DELTA 0x0001
+#define EVENT_FLAG_HAS_WEAPON_ID 0x0002
+
+#define DONE_REASON_NONE 0
+#define DONE_REASON_GOAL_REACHED 1
+
+#define EVENT_DAMAGE_TAKEN 1
+#define EVENT_PICKUP_HEALTH 2
+#define EVENT_PICKUP_ARMOR 3
+#define EVENT_PICKUP_AMMO 4
+#define EVENT_PICKUP_WEAPON 5
+#define EVENT_PICKUP_ITEM 6
+#define EVENT_FRAG_GAINED 7
+#define EVENT_FRAG_LOST 8
+#define EVENT_MONSTER_KILL 9
+#define EVENT_DAMAGE_DEALT 10
+#define EVENT_HIT_CONFIRMED 11
+#define EVENT_SHOTS_FIRED 12
+#define EVENT_GOAL_REACHED 13
 
 static int extract_int(const char *line, const char *key, int fallback)
 {
@@ -70,36 +97,290 @@ static int extract_string(const char *line, const char *key, char *out, size_t o
     return 1;
 }
 
-static void write_json_string(const char *value)
+static int parse_protocol_version_text(const char *value, int fallback)
 {
     const char *cursor;
-    putchar('"');
-    for (cursor = value; *cursor; ++cursor) {
-        if (*cursor == '"' || *cursor == '\\') {
-            putchar('\\');
-        }
-        putchar(*cursor);
+    int parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
     }
-    putchar('"');
+    cursor = value;
+    if (*cursor == 'v' || *cursor == 'V') {
+        cursor += 1;
+    }
+    if (*cursor == '\0') {
+        return fallback;
+    }
+    parsed = atoi(cursor);
+    return parsed > 0 ? parsed : fallback;
 }
 
-static void write_obs(int step)
+static int current_region_id(int step);
+
+typedef struct {
+    const char *values[16];
+    int count;
+} binary_string_table_t;
+
+static void write_bytes(const void *data, size_t size)
+{
+    if (size > 0) {
+        fwrite(data, 1, size, stdout);
+    }
+}
+
+static void write_u16_le(uint16_t value)
+{
+    unsigned char bytes[2];
+    bytes[0] = (unsigned char)(value & 0xff);
+    bytes[1] = (unsigned char)((value >> 8) & 0xff);
+    write_bytes(bytes, sizeof(bytes));
+}
+
+static void write_i16_le(int value)
+{
+    write_u16_le((uint16_t)(int16_t)value);
+}
+
+static void write_u32_le(uint32_t value)
+{
+    unsigned char bytes[4];
+    bytes[0] = (unsigned char)(value & 0xff);
+    bytes[1] = (unsigned char)((value >> 8) & 0xff);
+    bytes[2] = (unsigned char)((value >> 16) & 0xff);
+    bytes[3] = (unsigned char)((value >> 24) & 0xff);
+    write_bytes(bytes, sizeof(bytes));
+}
+
+static void write_i32_le(int value)
+{
+    write_u32_le((uint32_t)(int32_t)value);
+}
+
+static void write_f32_le(float value)
+{
+    union {
+        float f;
+        uint32_t u;
+    } bits;
+    bits.f = value;
+    write_u32_le(bits.u);
+}
+
+static int binary_string_index(binary_string_table_t *table, const char *value)
 {
     int i;
-    putchar('[');
-    for (i = 0; i < 20; ++i) {
-        double value = 0.0;
-        if (i == 0) {
-            value = (double)step / 10.0;
-        } else if (i == 12) {
-            value = step >= 3 ? 1.0 : 0.0;
-        }
-        if (i > 0) {
-            putchar(',');
-        }
-        printf("%.3f", value);
+    if (value == NULL || value[0] == '\0') {
+        return 0;
     }
-    putchar(']');
+    for (i = 0; i < table->count; ++i) {
+        if (strcmp(table->values[i], value) == 0) {
+            return i + 1;
+        }
+    }
+    if (table->count >= (int)(sizeof(table->values) / sizeof(table->values[0]))) {
+        return 0;
+    }
+    table->values[table->count] = value;
+    table->count += 1;
+    return table->count;
+}
+
+static void write_binary_strings(const binary_string_table_t *table)
+{
+    int i;
+    for (i = 0; i < table->count; ++i) {
+        const char *value = table->values[i];
+        size_t length = strlen(value);
+        if (length > 0xffff) {
+            length = 0xffff;
+        }
+        write_u16_le((uint16_t)length);
+        write_bytes(value, length);
+    }
+}
+
+static void write_action_binary(
+    int move,
+    int strafe,
+    int look_yaw,
+    int look_pitch,
+    int fire,
+    int jump,
+    int weapon)
+{
+    write_i16_le(move);
+    write_i16_le(strafe);
+    write_i16_le(look_yaw);
+    write_i16_le(look_pitch);
+    write_i16_le(fire);
+    write_i16_le(jump);
+    write_i16_le(weapon);
+}
+
+static void write_binary_event(
+    int event_code,
+    int flags,
+    int region_id,
+    int delta,
+    int weapon_id,
+    int source_entity_num,
+    int target_entity_num)
+{
+    write_u16_le((uint16_t)event_code);
+    write_u16_le((uint16_t)flags);
+    write_i32_le(region_id);
+    write_i32_le(delta);
+    write_i32_le(weapon_id);
+    write_i32_le(source_entity_num);
+    write_i32_le(target_entity_num);
+}
+
+static void write_step_binary(
+    int step,
+    int done,
+    int look_yaw,
+    int look_pitch,
+    int fire,
+    int jump,
+    int weapon,
+    double reward)
+{
+    binary_string_table_t strings = {0};
+    int region_id = current_region_id(step);
+    int previous_region_id = current_region_id(step > 0 ? step - 1 : 0);
+    int visible_entity_num = reset_deathmatch ? 2 : 9;
+    const char *visible_classname = reset_deathmatch ? "player" : "monster_ogre";
+    int visible_count = done ? 0 : 1;
+    int shots_fired = fire ? 1 : 0;
+    int action_history_count = step > 0 ? 1 : 0;
+    double x = (region_id - 1) * 256.0;
+    double vx = (x - ((previous_region_id - 1) * 256.0)) / 5.0;
+    int health = step >= 2 ? 85 : 100;
+    int armor = step >= 3 ? 25 : 0;
+    int ammo = fire ? 20 : 25;
+    int damage_dealt = step == kill_event_step ? 40 : 0;
+    int hit_count = step == kill_event_step ? 1 : 0;
+    int took_damage = step == 2;
+    int killed_target = step == kill_event_step;
+    int picked_up_health = step == 1;
+    int picked_up_weapon = fire && picked_up_health;
+    int event_count =
+        took_damage
+        + (shots_fired > 0)
+        + (damage_dealt > 0)
+        + (hit_count > 0)
+        + killed_target
+        + picked_up_health
+        + picked_up_weapon
+        + done;
+    uint16_t flags = 0;
+
+    if (done) {
+        flags |= STEP_FLAG_DONE | STEP_FLAG_GOAL_REACHED;
+    }
+    if (visible_count > 0) {
+        binary_string_index(&strings, visible_classname);
+    }
+
+    write_bytes(STEP_BINARY_MAGIC, 4);
+    write_u16_le(STEP_BINARY_VERSION);
+    write_u16_le(flags);
+    write_f32_le((float)reward);
+    write_i32_le(step);
+    write_i32_le(step);
+    write_i32_le(region_id);
+    write_i32_le(current_frags);
+    write_i32_le(current_monster_kills);
+    write_i32_le(4);
+    write_i32_le(health);
+    write_i32_le(armor);
+    write_i32_le(ammo);
+    write_i32_le(fire ? 3 : 1);
+    write_i32_le(0);
+    write_i32_le(0);
+    write_i32_le(0);
+    write_i32_le(0);
+    write_i32_le(0);
+    write_i32_le(1);
+    write_f32_le(0.0f);
+    write_f32_le((float)x);
+    write_f32_le(0.0f);
+    write_f32_le(0.0f);
+    write_f32_le((float)vx);
+    write_f32_le(0.0f);
+    write_f32_le(0.0f);
+    write_f32_le(0.0f);
+    write_f32_le(0.0f);
+    write_f32_le(0.0f);
+    write_i32_le(damage_dealt);
+    write_i32_le(total_damage_dealt);
+    write_i32_le(fire ? 3 : 0);
+    write_i32_le(hit_count);
+    write_i32_le(total_hit_count);
+    write_i32_le(shots_fired);
+    write_i32_le(total_shots_fired);
+    write_i32_le(done ? DONE_REASON_GOAL_REACHED : DONE_REASON_NONE);
+    for (int i = 0; i < 9; ++i) {
+        write_i32_le(weapon_damage_dealt[i]);
+    }
+    for (int i = 0; i < 9; ++i) {
+        write_i32_le(weapon_hits_landed[i]);
+    }
+    for (int i = 0; i < 9; ++i) {
+        write_i32_le(weapon_shots_fired[i]);
+    }
+    write_action_binary(1, 0, look_yaw, look_pitch, fire, jump, weapon);
+    write_u16_le((uint16_t)action_history_count);
+    write_u16_le((uint16_t)visible_count);
+    write_u16_le((uint16_t)event_count);
+    write_u16_le(0);
+    write_u16_le((uint16_t)strings.count);
+
+    if (action_history_count > 0) {
+        write_action_binary(1, 0, previous_look_yaw, previous_look_pitch, previous_fire, previous_jump, previous_weapon);
+    }
+
+    if (visible_count > 0) {
+        write_i32_le(visible_entity_num);
+        write_i32_le(visible_entity_num);
+        write_i32_le(3);
+        write_u16_le((uint16_t)binary_string_index(&strings, visible_classname));
+        write_u16_le(0);
+        write_u16_le(0);
+        write_f32_le(512.0f);
+        write_f32_le(reset_deathmatch ? 32.0f : -32.0f);
+        write_f32_le(0.0f);
+    }
+
+    if (took_damage) {
+        write_binary_event(EVENT_DAMAGE_TAKEN, EVENT_FLAG_HAS_DELTA, 3, 15, 0, 0, 0);
+    }
+    if (shots_fired > 0) {
+        write_binary_event(EVENT_SHOTS_FIRED, EVENT_FLAG_HAS_DELTA | EVENT_FLAG_HAS_WEAPON_ID, region_id, 1, 3, 1, 0);
+    }
+    if (damage_dealt > 0) {
+        write_binary_event(EVENT_DAMAGE_DEALT, EVENT_FLAG_HAS_DELTA | EVENT_FLAG_HAS_WEAPON_ID, 3, damage_dealt, 3, 1, visible_entity_num);
+    }
+    if (hit_count > 0) {
+        write_binary_event(EVENT_HIT_CONFIRMED, EVENT_FLAG_HAS_DELTA | EVENT_FLAG_HAS_WEAPON_ID, 3, hit_count, 3, 1, visible_entity_num);
+    }
+    if (killed_target) {
+        write_binary_event(reset_deathmatch ? EVENT_FRAG_GAINED : EVENT_MONSTER_KILL, EVENT_FLAG_HAS_DELTA, 3, 1, 0, 0, 0);
+    }
+    if (picked_up_health) {
+        write_binary_event(EVENT_PICKUP_HEALTH, EVENT_FLAG_HAS_DELTA, 2, 25, 0, 0, 0);
+    }
+    if (picked_up_weapon) {
+        write_binary_event(EVENT_PICKUP_WEAPON, EVENT_FLAG_HAS_WEAPON_ID, 2, 0, 3, 0, 0);
+    }
+    if (done) {
+        write_binary_event(EVENT_GOAL_REACHED, 0, 4, 0, 0, 0, 0);
+    }
+
+    write_binary_strings(&strings);
+    fflush(stdout);
 }
 
 static int current_region_id(int step)
@@ -287,6 +568,9 @@ int main(int argc, char **argv)
         if (strstr(line, "\"op\"") != NULL && strstr(line, "hello") != NULL) {
             const char *map_match = strstr(line, "\"map_id\"");
             const char *quote;
+            char version_text[16];
+            char step_format[32];
+            int requested_protocol_version;
             size_t len = 0;
             if (map_match != NULL) {
                 quote = strchr(map_match + 8, '"');
@@ -303,10 +587,19 @@ int main(int argc, char **argv)
                     }
                 }
             }
+            requested_protocol_version = 3;
+            version_text[0] = '\0';
+            step_format[0] = '\0';
+            if (extract_string(line, "\"protocol_version\"", version_text, sizeof(version_text))) {
+                requested_protocol_version = parse_protocol_version_text(version_text, 3);
+            }
+            binary_step_enabled = extract_string(line, "\"step_format\"", step_format, sizeof(step_format))
+                && strcmp(step_format, "binary_v1") == 0
+                && requested_protocol_version >= 3;
             tick_hz = extract_int(line, "\"tick_hz\"", tick_hz);
-            printf("{\"capabilities\":[\"legacy_obs\",\"world_v2\",\"reset_options\"],\"map_id\":\"%s\",\"map_state\":", map_id);
+            printf("{\"capabilities\":[\"binary_step_v1\",\"reset_options\",\"world_tick_only\"],\"map_id\":\"%s\",\"map_state\":", map_id);
             write_map_state();
-            printf(",\"ok\":true,\"protocol_version\":\"v2\",\"server\":\"native-stub\",\"tick_hz\":%d}\n", tick_hz);
+            printf(",\"ok\":true,\"protocol_version\":\"v3\",\"server\":\"native-stub\",\"tick_hz\":%d}\n", tick_hz);
             fflush(stdout);
             continue;
         }
@@ -325,21 +618,18 @@ int main(int argc, char **argv)
             current_frags = 0;
             current_monster_kills = 0;
             kill_event_step = -1;
-            damage_event_step = -1;
             total_damage_dealt = 0;
             total_hit_count = 0;
             total_shots_fired = 0;
             memset(weapon_damage_dealt, 0, sizeof(weapon_damage_dealt));
             memset(weapon_hits_landed, 0, sizeof(weapon_hits_landed));
             memset(weapon_shots_fired, 0, sizeof(weapon_shots_fired));
-            printf("{\"info\":{\"deathmatch\":%d,\"map_id\":\"%s\",\"maxplayers\":%d,\"seed\":%d,\"teamplay\":%d},\"obs\":",
+            printf("{\"info\":{\"deathmatch\":%d,\"map_id\":\"%s\",\"maxplayers\":%d,\"seed\":%d,\"teamplay\":%d},\"ok\":true,\"world_tick\":",
                    reset_deathmatch,
                    map_id,
                    reset_maxplayers,
                    episode_seed,
                    reset_teamplay);
-            write_obs(step_count);
-            printf(",\"ok\":true,\"world_tick\":");
             write_world_tick(step_count, 0, 12, 12, 0, 0, 0);
             printf("}\n");
             fflush(stdout);
@@ -356,9 +646,6 @@ int main(int argc, char **argv)
             double reward;
 
             step_count += 1;
-            if (step_count == 2) {
-                damage_event_step = step_count;
-            }
             if (fire && kill_event_step < 0) {
                 kill_event_step = step_count;
                 if (reset_deathmatch) {
@@ -377,23 +664,26 @@ int main(int argc, char **argv)
             }
             done = step_count >= 4;
             reward = done ? 1.0 : 0.1;
-            printf("{\"done\":%s,\"info\":{\"deathmatch\":%d,\"goal_reached\":%s,\"maxplayers\":%d,\"steps\":%d,\"teamplay\":%d},\"obs\":",
-                   done ? "true" : "false",
-                   reset_deathmatch,
-                   done ? "true" : "false",
-                   reset_maxplayers,
-                   step_count,
-                   reset_teamplay);
-            write_obs(step_count);
-            printf(",\"ok\":true,\"reward\":%.3f,\"world_tick\":", reward);
-            write_world_tick(step_count, done, look_yaw, look_pitch, fire, jump, weapon);
-            printf("}\n");
+            if (binary_step_enabled) {
+                write_step_binary(step_count, done, look_yaw, look_pitch, fire, jump, weapon, reward);
+            } else {
+                printf("{\"done\":%s,\"info\":{\"deathmatch\":%d,\"goal_reached\":%s,\"maxplayers\":%d,\"steps\":%d,\"teamplay\":%d},\"ok\":true,\"reward\":%.3f,\"world_tick\":",
+                       done ? "true" : "false",
+                       reset_deathmatch,
+                       done ? "true" : "false",
+                       reset_maxplayers,
+                       step_count,
+                       reset_teamplay,
+                       reward);
+                write_world_tick(step_count, done, look_yaw, look_pitch, fire, jump, weapon);
+                printf("}\n");
+                fflush(stdout);
+            }
             previous_look_yaw = look_yaw;
             previous_look_pitch = look_pitch;
             previous_fire = fire;
             previous_jump = jump;
             previous_weapon = weapon;
-            fflush(stdout);
             continue;
         }
 

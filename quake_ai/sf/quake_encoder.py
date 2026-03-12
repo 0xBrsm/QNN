@@ -1,0 +1,46 @@
+"""Sample Factory encoder wrapping the native token transformer trunk."""
+
+from __future__ import annotations
+
+try:
+    from sample_factory.model.encoder import Encoder
+except ImportError as exc:
+    raise ImportError("sample-factory is required: pip install sample-factory>=2.0.0") from exc
+
+from quake_ai.model.transformer import TransformerTrunk
+
+
+class QuakeTransformerEncoder(Encoder):
+    """Transformer-based encoder with tokenised observation groups."""
+
+    def __init__(self, cfg, obs_space) -> None:
+        super().__init__(cfg)
+
+        d_model: int = int(getattr(cfg, "quake_d_model", 64))
+        n_heads: int = int(getattr(cfg, "quake_n_heads", 2))
+        n_layers: int = int(getattr(cfg, "quake_n_layers", 2))
+        ffn_dim: int = int(getattr(cfg, "quake_ffn_dim", 256))
+        output_dim: int = int(getattr(cfg, "quake_trunk_hidden", 128))
+        dropout: float = float(getattr(cfg, "quake_attn_dropout", 0.0))
+
+        self.trunk = TransformerTrunk(
+            obs_dim=0,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            ffn_dim=ffn_dim,
+            output_dim=output_dim,
+            dropout=dropout,
+        )
+        self.encoder_out_size: int = output_dim
+
+    def forward(self, obs_dict):
+        return self.trunk(obs_dict)
+
+    def get_out_size(self) -> int:
+        return self.encoder_out_size
+
+
+def make_quake_encoder(cfg, obs_space) -> Encoder:
+    """Factory returning the transformer encoder."""
+    return QuakeTransformerEncoder(cfg, obs_space)

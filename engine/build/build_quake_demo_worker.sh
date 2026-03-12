@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SRC_DIR}/.." && pwd)
 
 UPSTREAM_URL=${QUAKE_UPSTREAM_URL:-"https://github.com/id-Software/Quake.git"}
 UPSTREAM_COMMIT=${QUAKE_UPSTREAM_COMMIT:-"bf4ac424ce754894ac8f1dae6a3981954bc9852d"}
-OUTPUT_PATH=${1:-"${REPO_ROOT}/artifacts/bin/quake_worker"}
+OUTPUT_PATH=${1:-"${REPO_ROOT}/artifacts/bin/quake_demo_worker"}
 
 PATCHES=(
   "${ENGINE_DIR}/patches/common.c.patch"
@@ -16,6 +16,7 @@ PATCHES=(
   "${ENGINE_DIR}/patches/com_parse.c.patch"
   "${ENGINE_DIR}/patches/common.h-offsetof.patch"
   "${ENGINE_DIR}/patches/world.h.patch"
+  "${ENGINE_DIR}/patches/host.c.patch"
   "${ENGINE_DIR}/patches/host_cmd.c.patch"
   "${ENGINE_DIR}/patches/net.h.patch"
   "${ENGINE_DIR}/patches/net_dgrm.c.patch"
@@ -98,16 +99,15 @@ UPSTREAM_SOURCES=(
 
 CUSTOM_SOURCES=(
   "${ENGINE_DIR}/worker/qnn_worker_common.c"
-  "${ENGINE_DIR}/worker/qnn_worker_main.c"
+  "${ENGINE_DIR}/worker/qnn_demo_worker_main.c"
   "${ENGINE_DIR}/worker/qnn_worker_input.c"
   "${ENGINE_DIR}/worker/qnn_worker_sound.c"
   "${ENGINE_DIR}/worker/qnn_worker_token.c"
-  "${ENGINE_DIR}/worker/qnn_worker_training.c"
   "${ENGINE_DIR}/worker/qnn_world_model.c"
 )
 
 if ! command -v cc >/dev/null 2>&1; then
-  echo "cc is required to build the Quake worker" >&2
+  echo "cc is required to build the Quake demo worker" >&2
   exit 1
 fi
 
@@ -121,7 +121,7 @@ if ! command -v patch >/dev/null 2>&1; then
   exit 1
 fi
 
-BUILD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/quake-worker-build.XXXXXX")
+BUILD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/quake-demo-worker-build.XXXXXX")
 trap 'rm -rf "${BUILD_ROOT}"' EXIT
 
 UPSTREAM_DIR="${BUILD_ROOT}/upstream"
@@ -137,45 +137,6 @@ cp -R "${UPSTREAM_DIR}/WinQuake" "${WORKTREE_DIR}"
 for patch_path in "${PATCHES[@]}"; do
   patch -d "${WORKTREE_DIR}" -p0 < "${patch_path}"
 done
-
-python3 - "${WORKTREE_DIR}/pr_cmds.c" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-
-decl_needle = '#define\tRETURN_EDICT(e) (((int *)pr_globals)[OFS_RETURN] = EDICT_TO_PROG(e))\n'
-decl_insert = (
-    decl_needle
-    + '\n'
-    + 'void PF_qnn_training_note_shot (void);\n'
-    + 'void PF_qnn_training_note_damage (void);\n'
-    + 'void PF_qnn_training_note_death (void);\n'
-    + 'void PF_qnn_training_note_item (void);\n'
-)
-if 'void PF_qnn_training_note_shot (void);' not in text:
-    if decl_needle not in text:
-        raise SystemExit("Could not inject training builtin declarations into pr_cmds.c")
-    text = text.replace(decl_needle, decl_insert, 1)
-
-table_needle = 'PF_precache_file,\n\nPF_setspawnparms\n};\n'
-table_insert = (
-    'PF_precache_file,\n\n'
-    'PF_setspawnparms,\n'
-    'PF_qnn_training_note_shot,\n'
-    'PF_qnn_training_note_damage,\n'
-    'PF_qnn_training_note_death,\n'
-    'PF_qnn_training_note_item\n'
-    '};\n'
-)
-if 'PF_qnn_training_note_item' not in text:
-    if table_needle not in text:
-        raise SystemExit("Could not inject training builtins into pr_builtin table")
-    text = text.replace(table_needle, table_insert, 1)
-
-path.write_text(text, encoding="utf-8")
-PY
 
 SOURCE_PATHS=()
 for source in "${UPSTREAM_SOURCES[@]}"; do

@@ -1,6 +1,6 @@
 # host_cmd.c - save/load path overflows and Host_Say buffer overflow
 #
-# These are stock WinQuake hardening fixes from the NexQuake bugfix catalog.
+# These are stock WinQuake hardening fixes from the QNN bugfix catalog.
 #
 --- host_cmd.c
 +++ host_cmd.c

@@ -35,11 +35,6 @@ LOOK_MOUSE_BINS: tuple[int, ...] = (
 LOOK_NEUTRAL_LABEL = LOOK_MOUSE_BINS.index(0)
 LOOK_MAX_ABS_MOUSE = max(abs(value) for value in LOOK_MOUSE_BINS)
 WEAPON_SWITCH_SLOTS = 8
-MOUSE_SENSITIVITY = 3.0
-MOUSE_YAW = 0.022
-MOUSE_PITCH = 0.022
-MOUSE_DEGREES_PER_COUNT = MOUSE_SENSITIVITY * MOUSE_YAW
-MOUSE_PITCH_DEGREES_PER_COUNT = MOUSE_SENSITIVITY * MOUSE_PITCH
 
 ACTION_HEADS = {
     "move": 3,        # 0 none, 1 forward, 2 back
@@ -73,16 +68,6 @@ def mouse_count_from_look_label(label: int) -> int:
     if idx < 0 or idx >= len(LOOK_MOUSE_BINS):
         raise ValueError(f"look label out of range [0, {len(LOOK_MOUSE_BINS)})")
     return int(LOOK_MOUSE_BINS[idx])
-
-
-def look_label_from_yaw_delta(yaw_delta_degrees: float) -> int:
-    mouse_count = int(round(-float(yaw_delta_degrees) / MOUSE_DEGREES_PER_COUNT))
-    return look_label_from_mouse_count(mouse_count)
-
-
-def look_label_from_pitch_delta(pitch_delta_degrees: float) -> int:
-    mouse_count = int(round(float(pitch_delta_degrees) / MOUSE_PITCH_DEGREES_PER_COUNT))
-    return look_label_from_mouse_count(mouse_count)
 
 
 def _legacy_turn_to_look_yaw(turn: int) -> int:

@@ -46,6 +46,16 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     return read_json(path)
 
 
+def trusted_torch_load(path: str | Path, *, map_location: Any = "cpu") -> Any:
+    """Load a trusted local PyTorch checkpoint across torch 2.5/2.6+ defaults."""
+    import torch
+
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def sha256_dict(data: Mapping[str, Any]) -> str:
     payload = json.dumps(dict(data), sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()

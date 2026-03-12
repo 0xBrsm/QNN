@@ -1,7 +1,7 @@
 [project]
 name = "quake-ai-v0"
-version = "0.1.0"
-description = "V0 imitation-to-RL Quake agent baseline for E1M1"
+version = "0.3.0"
+description = "Transformer BC plus Sample Factory APPO pipeline for PvP Quake"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -11,14 +11,18 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0"]
+sf = [
+  "sample-factory>=2.0.0",
+  "gymnasium>=0.29.0"
+]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
-testpaths = ["tests"]
+pythonpath = [".", ".."]
+testpaths = ["../tests"]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["quake_ai", "quake_ai.data", "quake_ai.maps", "quake_ai.models", "quake_ai.rl", "quake_ai.utils", "engine"]
+packages = ["demo", "quake_ai", "quake_ai.model", "quake_ai.rl", "quake_ai.sf", "quake_ai.utils", "engine"]

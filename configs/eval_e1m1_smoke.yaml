@@ -1,9 +1,0 @@
-{
-  "map_features_path": "../artifacts/runs/collect/map_features.json",
-  "checkpoint_path": "../artifacts/runs/ppo_smoke/ppo_model.npz",
-  "output_dir": "../artifacts/runs/eval_smoke",
-  "seed": 19,
-  "num_episodes": 20,
-  "max_steps_per_episode": 128,
-  "device": "auto"
-}

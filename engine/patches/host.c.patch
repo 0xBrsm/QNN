@@ -1,0 +1,6 @@
+--- host.c	2024-01-01 00:00:00.000000000 +0000
++++ host.c	2024-01-01 00:00:01.000000000 +0000
+@@ -136,2 +136,3 @@
+ 	Con_Printf ("Host_Error: %s\n",string);
++	fprintf(stderr, "Host_Error: %s\n", string);
+

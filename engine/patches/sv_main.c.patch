@@ -1,6 +1,6 @@
 # sv_main.c - format string hardening in SV_SendServerinfo
 #
-# These are stock WinQuake hardening fixes from the NexQuake bugfix catalog.
+# These are stock WinQuake hardening fixes from the QNN bugfix catalog.
 #
 --- sv_main.c
 +++ sv_main.c
