@@ -7,7 +7,6 @@ from collections.abc import Mapping as MappingABC
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from statistics import median
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -15,8 +14,8 @@ import torch
 
 from quake_ai.actions import ACTION_HEADS
 from quake_ai.rl.combat_metrics import iter_weapon_metric_keys
-from quake_ai.model.policy import MLPGRUPolicy
-from quake_ai.model.observation import observation_signature_dim
+from quake_ai.model.policy import QNNPolicy
+from quake_ai.model.observation import TokenObservationEncoder, observation_signature_dim
 from quake_ai.rl.environment import NativeWorldEnv
 from quake_ai.utils.io import write_json
 from quake_ai.utils.repro import set_global_seed, write_experiment_manifest
@@ -44,6 +43,7 @@ class EvalConfig:
     sample_seed_offset: int = 20_000
     map_features_path: str = ""
     scenario_config_path: str = ""
+    record_demos: bool = False
     device: str = "auto"
 
 
@@ -63,7 +63,7 @@ class _EpisodeState:
     scenario_id: str
     step_count: int = 0
     return_value: float = 0.0
-    last_info: Mapping[str, object] = field(default_factory=lambda: {"goal_reached": False, "items_collected": 0})
+    last_info: Mapping[str, object] = field(default_factory=dict)
     rng: torch.Generator | None = None
     hidden: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
 
@@ -120,6 +120,26 @@ def _build_eval_env(config: EvalConfig, env_index: int) -> tuple[NativeWorldEnv,
     ), scenario_id
 
 
+def _set_demo_recording(env: NativeWorldEnv, episode_index: int) -> None:
+    """Inject a ``record`` command into the env's pre_map_commands for this episode.
+
+    Quake's ``record`` console command only works when the client is **not**
+    yet connected to a server.  The worker's reset sequence runs
+    ``pre_map_commands`` before ``map <name>``, so the client is still
+    disconnected and ``record`` succeeds.  ``post_map_commands`` runs after
+    connection, which causes ``record`` to be silently rejected.
+    """
+    demo_name = f"eval_ep_{episode_index:04d}"
+    base_cmds = env.adapter.reset_options.get("_base_pre_map_commands")
+    if base_cmds is None:
+        base_cmds = str(env.adapter.reset_options.get("pre_map_commands", ""))
+        env.adapter.reset_options["_base_pre_map_commands"] = base_cmds
+    record_cmd = f"record {demo_name}"
+    env.adapter.reset_options["pre_map_commands"] = (
+        f"{base_cmds}\n{record_cmd}" if base_cmds else record_cmd
+    )
+
+
 def _episode_rng(config: EvalConfig, mode: str, episode_index: int, device: torch.device) -> torch.Generator:
     offset = 0 if mode == "greedy" else config.sample_seed_offset
     generator_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
@@ -129,7 +149,7 @@ def _episode_rng(config: EvalConfig, mode: str, episode_index: int, device: torc
 
 
 def _select_actions_batch(
-    model: MLPGRUPolicy,
+    model: QNNPolicy,
     obs_batch: np.ndarray | Dict[str, np.ndarray],
     mode: str,
     states: Sequence[_EpisodeState],
@@ -145,7 +165,7 @@ def _select_actions_batch(
     else:
         raise ValueError(f"Unsupported policy mode {mode}")
 
-    batch_size = obs_batch["obs"].shape[0] if isinstance(obs_batch, dict) else obs_batch.shape[0]
+    batch_size = next(iter(obs_batch.values())).shape[0] if isinstance(obs_batch, dict) else obs_batch.shape[0]
     actions = [
         {head: int(action_batch.actions[head][idx]) for head in ACTION_HEADS}
         for idx in range(batch_size)
@@ -204,7 +224,7 @@ def _iter_aux_metric_items(info: Mapping[str, object], keys: tuple[str, ...]) ->
 
 def _evaluate_mode(
     config: EvalConfig,
-    model: MLPGRUPolicy,
+    model: QNNPolicy,
     mode: str,
     episode_specs: Sequence[Tuple[int, int | None]],
 ) -> Dict[str, float]:
@@ -214,9 +234,6 @@ def _evaluate_mode(
     env_scenarios = [scenario_id for _, scenario_id in env_entries]
     executor = ThreadPoolExecutor(max_workers=num_envs, thread_name_prefix="nq-eval") if num_envs > 1 else None
 
-    completion = 0
-    times: List[float] = []
-    items: List[int] = []
     returns: List[float] = []
     end_health: List[int] = []
     end_armor: List[int] = []
@@ -240,9 +257,11 @@ def _evaluate_mode(
         while next_episode < len(episode_specs) and len(active) < len(envs):
             episode_seed, start_variant = episode_specs[next_episode]
             slot = len(active)
+            if config.record_demos:
+                _set_demo_recording(envs[slot], next_episode)
             obs = envs[slot].reset(seed=episode_seed, start_variant=start_variant)
             if not checked_obs_dim:
-                env_obs_dim = observation_signature_dim(obs) if isinstance(obs, dict) else int(obs.shape[0])
+                env_obs_dim = TokenObservationEncoder().obs_dim if isinstance(obs, dict) else int(obs.shape[0])
                 if env_obs_dim != model.obs_dim:
                     raise RuntimeError(
                         f"Evaluation checkpoint obs_dim={model.obs_dim} does not match environment obs_dim={env_obs_dim}"
@@ -282,7 +301,7 @@ def _evaluate_mode(
                 state = active[slot]
                 state.hidden = next_hidden[batch_idx].copy()
                 state.step_count += 1
-                # Reward is useful in combat/survival eval even when completion stays at zero.
+                # Reward remains useful even when the episode ends without a special terminal condition.
                 state.return_value += float(reward)
                 state.last_info = info
                 total_steps += 1
@@ -298,10 +317,6 @@ def _evaluate_mode(
                     scenario_metric_sums[key] = scenario_metric_sums.get(key, 0.0) + value
 
                 if done or state.step_count >= config.max_steps_per_episode:
-                    if bool(state.last_info.get("goal_reached", False)):
-                        completion += 1
-                    times.append(float(state.step_count))
-                    items.append(int(state.last_info.get("items_collected", 0)))
                     returns.append(float(state.return_value))
                     end_health.append(int(state.last_info.get("health", 0)))
                     end_armor.append(int(state.last_info.get("armor", 0)))
@@ -319,6 +334,8 @@ def _evaluate_mode(
 
                     if next_episode < len(episode_specs):
                         episode_seed, start_variant = episode_specs[next_episode]
+                        if config.record_demos:
+                            _set_demo_recording(envs[slot], next_episode)
                         next_obs = envs[slot].reset(seed=episode_seed, start_variant=start_variant)
                         active[slot] = _EpisodeState(
                             episode_index=next_episode,
@@ -338,16 +355,10 @@ def _evaluate_mode(
         for env in envs:
             env.close()
 
-    completion_rate = completion / max(config.num_episodes, 1)
-    median_time = float(median(times)) if times else 0.0
-    item_coverage = float(np.mean(items)) if items else 0.0
     stuck_rate = float(stuck_steps / max(total_steps, 1))
 
     summary = {
-        "completion_rate": completion_rate,
         "death_rate": float(done_reasons.get("player_died", 0) / max(config.num_episodes, 1)),
-        "median_time_to_goal": median_time,
-        "item_coverage": item_coverage,
         "mean_episode_return": float(np.mean(returns)) if returns else 0.0,
         "mean_end_health": float(np.mean(end_health)) if end_health else 0.0,
         "mean_end_armor": float(np.mean(end_armor)) if end_armor else 0.0,
@@ -384,7 +395,7 @@ def run_evaluation(config: EvalConfig) -> Dict[str, float]:
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    model = MLPGRUPolicy.load(config.checkpoint_path, device=config.device)
+    model = QNNPolicy.load(config.checkpoint_path, device=config.device)
     episode_specs = _episode_specs(config)
     mode_summaries = {mode: _evaluate_mode(config, model, mode, episode_specs) for mode in config.policy_modes}
 

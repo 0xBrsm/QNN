@@ -151,7 +151,7 @@ static void qnn_demo_infer_action(qnn_worker_action_t *action, const qnn_worker_
 		action->jump = 1;
 
 	if (snapshot->weapon_id != qnn_demo_runtime.prev_weapon_id && snapshot->weapon_id > 0)
-		action->weapon = snapshot->weapon_id <= 8 ? snapshot->weapon_id : 0;
+		action->weapon = qnn_weapon_class_from_id(snapshot->weapon_id) + 1;
 }
 
 static void qnn_demo_save_prev(const qnn_worker_snapshot_t *snapshot)
@@ -229,11 +229,7 @@ static void qnn_demo_detect_native_tick_hz(void)
 static void qnn_worker_capture_snapshot(qnn_worker_snapshot_t *snapshot, qboolean reset_flag)
 {
 	qnn_worker_capture_base_snapshot(snapshot);
-	snapshot->goal_reached = false;
 	snapshot->done = reset_flag ? false : qnn_demo_runtime.done;
-	snapshot->done_reason[0] = 0;
-	if (snapshot->done)
-		snprintf(snapshot->done_reason, sizeof(snapshot->done_reason), "demo_complete");
 	qnn_worker_capture_visible_entities(snapshot, qnn_demo_runtime.fixed_dt);
 	qnn_worker_drain_sounds(snapshot);
 }
@@ -300,7 +296,7 @@ static qboolean qnn_demo_reset_world(const char *demo_path, int seed, char *erro
 
 static void qnn_worker_write_hello_response(void)
 {
-	fprintf(stdout, "{\"capabilities\":[\"demo_playback\",\"reset_options\",\"token_collect_v1\",\"token_step_v2\"],\"map_id\":");
+	fprintf(stdout, "{\"capabilities\":[\"demo_playback\",\"navmesh_query_v1\",\"reset_options\",\"token_collect_v1\",\"token_step_v2\"],\"map_id\":");
 	qnn_worker_write_json_string(stdout, qnn_worker_map_state.requested_map_id);
 	fprintf(stdout, ",\"map_state\":");
 	qnn_worker_write_map_state_json(stdout, &qnn_worker_map_state);
@@ -485,6 +481,11 @@ int main(int argc, char **argv)
 		if (strstr(line, "\"op\"") != NULL && strstr(line, "step") != NULL)
 		{
 			qnn_worker_handle_step(line);
+			continue;
+		}
+		if (strstr(line, "\"op\"") != NULL && strstr(line, "nav_query") != NULL)
+		{
+			qnn_worker_handle_nav_query(line);
 			continue;
 		}
 		if (strstr(line, "\"op\"") != NULL && strstr(line, "collect") != NULL)

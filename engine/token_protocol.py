@@ -15,14 +15,17 @@ from quake_ai.vocab import (
 )
 
 TOKEN_BINARY_MAGIC = b"QTOK"
-TOKEN_BINARY_VERSION = 3
+TOKEN_BINARY_VERSION = 5
 
 _HEADER_STRUCT = struct.Struct("<4sHHIIiHHHH")
 TOKEN_BINARY_HEADER_SIZE = _HEADER_STRUCT.size
 
-_SELF_STRUCT = struct.Struct("<9fiif9i")
-_OBJECT_STRUCT = struct.Struct("<IHHHH7fHH")
+# v5 self token: 23 floats (scalars) + 3 int32s (embedding IDs)
+_SELF_STRUCT = struct.Struct("<23f3i")
+# v5 object token: u32 handle + 5 u16 IDs + 8 floats (scalars) + u16 event_count + u16 event_base + u16 route_cluster_count + 8 u16 route_cluster_ids
+_OBJECT_STRUCT = struct.Struct("<I5H8f2H9H")
 _EVENT_STRUCT = struct.Struct("<HHHH3f")
+# v5 spatial: u16 sector_id + u16 reserved + 10 floats (reordered)
 _SPATIAL_STRUCT = struct.Struct("<HH10f")
 
 _FLAG_RESET = 1 << 0
@@ -34,39 +37,40 @@ _ACTION_STRUCT = struct.Struct("<7H")
 
 @dataclass(slots=True)
 class TrustedSelfToken:
-    origin: List[float]
-    velocity: List[float]
-    view_angles: List[float]
-    health: int
-    armor: int
+    """V5 self token — pre-normalized scalars + embedding IDs."""
+    health: float
+    armor: float
     armor_type: float
-    ammo_shells: int
-    ammo_nails: int
-    ammo_rockets: int
-    ammo_cells: int
+    weapon_bits: List[float]  # 7 bitmask bits
+    weapon_super: float
+    ammo: List[float]  # 4 values (shells, nails, rockets, cells)
+    velocity: List[float]  # 3 values (x, y, z)
+    yaw_sin: float
+    yaw_cos: float
+    pitch_sin: float
+    pitch_cos: float
+    dt: float
     weapon_id: int
-    weapons_owned: int
-    grounded: bool
-    waterlevel: int
-    current_region_id: int
+    movement_id: int
+    cluster_id: int
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "origin": list(self.origin),
-            "velocity": list(self.velocity),
-            "view_angles": list(self.view_angles),
-            "health": int(self.health),
-            "armor": int(self.armor),
+            "health": float(self.health),
+            "armor": float(self.armor),
             "armor_type": float(self.armor_type),
-            "ammo_shells": int(self.ammo_shells),
-            "ammo_nails": int(self.ammo_nails),
-            "ammo_rockets": int(self.ammo_rockets),
-            "ammo_cells": int(self.ammo_cells),
+            "weapon_bits": list(self.weapon_bits),
+            "weapon_super": float(self.weapon_super),
+            "ammo": list(self.ammo),
+            "velocity": list(self.velocity),
+            "yaw_sin": float(self.yaw_sin),
+            "yaw_cos": float(self.yaw_cos),
+            "pitch_sin": float(self.pitch_sin),
+            "pitch_cos": float(self.pitch_cos),
+            "dt": float(self.dt),
             "weapon_id": int(self.weapon_id),
-            "weapons_owned": int(self.weapons_owned),
-            "grounded": bool(self.grounded),
-            "waterlevel": int(self.waterlevel),
-            "current_region_id": int(self.current_region_id),
+            "movement_id": int(self.movement_id),
+            "cluster_id": int(self.cluster_id),
         }
 
 
@@ -103,13 +107,16 @@ class TrustedObjectToken:
     qualifier_id: int
     modality_id: int
     player_id: int
+    cluster_id: int
     rel_x: float
     rel_y: float
     rel_z: float
+    route_cost: float
     recency: float
     confidence: float
     magnitude: float
     state: float
+    route_cluster_ids: List[int] = field(default_factory=list)
     events: List[TrustedEventAtom] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -122,13 +129,16 @@ class TrustedObjectToken:
             "modality_id": int(self.modality_id),
             "modality": MODALITY_NAMES.get(int(self.modality_id), "UNKNOWN"),
             "player_id": int(self.player_id),
+            "cluster_id": int(self.cluster_id),
             "rel_x": float(self.rel_x),
             "rel_y": float(self.rel_y),
             "rel_z": float(self.rel_z),
+            "route_cost": float(self.route_cost),
             "recency": float(self.recency),
             "confidence": float(self.confidence),
             "magnitude": float(self.magnitude),
             "state": float(self.state),
+            "route_cluster_ids": list(self.route_cluster_ids),
             "events": [event.to_dict() for event in self.events],
         }
 
@@ -139,13 +149,13 @@ class TrustedSpatialToken:
     nearest_dist: float
     mean_dist: float
     openness: float
+    clearance: float
+    traversable: float
+    dropoff: float
     solid_frac: float
     water_frac: float
     slime_frac: float
     lava_frac: float
-    traversable: float
-    dropoff: float
-    clearance: float
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -154,13 +164,13 @@ class TrustedSpatialToken:
             "nearest_dist": float(self.nearest_dist),
             "mean_dist": float(self.mean_dist),
             "openness": float(self.openness),
+            "clearance": float(self.clearance),
+            "traversable": float(self.traversable),
+            "dropoff": float(self.dropoff),
             "solid_frac": float(self.solid_frac),
             "water_frac": float(self.water_frac),
             "slime_frac": float(self.slime_frac),
             "lava_frac": float(self.lava_frac),
-            "traversable": float(self.traversable),
-            "dropoff": float(self.dropoff),
-            "clearance": float(self.clearance),
         }
 
 
@@ -212,26 +222,28 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
     if version != TOKEN_BINARY_VERSION:
         raise ValueError(f"Unsupported token packet version {version}")
 
+    # v5 self token: 23 scalars + 3 IDs
     self_values = _SELF_STRUCT.unpack(read_exact(_SELF_STRUCT.size))
     self_token = TrustedSelfToken(
-        origin=[float(self_values[0]), float(self_values[1]), float(self_values[2])],
-        velocity=[float(self_values[3]), float(self_values[4]), float(self_values[5])],
-        view_angles=[float(self_values[6]), float(self_values[7]), float(self_values[8])],
-        health=int(self_values[9]),
-        armor=int(self_values[10]),
-        armor_type=float(self_values[11]),
-        ammo_shells=int(self_values[12]),
-        ammo_nails=int(self_values[13]),
-        ammo_rockets=int(self_values[14]),
-        ammo_cells=int(self_values[15]),
-        weapon_id=int(self_values[16]),
-        weapons_owned=int(self_values[17]),
-        grounded=bool(self_values[18]),
-        waterlevel=int(self_values[19]),
-        current_region_id=int(self_values[20]),
+        health=float(self_values[0]),
+        armor=float(self_values[1]),
+        armor_type=float(self_values[2]),
+        weapon_bits=[float(self_values[i]) for i in range(3, 10)],
+        weapon_super=float(self_values[10]),
+        ammo=[float(self_values[i]) for i in range(11, 15)],
+        velocity=[float(self_values[i]) for i in range(15, 18)],
+        yaw_sin=float(self_values[18]),
+        yaw_cos=float(self_values[19]),
+        pitch_sin=float(self_values[20]),
+        pitch_cos=float(self_values[21]),
+        dt=float(self_values[22]),
+        weapon_id=int(self_values[23]),
+        movement_id=int(self_values[24]),
+        cluster_id=int(self_values[25]),
     )
 
-    raw_objects: List[tuple[int, int, int, int, int, float, float, float, float, float, float, float, int, int]] = []
+    # v5 object tokens: u32 handle + 5 u16 IDs + 8 floats + u16 event_count + u16 event_base
+    raw_objects = []
     for _ in range(object_count):
         raw_objects.append(_OBJECT_STRUCT.unpack(read_exact(_OBJECT_STRUCT.size)))
 
@@ -260,17 +272,23 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
             qualifier_id,
             modality_id,
             player_id,
+            cluster_id,
             rel_x,
             rel_y,
             rel_z,
+            route_cost,
             recency,
             confidence,
             magnitude,
             state,
             event_count_local,
             event_base,
+            route_cluster_count,
+            *route_cluster_raw,
         ) = row
         events = raw_events[event_base: event_base + event_count_local]
+        n_route = min(int(route_cluster_count), len(route_cluster_raw))
+        route_clusters = [int(route_cluster_raw[i]) for i in range(n_route)]
         object_tokens.append(
             TrustedObjectToken(
                 handle=int(handle),
@@ -278,17 +296,21 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
                 qualifier_id=int(qualifier_id),
                 modality_id=int(modality_id),
                 player_id=int(player_id),
+                cluster_id=int(cluster_id),
                 rel_x=float(rel_x),
                 rel_y=float(rel_y),
                 rel_z=float(rel_z),
+                route_cost=float(route_cost),
                 recency=float(recency),
                 confidence=float(confidence),
                 magnitude=float(magnitude),
                 state=float(state),
+                route_cluster_ids=route_clusters,
                 events=list(events),
             )
         )
 
+    # v5 spatial: reordered geometry→traversability→content
     spatial_tokens: List[TrustedSpatialToken] = []
     for _ in range(spatial_count):
         (
@@ -297,13 +319,13 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
             nearest_dist,
             mean_dist,
             openness,
+            clearance,
+            traversable,
+            dropoff,
             solid_frac,
             water_frac,
             slime_frac,
             lava_frac,
-            traversable,
-            dropoff,
-            clearance,
         ) = _SPATIAL_STRUCT.unpack(read_exact(_SPATIAL_STRUCT.size))
         spatial_tokens.append(
             TrustedSpatialToken(
@@ -311,13 +333,13 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
                 nearest_dist=float(nearest_dist),
                 mean_dist=float(mean_dist),
                 openness=float(openness),
+                clearance=float(clearance),
+                traversable=float(traversable),
+                dropoff=float(dropoff),
                 solid_frac=float(solid_frac),
                 water_frac=float(water_frac),
                 slime_frac=float(slime_frac),
                 lava_frac=float(lava_frac),
-                traversable=float(traversable),
-                dropoff=float(dropoff),
-                clearance=float(clearance),
             )
         )
 
@@ -351,7 +373,7 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
 
 
 def encode_binary_token_tick(tick: TrustedTokenTick) -> bytes:
-    """Encode a TrustedTokenTick back to the QTOK binary wire format."""
+    """Encode a TrustedTokenTick back to the QTOK v5 binary wire format."""
     all_events: List[TrustedEventAtom] = []
     event_bases: List[int] = []
     for obj in tick.object_tokens:
@@ -366,6 +388,7 @@ def encode_binary_token_tick(tick: TrustedTokenTick) -> bytes:
     if tick.action_label:
         flags |= _FLAG_HAS_ACTION
 
+    st = tick.self_token
     parts = [
         _HEADER_STRUCT.pack(
             TOKEN_BINARY_MAGIC,
@@ -380,24 +403,27 @@ def encode_binary_token_tick(tick: TrustedTokenTick) -> bytes:
             tick.tick_hz,
         ),
         _SELF_STRUCT.pack(
-            *tick.self_token.origin,
-            *tick.self_token.velocity,
-            *tick.self_token.view_angles,
-            tick.self_token.health,
-            tick.self_token.armor,
-            tick.self_token.armor_type,
-            tick.self_token.ammo_shells,
-            tick.self_token.ammo_nails,
-            tick.self_token.ammo_rockets,
-            tick.self_token.ammo_cells,
-            tick.self_token.weapon_id,
-            tick.self_token.weapons_owned,
-            int(tick.self_token.grounded),
-            tick.self_token.waterlevel,
-            tick.self_token.current_region_id,
+            st.health,
+            st.armor,
+            st.armor_type,
+            *st.weapon_bits,
+            st.weapon_super,
+            *st.ammo,
+            *st.velocity,
+            st.yaw_sin,
+            st.yaw_cos,
+            st.pitch_sin,
+            st.pitch_cos,
+            st.dt,
+            st.weapon_id,
+            st.movement_id,
+            st.cluster_id,
         ),
     ]
     for idx, obj in enumerate(tick.object_tokens):
+        rc = list(obj.route_cluster_ids or [])
+        rc_count = len(rc)
+        rc_padded = rc + [0] * (8 - len(rc))
         parts.append(
             _OBJECT_STRUCT.pack(
                 obj.handle,
@@ -405,15 +431,19 @@ def encode_binary_token_tick(tick: TrustedTokenTick) -> bytes:
                 obj.qualifier_id,
                 obj.modality_id,
                 obj.player_id,
+                obj.cluster_id,
                 obj.rel_x,
                 obj.rel_y,
                 obj.rel_z,
+                obj.route_cost,
                 obj.recency,
                 obj.confidence,
                 obj.magnitude,
                 obj.state,
                 len(obj.events),
                 event_bases[idx],
+                rc_count,
+                *rc_padded,
             )
         )
     for ev in all_events:
@@ -436,13 +466,13 @@ def encode_binary_token_tick(tick: TrustedTokenTick) -> bytes:
                 sp.nearest_dist,
                 sp.mean_dist,
                 sp.openness,
+                sp.clearance,
+                sp.traversable,
+                sp.dropoff,
                 sp.solid_frac,
                 sp.water_frac,
                 sp.slime_frac,
                 sp.lava_frac,
-                sp.traversable,
-                sp.dropoff,
-                sp.clearance,
             )
         )
     if tick.action_label:

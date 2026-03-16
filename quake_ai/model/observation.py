@@ -14,7 +14,6 @@ tokens into stable numpy tensors.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
 from typing import Dict, Mapping
 
 import numpy as np
@@ -23,29 +22,22 @@ from engine.token_protocol import TrustedTokenTick
 from quake_ai.actions import normalized_action_features
 from quake_ai.vocab import MODALITY_IDS, SPATIAL_SECTOR_IDS, SUBJECT_IDS
 
-MAX_OBJECT_TOKENS = 128
+MAX_OBJECT_TOKENS = 64
 MAX_EVENT_ATOMS = 256
 SPATIAL_TOKEN_COUNT = 9
+MAX_ROUTE_CLUSTERS = 8
 
 ACTION_HISTORY_LEN = 8
 ACTION_HISTORY_DIM = 7
 
-SELF_SCALAR_DIM = 27
-OBJECT_ID_DIM = 4
-OBJECT_SCALAR_DIM = 7
+SELF_SCALAR_DIM = 23
+SELF_ID_DIM = 3
+OBJECT_ID_DIM = 5
+OBJECT_SCALAR_DIM = 8
 EVENT_ID_DIM = 4
 EVENT_SCALAR_DIM = 3
 SPATIAL_SCALAR_DIM = 10
 
-_ABS_POS_SCALE = 4096.0
-_REL_POS_SCALE = 4096.0
-_SPATIAL_DIST_SCALE = 1024.0
-_VEL_SCALE = 2000.0
-_HEALTH_SCALE = 250.0
-_ARMOR_SCALE = 200.0
-_ARMOR_TYPE_SCALE = 0.8
-_AMMO_CAPS = (100.0, 200.0, 100.0, 100.0)
-_DT_SCALE = 0.1
 
 _THREAT_SUBJECT_IDS = frozenset(
     {
@@ -57,17 +49,12 @@ _THREAT_SUBJECT_IDS = frozenset(
     }
 )
 
-_WEAPON_BITS = (1, 2, 4, 8, 16, 32, 64)
-
 # Cached default spatial ids — constant across all ticks.
 _DEFAULT_SPATIAL_IDS = np.asarray(
     [SPATIAL_SECTOR_IDS[name] for name in SPATIAL_SECTOR_IDS], dtype=np.int32
 )
 
 
-def _normalized_dt_value(tick_hz: int) -> float:
-    hz = max(int(tick_hz), 1)
-    return float(min((1.0 / float(hz)) / _DT_SCALE, 1.0))
 
 
 def observation_signature_dim(obs: Mapping[str, np.ndarray]) -> int:
@@ -83,7 +70,7 @@ class TokenObservationEncoder:
     def obs_dim(self) -> int:
         return int(
             SELF_SCALAR_DIM
-            + 1
+            + SELF_ID_DIM
             + (MAX_OBJECT_TOKENS * (OBJECT_ID_DIM + OBJECT_SCALAR_DIM + 1))
             + (MAX_EVENT_ATOMS * (EVENT_ID_DIM + EVENT_SCALAR_DIM + 2))
             + SPATIAL_TOKEN_COUNT
@@ -123,31 +110,19 @@ class TokenObservationEncoder:
             self.reset()
 
         # --- self token (single row, no loop) ---
+        # v5: all scalars arrive pre-normalized from the C worker.
         st = tick.self_token
-        origin = st.origin
-        vel = st.velocity
-        pitch = math.radians(float(st.view_angles[0]) if len(st.view_angles) > 0 else 0.0)
-        yaw = math.radians(float(st.view_angles[1]) if len(st.view_angles) > 1 else 0.0)
-        wo = int(st.weapons_owned)
+        self_cluster_id = int(st.cluster_id)
         self_scalars = np.array([
-            min(float(st.health) / _HEALTH_SCALE, 1.0),
-            min(float(st.armor) / _ARMOR_SCALE, 1.0),
-            min(float(st.armor_type) / _ARMOR_TYPE_SCALE, 1.0),
-            min(float(st.ammo_shells) / _AMMO_CAPS[0], 1.0),
-            min(float(st.ammo_nails) / _AMMO_CAPS[1], 1.0),
-            min(float(st.ammo_rockets) / _AMMO_CAPS[2], 1.0),
-            min(float(st.ammo_cells) / _AMMO_CAPS[3], 1.0),
-            float(origin[0]) / _ABS_POS_SCALE if len(origin) > 0 else 0.0,
-            float(origin[1]) / _ABS_POS_SCALE if len(origin) > 1 else 0.0,
-            float(origin[2]) / _ABS_POS_SCALE if len(origin) > 2 else 0.0,
-            float(vel[0]) / _VEL_SCALE if len(vel) > 0 else 0.0,
-            float(vel[1]) / _VEL_SCALE if len(vel) > 1 else 0.0,
-            float(vel[2]) / _VEL_SCALE if len(vel) > 2 else 0.0,
-            math.sin(yaw), math.cos(yaw), math.sin(pitch), math.cos(pitch),
-            1.0 if st.grounded else 0.0,
-            min(float(st.waterlevel) / 3.0, 1.0),
-            *[1.0 if (wo & bit) else 0.0 for bit in _WEAPON_BITS],
-            _normalized_dt_value(getattr(tick, "tick_hz", 20)),
+            st.health,
+            st.armor,
+            st.armor_type,
+            *st.weapon_bits,
+            st.weapon_super,
+            *st.ammo,
+            *st.velocity,
+            st.yaw_sin, st.yaw_cos, st.pitch_sin, st.pitch_cos,
+            st.dt,
         ], dtype=np.float32)
 
         # --- objects: bulk fill into pre-allocated arrays ---
@@ -157,28 +132,35 @@ class TokenObservationEncoder:
         object_ids = np.zeros((MAX_OBJECT_TOKENS, OBJECT_ID_DIM), dtype=np.int32)
         object_scalars = np.zeros((MAX_OBJECT_TOKENS, OBJECT_SCALAR_DIM), dtype=np.float32)
         object_mask = np.zeros(MAX_OBJECT_TOKENS, dtype=np.bool_)
+        object_route_cluster_ids = np.zeros((MAX_OBJECT_TOKENS, MAX_ROUTE_CLUSTERS), dtype=np.int32)
 
         if n_obj > 0:
             ids_buf = np.empty((n_obj, OBJECT_ID_DIM), dtype=np.int32)
             sc_buf = np.empty((n_obj, OBJECT_SCALAR_DIM), dtype=np.float32)
+            rc_buf = np.zeros((n_obj, MAX_ROUTE_CLUSTERS), dtype=np.int32)
             for i in range(n_obj):
                 obj = objects[i]
                 ids_buf[i, 0] = obj.subject_id
                 ids_buf[i, 1] = obj.qualifier_id
                 ids_buf[i, 2] = obj.modality_id
                 ids_buf[i, 3] = obj.player_id
+                ids_buf[i, 4] = int(obj.cluster_id)
+                # v5: rel_x/y/z and route_cost arrive pre-normalized from C worker
                 sc_buf[i, 0] = obj.rel_x
                 sc_buf[i, 1] = obj.rel_y
                 sc_buf[i, 2] = obj.rel_z
-                sc_buf[i, 3] = obj.recency
-                sc_buf[i, 4] = obj.confidence
-                sc_buf[i, 5] = obj.magnitude
-                sc_buf[i, 6] = obj.state
-            sc_buf[:, :3] /= _REL_POS_SCALE
-            np.clip(sc_buf[:, 3:], 0.0, 1.0, out=sc_buf[:, 3:])
+                sc_buf[i, 3] = obj.route_cost
+                sc_buf[i, 4] = obj.recency
+                sc_buf[i, 5] = obj.confidence
+                sc_buf[i, 6] = obj.magnitude
+                sc_buf[i, 7] = obj.state
+                rc = getattr(obj, 'route_cluster_ids', None) or []
+                for j in range(min(len(rc), MAX_ROUTE_CLUSTERS)):
+                    rc_buf[i, j] = rc[j]
             object_ids[:n_obj] = ids_buf
             object_scalars[:n_obj] = sc_buf
             object_mask[:n_obj] = True
+            object_route_cluster_ids[:n_obj] = rc_buf
 
         # --- events: flatten nested events, bulk fill ---
         event_ids = np.zeros((MAX_EVENT_ATOMS, EVENT_ID_DIM), dtype=np.int32)
@@ -220,16 +202,14 @@ class TokenObservationEncoder:
                 sp_buf[i, 0] = sp.nearest_dist
                 sp_buf[i, 1] = sp.mean_dist
                 sp_buf[i, 2] = sp.openness
-                sp_buf[i, 3] = sp.solid_frac
-                sp_buf[i, 4] = sp.water_frac
-                sp_buf[i, 5] = sp.slime_frac
-                sp_buf[i, 6] = sp.lava_frac
-                sp_buf[i, 7] = sp.traversable
-                sp_buf[i, 8] = sp.dropoff
-                sp_buf[i, 9] = sp.clearance
-            np.clip(sp_buf[:, :2], 0.0, _SPATIAL_DIST_SCALE, out=sp_buf[:, :2])
-            sp_buf[:, :2] /= _SPATIAL_DIST_SCALE
-            np.clip(sp_buf[:, 2:], 0.0, 1.0, out=sp_buf[:, 2:])
+                sp_buf[i, 3] = sp.clearance
+                sp_buf[i, 4] = sp.traversable
+                sp_buf[i, 5] = sp.dropoff
+                sp_buf[i, 6] = sp.solid_frac
+                sp_buf[i, 7] = sp.water_frac
+                sp_buf[i, 8] = sp.slime_frac
+                sp_buf[i, 9] = sp.lava_frac
+            # v5: spatial scalars arrive pre-normalized from C worker
             spatial_scalars[:n_sp] = sp_buf
 
         action_history = np.zeros((ACTION_HISTORY_LEN, ACTION_HISTORY_DIM), dtype=np.float32)
@@ -244,10 +224,13 @@ class TokenObservationEncoder:
 
         return {
             "self_scalars": self_scalars,
-            "self_weapon_id": np.asarray(int(st.weapon_id), dtype=np.int32),
+            "self_weapon_id": np.array([st.weapon_id], dtype=np.int32),
+            "self_movement_id": np.array([st.movement_id], dtype=np.int32),
+            "self_cluster_id": np.array([self_cluster_id], dtype=np.int32),
             "object_ids": object_ids,
             "object_scalars": object_scalars,
             "object_mask": object_mask,
+            "object_route_cluster_ids": object_route_cluster_ids,
             "event_ids": event_ids,
             "event_scalars": event_scalars,
             "event_owner": event_owner,

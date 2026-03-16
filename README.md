@@ -10,7 +10,8 @@ This repo is centered on one training path: competitive BC warm start plus Sampl
 | Policy | transformer trunk + GRU actor-critic |
 | PPO backend | Sample Factory 2.1.1 APPO |
 | Default profile | `combat-bot-multi` |
-| Warm start | `artifacts/runs/competitive_materialized_competitive_all51/` |
+| Wire format | v5 (see `token-spec.md`) |
+| Warm start | `assets/runs/live/best/best_model.pth` |
 | Scenario source | `quake_ai/rl/configs/combat_bot_scenarios.json` |
 
 The old campaign and E1M1 lanes are gone from the supported surface.
@@ -19,7 +20,7 @@ The old campaign and E1M1 lanes are gone from the supported surface.
 
 - `overview.md` is the source of truth for architecture and observation layout.
 - `quake_ai.rl.training` is the promoted orchestration entry point.
-- `docker/train-container.sh` is the promoted runtime wrapper for engine-backed work.
+- `scripts/container.sh` is the promoted runtime wrapper for engine-backed work.
 - The public profile surface is only `combat-bot-multi[-verify]` plus `combat-bot-<scenario>[-verify]`.
 
 ## Install
@@ -47,14 +48,12 @@ For AMD GPUs, use the training container instead of modifying the editor environ
 From the repo root:
 
 ```bash
-src/docker/train-container.sh check
-src/docker/train-container.sh install-frikbotnex
-src/docker/train-container.sh live-check
-src/docker/train-container.sh combat-bot-multi-verify plan
-src/docker/train-container.sh combat-bot-multi-verify check
-src/docker/train-container.sh combat-bot-multi-verify all
-src/docker/train-container.sh combat-bot-multi all
-src/docker/train-container.sh combat-bot-open-dm4-verify all
+scripts/container.sh check
+scripts/container.sh shell
+scripts/container.sh run scripts/train.sh --bc
+scripts/container.sh run scripts/train.sh --bc --eval-bc
+scripts/container.sh run scripts/train.sh --ppo
+scripts/container.sh run scripts/train.sh --check
 ```
 
 Direct invocation remains available:
@@ -90,15 +89,12 @@ Sample Factory settings are built from the PPO dicts inside `quake_ai.rl.trainin
 
 | Path | Purpose |
 |------|---------|
-| `artifacts/runs/competitive_materialized_competitive_all51/` | current BC warm start |
-| `artifacts/runs/competitive_bot_multi_verify/` | retained multi-scenario verify root |
-| `artifacts/runs/competitive_bot_multi_live/` | retained multi-scenario live root |
-| `artifacts/runs/competitive_bot_open_dm4_verify/` | retained single-scenario verify comparison |
-| `artifacts/runs/competitive_bot_open_dm4_live/` | retained single-scenario live comparison |
-| `artifacts/runs/competitive_bot_pressure_dm6_verify/` | retained secondary verify comparison |
+| `assets/runs/live/` | live training root (`sf/`, `best/`, `eval/`) |
+| `assets/runs/competitive_bot_multi_verify/` | multi-scenario verify root |
 
 ## Related Docs
 
-- [`overview.md`](/workspaces/dev-qnn/overview.md)
-- [`agents/training-quality-plan.md`](/workspaces/dev-qnn/agents/training-quality-plan.md)
-- [`agents/environment.md`](/workspaces/dev-qnn/agents/environment.md)
+- [`overview.md`](../overview.md)
+- [`token-spec.md`](../token-spec.md)
+- [`agents/training-quality-plan.md`](../agents/training-quality-plan.md)
+- [`agents/environment.md`](../agents/environment.md)

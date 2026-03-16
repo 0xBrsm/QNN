@@ -1,4 +1,5 @@
 #include "qnn_worker.h"
+#include "qnn_nav_oracle.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -10,6 +11,19 @@
 #define QNN_WORKER_GRID_HALF 128.0f
 #define QNN_WORKER_Z_HALF 256.0f
 #define QNN_WORKER_OBJECT_PADDING 16.0f
+#define QNN_NAV_CELL_SIZE 16.0f
+#define QNN_NAV_CELL_HEIGHT 8.0f
+#define QNN_NAV_WALKABLE_SLOPE_ANGLE 45.0f
+#define QNN_NAV_WALKABLE_HEIGHT 56.0f
+#define QNN_NAV_WALKABLE_CLIMB 18.0f
+#define QNN_NAV_WALKABLE_RADIUS 16.0f
+#define QNN_NAV_MAX_EDGE_LEN 192.0f
+#define QNN_NAV_MAX_SIMPLIFICATION_ERROR 1.3f
+#define QNN_NAV_MIN_REGION_SIZE 8
+#define QNN_NAV_MERGE_REGION_SIZE 20
+#define QNN_NAV_MAX_VERTS_PER_POLY 6
+#define QNN_NAV_DETAIL_SAMPLE_DISTANCE 6.0f
+#define QNN_NAV_DETAIL_SAMPLE_MAX_ERROR 1.0f
 
 typedef struct
 {
@@ -22,6 +36,247 @@ typedef struct
 	qnn_worker_property_t *properties;
 	int	property_count;
 } qnn_parsed_entity_t;
+
+static void qnn_worker_default_navmesh_config(qnn_navmesh_build_config_t *config)
+{
+	memset(config, 0, sizeof(*config));
+	config->cell_size = QNN_NAV_CELL_SIZE;
+	config->cell_height = QNN_NAV_CELL_HEIGHT;
+	config->walkable_slope_angle = QNN_NAV_WALKABLE_SLOPE_ANGLE;
+	config->walkable_height = QNN_NAV_WALKABLE_HEIGHT;
+	config->walkable_climb = QNN_NAV_WALKABLE_CLIMB;
+	config->walkable_radius = QNN_NAV_WALKABLE_RADIUS;
+	config->max_edge_len = QNN_NAV_MAX_EDGE_LEN;
+	config->max_simplification_error = QNN_NAV_MAX_SIMPLIFICATION_ERROR;
+	config->min_region_size = QNN_NAV_MIN_REGION_SIZE;
+	config->merge_region_size = QNN_NAV_MERGE_REGION_SIZE;
+	config->max_verts_per_poly = QNN_NAV_MAX_VERTS_PER_POLY;
+	config->detail_sample_distance = QNN_NAV_DETAIL_SAMPLE_DISTANCE;
+	config->detail_sample_max_error = QNN_NAV_DETAIL_SAMPLE_MAX_ERROR;
+}
+
+static qboolean qnn_worker_bsp_lump_view(
+	const byte *raw,
+	const dheader_t *header,
+	int lump_index,
+	size_t element_size,
+	const void **out_data,
+	int *out_count,
+	char *error,
+	size_t error_size)
+{
+	int offset;
+	int length;
+
+	offset = LittleLong(header->lumps[lump_index].fileofs);
+	length = LittleLong(header->lumps[lump_index].filelen);
+	if (offset < 0 || length < 0 || (element_size > 0 && (length % (int)element_size) != 0))
+	{
+		snprintf(error, error_size, "Invalid BSP lump %d", lump_index);
+		return false;
+	}
+	*out_data = raw + offset;
+	*out_count = element_size > 0 ? (length / (int)element_size) : 0;
+	return true;
+}
+
+static int qnn_worker_count_navmesh_triangles(const dmodel_t *models, int model_count, const dface_t *faces, int face_count, const texinfo_t *texinfo, int texinfo_count)
+{
+	const dmodel_t *world_model;
+	int first_face;
+	int num_faces;
+	int face_index;
+	int triangle_count;
+
+	if (model_count <= 0)
+		return 0;
+
+	world_model = &models[0];
+	first_face = LittleLong(world_model->firstface);
+	num_faces = LittleLong(world_model->numfaces);
+	if (first_face < 0 || num_faces < 0 || first_face + num_faces > face_count)
+		return 0;
+
+	triangle_count = 0;
+	for (face_index = 0; face_index < num_faces; ++face_index)
+	{
+		const dface_t *face;
+		int edge_count;
+		int texinfo_index;
+
+		face = &faces[first_face + face_index];
+		edge_count = LittleShort(face->numedges);
+		texinfo_index = LittleShort(face->texinfo);
+		if (edge_count < 3 || texinfo_index < 0 || texinfo_index >= texinfo_count)
+			continue;
+		if (LittleLong(texinfo[texinfo_index].flags) & TEX_SPECIAL)
+			continue;
+		triangle_count += edge_count - 2;
+	}
+	return triangle_count;
+}
+
+static qboolean qnn_worker_extract_navmesh_geometry(
+	const byte *raw,
+	const dheader_t *header,
+	float **out_vertices,
+	int *out_vertex_count,
+	int **out_triangles,
+	int *out_triangle_count,
+	char *error,
+	size_t error_size)
+{
+	const dmodel_t *models;
+	const dvertex_t *vertices;
+	const dedge_t *edges;
+	const int *surfedges;
+	const dface_t *faces;
+	const texinfo_t *texinfo;
+	int model_count;
+	int vertex_count;
+	int edge_count;
+	int surfedge_count;
+	int face_count;
+	int texinfo_count;
+	const dmodel_t *world_model;
+	int first_face;
+	int num_faces;
+	float *nav_vertices;
+	int *nav_triangles;
+	int triangle_count;
+	int *face_vertices;
+	int face_capacity;
+	int write_index;
+	int face_index;
+
+	*out_vertices = NULL;
+	*out_vertex_count = 0;
+	*out_triangles = NULL;
+	*out_triangle_count = 0;
+
+	if (!qnn_worker_bsp_lump_view(raw, header, LUMP_MODELS, sizeof(dmodel_t), (const void **)&models, &model_count, error, error_size)
+		|| !qnn_worker_bsp_lump_view(raw, header, LUMP_VERTEXES, sizeof(dvertex_t), (const void **)&vertices, &vertex_count, error, error_size)
+		|| !qnn_worker_bsp_lump_view(raw, header, LUMP_EDGES, sizeof(dedge_t), (const void **)&edges, &edge_count, error, error_size)
+		|| !qnn_worker_bsp_lump_view(raw, header, LUMP_SURFEDGES, sizeof(int), (const void **)&surfedges, &surfedge_count, error, error_size)
+		|| !qnn_worker_bsp_lump_view(raw, header, LUMP_FACES, sizeof(dface_t), (const void **)&faces, &face_count, error, error_size)
+		|| !qnn_worker_bsp_lump_view(raw, header, LUMP_TEXINFO, sizeof(texinfo_t), (const void **)&texinfo, &texinfo_count, error, error_size))
+		return false;
+
+	if (model_count <= 0 || vertex_count <= 0)
+	{
+		snprintf(error, error_size, "BSP is missing world model geometry");
+		return false;
+	}
+
+	triangle_count = qnn_worker_count_navmesh_triangles(models, model_count, faces, face_count, texinfo, texinfo_count);
+	if (triangle_count <= 0)
+	{
+		snprintf(error, error_size, "BSP did not yield any walkable world triangles");
+		return false;
+	}
+
+	nav_vertices = (float *)malloc((size_t)vertex_count * 3u * sizeof(*nav_vertices));
+	nav_triangles = (int *)malloc((size_t)triangle_count * 3u * sizeof(*nav_triangles));
+	if (nav_vertices == NULL || nav_triangles == NULL)
+	{
+		snprintf(error, error_size, "Out of memory while extracting navmesh geometry");
+		goto cleanup_fail;
+	}
+
+	for (face_index = 0; face_index < vertex_count; ++face_index)
+	{
+		nav_vertices[face_index * 3 + 0] = LittleFloat(vertices[face_index].point[0]);
+		nav_vertices[face_index * 3 + 1] = LittleFloat(vertices[face_index].point[1]);
+		nav_vertices[face_index * 3 + 2] = LittleFloat(vertices[face_index].point[2]);
+	}
+
+	world_model = &models[0];
+	first_face = LittleLong(world_model->firstface);
+	num_faces = LittleLong(world_model->numfaces);
+	face_vertices = NULL;
+	face_capacity = 0;
+	write_index = 0;
+
+	for (face_index = 0; face_index < num_faces; ++face_index)
+	{
+		const dface_t *face;
+		int edge_count_local;
+		int texinfo_index;
+		int first_edge;
+		int edge_index;
+
+		face = &faces[first_face + face_index];
+		edge_count_local = LittleShort(face->numedges);
+		texinfo_index = LittleShort(face->texinfo);
+		if (edge_count_local < 3 || texinfo_index < 0 || texinfo_index >= texinfo_count)
+			continue;
+		if (LittleLong(texinfo[texinfo_index].flags) & TEX_SPECIAL)
+			continue;
+
+		if (edge_count_local > face_capacity)
+		{
+			int *next_face_vertices;
+
+			next_face_vertices = (int *)realloc(face_vertices, (size_t)edge_count_local * sizeof(*next_face_vertices));
+			if (next_face_vertices == NULL)
+			{
+				snprintf(error, error_size, "Out of memory while triangulating BSP faces");
+				goto cleanup_fail;
+			}
+			face_vertices = next_face_vertices;
+			face_capacity = edge_count_local;
+		}
+
+		first_edge = LittleLong(face->firstedge);
+		if (first_edge < 0 || first_edge + edge_count_local > surfedge_count)
+		{
+			snprintf(error, error_size, "BSP face references invalid surfedge range");
+			goto cleanup_fail;
+		}
+
+		for (edge_index = 0; edge_index < edge_count_local; ++edge_index)
+		{
+			int surfedge_index;
+			int edge_lookup;
+			int vertex_index;
+
+			surfedge_index = LittleLong(surfedges[first_edge + edge_index]);
+			edge_lookup = surfedge_index >= 0 ? surfedge_index : -surfedge_index;
+			if (edge_lookup < 0 || edge_lookup >= edge_count)
+			{
+				snprintf(error, error_size, "BSP face references invalid edge index");
+				goto cleanup_fail;
+			}
+			vertex_index = surfedge_index >= 0 ? LittleShort(edges[edge_lookup].v[0]) : LittleShort(edges[edge_lookup].v[1]);
+			if (vertex_index < 0 || vertex_index >= vertex_count)
+			{
+				snprintf(error, error_size, "BSP face references invalid vertex index");
+				goto cleanup_fail;
+			}
+			face_vertices[edge_index] = vertex_index;
+		}
+
+		for (edge_index = 1; edge_index < edge_count_local - 1; ++edge_index)
+		{
+			nav_triangles[write_index++] = face_vertices[0];
+			nav_triangles[write_index++] = face_vertices[edge_index];
+			nav_triangles[write_index++] = face_vertices[edge_index + 1];
+		}
+	}
+
+	free(face_vertices);
+	*out_vertices = nav_vertices;
+	*out_vertex_count = vertex_count;
+	*out_triangles = nav_triangles;
+	*out_triangle_count = triangle_count;
+	return true;
+
+cleanup_fail:
+	free(face_vertices);
+	free(nav_vertices);
+	free(nav_triangles);
+	return false;
+}
 
 static int qnn_worker_region_id_from_point(const vec3_t point)
 {
@@ -207,6 +462,61 @@ static qboolean qnn_worker_parse_origin(const char *value, vec3_t out)
 	return true;
 }
 
+static void qnn_worker_format_vec3(const vec3_t value, char *out, size_t out_size)
+{
+	snprintf(out, out_size, "%.1f %.1f %.1f", value[0], value[1], value[2]);
+}
+
+static qboolean qnn_worker_model_bounds(
+	const dmodel_t *models,
+	int model_count,
+	const char *model_name,
+	vec3_t bounds_min,
+	vec3_t bounds_max,
+	vec3_t center)
+{
+	int model_index;
+
+	if (models == NULL || model_name == NULL || model_name[0] != '*')
+		return false;
+	model_index = atoi(model_name + 1);
+	if (model_index <= 0 || model_index >= model_count)
+		return false;
+
+	bounds_min[0] = LittleFloat(models[model_index].mins[0]);
+	bounds_min[1] = LittleFloat(models[model_index].mins[1]);
+	bounds_min[2] = LittleFloat(models[model_index].mins[2]);
+	bounds_max[0] = LittleFloat(models[model_index].maxs[0]);
+	bounds_max[1] = LittleFloat(models[model_index].maxs[1]);
+	bounds_max[2] = LittleFloat(models[model_index].maxs[2]);
+	center[0] = (bounds_min[0] + bounds_max[0]) * 0.5f;
+	center[1] = (bounds_min[1] + bounds_max[1]) * 0.5f;
+	center[2] = (bounds_min[2] + bounds_max[2]) * 0.5f;
+	return true;
+}
+
+static qboolean qnn_worker_append_model_properties(
+	qnn_parsed_entity_t *entity,
+	const dmodel_t *models,
+	int model_count,
+	const char *model_name)
+{
+	vec3_t bounds_min;
+	vec3_t bounds_max;
+	vec3_t center;
+	char buffer[96];
+
+	if (!qnn_worker_model_bounds(models, model_count, model_name, bounds_min, bounds_max, center))
+		return true;
+	qnn_worker_format_vec3(bounds_min, buffer, sizeof(buffer));
+	if (!qnn_worker_append_property(entity, "qnn_model_bounds_min", buffer))
+		return false;
+	qnn_worker_format_vec3(bounds_max, buffer, sizeof(buffer));
+	if (!qnn_worker_append_property(entity, "qnn_model_bounds_max", buffer))
+		return false;
+	return true;
+}
+
 static void qnn_worker_parse_angle_value(const char *value, vec3_t out)
 {
 	float yaw;
@@ -288,39 +598,6 @@ static int qnn_worker_compare_ints(const void *lhs_ptr, const void *rhs_ptr)
 	return *lhs - *rhs;
 }
 
-static qboolean qnn_worker_push_unique_int(int **values, int *count, int value)
-{
-	int *next;
-	int i;
-
-	for (i = 0; i < *count; ++i)
-	{
-		if ((*values)[i] == value)
-			return true;
-	}
-
-	next = (int *)realloc(*values, (*count + 1) * sizeof(*next));
-	if (next == NULL)
-		return false;
-	*values = next;
-	(*values)[*count] = value;
-	*count += 1;
-	return true;
-}
-
-static qboolean qnn_worker_push_object_index(qnn_worker_region_t *region, int object_index)
-{
-	int *next;
-
-	next = (int *)realloc(region->object_indices, (region->object_count + 1) * sizeof(*next));
-	if (next == NULL)
-		return false;
-	region->object_indices = next;
-	region->object_indices[region->object_count] = object_index;
-	region->object_count += 1;
-	return true;
-}
-
 static qnn_worker_region_t *qnn_worker_get_or_add_region(qnn_worker_map_state_t *map_state, int region_id)
 {
 	qnn_worker_region_t *region;
@@ -367,7 +644,14 @@ static void qnn_worker_expand_region_bounds(qnn_worker_region_t *region, const v
 		region->bounds_max[2] = origin[2] + QNN_WORKER_OBJECT_PADDING;
 }
 
-static qboolean qnn_worker_parse_entities(char *text, qnn_parsed_entity_t **out_entities, int *out_count, char *error, size_t error_size)
+static qboolean qnn_worker_parse_entities(
+	char *text,
+	const dmodel_t *models,
+	int model_count,
+	qnn_parsed_entity_t **out_entities,
+	int *out_count,
+	char *error,
+	size_t error_size)
 {
 	qnn_parsed_entity_t *entities;
 	int entity_count;
@@ -384,8 +668,10 @@ static qboolean qnn_worker_parse_entities(char *text, qnn_parsed_entity_t **out_
 		qnn_parsed_entity_t entity;
 		char key[QNN_WORKER_MAX_PROPERTY_KEY];
 		char value[QNN_WORKER_MAX_PROPERTY_VALUE];
+		char model_name[QNN_WORKER_MAX_MODEL_NAME];
 		qboolean has_origin;
 		qboolean has_angles;
+		qboolean has_model;
 		qnn_parsed_entity_t *next_entities;
 
 		qnn_worker_skip_space(&cursor);
@@ -399,9 +685,11 @@ static qboolean qnn_worker_parse_entities(char *text, qnn_parsed_entity_t **out_
 		cursor += 1;
 
 		memset(&entity, 0, sizeof(entity));
+		memset(model_name, 0, sizeof(model_name));
 		entity.input_index = input_index;
 		has_origin = false;
 		has_angles = false;
+		has_model = false;
 
 		while (*cursor)
 		{
@@ -430,6 +718,18 @@ static qboolean qnn_worker_parse_entities(char *text, qnn_parsed_entity_t **out_
 			{
 				strncpy(entity.classname, value, sizeof(entity.classname) - 1);
 			}
+			else if (!strcmp(key, "model"))
+			{
+				strncpy(model_name, value, sizeof(model_name) - 1);
+				has_model = true;
+				if (!qnn_worker_append_property(&entity, key, value))
+				{
+					snprintf(error, error_size, "Out of memory while parsing entity properties");
+					qnn_worker_free_parsed_entities(entities, entity_count);
+					free(entity.properties);
+					return false;
+				}
+			}
 			else if (!strcmp(key, "origin"))
 			{
 				has_origin = qnn_worker_parse_origin(value, entity.origin);
@@ -454,6 +754,25 @@ static qboolean qnn_worker_parse_entities(char *text, qnn_parsed_entity_t **out_
 		}
 
 		input_index += 1;
+		if (has_model)
+		{
+			vec3_t model_center;
+			vec3_t model_bounds_min;
+			vec3_t model_bounds_max;
+
+			if (!qnn_worker_append_model_properties(&entity, models, model_count, model_name))
+			{
+				snprintf(error, error_size, "Out of memory while annotating BSP model bounds");
+				qnn_worker_free_parsed_entities(entities, entity_count);
+				free(entity.properties);
+				return false;
+			}
+			if (!has_origin && qnn_worker_model_bounds(models, model_count, model_name, model_bounds_min, model_bounds_max, model_center))
+			{
+				VectorCopy(model_center, entity.origin);
+				has_origin = true;
+			}
+		}
 		if (!has_origin)
 		{
 			free(entity.properties);
@@ -480,182 +799,6 @@ static qboolean qnn_worker_parse_entities(char *text, qnn_parsed_entity_t **out_
 	return true;
 }
 
-static qboolean qnn_worker_add_neighbors(qnn_worker_region_t *regions, int region_count)
-{
-	int src_index;
-
-	for (src_index = 0; src_index < region_count; ++src_index)
-	{
-		int best_ids[3];
-		int best_dist[3];
-		int dst_index;
-		int slot;
-		int rank;
-		int src_gx;
-		int src_gy;
-
-		best_ids[0] = -1;
-		best_ids[1] = -1;
-		best_ids[2] = -1;
-		best_dist[0] = 0x7fffffff;
-		best_dist[1] = 0x7fffffff;
-		best_dist[2] = 0x7fffffff;
-
-		src_gx = regions[src_index].region_id / 2048 - 1024;
-		src_gy = regions[src_index].region_id % 2048 - 1024;
-
-		for (dst_index = 0; dst_index < region_count; ++dst_index)
-		{
-			int dst_gx;
-			int dst_gy;
-			int manhattan;
-
-			if (src_index == dst_index)
-				continue;
-			dst_gx = regions[dst_index].region_id / 2048 - 1024;
-			dst_gy = regions[dst_index].region_id % 2048 - 1024;
-			manhattan = abs(src_gx - dst_gx) + abs(src_gy - dst_gy);
-
-			slot = -1;
-			for (rank = 0; rank < 3; ++rank)
-			{
-				if (manhattan < best_dist[rank]
-					|| (manhattan == best_dist[rank] && regions[dst_index].region_id < best_ids[rank]))
-				{
-					slot = rank;
-					break;
-				}
-			}
-			if (slot < 0)
-				continue;
-			for (rank = 2; rank > slot; --rank)
-			{
-				best_dist[rank] = best_dist[rank - 1];
-				best_ids[rank] = best_ids[rank - 1];
-			}
-			best_dist[slot] = manhattan;
-			best_ids[slot] = regions[dst_index].region_id;
-		}
-
-		for (rank = 0; rank < 3; ++rank)
-		{
-			int dst_region_index;
-
-			if (best_ids[rank] < 0)
-				continue;
-			if (!qnn_worker_push_unique_int(&regions[src_index].neighbors, &regions[src_index].neighbor_count, best_ids[rank]))
-				return false;
-			for (dst_region_index = 0; dst_region_index < region_count; ++dst_region_index)
-			{
-				if (regions[dst_region_index].region_id == best_ids[rank])
-				{
-					if (!qnn_worker_push_unique_int(&regions[dst_region_index].neighbors, &regions[dst_region_index].neighbor_count, regions[src_index].region_id))
-						return false;
-					break;
-				}
-			}
-		}
-	}
-
-	for (src_index = 0; src_index < region_count; ++src_index)
-	{
-		if (regions[src_index].neighbor_count > 1)
-			qsort(regions[src_index].neighbors, regions[src_index].neighbor_count, sizeof(int), qnn_worker_compare_ints);
-	}
-	return true;
-}
-
-static void qnn_worker_compute_distances(qnn_worker_map_state_t *map_state)
-{
-	int *queue;
-	int queue_head;
-	int queue_tail;
-	int region_index;
-	float max_distance;
-
-	queue = NULL;
-	queue_head = 0;
-	queue_tail = 0;
-	max_distance = 0.0f;
-
-	for (region_index = 0; region_index < map_state->region_count; ++region_index)
-	{
-		map_state->regions[region_index].distance_to_goal = 999999.0f;
-	}
-
-	queue = (int *)malloc(map_state->region_count * sizeof(*queue));
-	if (queue == NULL)
-	{
-		for (region_index = 0; region_index < map_state->region_count; ++region_index)
-			map_state->regions[region_index].distance_to_goal = 0.0f;
-		map_state->max_distance_to_goal = 0.0f;
-		return;
-	}
-
-	for (region_index = 0; region_index < map_state->goal_region_count; ++region_index)
-	{
-		int goal_id;
-		int i;
-
-		goal_id = map_state->goal_region_ids[region_index];
-		for (i = 0; i < map_state->region_count; ++i)
-		{
-			if (map_state->regions[i].region_id == goal_id)
-			{
-				map_state->regions[i].distance_to_goal = 0.0f;
-				queue[queue_tail++] = i;
-				break;
-			}
-		}
-	}
-
-	while (queue_head < queue_tail)
-	{
-		int current_index;
-		qnn_worker_region_t *current_region;
-		int neighbor_pos;
-
-		current_index = queue[queue_head++];
-		current_region = &map_state->regions[current_index];
-
-		for (neighbor_pos = 0; neighbor_pos < current_region->neighbor_count; ++neighbor_pos)
-		{
-			int neighbor_id;
-			int neighbor_index;
-
-			neighbor_id = current_region->neighbors[neighbor_pos];
-			for (neighbor_index = 0; neighbor_index < map_state->region_count; ++neighbor_index)
-			{
-				if (map_state->regions[neighbor_index].region_id != neighbor_id)
-					continue;
-				if (map_state->regions[neighbor_index].distance_to_goal > current_region->distance_to_goal + 1.0f)
-				{
-					map_state->regions[neighbor_index].distance_to_goal = current_region->distance_to_goal + 1.0f;
-					queue[queue_tail++] = neighbor_index;
-				}
-				break;
-			}
-		}
-	}
-
-	for (region_index = 0; region_index < map_state->region_count; ++region_index)
-	{
-		if (map_state->regions[region_index].distance_to_goal < 999999.0f
-			&& map_state->regions[region_index].distance_to_goal > max_distance)
-			max_distance = map_state->regions[region_index].distance_to_goal;
-	}
-	for (region_index = 0; region_index < map_state->region_count; ++region_index)
-	{
-		if (map_state->regions[region_index].distance_to_goal >= 999999.0f)
-			map_state->regions[region_index].distance_to_goal = max_distance + 1.0f;
-	}
-	map_state->max_distance_to_goal = map_state->region_count > 0 ? max_distance : 0.0f;
-	if (map_state->max_distance_to_goal <= 0.0f && map_state->region_count > 0)
-		map_state->max_distance_to_goal = 1.0f;
-
-	free(queue);
-}
-
 void qnn_worker_clear_action(qnn_worker_action_t *action)
 {
 	action->move = 0;
@@ -667,6 +810,10 @@ void qnn_worker_clear_action(qnn_worker_action_t *action)
 	action->fire = 0;
 	action->jump = 0;
 	action->weapon = 0;
+	action->recall[0] = 0;
+	action->recall[1] = 0;
+	action->recall[2] = 0;
+	action->recall[3] = 0;
 }
 
 void qnn_worker_free_map_state(qnn_worker_map_state_t *map_state)
@@ -676,20 +823,15 @@ void qnn_worker_free_map_state(qnn_worker_map_state_t *map_state)
 	if (map_state == NULL)
 		return;
 
-	for (i = 0; i < map_state->region_count; ++i)
-	{
-		free(map_state->regions[i].neighbors);
-		free(map_state->regions[i].object_indices);
-	}
 	for (i = 0; i < map_state->static_object_count; ++i)
 	{
 		free(map_state->static_objects[i].properties);
 	}
 
+	qnn_nav_oracle_destroy(map_state->nav_oracle);
+	qnn_navmesh_destroy(map_state->navmesh);
 	free(map_state->regions);
 	free(map_state->static_objects);
-	free(map_state->spawn_region_ids);
-	free(map_state->goal_region_ids);
 	memset(map_state, 0, sizeof(*map_state));
 }
 
@@ -701,6 +843,11 @@ qboolean qnn_worker_build_map_state(qnn_worker_map_state_t *out, const char *req
 	int entity_ofs;
 	int entity_len;
 	char *entity_text;
+	float *nav_vertices;
+	int nav_vertex_count;
+	int *nav_triangles;
+	int nav_triangle_count;
+	char nav_error[256];
 	qnn_parsed_entity_t *entities;
 	int entity_count;
 	int stable_index;
@@ -709,6 +856,9 @@ qboolean qnn_worker_build_map_state(qnn_worker_map_state_t *out, const char *req
 	strncpy(out->requested_map_id, requested_map_id, sizeof(out->requested_map_id) - 1);
 	strncpy(out->map_name, map_name, sizeof(out->map_name) - 1);
 	strncpy(out->source, "bsp_entities", sizeof(out->source) - 1);
+	strncpy(out->navmesh_status, "missing", sizeof(out->navmesh_status) - 1);
+	strncpy(out->nav_oracle_status, "missing", sizeof(out->nav_oracle_status) - 1);
+	qnn_worker_default_navmesh_config(&out->navmesh_config);
 
 	snprintf(path, sizeof(path), "maps/%s.bsp", map_name);
 	raw = COM_LoadTempFile(path);
@@ -728,11 +878,23 @@ qboolean qnn_worker_build_map_state(qnn_worker_map_state_t *out, const char *req
 	entity_ofs = LittleLong(header->lumps[LUMP_ENTITIES].fileofs);
 	entity_len = LittleLong(header->lumps[LUMP_ENTITIES].filelen);
 	entity_text = (char *)(raw + entity_ofs);
-	entities = NULL;
-	entity_count = 0;
+	{
+		const dmodel_t *models;
+		int model_count;
 
-	if (!qnn_worker_parse_entities(entity_text, &entities, &entity_count, error, error_size))
-		return false;
+		if (!qnn_worker_bsp_lump_view(raw, header, LUMP_MODELS, sizeof(dmodel_t), (const void **)&models, &model_count, error, error_size))
+			return false;
+		entities = NULL;
+		entity_count = 0;
+		nav_vertices = NULL;
+		nav_vertex_count = 0;
+		nav_triangles = NULL;
+		nav_triangle_count = 0;
+		memset(nav_error, 0, sizeof(nav_error));
+
+		if (!qnn_worker_parse_entities(entity_text, models, model_count, &entities, &entity_count, error, error_size))
+			return false;
+	}
 
 	if (entity_count > 1)
 		qsort(entities, entity_count, sizeof(*entities), qnn_worker_compare_entities);
@@ -774,45 +936,14 @@ qboolean qnn_worker_build_map_state(qnn_worker_map_state_t *out, const char *req
 			qnn_worker_free_map_state(out);
 			return false;
 		}
-		if (!qnn_worker_push_object_index(region, out->static_object_count - 1))
-		{
-			snprintf(error, error_size, "Out of memory while attaching region objects");
-			qnn_worker_free_parsed_entities(entities, entity_count);
-			qnn_worker_free_map_state(out);
-			return false;
-		}
 		qnn_worker_expand_region_bounds(region, object->origin);
-
-		if (!strcmp(object->category, "spawn"))
-		{
-			if (!qnn_worker_push_unique_int(&out->spawn_region_ids, &out->spawn_region_count, object->region_id))
-			{
-				snprintf(error, error_size, "Out of memory while collecting spawn regions");
-				qnn_worker_free_parsed_entities(entities, entity_count);
-				qnn_worker_free_map_state(out);
-				return false;
-			}
-		}
-		if (!strcmp(object->category, "goal"))
-		{
-			if (!qnn_worker_push_unique_int(&out->goal_region_ids, &out->goal_region_count, object->region_id))
-			{
-				snprintf(error, error_size, "Out of memory while collecting goal regions");
-				qnn_worker_free_parsed_entities(entities, entity_count);
-				qnn_worker_free_map_state(out);
-				return false;
-			}
-		}
 	}
 
 	qnn_worker_free_parsed_entities(entities, entity_count);
 
 	if (out->region_count == 0)
 	{
-		qnn_worker_region_t *region;
-
-		region = qnn_worker_get_or_add_region(out, 0);
-		if (region == NULL)
+		if (qnn_worker_get_or_add_region(out, 0) == NULL)
 		{
 			snprintf(error, error_size, "Out of memory while creating fallback region");
 			qnn_worker_free_map_state(out);
@@ -820,73 +951,186 @@ qboolean qnn_worker_build_map_state(qnn_worker_map_state_t *out, const char *req
 		}
 	}
 
-	if (out->spawn_region_count == 0)
-	{
-		if (!qnn_worker_push_unique_int(&out->spawn_region_ids, &out->spawn_region_count, out->regions[0].region_id))
-		{
-			snprintf(error, error_size, "Out of memory while setting fallback spawn region");
-			qnn_worker_free_map_state(out);
-			return false;
-		}
-	}
-	if (out->goal_region_count == 0)
-	{
-		int fallback_goal;
-
-		fallback_goal = out->regions[out->region_count - 1].region_id;
-		if (!qnn_worker_push_unique_int(&out->goal_region_ids, &out->goal_region_count, fallback_goal))
-		{
-			snprintf(error, error_size, "Out of memory while setting fallback goal region");
-			qnn_worker_free_map_state(out);
-			return false;
-		}
-	}
-
 	if (out->region_count > 1)
 		qsort(out->regions, out->region_count, sizeof(*out->regions), qnn_worker_compare_regions);
-	if (out->spawn_region_count > 1)
-		qsort(out->spawn_region_ids, out->spawn_region_count, sizeof(int), qnn_worker_compare_ints);
-	if (out->goal_region_count > 1)
-		qsort(out->goal_region_ids, out->goal_region_count, sizeof(int), qnn_worker_compare_ints);
 
-	if (!qnn_worker_add_neighbors(out->regions, out->region_count))
+	if (qnn_worker_extract_navmesh_geometry(raw, header, &nav_vertices, &nav_vertex_count, &nav_triangles, &nav_triangle_count, nav_error, sizeof(nav_error)))
 	{
-		snprintf(error, error_size, "Out of memory while computing region graph");
-		qnn_worker_free_map_state(out);
-		return false;
+		out->navmesh = qnn_navmesh_build(
+			nav_vertices,
+			nav_vertex_count,
+			nav_triangles,
+			nav_triangle_count,
+			&out->navmesh_config,
+			&out->navmesh_summary,
+			nav_error,
+			sizeof(nav_error));
+		if (out->navmesh != NULL)
+			strncpy(out->navmesh_status, "ready", sizeof(out->navmesh_status) - 1);
+		else
+			strncpy(out->navmesh_status, "error", sizeof(out->navmesh_status) - 1);
 	}
+	else
+	{
+		strncpy(out->navmesh_status, "error", sizeof(out->navmesh_status) - 1);
+	}
+	if (nav_error[0] != 0)
+		strncpy(out->navmesh_error, nav_error, sizeof(out->navmesh_error) - 1);
+	memset(nav_error, 0, sizeof(nav_error));
+	if (out->navmesh != NULL)
+	{
+		qnn_nav_oracle_static_object_view_t *oracle_objects;
+		qnn_nav_oracle_property_view_t *oracle_properties;
+		qnn_nav_oracle_summary_t oracle_summary;
+		int total_properties;
+		int property_offset;
+		int object_index;
 
-	qnn_worker_compute_distances(out);
+		memset(&oracle_summary, 0, sizeof(oracle_summary));
+		oracle_objects = NULL;
+		oracle_properties = NULL;
+		total_properties = 0;
+		property_offset = 0;
+		for (object_index = 0; object_index < out->static_object_count; ++object_index)
+			total_properties += out->static_objects[object_index].property_count;
+
+		if (out->static_object_count > 0)
+		{
+			oracle_objects = (qnn_nav_oracle_static_object_view_t *)calloc((size_t)out->static_object_count, sizeof(*oracle_objects));
+			if (oracle_objects == NULL)
+			{
+				snprintf(error, error_size, "Out of memory while preparing nav oracle objects");
+				qnn_worker_free_map_state(out);
+				free(nav_vertices);
+				free(nav_triangles);
+				return false;
+			}
+		}
+		if (total_properties > 0)
+		{
+			oracle_properties = (qnn_nav_oracle_property_view_t *)calloc((size_t)total_properties, sizeof(*oracle_properties));
+			if (oracle_properties == NULL)
+			{
+				free(oracle_objects);
+				snprintf(error, error_size, "Out of memory while preparing nav oracle properties");
+				qnn_worker_free_map_state(out);
+				free(nav_vertices);
+				free(nav_triangles);
+				return false;
+			}
+		}
+
+		for (object_index = 0; object_index < out->static_object_count; ++object_index)
+		{
+			int property_index;
+
+			oracle_objects[object_index].object_id = out->static_objects[object_index].object_id;
+			oracle_objects[object_index].category = out->static_objects[object_index].category;
+			oracle_objects[object_index].classname = out->static_objects[object_index].classname;
+			oracle_objects[object_index].origin = out->static_objects[object_index].origin;
+			oracle_objects[object_index].angles = out->static_objects[object_index].angles;
+			oracle_objects[object_index].property_count = out->static_objects[object_index].property_count;
+			oracle_objects[object_index].properties = oracle_properties + property_offset;
+			for (property_index = 0; property_index < out->static_objects[object_index].property_count; ++property_index)
+			{
+				oracle_properties[property_offset + property_index].key = out->static_objects[object_index].properties[property_index].key;
+				oracle_properties[property_offset + property_index].value = out->static_objects[object_index].properties[property_index].value;
+			}
+			property_offset += out->static_objects[object_index].property_count;
+		}
+
+		out->nav_oracle = qnn_nav_oracle_build(
+			out->navmesh,
+			oracle_objects,
+			out->static_object_count,
+			&oracle_summary,
+			nav_error,
+			sizeof(nav_error));
+		free(oracle_objects);
+		free(oracle_properties);
+		if (out->nav_oracle != NULL)
+		{
+			strncpy(out->nav_oracle_status, "ready", sizeof(out->nav_oracle_status) - 1);
+			out->nav_area_count = oracle_summary.area_count;
+			out->nav_cluster_count = oracle_summary.cluster_count;
+			out->nav_min_cluster_area_count = oracle_summary.min_cluster_area_count;
+			out->nav_max_cluster_area_count = oracle_summary.max_cluster_area_count;
+			out->nav_avg_cluster_area_count = oracle_summary.avg_cluster_area_count;
+			out->nav_walk_link_count = oracle_summary.walk_link_count;
+			out->nav_teleport_link_count = oracle_summary.teleport_link_count;
+			out->nav_lift_link_count = oracle_summary.lift_link_count;
+			out->nav_push_link_count = oracle_summary.push_link_count;
+			out->nav_drop_link_count = oracle_summary.drop_link_count;
+		}
+		else
+		{
+			strncpy(out->nav_oracle_status, "error", sizeof(out->nav_oracle_status) - 1);
+		}
+	}
+	if (nav_error[0] != 0)
+		strncpy(out->nav_oracle_error, nav_error, sizeof(out->nav_oracle_error) - 1);
+	free(nav_vertices);
+	free(nav_triangles);
 	return true;
 }
 
 void qnn_worker_write_map_state_json(FILE *out, const qnn_worker_map_state_t *map_state)
 {
 	int i;
+	qnn_nav_oracle_summary_t oracle_summary;
 
-	fprintf(out, "{\"goal_region_ids\":[");
-	for (i = 0; i < map_state->goal_region_count; ++i)
-	{
-		if (i > 0)
-			fputc(',', out);
-		fprintf(out, "%d", map_state->goal_region_ids[i]);
-	}
-	fprintf(out, "],\"map_id\":");
+	memset(&oracle_summary, 0, sizeof(oracle_summary));
+	oracle_summary.area_count = map_state->nav_area_count;
+	oracle_summary.cluster_count = map_state->nav_cluster_count;
+	oracle_summary.min_cluster_area_count = map_state->nav_min_cluster_area_count;
+	oracle_summary.max_cluster_area_count = map_state->nav_max_cluster_area_count;
+	oracle_summary.avg_cluster_area_count = map_state->nav_avg_cluster_area_count;
+	oracle_summary.walk_link_count = map_state->nav_walk_link_count;
+	oracle_summary.teleport_link_count = map_state->nav_teleport_link_count;
+	oracle_summary.lift_link_count = map_state->nav_lift_link_count;
+	oracle_summary.push_link_count = map_state->nav_push_link_count;
+	oracle_summary.drop_link_count = map_state->nav_drop_link_count;
+	oracle_summary.total_link_count = map_state->nav_walk_link_count
+		+ map_state->nav_teleport_link_count
+		+ map_state->nav_lift_link_count
+		+ map_state->nav_push_link_count
+		+ map_state->nav_drop_link_count;
+
+	fprintf(out, "{\"map_id\":");
 	qnn_worker_json_string(out, map_state->requested_map_id);
-	fprintf(out, ",\"metadata\":{\"distance_to_goal\":{");
-	for (i = 0; i < map_state->region_count; ++i)
-	{
-		if (i > 0)
-			fputc(',', out);
-		qnn_worker_json_string(out, va("%d", map_state->regions[i].region_id));
-		fprintf(out, ":%.3f", map_state->regions[i].distance_to_goal);
-	}
-	fprintf(out, "},\"grid_size\":%.1f,\"max_distance_to_goal\":%.3f,\"region_count\":%d,\"source\":",
+	fprintf(out, ",\"metadata\":{\"grid_size\":%.1f,\"region_count\":%d,\"source\":",
 		QNN_WORKER_GRID_SIZE,
-		map_state->max_distance_to_goal,
 		map_state->region_count);
 	qnn_worker_json_string(out, map_state->source);
-	fprintf(out, ",\"static_object_count\":%d},\"regions\":[", map_state->static_object_count);
+	fprintf(out, ",\"static_object_count\":%d,\"navmesh\":{\"backend\":\"recast_detour\",\"cell_height\":%.1f,\"cell_size\":%.1f,",
+		map_state->static_object_count,
+		map_state->navmesh_config.cell_height,
+		map_state->navmesh_config.cell_size);
+	fprintf(out, "\"status\":");
+	qnn_worker_json_string(out, map_state->navmesh_status);
+	fprintf(out, ",\"walkable_climb\":%.1f,\"walkable_height\":%.1f,\"walkable_radius\":%.1f,\"walkable_slope_angle\":%.1f",
+		map_state->navmesh_config.walkable_climb,
+		map_state->navmesh_config.walkable_height,
+		map_state->navmesh_config.walkable_radius,
+		map_state->navmesh_config.walkable_slope_angle);
+	if (map_state->navmesh_error[0] != 0)
+	{
+		fprintf(out, ",\"error\":");
+		qnn_worker_json_string(out, map_state->navmesh_error);
+	}
+	fprintf(out, ",\"summary\":");
+	qnn_navmesh_write_summary_json(out, &map_state->navmesh_summary);
+	fprintf(out, ",\"oracle\":{\"status\":");
+	qnn_worker_json_string(out, map_state->nav_oracle_status);
+	if (map_state->nav_oracle_error[0] != 0)
+	{
+		fprintf(out, ",\"error\":");
+		qnn_worker_json_string(out, map_state->nav_oracle_error);
+	}
+	fprintf(out, ",\"summary\":");
+	qnn_nav_oracle_write_summary_json(out, &oracle_summary);
+	fprintf(out, "}");
+	fprintf(out, "}},\"regions\":[");
 
 	for (i = 0; i < map_state->region_count; ++i)
 	{
@@ -897,39 +1141,11 @@ void qnn_worker_write_map_state_json(FILE *out, const qnn_worker_map_state_t *ma
 		if (i > 0)
 			fputc(',', out);
 		fprintf(out,
-			"{\"bounds_max\":[%.1f,%.1f,%.1f],\"bounds_min\":[%.1f,%.1f,%.1f],\"center\":[%.1f,%.1f,%.1f],\"neighbors\":[",
+			"{\"bounds_max\":[%.1f,%.1f,%.1f],\"bounds_min\":[%.1f,%.1f,%.1f],\"center\":[%.1f,%.1f,%.1f],\"region_id\":%d}",
 			region->bounds_max[0], region->bounds_max[1], region->bounds_max[2],
 			region->bounds_min[0], region->bounds_min[1], region->bounds_min[2],
-			region->center[0], region->center[1], region->center[2]);
-		for (j = 0; j < region->neighbor_count; ++j)
-		{
-			if (j > 0)
-				fputc(',', out);
-			fprintf(out, "%d", region->neighbors[j]);
-		}
-		fprintf(out, "],\"object_ids\":[");
-		for (j = 0; j < region->object_count; ++j)
-		{
-			if (j > 0)
-				fputc(',', out);
-			qnn_worker_json_string(out, map_state->static_objects[region->object_indices[j]].object_id);
-		}
-		fprintf(out, "],\"region_id\":%d,\"visibility_hints\":[", region->region_id);
-		for (j = 0; j < region->neighbor_count; ++j)
-		{
-			if (j > 0)
-				fputc(',', out);
-			fprintf(out, "%d", region->neighbors[j]);
-		}
-		fprintf(out, "]}");
-	}
-
-	fprintf(out, "],\"spawn_region_ids\":[");
-	for (i = 0; i < map_state->spawn_region_count; ++i)
-	{
-		if (i > 0)
-			fputc(',', out);
-		fprintf(out, "%d", map_state->spawn_region_ids[i]);
+			region->center[0], region->center[1], region->center[2],
+			region->region_id);
 	}
 	fprintf(out, "],\"static_objects\":[");
 
@@ -997,43 +1213,4 @@ int qnn_worker_nearest_region_id(const qnn_worker_map_state_t *map_state, const 
 	}
 
 	return best_region_id;
-}
-
-float qnn_worker_goal_progress(const qnn_worker_map_state_t *map_state, int region_id)
-{
-	int i;
-	float distance;
-	float max_distance;
-
-	max_distance = map_state->max_distance_to_goal;
-	if (max_distance <= 0.0f)
-		return 0.0f;
-
-	distance = max_distance;
-	for (i = 0; i < map_state->region_count; ++i)
-	{
-		if (map_state->regions[i].region_id == region_id)
-		{
-			distance = map_state->regions[i].distance_to_goal;
-			break;
-		}
-	}
-
-	if (distance < 0.0f)
-		distance = 0.0f;
-	if (distance > max_distance)
-		distance = max_distance;
-	return 1.0f - (distance / max_distance);
-}
-
-qboolean qnn_worker_is_goal_region(const qnn_worker_map_state_t *map_state, int region_id)
-{
-	int i;
-
-	for (i = 0; i < map_state->goal_region_count; ++i)
-	{
-		if (map_state->goal_region_ids[i] == region_id)
-			return true;
-	}
-	return false;
 }

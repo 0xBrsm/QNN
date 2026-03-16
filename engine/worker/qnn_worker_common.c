@@ -1,4 +1,5 @@
 #include "qnn_worker.h"
+#include "qnn_nav_oracle.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -317,6 +318,48 @@ qboolean qnn_json_extract_string(const char *line, const char *key, char *out, s
 	return true;
 }
 
+qboolean qnn_json_extract_vec3(const char *line, const char *key, vec3_t out)
+{
+	const char *match;
+	const char *colon;
+	const char *cursor;
+	char *endptr;
+	int axis;
+
+	match = strstr(line, key);
+	if (match == NULL)
+		return false;
+	colon = strchr(match, ':');
+	if (colon == NULL)
+		return false;
+	cursor = strchr(colon, '[');
+	if (cursor == NULL)
+		return false;
+	cursor += 1;
+
+	for (axis = 0; axis < 3; ++axis)
+	{
+		while (*cursor && isspace((unsigned char)*cursor))
+			cursor += 1;
+		out[axis] = (float)strtod(cursor, &endptr);
+		if (endptr == cursor)
+			return false;
+		cursor = endptr;
+		while (*cursor && isspace((unsigned char)*cursor))
+			cursor += 1;
+		if (axis < 2)
+		{
+			if (*cursor != ',')
+				return false;
+			cursor += 1;
+		}
+	}
+
+	while (*cursor && isspace((unsigned char)*cursor))
+		cursor += 1;
+	return *cursor == ']' ? true : false;
+}
+
 /* ── map preparation ─────────────────────────────────────────────── */
 
 static void qnn_worker_canonicalize_map(char *out, size_t out_size, const char *requested)
@@ -415,6 +458,19 @@ int qnn_worker_weapon_id(void)
 	int weapon_id;
 
 	active = cl.stats[STAT_ACTIVEWEAPON];
+	/* In listen server mode cl.stats[STAT_ACTIVEWEAPON] can stay zero even
+	   though the server-side edict has the correct weapon field.  Fall back
+	   to the authoritative server edict when the client stat is missing. */
+	if (sv.active && cl.viewentity > 0 && cl.viewentity < sv.num_edicts)
+	{
+		edict_t *ent = EDICT_NUM(cl.viewentity);
+		if (ent && !ent->free)
+		{
+			if (active <= 0)
+				active = (int)ent->v.weapon;
+			(void)0; /* weapon fallback checked */
+		}
+	}
 	if (active > 0)
 	{
 		weapon_id = 1;
@@ -496,9 +552,11 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 void qnn_worker_capture_base_snapshot(qnn_worker_snapshot_t *snapshot)
 {
 	entity_t *player_entity;
+	edict_t *server_edict;
 
 	memset(snapshot, 0, sizeof(*snapshot));
 	player_entity = (cl.viewentity > 0 && cl.viewentity < MAX_EDICTS) ? &cl_entities[cl.viewentity] : NULL;
+	server_edict = (sv.active && cl.viewentity > 0 && cl.viewentity < sv.num_edicts) ? EDICT_NUM(cl.viewentity) : NULL;
 	if (player_entity != NULL)
 	{
 		VectorCopy(player_entity->origin, snapshot->player_origin);
@@ -520,8 +578,10 @@ void qnn_worker_capture_base_snapshot(qnn_worker_snapshot_t *snapshot)
 	snapshot->ammo_cells = cl.stats[STAT_CELLS];
 	snapshot->weapons_owned = cl.items & (IT_SHOTGUN | IT_SUPER_SHOTGUN | IT_NAILGUN | IT_SUPER_NAILGUN | IT_GRENADE_LAUNCHER | IT_ROCKET_LAUNCHER | IT_LIGHTNING);
 	snapshot->weapon_id = qnn_worker_weapon_id();
-	snapshot->waterlevel = cl.inwater ? 2 : 0;
-	snapshot->grounded = cl.onground ? true : false;
+	snapshot->waterlevel = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.waterlevel : (cl.inwater ? 2 : 0);
+	snapshot->grounded = (server_edict != NULL && !server_edict->free)
+		? ((((int)server_edict->v.flags) & FL_ONGROUND) ? true : false)
+		: (cl.onground ? true : false);
 	snapshot->current_region_id = qnn_worker_nearest_region_id(&qnn_worker_map_state, snapshot->player_origin);
 }
 
@@ -532,4 +592,167 @@ void qnn_worker_drain_sounds(qnn_worker_snapshot_t *snapshot)
 	if (snapshot->sound_count > 0)
 		memcpy(snapshot->sounds, qnn_worker_sound_buffer, snapshot->sound_count * sizeof(qnn_worker_sound_event_t));
 	qnn_worker_sound_count = 0;
+}
+
+/* ── shared nav query handler ───────────────────────────────────── */
+
+int qnn_worker_handle_nav_query(const char *line)
+{
+	char kind[32];
+	char error[256];
+
+	memset(kind, 0, sizeof(kind));
+	memset(error, 0, sizeof(error));
+	if (qnn_worker_map_state.navmesh == NULL)
+	{
+		qnn_worker_write_error("Navmesh is unavailable for this map");
+		return 0;
+	}
+	if (!qnn_json_extract_string(line, "\"kind\"", kind, sizeof(kind)))
+	{
+		qnn_worker_write_error("nav_query requires kind");
+		return 0;
+	}
+
+	if (!strcmp(kind, "nearest"))
+	{
+		vec3_t point;
+		qnn_navmesh_nearest_result_t result;
+		int found;
+
+		if (!qnn_json_extract_vec3(line, "\"point\"", point))
+		{
+			qnn_worker_write_error("nav_query nearest requires point=[x,y,z]");
+			return 0;
+		}
+		found = qnn_navmesh_find_nearest(qnn_worker_map_state.navmesh, point, &result, error, sizeof(error));
+		if (!found && error[0] != 0)
+		{
+			qnn_worker_write_error(error);
+			return 0;
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"nearest\",\"result\":");
+		qnn_navmesh_write_nearest_json(stdout, &result);
+		fprintf(stdout, "}\n");
+		fflush(stdout);
+		return 0;
+	}
+
+	if (!strcmp(kind, "path"))
+	{
+		vec3_t start;
+		vec3_t end;
+		qnn_navmesh_path_result_t result;
+		int found;
+
+		if (!qnn_json_extract_vec3(line, "\"start\"", start)
+			|| !qnn_json_extract_vec3(line, "\"end\"", end))
+		{
+			qnn_worker_write_error("nav_query path requires start=[x,y,z] and end=[x,y,z]");
+			return 0;
+		}
+		found = qnn_navmesh_find_path(qnn_worker_map_state.navmesh, start, end, &result, error, sizeof(error));
+		if (!found && error[0] != 0)
+		{
+			qnn_worker_write_error(error);
+			return 0;
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"path\",\"result\":");
+		qnn_navmesh_write_path_json(stdout, &result);
+		fprintf(stdout, "}\n");
+		fflush(stdout);
+		return 0;
+	}
+
+	if (!strcmp(kind, "area"))
+	{
+		vec3_t point;
+		qnn_nav_area_result_t result;
+		int found;
+
+		if (qnn_worker_map_state.nav_oracle == NULL)
+		{
+			qnn_worker_write_error("Navigation oracle is unavailable for this map");
+			return 0;
+		}
+		if (!qnn_json_extract_vec3(line, "\"point\"", point))
+		{
+			qnn_worker_write_error("nav_query area requires point=[x,y,z]");
+			return 0;
+		}
+		found = qnn_nav_oracle_find_area(qnn_worker_map_state.nav_oracle, point, &result, error, sizeof(error));
+		if (!found && error[0] != 0)
+		{
+			qnn_worker_write_error(error);
+			return 0;
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"area\",\"result\":");
+		qnn_nav_oracle_write_area_json(stdout, &result);
+		fprintf(stdout, "}\n");
+		fflush(stdout);
+		return 0;
+	}
+
+	if (!strcmp(kind, "cluster"))
+	{
+		vec3_t point;
+		qnn_nav_cluster_result_t result;
+		int found;
+
+		if (qnn_worker_map_state.nav_oracle == NULL)
+		{
+			qnn_worker_write_error("Navigation oracle is unavailable for this map");
+			return 0;
+		}
+		if (!qnn_json_extract_vec3(line, "\"point\"", point))
+		{
+			qnn_worker_write_error("nav_query cluster requires point=[x,y,z]");
+			return 0;
+		}
+		found = qnn_nav_oracle_find_cluster(qnn_worker_map_state.nav_oracle, point, &result, error, sizeof(error));
+		if (!found && error[0] != 0)
+		{
+			qnn_worker_write_error(error);
+			return 0;
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"cluster\",\"result\":");
+		qnn_nav_oracle_write_cluster_json(stdout, &result);
+		fprintf(stdout, "}\n");
+		fflush(stdout);
+		return 0;
+	}
+
+	if (!strcmp(kind, "route"))
+	{
+		vec3_t start;
+		vec3_t end;
+		qnn_nav_route_result_t result;
+		int found;
+
+		if (qnn_worker_map_state.nav_oracle == NULL)
+		{
+			qnn_worker_write_error("Navigation oracle is unavailable for this map");
+			return 0;
+		}
+		if (!qnn_json_extract_vec3(line, "\"start\"", start)
+			|| !qnn_json_extract_vec3(line, "\"end\"", end))
+		{
+			qnn_worker_write_error("nav_query route requires start=[x,y,z] and end=[x,y,z]");
+			return 0;
+		}
+		found = qnn_nav_oracle_find_route(qnn_worker_map_state.nav_oracle, start, end, &result, error, sizeof(error));
+		if (!found && error[0] != 0)
+		{
+			qnn_worker_write_error(error);
+			return 0;
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"route\",\"result\":");
+		qnn_nav_oracle_write_route_json(stdout, &result);
+		fprintf(stdout, "}\n");
+		fflush(stdout);
+		return 0;
+	}
+
+	qnn_worker_write_error("unsupported nav_query kind");
+	return 0;
 }

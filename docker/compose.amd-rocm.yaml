@@ -9,21 +9,21 @@ services:
       - HOST_WORKSPACE=/workspace
       - PYTHONUNBUFFERED=1
       - QUAKE_AI_DEVICE=${QUAKE_AI_DEVICE:-gpu}
-      - QUAKE_AI_ARTIFACT_ROOT=/artifacts
+      - QUAKE_AI_ARTIFACT_ROOT=/workspace/assets
       - ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-0}
       - HIP_VISIBLE_DEVICES
       - ROCR_VISIBLE_DEVICES
     volumes:
       - type: bind
-        source: ${HOST_SRC_ROOT}
+        source: ${HOST_WORKSPACE}
         target: /workspace
         read_only: true
-      - type: bind
-        source: ${HOST_ARTIFACT_ROOT}
-        target: /artifacts
       - type: volume
         source: quake-ai-pip-cache
         target: /home/trainer/.cache/pip
+      - type: volume
+        source: quake-ai-miopen-cache
+        target: /home/trainer/.config/miopen
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
@@ -46,3 +46,4 @@ services:
 
 volumes:
   quake-ai-pip-cache:
+  quake-ai-miopen-cache:

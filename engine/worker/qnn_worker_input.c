@@ -47,14 +47,33 @@ void IN_Move(usercmd_t *cmd)
 			cl.viewangles[PITCH] = -70.0f;
 	}
 
-	if (qnn_worker_pending_action.fire)
+	/* Auto-respawn: QuakeC PlayerDeathThink requires all buttons to be
+	   released before it will accept a press to respawn.  Alternate
+	   between releasing (even ticks) and pressing (odd ticks) so the
+	   server sees a clean edge. */
+	if (cl.stats[STAT_HEALTH] <= 0)
+	{
+		static int respawn_tick = 0;
+		respawn_tick++;
+		if (respawn_tick & 1)
+		{
+			qnn_worker_press_button(&in_attack);
+			qnn_worker_press_button(&in_jump);
+		}
+		else
+		{
+			in_attack.state = 0;
+			in_jump.state = 0;
+		}
+	}
+	else if (qnn_worker_pending_action.fire)
 		qnn_worker_press_button(&in_attack);
 	else
 		in_attack.state = 0;
 
-	if (qnn_worker_pending_action.jump)
+	if (cl.stats[STAT_HEALTH] > 0 && qnn_worker_pending_action.jump)
 		qnn_worker_press_button(&in_jump);
-	else
+	else if (cl.stats[STAT_HEALTH] > 0)
 		in_jump.state = 0;
 
 	if (qnn_worker_pending_action.weapon > 0)

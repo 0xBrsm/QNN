@@ -15,6 +15,7 @@ from quake_ai.model.observation import (
     EVENT_ID_DIM,
     EVENT_SCALAR_DIM,
     MAX_OBJECT_TOKENS,
+    MAX_ROUTE_CLUSTERS,
     OBJECT_ID_DIM,
     OBJECT_SCALAR_DIM,
     SELF_SCALAR_DIM,
@@ -42,7 +43,9 @@ class TokenObservationTokenizer(nn.Module):
         self.spatial_proj = nn.Linear(SPATIAL_SCALAR_DIM, d_model)
 
         self.kind_embed = nn.Embedding(3, d_model)
-        self.weapon_embed = nn.Embedding(9, d_model)
+        self.weapon_embed = nn.Embedding(5, d_model)
+        self.movement_embed = nn.Embedding(5, d_model)
+        self.cluster_embed = nn.Embedding(256, d_model)
         self.subject_embed = nn.Embedding(max(SUBJECT_IDS.values()) + 1, d_model)
         self.action_embed = nn.Embedding(max(ACTION_IDS.values()) + 1, d_model)
         self.qualifier_embed = nn.Embedding(max(QUALIFIER_IDS.values()) + 1, d_model)
@@ -57,7 +60,9 @@ class TokenObservationTokenizer(nn.Module):
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         self_scalars = obs_dict["self_scalars"]
-        self_weapon_id = obs_dict["self_weapon_id"].long()
+        self_weapon_id = obs_dict["self_weapon_id"].long().squeeze(-1)
+        self_movement_id = obs_dict.get("self_movement_id")
+        self_cluster_id = obs_dict.get("self_cluster_id")
         object_ids = obs_dict["object_ids"].long()
         object_scalars = obs_dict["object_scalars"]
         object_mask = obs_dict["object_mask"].bool()
@@ -70,11 +75,21 @@ class TokenObservationTokenizer(nn.Module):
 
         batch = int(self_scalars.shape[0])
         device = self_scalars.device
+        if self_movement_id is None:
+            self_movement_id = torch.zeros((batch,), dtype=torch.long, device=device)
+        else:
+            self_movement_id = self_movement_id.long().squeeze(-1)
+        if self_cluster_id is None:
+            self_cluster_id = torch.zeros((batch,), dtype=torch.long, device=device)
+        else:
+            self_cluster_id = self_cluster_id.long().squeeze(-1)
 
         self_token = (
             self.self_proj(self_scalars).unsqueeze(1)
             + self.kind_embed(torch.full((batch, 1), _TOKEN_KIND_SELF, dtype=torch.long, device=device))
             + self.weapon_embed(self_weapon_id.clamp(min=0, max=self.weapon_embed.num_embeddings - 1)).unsqueeze(1)
+            + self.movement_embed(self_movement_id.clamp(min=0, max=self.movement_embed.num_embeddings - 1)).unsqueeze(1)
+            + self.cluster_embed(self_cluster_id.clamp(min=0, max=self.cluster_embed.num_embeddings - 1)).unsqueeze(1)
         )
 
         object_token = self.object_proj(object_scalars)
@@ -85,6 +100,22 @@ class TokenObservationTokenizer(nn.Module):
         object_token = object_token + self.qualifier_embed(object_ids[:, :, 1].clamp(min=0, max=self.qualifier_embed.num_embeddings - 1))
         object_token = object_token + self.modality_embed(object_ids[:, :, 2].clamp(min=0, max=self.modality_embed.num_embeddings - 1))
         object_token = object_token + self.player_embed(object_ids[:, :, 3].clamp(min=0, max=self.player_embed.num_embeddings - 1))
+        if int(object_ids.shape[-1]) > 4:
+            object_cluster_ids = object_ids[:, :, 4]
+        else:
+            object_cluster_ids = torch.zeros((batch, MAX_OBJECT_TOKENS), dtype=torch.long, device=device)
+        object_token = object_token + self.cluster_embed(
+            object_cluster_ids.clamp(min=0, max=self.cluster_embed.num_embeddings - 1)
+        )
+        route_cluster_ids = obs_dict.get("object_route_cluster_ids")
+        if route_cluster_ids is not None:
+            route_cluster_ids = route_cluster_ids.long().clamp(min=0, max=self.cluster_embed.num_embeddings - 1)
+            route_embeds = self.cluster_embed(route_cluster_ids)
+            route_mask = route_cluster_ids > 0
+            route_embed = (route_embeds * route_mask.unsqueeze(-1).to(dtype=route_embeds.dtype)).sum(dim=2)
+        else:
+            route_embed = torch.zeros((batch, MAX_OBJECT_TOKENS, self.d_model), dtype=object_token.dtype, device=device)
+        object_token = object_token + route_embed
 
         event_token = self.event_proj(event_scalars)
         event_token = event_token + self.subject_embed(event_ids[:, :, 0].clamp(min=0, max=self.subject_embed.num_embeddings - 1))

@@ -1,0 +1,83 @@
+{
+  "arena": {
+    "size": 3072,
+    "max_depth": 3,
+    "floor_thickness": 16,
+    "shell_thickness": 32
+  },
+  "rooms": {
+    "min_size": 256,
+    "max_size": 1024,
+    "corridor_width": 96,
+    "floor_elevation_min": -128,
+    "floor_elevation_max": 384,
+    "floor_elevation_step": 16,
+    "ceiling_heights": [128, 160, 192, 224, 256, 320],
+    "corridor_headroom": 112
+  },
+  "stairs": {
+    "height": 8,
+    "max_rise": 96,
+    "min_step_run": 16
+  },
+  "pools": {
+    "depth": 48,
+    "border": 64,
+    "wall_thickness": 16,
+    "min_room_size": 320,
+    "min_pool_size": 96,
+    "max_pool_size": 256,
+    "lava_chance": 0.15,
+    "water_chance": 0.50,
+    "slime_chance": 0.55,
+    "min_guaranteed": 2
+  },
+  "entities": {
+    "item_z_above_floor": 32,
+    "margin": 48,
+    "health_per_room_min": 1,
+    "health_per_room_max": 3,
+    "health_total_min": 10,
+    "health_total_max": 20,
+    "quad_chance": 0.60,
+    "pent_ring_chance": 0.25,
+    "second_rl_min_rooms": 7,
+    "armor_extra_rooms_5": 5,
+    "armor_extra_rooms_7": 7
+  },
+  "navmesh": {
+    "cell_size": 16.0,
+    "cell_height": 8.0,
+    "walkable_slope_angle": 45.0,
+    "walkable_height": 56.0,
+    "walkable_climb": 18.0,
+    "walkable_radius": 16.0,
+    "max_edge_len": 192.0,
+    "max_simplification_error": 1.3,
+    "min_region_size": 8,
+    "merge_region_size": 20,
+    "max_verts_per_poly": 6,
+    "detail_sample_distance": 6.0,
+    "detail_sample_max_error": 1.0
+  },
+  "textures": {
+    "floor": "tech01_1",
+    "ceiling": "tech02_1",
+    "shell": "tech04_1",
+    "fill": "metal1_1",
+    "lava": "*lava1",
+    "water": "*04water1",
+    "slime": "*slime",
+    "wad_name": "mapgen_textures.wad"
+  },
+  "compile": {
+    "enabled": false,
+    "tools_dir": "",
+    "qbsp_flags": ["-splitturb", "-splitspecial"],
+    "run_vis": true,
+    "run_light": true
+  },
+  "generation": {
+    "max_attempts": 10
+  }
+}

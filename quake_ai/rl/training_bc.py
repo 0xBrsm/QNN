@@ -4,24 +4,30 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from queue import Queue
 from typing import Any, BinaryIO, Dict, List, Sequence
 
 import numpy as np
 import torch
 
 from engine.token_protocol import TOKEN_BINARY_HEADER_SIZE, TrustedTokenTick, decode_binary_token_tick
-from quake_ai.actions import ACTION_HEADS
+from quake_ai.actions import ACTION_HEADS, ActionLabels
 from quake_ai.model.observation import TokenObservationEncoder
 from quake_ai.rl.dataset_bc import (
     Sample,
     build_token_samples,
+    randomize_player_slots,
 )
-from quake_ai.model.policy import MLPGRUPolicy
+from quake_ai.model.policy import QNNPolicy
 from quake_ai.rl.schemas import MapState
 from quake_ai.utils.io import read_json, read_ndjson, write_json
 from quake_ai.utils.repro import set_global_seed, write_experiment_manifest
+
+_ACTION_HEAD_NAMES = list(ACTION_HEADS.keys())
+_SENTINEL = None
 
 
 @dataclass(slots=True)
@@ -67,6 +73,82 @@ class _EpisodeSplit:
     test: list[_EpisodeRecord]
 
 
+# ---------------------------------------------------------------------------
+# Precomputed episode data — observations and actions stored as contiguous
+# numpy arrays, encoded once and reused across all epochs.
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class _PrecomputedEpisode:
+    """One episode's observations and actions as contiguous arrays."""
+    obs: dict[str, np.ndarray]      # key → (n_samples, ...) arrays
+    actions: dict[str, np.ndarray]   # head → (n_samples,) int64
+    n_samples: int
+
+
+def _pack_samples(samples: List[Sample]) -> _PrecomputedEpisode | None:
+    """Pack a list of Sample objects into contiguous arrays."""
+    if not samples:
+        return None
+    n = len(samples)
+    first_obs = samples[0].obs
+    if not isinstance(first_obs, dict):
+        return None
+    obs: dict[str, np.ndarray] = {}
+    for key, value in first_obs.items():
+        arr = np.empty((n, *value.shape), dtype=value.dtype)
+        arr[0] = value
+        obs[key] = arr
+    actions: dict[str, np.ndarray] = {
+        head: np.empty(n, dtype=np.int64)
+        for head in _ACTION_HEAD_NAMES
+    }
+    for head in _ACTION_HEAD_NAMES:
+        actions[head][0] = int(samples[0].action.get(head, 0))
+    for i in range(1, n):
+        s = samples[i]
+        for key, value in s.obs.items():
+            obs[key][i] = value
+        for head in _ACTION_HEAD_NAMES:
+            actions[head][i] = int(s.action.get(head, 0))
+    return _PrecomputedEpisode(obs=obs, actions=actions, n_samples=n)
+
+
+# ---------------------------------------------------------------------------
+# Batch assembly from precomputed arrays — numpy slicing, no Python loops
+# over individual samples.
+# ---------------------------------------------------------------------------
+
+def _build_batch_from_chunks(
+    episodes: Sequence[_PrecomputedEpisode],
+    chunk_indices: Sequence[tuple[int, int, int]],  # (episode_idx, start, length)
+    seq_len: int,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], int]:
+    """Assemble a (seq_len, batch_size, ...) batch from precomputed episode slices."""
+    batch_size = len(chunk_indices)
+    first_ep = episodes[chunk_indices[0][0]]
+    obs_batch: dict[str, np.ndarray] = {}
+    for key, value in first_ep.obs.items():
+        obs_batch[key] = np.zeros((seq_len, batch_size, *value.shape[1:]), dtype=value.dtype)
+    actions: dict[str, np.ndarray] = {
+        head: np.zeros((seq_len, batch_size), dtype=np.int64)
+        for head in _ACTION_HEAD_NAMES
+    }
+
+    for batch_idx, (ep_idx, start, length) in enumerate(chunk_indices):
+        ep = episodes[ep_idx]
+        for key in obs_batch:
+            obs_batch[key][:length, batch_idx] = ep.obs[key][start:start + length]
+        for head in _ACTION_HEAD_NAMES:
+            actions[head][:length, batch_idx] = ep.actions[head][start:start + length]
+
+    return obs_batch, actions, seq_len * batch_size
+
+
+# ---------------------------------------------------------------------------
+# Legacy batch stacking for callers that still use Sample lists (dataset_bc).
+# ---------------------------------------------------------------------------
+
 def _stack_sequence_batch(chunks: Sequence[Sequence]) -> tuple[dict[str, np.ndarray], Dict[str, np.ndarray], int]:
     if not chunks:
         raise ValueError("chunks must be non-empty")
@@ -80,10 +162,10 @@ def _stack_sequence_batch(chunks: Sequence[Sequence]) -> tuple[dict[str, np.ndar
     for key, value in first_obs.items():
         obs_batch[key] = np.zeros((seq_len, batch_size, *value.shape), dtype=value.dtype)
 
-    actions: Dict[str, np.ndarray] = {}
-    first_action = chunks[0][0].action
-    for head in first_action.keys():
-        actions[head] = np.zeros((seq_len, batch_size), dtype=np.int64)
+    actions: Dict[str, np.ndarray] = {
+        head: np.zeros((seq_len, batch_size), dtype=np.int64)
+        for head in ACTION_HEADS
+    }
 
     for batch_idx, chunk in enumerate(chunks):
         if len(chunk) != seq_len:
@@ -93,11 +175,15 @@ def _stack_sequence_batch(chunks: Sequence[Sequence]) -> tuple[dict[str, np.ndar
                 raise ValueError("Token BC expects dict observations")
             for key, value in sample.obs.items():
                 obs_batch[key][step_idx, batch_idx] = value
-            for head, value in sample.action.items():
-                actions[head][step_idx, batch_idx] = int(value)
+            for head in ACTION_HEADS:
+                actions[head][step_idx, batch_idx] = int(sample.action.get(head, 0))
 
     return obs_batch, actions, seq_len * batch_size
 
+
+# ---------------------------------------------------------------------------
+# File and metadata helpers (unchanged).
+# ---------------------------------------------------------------------------
 
 def _load_episode_rows(metadata_path: str, episode_count: int) -> list[Dict[str, Any]]:
     if not metadata_path:
@@ -249,45 +335,16 @@ def _read_episode_ticks_for_record(handle: BinaryIO, record: _EpisodeRecord) -> 
     return ticks
 
 
-def _episode_chunks(samples: Sequence[Sample], sequence_length: int) -> list[list[Sample]]:
-    chunk_len = max(int(sequence_length), 1)
-    return [list(samples[start : start + chunk_len]) for start in range(0, len(samples), chunk_len) if samples[start : start + chunk_len]]
-
-
-def _normalized_goal_progress(tick: TrustedTokenTick, map_state: MapState) -> float:
-    raw_distances = map_state.metadata.get("distance_to_goal", {})
-    max_distance = float(map_state.metadata.get("max_distance_to_goal", 0.0))
-    if max_distance <= 0.0:
-        max_distance = 1.0
-    region_id = tick.current_region_id
-    if region_id < 0:
-        return float(tick.done)
-    if isinstance(raw_distances, dict):
-        distance = float(raw_distances.get(str(region_id), raw_distances.get(region_id, 0.0)))
-        return float(max(0.0, min(1.0, 1.0 - (distance / max_distance))))
-    return 0.0
-
-
 def _init_action_counts() -> dict[str, np.ndarray]:
     return {head: np.ones(size, dtype=np.float32) for head, size in ACTION_HEADS.items()}
 
 
-def _accumulate_episode_stats(
-    ticks: Sequence[TrustedTokenTick],
-    map_state: MapState,
-    action_counts: Mapping[str, np.ndarray] | None = None,
-) -> tuple[int, float]:
-    sample_count = 0
-    goal_progress_max = 0.0
-    for tick in ticks:
-        if not tick.action_label:
-            continue
-        sample_count += 1
-        goal_progress_max = max(goal_progress_max, _normalized_goal_progress(tick, map_state))
-        if action_counts is not None:
-            for head in ACTION_HEADS:
-                action_counts[head][int(tick.action_label.get(head, 0))] += 1.0
-    return sample_count, goal_progress_max
+def _accumulate_action_counts(
+    ep: _PrecomputedEpisode,
+    action_counts: dict[str, np.ndarray],
+) -> None:
+    for head in _ACTION_HEAD_NAMES:
+        np.add.at(action_counts[head], ep.actions[head], 1.0)
 
 
 def _class_weights_from_counts(
@@ -311,23 +368,6 @@ def _episode_slot_rng(base_seed: int, episode_index: int) -> np.random.Generator
     return np.random.default_rng(seed_value)
 
 
-def _load_episode_samples(
-    handle: BinaryIO,
-    record: _EpisodeRecord,
-    *,
-    slot_seed: int,
-) -> list[Sample]:
-    ticks = _read_episode_ticks_for_record(handle, record)
-    return build_token_samples(
-        ticks,
-        record.map_state,
-        episode_id=record.episode_id,
-        map_id=record.map_id,
-        source_path=record.source_path,
-        rng=_episode_slot_rng(slot_seed, record.index),
-    )
-
-
 def _write_episode_split_manifest(
     path: Path,
     sample_counts: Mapping[str, int],
@@ -346,72 +386,141 @@ def _write_episode_split_manifest(
     )
 
 
-def _run_streaming_supervised(
-    model: MLPGRUPolicy,
+# ---------------------------------------------------------------------------
+# Precompute phase — read all episodes once, encode observations, store as
+# contiguous numpy arrays. Amortizes I/O and encoding across all epochs.
+# ---------------------------------------------------------------------------
+
+def _precompute_split(
     token_ticks_path: str,
     records: Sequence[_EpisodeRecord],
+    slot_seed: int,
+) -> list[_PrecomputedEpisode]:
+    """Precompute all episodes in a split into memory."""
+    episodes: list[_PrecomputedEpisode] = []
+    with open(token_ticks_path, "rb") as handle:
+        for record in records:
+            ticks = _read_episode_ticks_for_record(handle, record)
+            slot_rng = _episode_slot_rng(slot_seed, record.index)
+            randomize_player_slots(ticks, slot_rng)
+            samples = build_token_samples(
+                ticks,
+                record.episode_id,
+                map_id=record.map_id,
+                source_path=record.source_path,
+            )
+            ep = _pack_samples(samples)
+            if ep is not None:
+                episodes.append(ep)
+    return episodes
+
+
+# ---------------------------------------------------------------------------
+# Training loop — operates on precomputed arrays, with background prefetch.
+# ---------------------------------------------------------------------------
+
+def _generate_chunk_indices(
+    episodes: Sequence[_PrecomputedEpisode],
+    sequence_length: int,
+) -> list[tuple[int, int, int]]:
+    """Generate (episode_idx, start_offset, chunk_length) for all chunks."""
+    chunk_len = max(int(sequence_length), 1)
+    indices: list[tuple[int, int, int]] = []
+    for ep_idx, ep in enumerate(episodes):
+        for start in range(0, ep.n_samples, chunk_len):
+            length = min(chunk_len, ep.n_samples - start)
+            indices.append((ep_idx, start, length))
+    return indices
+
+
+def _run_precomputed_supervised(
+    model: QNNPolicy,
+    episodes: Sequence[_PrecomputedEpisode],
     batch_size: int,
     sequence_length: int,
     *,
-    slot_seed: int,
     class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     lr: float | None = None,
     rng: np.random.Generator | None = None,
 ) -> Dict[str, float]:
-    if not records:
-        return {"loss": 0.0, "accuracy": 0.0}
+    _empty: Dict[str, float] = {"loss": 0.0, "accuracy": 0.0, "fuzzy_accuracy": 0.0}
+    if not episodes:
+        return _empty
+
+    chunk_indices = _generate_chunk_indices(episodes, sequence_length)
+    if not chunk_indices:
+        return _empty
+
+    if rng is not None:
+        order = rng.permutation(len(chunk_indices))
+        chunk_indices = [chunk_indices[int(i)] for i in order]
+
+    # Group by chunk length for uniform batching
+    by_length: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+    for ci in chunk_indices:
+        by_length[ci[2]].append(ci)
+
+    # Flatten into batches
+    batches: list[tuple[int, list[tuple[int, int, int]]]] = []
+    for length, group in by_length.items():
+        seqs_per_batch = max(1, int(batch_size) // max(length, 1))
+        for i in range(0, len(group), seqs_per_batch):
+            batches.append((length, group[i:i + seqs_per_batch]))
+
+    # Shuffle batch order
+    if rng is not None and len(batches) > 1:
+        batch_order = rng.permutation(len(batches))
+        batches = [batches[int(i)] for i in batch_order]
+
+    # Prefetch: prepare next batch on background thread while GPU runs
+    prefetch_queue: Queue[tuple[dict[str, np.ndarray], dict[str, np.ndarray], int] | None] = Queue(maxsize=2)
+
+    def _prefetch_worker() -> None:
+        for seq_len, batch_chunk_indices in batches:
+            obs_b, act_b, rows = _build_batch_from_chunks(episodes, batch_chunk_indices, seq_len)
+            prefetch_queue.put((obs_b, act_b, rows))
+        prefetch_queue.put(_SENTINEL)
 
     total_rows = 0
     total_loss = 0.0
     total_accuracy = 0.0
-    pending_chunks: dict[int, list[list[Sample]]] = defaultdict(list)
-    ordered_records = list(records)
-    if rng is not None and len(ordered_records) > 1:
-        order = rng.permutation(len(ordered_records))
-        ordered_records = [ordered_records[int(index)] for index in order]
+    total_fuzzy = 0.0
+    per_head_totals: Dict[str, float] = {}
+    training = class_weights is not None and lr is not None
 
-    with open(token_ticks_path, "rb") as handle:
-        for record in ordered_records:
-            samples = _load_episode_samples(handle, record, slot_seed=slot_seed)
-            if not samples:
-                continue
-            chunks = _episode_chunks(samples, sequence_length)
-            if rng is not None and len(chunks) > 1:
-                chunk_order = rng.permutation(len(chunks))
-                chunks = [chunks[int(index)] for index in chunk_order]
-            for chunk in chunks:
-                length = len(chunk)
-                pending_chunks[length].append(chunk)
-                sequences_per_batch = max(1, int(batch_size) // max(length, 1))
-                while len(pending_chunks[length]) >= sequences_per_batch:
-                    batch_chunks = pending_chunks[length][:sequences_per_batch]
-                    del pending_chunks[length][:sequences_per_batch]
-                    obs_batch, action_batch, rows = _stack_sequence_batch(batch_chunks)
-                    if class_weights is not None and lr is not None:
-                        metrics = model.supervised_step(obs_batch, action_batch, class_weights, lr=lr)
-                    else:
-                        metrics = model.evaluate_supervised(obs_batch, action_batch)
-                    total_rows += rows
-                    total_loss += float(metrics["loss"]) * rows
-                    total_accuracy += float(metrics["accuracy"]) * rows
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(_prefetch_worker)
+        while True:
+            item = prefetch_queue.get()
+            if item is _SENTINEL:
+                break
+            obs_batch, action_batch, rows = item
+            if training:
+                metrics = model.supervised_step(obs_batch, action_batch, class_weights, lr=lr)
+            else:
+                metrics = model.evaluate_supervised(obs_batch, action_batch)
+            total_rows += rows
+            total_loss += float(metrics["loss"]) * rows
+            total_accuracy += float(metrics["accuracy"]) * rows
+            total_fuzzy += float(metrics.get("fuzzy_accuracy", 0.0)) * rows
+            for key, val in metrics.items():
+                if key.startswith("acc_"):
+                    per_head_totals[key] = per_head_totals.get(key, 0.0) + float(val) * rows
 
-    for length in sorted(pending_chunks.keys()):
-        if not pending_chunks[length]:
-            continue
-        obs_batch, action_batch, rows = _stack_sequence_batch(pending_chunks[length])
-        if class_weights is not None and lr is not None:
-            metrics = model.supervised_step(obs_batch, action_batch, class_weights, lr=lr)
-        else:
-            metrics = model.evaluate_supervised(obs_batch, action_batch)
-        total_rows += rows
-        total_loss += float(metrics["loss"]) * rows
-        total_accuracy += float(metrics["accuracy"]) * rows
-
-    return {
-        "loss": total_loss / max(total_rows, 1),
-        "accuracy": total_accuracy / max(total_rows, 1),
+    denom = max(total_rows, 1)
+    result: Dict[str, float] = {
+        "loss": total_loss / denom,
+        "accuracy": total_accuracy / denom,
+        "fuzzy_accuracy": total_fuzzy / denom,
     }
+    for key, total in per_head_totals.items():
+        result[key] = total / denom
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Main entry point.
+# ---------------------------------------------------------------------------
 
 def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
     set_global_seed(config.seed)
@@ -436,40 +545,40 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
     records = _scan_episode_records(config, map_states, default_map_state)
     split = _split_episode_records(records, config.train_ratio, config.val_ratio, config.seed)
 
-    sample_counts = {"train": 0, "val": 0, "test": 0}
-    sample_episode_ids: dict[str, set[str]] = {"train": set(), "val": set(), "test": set()}
-    class_counts = _init_action_counts()
-    train_success_values: list[float] = []
-    val_success_values: list[float] = []
-    obs_dim = 0
+    # Precompute all episodes once — observations encoded and stored as contiguous arrays.
+    train_episodes = _precompute_split(config.token_ticks_path, split.train, config.seed)
+    val_episodes = _precompute_split(config.token_ticks_path, split.val, config.seed)
+    test_episodes = _precompute_split(config.token_ticks_path, split.test, config.seed)
 
-    with open(config.token_ticks_path, "rb") as handle:
-        for split_name, split_records in (("train", split.train), ("val", split.val), ("test", split.test)):
-            for record in split_records:
-                ticks = _read_episode_ticks_for_record(handle, record)
-                sample_count, goal_progress_max = _accumulate_episode_stats(
-                    ticks,
-                    record.map_state,
-                    class_counts if split_name == "train" else None,
-                )
-                sample_counts[split_name] += sample_count
-                if sample_count > 0:
-                    sample_episode_ids[split_name].add(record.episode_id)
-                if split_name == "train" and sample_count > 0:
-                    train_success_values.append(goal_progress_max)
-                elif split_name == "val" and sample_count > 0:
-                    val_success_values.append(goal_progress_max)
-                if split_name == "train" and obs_dim <= 0 and sample_count > 0:
-                    obs_dim = TokenObservationEncoder().obs_dim
+    sample_counts = {
+        "train": sum(ep.n_samples for ep in train_episodes),
+        "val": sum(ep.n_samples for ep in val_episodes),
+        "test": sum(ep.n_samples for ep in test_episodes),
+    }
+    sample_episode_ids: dict[str, set[str]] = {"train": set(), "val": set(), "test": set()}
+    for split_name, split_records, split_episodes in (
+        ("train", split.train, train_episodes),
+        ("val", split.val, val_episodes),
+        ("test", split.test, test_episodes),
+    ):
+        ep_idx = 0
+        for record in split_records:
+            if ep_idx < len(split_episodes) and split_episodes[ep_idx].n_samples > 0:
+                sample_episode_ids[split_name].add(record.episode_id)
+                ep_idx += 1
+
+    # Accumulate action class counts from precomputed arrays (vectorized)
+    class_counts = _init_action_counts()
+    for ep in train_episodes:
+        _accumulate_action_counts(ep, class_counts)
 
     _write_episode_split_manifest(output / "split_manifest.json", sample_counts, sample_episode_ids)
 
     if sample_counts["train"] <= 0:
         raise RuntimeError("No training samples available after split")
-    if obs_dim <= 0:
-        obs_dim = TokenObservationEncoder().obs_dim
 
-    model = MLPGRUPolicy(
+    obs_dim = TokenObservationEncoder().obs_dim
+    model = QNNPolicy(
         obs_dim=obs_dim,
         trunk_hidden=config.trunk_hidden,
         gru_hidden=config.gru_hidden,
@@ -487,8 +596,6 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
             max_weight=config.class_weight_max,
         ).items()
     }
-    train_success_proxy = float(np.mean(train_success_values)) if train_success_values else 0.0
-    val_success_proxy = float(np.mean(val_success_values)) if val_success_values else 0.0
 
     best_val_acc = -1.0
     best_epoch = -1
@@ -496,35 +603,34 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
     history: List[Dict[str, float]] = []
 
     for epoch in range(config.epochs):
-        train_metrics = _run_streaming_supervised(
+        train_metrics = _run_precomputed_supervised(
             model,
-            config.token_ticks_path,
-            split.train,
+            train_episodes,
             batch_size=config.batch_size,
             sequence_length=config.sequence_length,
-            slot_seed=config.seed,
             class_weights=weights,
             lr=config.lr,
             rng=rng,
         )
-        val_metrics = _run_streaming_supervised(
+        val_metrics = _run_precomputed_supervised(
             model,
-            config.token_ticks_path,
-            split.val,
+            val_episodes,
             batch_size=config.batch_size,
             sequence_length=config.sequence_length,
-            slot_seed=config.seed,
         )
 
-        proxy = val_success_proxy if split.val else train_success_proxy
-        epoch_metrics = {
+        epoch_metrics: Dict[str, float] = {
             "epoch": float(epoch),
             "train_loss": float(train_metrics["loss"]),
             "train_accuracy": float(train_metrics["accuracy"]),
+            "train_fuzzy_accuracy": float(train_metrics.get("fuzzy_accuracy", 0.0)),
             "val_loss": float(val_metrics["loss"]),
             "val_accuracy": float(val_metrics["accuracy"]),
-            "val_success_proxy": float(proxy),
+            "val_fuzzy_accuracy": float(val_metrics.get("fuzzy_accuracy", 0.0)),
         }
+        for key in val_metrics:
+            if key.startswith("acc_"):
+                epoch_metrics[f"val_{key}"] = float(val_metrics[key])
         history.append(epoch_metrics)
 
         improved = val_metrics["accuracy"] > best_val_acc
@@ -542,27 +648,29 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
     if best_epoch < 0:
         model.save(output / "bc_best_model.npz")
 
-    final_model = MLPGRUPolicy.load(output / "bc_best_model.npz", device=config.device)
+    final_model = QNNPolicy.load(output / "bc_best_model.npz", device=config.device)
 
-    test_metrics = _run_streaming_supervised(
+    test_metrics = _run_precomputed_supervised(
         final_model,
-        config.token_ticks_path,
-        split.test,
+        test_episodes,
         batch_size=config.batch_size,
         sequence_length=config.sequence_length,
-        slot_seed=config.seed,
     )
 
-    summary = {
+    summary: Dict[str, Any] = {
         "best_epoch": best_epoch,
         "best_val_accuracy": best_val_acc,
         "test_loss": float(test_metrics["loss"]),
         "test_accuracy": float(test_metrics["accuracy"]),
+        "test_fuzzy_accuracy": float(test_metrics.get("fuzzy_accuracy", 0.0)),
         "num_train_samples": int(sample_counts["train"]),
         "num_val_samples": int(sample_counts["val"]),
         "num_test_samples": int(sample_counts["test"]),
         "epochs_ran": len(history),
     }
+    for key in test_metrics:
+        if key.startswith("acc_"):
+            summary[f"test_{key}"] = float(test_metrics[key])
 
     write_json(output / "bc_history.json", {"history": history})
     write_json(output / "bc_summary.json", summary)

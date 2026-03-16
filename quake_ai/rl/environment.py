@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from math import dist, hypot
+from math import hypot
 from pathlib import Path
-from typing import Dict, List, Mapping, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
-from engine.bridge import NativeTokenAdapter
+import logging
+
+from engine.bridge import NativeEngineError, NativeTokenAdapter
 from engine.training_protocol import TrustedTrainingExtrasV1
 from quake_ai.actions import ActionLabels
 from quake_ai.rl.combat_metrics import WEAPON_TOTAL_DEBUG_KEYS, weapon_metric_key
@@ -18,72 +20,28 @@ from quake_ai.model.observation import TokenObservationEncoder, visible_threat_c
 from quake_ai.rl.reward import WEAPON_TIER_VALUES, RewardWeights, effective_hp, reward_components
 from quake_ai.rl.schemas import MapState
 
+if TYPE_CHECKING:
+    from mapgen.pool import MapPool
+
+
+_HEALTH_CAP = 250.0
+_ARMOR_CAP = 200.0
+_ARMOR_TYPE_CAP = 0.8
+_VEL_CAP = 2000.0
+
 
 @dataclass(slots=True)
 class NativeEnvState:
     steps: int
     current_region_id: int | None
-    prev_distance: float
-    items_collected: int
-    player_origin: Tuple[float, float, float]
     frags: int
     weapon_id: int
     prev_ehp: float = 100.0
 
 
-def _distance_to_goal(map_state: MapState, region_id: int | None) -> float:
-    max_distance = float(map_state.metadata.get("max_distance_to_goal", 0.0))
-    if max_distance <= 0.0:
-        max_distance = 1.0
-
-    if region_id is None:
-        return max_distance
-
-    raw_distances = map_state.metadata.get("distance_to_goal", {})
-    if isinstance(raw_distances, dict):
-        return float(raw_distances.get(str(region_id), raw_distances.get(region_id, max_distance)))
-    return max_distance
-
-
-def _goal_progress(map_state: MapState, region_id: int | None, goal_reached: bool) -> float:
-    max_distance = float(map_state.metadata.get("max_distance_to_goal", 0.0))
-    if max_distance <= 0.0:
-        max_distance = 1.0
-    distance = 0.0 if goal_reached else _distance_to_goal(map_state, region_id)
-    return _goal_progress_from_distance(map_state, distance)
-
-
-def _goal_progress_from_distance(map_state: MapState, distance: float) -> float:
-    max_distance = float(map_state.metadata.get("max_distance_to_goal", 0.0))
-    if max_distance <= 0.0:
-        max_distance = 1.0
-    return float(max(0.0, min(1.0, 1.0 - (distance / max_distance))))
-
-
-def _goal_region_centers(map_state: MapState) -> Tuple[Tuple[float, float, float], ...]:
-    centers_by_region = {region.region_id: tuple(float(value) for value in region.center) for region in map_state.regions}
-    centers = [centers_by_region[region_id] for region_id in map_state.goal_region_ids if region_id in centers_by_region]
-    return tuple(centers)
-
-
-def _native_distance_to_goal(
-    map_state: MapState,
-    goal_centers: Tuple[Tuple[float, float, float], ...],
-    goal_distance_scale: float,
-    origin: Tuple[float, float, float],
-    region_id: int | None,
-    *,
-    goal_reached: bool,
-) -> float:
-    if goal_reached:
-        return 0.0
-    if goal_centers:
-        return float(min(dist(origin, goal_center) for goal_center in goal_centers) / max(goal_distance_scale, 1.0))
-    return _distance_to_goal(map_state, region_id)
-
-
-def _planar_displacement(previous_origin: Tuple[float, float, float], current_origin: Tuple[float, float, float]) -> float:
-    return float(hypot(current_origin[0] - previous_origin[0], current_origin[1] - previous_origin[1]))
+def _velocity_magnitude(vel_norm: List[float]) -> float:
+    """Planar speed from normalized velocity (v5 self_token.velocity / 2000)."""
+    return float(hypot(vel_norm[0] * _VEL_CAP, vel_norm[1] * _VEL_CAP))
 
 
 def _combat_signals(
@@ -186,6 +144,7 @@ class NativeWorldEnv:
         native_args: Sequence[str] | None = None,
         options: Mapping[str, object] | None = None,
         encoder: TokenObservationEncoder | None = None,
+        map_pool: MapPool | None = None,
     ) -> None:
         self.max_steps = max_steps
         resolved_mode = mode.strip().lower() if mode else "pvp"
@@ -199,6 +158,17 @@ class NativeWorldEnv:
         self.rng = np.random.default_rng(seed)
         self.encoder = encoder if encoder is not None else TokenObservationEncoder()
         self.options = dict(options or {})
+        self.map_pool = map_pool
+
+        # If we have a pool, grab the first map from it instead of using the
+        # sentinel ``map_id`` directly.
+        self._maps_dir: Path | None = None
+        self._current_map_id: str | None = None
+        if self.map_pool is not None:
+            map_id = self.map_pool.get(timeout=120.0)
+            self._current_map_id = map_id
+            self._maps_dir = self.map_pool._maps_dir
+
         self.adapter = NativeTokenAdapter(
             executable=executable,
             map_id=map_id,
@@ -214,36 +184,56 @@ class NativeWorldEnv:
             self.adapter.close()
             raise RuntimeError("Native worker did not return MapState in hello payload")
         self.map_state = map_state
-        self.goal_centers = _goal_region_centers(map_state)
-        self.goal_distance_scale = max(float(map_state.metadata.get("grid_size", 0.0)), 256.0)
         self.state: NativeEnvState | None = None
+
+    _MAX_PROCGEN_RETRIES = 3
 
     def reset(self, seed: int | None = None, start_variant: int | None = None) -> Dict[str, np.ndarray]:
         del start_variant
         reset_seed = seed if seed is not None else int(self.rng.integers(0, 2**31 - 1))
         self.encoder.reset()
-        token_tick, training_extras = self.adapter.reset_tokens_with_training(seed=reset_seed)
-        player_origin = tuple(float(value) for value in token_tick.self_token.origin)
+
+        # Swap to a fresh procgen map each episode.  Retry with a different map
+        # if the engine crashes (e.g. malformed BSP from the generator).
+        if self.map_pool is not None:
+            old_map_id = self._current_map_id
+            last_err: Exception | None = None
+            for attempt in range(self._MAX_PROCGEN_RETRIES):
+                new_map_id = self.map_pool.get(timeout=120.0)
+                try:
+                    new_map_state = self.adapter.change_map(new_map_id)
+                    if new_map_state is not None:
+                        self.map_state = new_map_state
+                    token_tick, training_extras = self.adapter.reset_tokens_with_training(seed=reset_seed)
+                    self._current_map_id = new_map_id
+                    last_err = None
+                    break
+                except (NativeEngineError, OSError) as exc:
+                    logging.getLogger(__name__).warning(
+                        "Procgen map %s failed (attempt %d/%d): %s",
+                        new_map_id, attempt + 1, self._MAX_PROCGEN_RETRIES, exc,
+                    )
+                    last_err = exc
+            if last_err is not None:
+                raise last_err
+            # Clean up old map files to avoid filling disk.
+            if old_map_id and self._maps_dir:
+                for ext in (".bsp", ".map", ".log", ".prt"):
+                    p = self._maps_dir / f"{old_map_id}{ext}"
+                    p.unlink(missing_ok=True)
+        else:
+            token_tick, training_extras = self.adapter.reset_tokens_with_training(seed=reset_seed)
         frag_delta = int(training_extras.frag_gain) if training_extras is not None else 0
+        st = token_tick.self_token
         self.state = NativeEnvState(
             steps=0,
             current_region_id=token_tick.current_region_id,
-            prev_distance=_native_distance_to_goal(
-                self.map_state,
-                self.goal_centers,
-                self.goal_distance_scale,
-                player_origin,
-                token_tick.current_region_id,
-                goal_reached=False,
-            ),
-            items_collected=0,
-            player_origin=player_origin,
             frags=frag_delta,
-            weapon_id=int(token_tick.self_token.weapon_id),
+            weapon_id=int(st.weapon_id),
             prev_ehp=effective_hp(
-                float(token_tick.self_token.health),
-                float(token_tick.self_token.armor),
-                float(token_tick.self_token.armor_type),
+                float(st.health * _HEALTH_CAP),
+                float(st.armor * _ARMOR_CAP),
+                float(st.armor_type * _ARMOR_TYPE_CAP),
             ),
         )
         return self.encoder.encode(token_tick)
@@ -255,65 +245,52 @@ class NativeWorldEnv:
         token_tick, training_extras = self.adapter.step_tokens_with_training(action)
         obs = self.encoder.encode(token_tick)
 
+        st = token_tick.self_token
         steps = self.state.steps + 1
-        previous_origin = self.state.player_origin
         current_region_id = token_tick.current_region_id
-        current_origin = tuple(float(value) for value in token_tick.self_token.origin)
-        pickup_count = int(sum(1 for row in (training_extras.item_records if training_extras is not None else ()) if row.event_kind == 1))
-        goal_reached = False
-        at_goal = goal_reached or (current_region_id in self.map_state.goal_region_ids if current_region_id is not None else False)
         timed_out = bool(steps >= self.max_steps and not token_tick.done)
         done = bool(token_tick.done or timed_out)
-        movement_delta = _planar_displacement(previous_origin, current_origin)
-        stuck = movement_delta < 1.0
-        new_distance = _native_distance_to_goal(
-            self.map_state,
-            self.goal_centers,
-            self.goal_distance_scale,
-            current_origin,
-            current_region_id,
-            goal_reached=goal_reached,
-        )
+        # v5: use velocity magnitude for stuck detection (origin removed from wire)
+        speed = _velocity_magnitude(st.velocity)
+        stuck = speed < 10.0  # units/sec threshold
+
+        raw_health = st.health * _HEALTH_CAP
+        raw_armor = st.armor * _ARMOR_CAP
+        raw_armor_type = st.armor_type * _ARMOR_TYPE_CAP
 
         current_frags = self.state.frags + (int(training_extras.frag_gain) if training_extras is not None else 0) - (int(training_extras.frag_loss) if training_extras is not None else 0)
         visible_threats = visible_threat_count(obs)
         combat_signals = _combat_signals(
             state=self.state,
-            health=int(token_tick.self_token.health),
-            armor=int(token_tick.self_token.armor),
-            armor_type=float(token_tick.self_token.armor_type),
-            weapon_id=int(token_tick.self_token.weapon_id),
+            health=int(raw_health),
+            armor=int(raw_armor),
+            armor_type=float(raw_armor_type),
+            weapon_id=int(st.weapon_id),
             visible_threats=visible_threats,
             fire_pressed=int(action.get("fire", 0)),
         )
         combat_signals = _apply_training_extras(combat_signals, training_extras=training_extras)
         reward_breakdown = reward_components(
-            previous_distance=self.state.prev_distance,
-            new_distance=new_distance,
-            item_picked=pickup_count > 0,
-            goal_reached=goal_reached,
-            timed_out=timed_out,
-            stuck=stuck,
             weights=self.reward_weights,
             combat_signals=combat_signals,
         )
         reward = reward_breakdown["reward_total"]
 
-        items_collected = self.state.items_collected + pickup_count
         current_ehp = effective_hp(
-            float(token_tick.self_token.health),
-            float(token_tick.self_token.armor),
-            float(token_tick.self_token.armor_type),
+            float(raw_health),
+            float(raw_armor),
+            float(raw_armor_type),
         )
+        # On death ticks, pretend prev_ehp is spawn health (100, no armor)
+        # so the respawn tick doesn't get a free +2.3 ehp_delta reward.
+        player_died = training_extras is not None and training_extras.player_died
+        stored_ehp = 100.0 if player_died else current_ehp
         self.state = NativeEnvState(
             steps=steps,
             current_region_id=current_region_id,
-            prev_distance=new_distance,
-            items_collected=items_collected,
-            player_origin=current_origin,
             frags=current_frags,
-            weapon_id=int(token_tick.self_token.weapon_id),
-            prev_ehp=current_ehp,
+            weapon_id=int(st.weapon_id),
+            prev_ehp=stored_ehp,
         )
 
         done_reason = ""
@@ -326,26 +303,17 @@ class NativeWorldEnv:
         info: Dict[str, object] = {}
         info.update(
             {
-                "at_goal": at_goal,
-                "goal_reached": goal_reached,
-                "items_collected": items_collected,
                 "steps": steps,
-                "distance_to_goal": new_distance,
-                "goal_progress": _goal_progress_from_distance(self.map_state, new_distance),
+                "current_region_id": current_region_id,
                 "stuck": stuck,
-                "movement_delta": movement_delta,
+                "speed": speed,
                 "done_reason": done_reason,
                 "worker_done": bool(token_tick.done),
                 "worker_reward": 0.0,
-                "health": int(token_tick.self_token.health),
-                "armor": int(token_tick.self_token.armor),
-                "ammo": int(
-                    token_tick.self_token.ammo_shells
-                    + token_tick.self_token.ammo_nails
-                    + token_tick.self_token.ammo_rockets
-                    + token_tick.self_token.ammo_cells
-                ),
-                "weapon_id": int(token_tick.self_token.weapon_id),
+                "health": int(raw_health),
+                "armor": int(raw_armor),
+                "ammo": float(sum(st.ammo)),
+                "weapon_id": int(st.weapon_id),
                 "scenario_id": str(self.map_state.map_id),
                 "frags": current_frags,
                 "monster_kills": 0,

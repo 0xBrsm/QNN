@@ -28,6 +28,11 @@ HEAD_LOSS_WEIGHTS: Dict[str, float] = {
     "weapon": 1.0,
 }
 
+# Heads used for the primary accuracy metric (excludes recall which is always 0 in BC)
+_COMBAT_HEADS = frozenset(HEAD_LOSS_WEIGHTS.keys())
+# Look heads get ±1 bin tolerance for the "fuzzy" accuracy metric.
+_FUZZY_TOLERANCE_HEADS = frozenset({"look_yaw", "look_pitch"})
+
 
 @dataclass(slots=True)
 class PolicyActionBatch:
@@ -148,15 +153,15 @@ class _ActorCriticNet(nn.Module):
         return features, logits, values, next_hidden
 
 
-class MLPGRUPolicy:
-    """Actor-critic policy with transformer encoder and optional GRU core."""
+class QNNPolicy:
+    """Actor-critic policy: transformer encoder + GRU temporal core."""
 
     def __init__(
         self,
         obs_dim: int,
         trunk_hidden: int = 128,
-        gru_hidden: int = 0,
-        use_gru: bool = False,
+        gru_hidden: int = 128,
+        use_gru: bool = True,
         seed: int = 0,
         device: str = "auto",
         d_model: int = 64,
@@ -295,6 +300,32 @@ class MLPGRUPolicy:
         if target.ndim > 1:
             return target.reshape(-1)
         return target
+
+    def _action_targets_for_head(
+        self,
+        actions: Mapping[str, np.ndarray | torch.Tensor],
+        head: str,
+        head_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        source = actions.get(head)
+        if source is None:
+            return torch.zeros(
+                (self._flatten_logits(head_logits).shape[0],),
+                dtype=torch.long,
+                device=self.device,
+            )
+        return self._flatten_targets(self._tensor(source, dtype=torch.long))
+
+    def _class_weights_for_head(
+        self,
+        class_weights: Mapping[str, np.ndarray | torch.Tensor],
+        head: str,
+        size: int,
+    ) -> torch.Tensor:
+        source = class_weights.get(head)
+        if source is None:
+            return torch.ones((size,), dtype=torch.float32, device=self.device)
+        return self._tensor(source, dtype=torch.float32)
 
     def _forward_tensors(
         self,
@@ -474,25 +505,38 @@ class MLPGRUPolicy:
         _, logits, _, _ = self._forward_tensors(obs, hidden=hidden, masks=masks)
 
         losses = []
-        accuracies = []
+        combat_accuracies = []
+        fuzzy_accuracies = []
+        per_head_acc: Dict[str, float] = {}
         for head in ACTION_HEADS:
-            target = self._flatten_targets(self._tensor(actions[head], dtype=torch.long))
-            weights = self._tensor(class_weights[head], dtype=torch.float32)
             head_logits = self._flatten_logits(logits[head])
+            target = self._action_targets_for_head(actions, head, head_logits)
+            weights = self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
             head_loss = F.cross_entropy(head_logits, target, weight=weights, reduction="mean")
             head_loss = head_loss * HEAD_LOSS_WEIGHTS.get(head, 1.0)
             losses.append(head_loss)
-            pred = torch.argmax(head_logits, dim=1)
-            accuracies.append(float((pred == target).float().mean().item()))
+            if head in _COMBAT_HEADS:
+                pred = torch.argmax(head_logits, dim=1)
+                exact = float((pred == target).float().mean().item())
+                combat_accuracies.append(exact)
+                per_head_acc[head] = exact
+                if head in _FUZZY_TOLERANCE_HEADS:
+                    fuzzy_accuracies.append(float(((pred - target).abs() <= 1).float().mean().item()))
+                else:
+                    fuzzy_accuracies.append(exact)
 
         loss = torch.stack(losses).mean()
         loss.backward()
         optimizer.step()
 
-        return {
+        result: Dict[str, float] = {
             "loss": float(loss.item()),
-            "accuracy": float(np.mean(accuracies) if accuracies else 0.0),
+            "accuracy": float(np.mean(combat_accuracies) if combat_accuracies else 0.0),
+            "fuzzy_accuracy": float(np.mean(fuzzy_accuracies) if fuzzy_accuracies else 0.0),
         }
+        for head, acc in per_head_acc.items():
+            result[f"acc_{head}"] = acc
+        return result
 
     def evaluate_supervised(
         self,
@@ -505,18 +549,31 @@ class MLPGRUPolicy:
         with torch.inference_mode():
             _, logits, _, _ = self._forward_tensors(obs, hidden=hidden, masks=masks)
             losses = []
-            accuracies = []
+            combat_accuracies = []
+            fuzzy_accuracies = []
+            per_head_acc: Dict[str, float] = {}
             for head in ACTION_HEADS:
-                target = self._flatten_targets(self._tensor(actions[head], dtype=torch.long))
                 head_logits = self._flatten_logits(logits[head])
+                target = self._action_targets_for_head(actions, head, head_logits)
                 head_loss = F.cross_entropy(head_logits, target, reduction="mean")
                 losses.append(float(head_loss.item()))
-                pred = torch.argmax(head_logits, dim=1)
-                accuracies.append(float((pred == target).float().mean().item()))
-        return {
+                if head in _COMBAT_HEADS:
+                    pred = torch.argmax(head_logits, dim=1)
+                    exact = float((pred == target).float().mean().item())
+                    combat_accuracies.append(exact)
+                    per_head_acc[head] = exact
+                    if head in _FUZZY_TOLERANCE_HEADS:
+                        fuzzy_accuracies.append(float(((pred - target).abs() <= 1).float().mean().item()))
+                    else:
+                        fuzzy_accuracies.append(exact)
+        result: Dict[str, float] = {
             "loss": float(np.mean(losses) if losses else 0.0),
-            "accuracy": float(np.mean(accuracies) if accuracies else 0.0),
+            "accuracy": float(np.mean(combat_accuracies) if combat_accuracies else 0.0),
+            "fuzzy_accuracy": float(np.mean(fuzzy_accuracies) if fuzzy_accuracies else 0.0),
         }
+        for head, acc in per_head_acc.items():
+            result[f"acc_{head}"] = acc
+        return result
 
     def ppo_step(
         self,
@@ -531,7 +588,7 @@ class MLPGRUPolicy:
         value_coef: float,
         entropy_coef: float,
         max_grad_norm: float | None,
-        reference_policy: "MLPGRUPolicy | None" = None,
+        reference_policy: "QNNPolicy | None" = None,
         reference_kl_coef: float = 0.0,
         sample_temperatures: Mapping[str, float] | None = None,
         *,
@@ -551,11 +608,11 @@ class MLPGRUPolicy:
         log_probs = []
         entropies = []
         for head in ACTION_HEADS:
-            target = self._flatten_targets(self._tensor(actions[head], dtype=torch.long))
             head_logits = self._sampling_logits(
                 self._flatten_logits(logits[head]),
                 float(sample_temperatures.get(head, 1.0)) if sample_temperatures else 1.0,
             )
+            target = self._action_targets_for_head(actions, head, head_logits)
             chosen_log_probs, head_entropy, _ = self._log_prob_entropy_from_logits(head_logits, target)
             log_probs.append(chosen_log_probs)
             entropies.append(head_entropy)
@@ -644,7 +701,7 @@ class MLPGRUPolicy:
         target.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | Path, device: str = "auto") -> "MLPGRUPolicy":
+    def load(cls, path: str | Path, device: str = "auto") -> "QNNPolicy":
         source = Path(path)
         payload = trusted_torch_load(source, map_location="cpu")
         if not isinstance(payload, dict) or "state_dict" not in payload or "meta" not in payload:
@@ -670,7 +727,7 @@ class MLPGRUPolicy:
         use_gru: bool,
         gru_hidden: int,
         device: str = "auto",
-    ) -> "MLPGRUPolicy":
+    ) -> "QNNPolicy":
         loaded = cls.load(path, device=device)
         target_use_gru = bool(use_gru and gru_hidden > 0)
         if loaded.use_gru == target_use_gru and loaded.gru_hidden == (gru_hidden if target_use_gru else 0):

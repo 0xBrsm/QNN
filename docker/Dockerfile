@@ -46,6 +46,7 @@ RUN apt-get update \
         "tensorboard" \
         "tensorboardX" \
         "threadpoolctl" \
+        "smbprotocol" \
         "wandb"
 
 WORKDIR /workspace

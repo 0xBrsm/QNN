@@ -16,7 +16,7 @@ from quake_ai.rl.planning import (
 from quake_ai.rl.profiles import PROFILES, LiveProfile
 from quake_ai.utils.io import write_json
 
-REPORT_STAGES = ("collect", "bc", "eval_bc", "ppo", "eval")
+REPORT_STAGES = ("bc", "eval_bc", "sf", "best", "eval")
 
 
 def _collect_existing_files(path: Path) -> list[Path]:
@@ -214,14 +214,15 @@ def _build_operational_note(
         utilization_parts.append(f"eval_episodes={eval_episodes}")
     utilization_parts.append("direct accelerator utilization sampling not captured")
 
-    ppo_report = stage_reports.get("ppo", {})
+    sf_report = stage_reports.get("sf", {})
+    best_report = stage_reports.get("best", {})
     eval_report = stage_reports.get("eval", {})
     eval_bc_report = stage_reports.get("eval_bc", {})
     bc_report = stage_reports.get("bc", {})
     baseline_compare = _intra_profile_baseline_comparison(stage_reports)
 
     instability_notes: list[str] = []
-    if (ppo_report.get("status") == "present") and (Path(str(ppo_report.get("output_dir", ""))) / "ppo_model.npz").exists():
+    if best_report.get("status") == "present":
         instability_notes.append("PPO completed and wrote a checkpoint without a recorded worker crash.")
     if _metric(eval_report, "manifest", "metrics", "modes", "greedy", "stuck_rate") and _metric(
         eval_report, "manifest", "metrics", "modes", "greedy", "stuck_rate"
@@ -267,12 +268,12 @@ def _build_operational_note(
             "eval_bc_greedy_stuck_rate": _metric(eval_bc_report, "manifest", "metrics", "modes", "greedy", "stuck_rate"),
             "eval_bc_sampled_return": _metric(eval_bc_report, "manifest", "metrics", "modes", "sampled", "mean_episode_return"),
             "eval_bc_sampled_stuck_rate": _metric(eval_bc_report, "manifest", "metrics", "modes", "sampled", "stuck_rate"),
-            "ppo_steps_done": _metric(ppo_report, "summary", "steps_done") or _metric(ppo_report, "manifest", "metrics", "steps_done"),
-            "ppo_death_rate": _metric(ppo_report, "summary", "death_rate") or _metric(ppo_report, "manifest", "metrics", "death_rate"),
-            "ppo_frag_delta_mean": _metric(ppo_report, "summary", "frag_delta_mean")
-            or _metric(ppo_report, "manifest", "metrics", "frag_delta_mean"),
-            "ppo_episodes_completed": _metric(ppo_report, "summary", "episodes_completed")
-            or _metric(ppo_report, "manifest", "metrics", "episodes_completed"),
+            "ppo_steps_done": _metric(sf_report, "summary", "steps_done") or _metric(sf_report, "manifest", "metrics", "steps_done"),
+            "ppo_death_rate": _metric(sf_report, "summary", "death_rate") or _metric(sf_report, "manifest", "metrics", "death_rate"),
+            "ppo_frag_delta_mean": _metric(sf_report, "summary", "frag_delta_mean")
+            or _metric(sf_report, "manifest", "metrics", "frag_delta_mean"),
+            "ppo_episodes_completed": _metric(sf_report, "summary", "episodes_completed")
+            or _metric(sf_report, "manifest", "metrics", "episodes_completed"),
             "eval_greedy_return": _metric(eval_report, "manifest", "metrics", "modes", "greedy", "mean_episode_return"),
             "eval_greedy_stuck_rate": _metric(eval_report, "manifest", "metrics", "modes", "greedy", "stuck_rate"),
             "eval_greedy_death_rate": _metric(eval_report, "manifest", "metrics", "modes", "greedy", "death_rate"),

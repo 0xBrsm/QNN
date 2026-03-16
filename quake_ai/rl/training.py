@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict
 
-from engine.bridge import NativeWorldProcess as NativeEngineProcess
+from engine.bridge import NativeTokenProcess
 from quake_ai.actions import LOOK_NEUTRAL_LABEL
 from quake_ai.rl.evaluation import EvalConfig, run_evaluation
 from quake_ai.rl.planning import (
@@ -19,13 +19,15 @@ from quake_ai.rl.planning import (
     _profile_output_root,
     _resolve_asset_root,
     _resolve_demo_dir,
-    _resolve_ppo_init_checkpoint,
     _validate_native_mod_assets,
     _write_plan,
     build_runtime_plan,
 )
 from quake_ai.rl.collect import CollectConfig, collect_demo_tokens
-from quake_ai.rl.profiles import PROFILES, LiveProfile, load_config_with_runtime
+from quake_ai.rl.profiles import (
+    BC_CHECKPOINT, BC_COLLECT_DIR, BC_OUTPUT_DIR,
+    PROFILES, LiveProfile, build_bc_config, load_config_with_runtime,
+)
 from quake_ai.rl.reporting import REPORT_STAGES, _load_existing_runtime_context, _write_run_report
 from quake_ai.rl.training_bc import BCConfig, run_behavior_cloning
 from quake_ai.utils.io import read_json, trusted_torch_load
@@ -34,7 +36,7 @@ from quake_ai.utils.io import read_json, trusted_torch_load
 def _ensure_worker(worker_binary: Path, rebuild: bool) -> Path:
     if worker_binary.exists() and not rebuild:
         return worker_binary
-    build_script = Path("engine/build/build_quake_worker.sh")
+    build_script = Path("src/engine/build/build_quake_worker.sh")
     subprocess.run(["bash", str(build_script), str(worker_binary)], check=True)
     return worker_binary
 
@@ -42,7 +44,7 @@ def _ensure_worker(worker_binary: Path, rebuild: bool) -> Path:
 def _ensure_demo_worker(demo_worker_binary: Path, rebuild: bool) -> Path:
     if demo_worker_binary.exists() and not rebuild:
         return demo_worker_binary
-    build_script = Path("engine/build/build_quake_demo_worker.sh")
+    build_script = Path("src/engine/build/build_quake_demo_worker.sh")
     subprocess.run(["bash", str(build_script), str(demo_worker_binary)], check=True)
     return demo_worker_binary
 
@@ -57,7 +59,7 @@ def _run_live_check(
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     env = {"QUAKE_BASEDIR": str(asset_root)}
-    with NativeEngineProcess(
+    with NativeTokenProcess(
         executable=worker_binary,
         map_id=map_id,
         fixed_tick_hz=tick_hz,
@@ -65,18 +67,17 @@ def _run_live_check(
         extra_args=native_args,
     ) as proc:
         hello = proc.start()
-        reset = proc.reset(seed=7, options=options)
-        step = proc.step({"move": 1, "strafe": 0, "look_yaw": LOOK_NEUTRAL_LABEL, "look_pitch": LOOK_NEUTRAL_LABEL, "fire": 0, "jump": 0, "weapon": 0})
+        reset_tick = proc.reset(seed=7, options=options)
+        step_tick = proc.step({"move": 1, "strafe": 0, "look_yaw": LOOK_NEUTRAL_LABEL, "look_pitch": LOOK_NEUTRAL_LABEL, "fire": 0, "jump": 0, "weapon": 0})
     result = {
         "worker_binary": str(worker_binary),
         "asset_root": str(asset_root),
         "hello_server": hello["server"],
         "capabilities": list(hello.get("capabilities", [])),
         "native_args": list(native_args or []),
-        "reset_info": dict(reset.get("info", {})),
-        "reset_tick": int(reset["world_tick"]["tick"]),
-        "step_tick": int(step["world_tick"]["tick"]),
-        "step_done": bool(step.get("done", False)),
+        "reset_tick": int(reset_tick.tick),
+        "step_tick": int(step_tick.tick),
+        "step_done": bool(step_tick.done),
     }
     print(json.dumps(result, indent=2, sort_keys=True))
     return result
@@ -93,24 +94,19 @@ def _scenario_config_json(config: Mapping[str, Any]) -> str:
     return json.dumps(scenarios)
 
 
-def _seed_bc_collect_paths(profile: LiveProfile, bc_cfg: dict[str, Any]) -> None:
-    collect_dir = Path(profile.collect_out)
-    if not str(bc_cfg.get("token_ticks_path", "")).strip():
-        token_ticks_path = collect_dir / "token_ticks.bin"
-        if token_ticks_path.exists():
-            bc_cfg["token_ticks_path"] = str(token_ticks_path)
-    if not str(bc_cfg.get("map_state_path", "")).strip():
-        map_state_path = collect_dir / "world_map.json"
-        if map_state_path.exists():
-            bc_cfg["map_state_path"] = str(map_state_path)
-    if not str(bc_cfg.get("map_states_path", "")).strip():
-        map_states_path = collect_dir / "map_states.json"
-        if map_states_path.exists():
-            bc_cfg["map_states_path"] = str(map_states_path)
-    if not str(bc_cfg.get("metadata_path", "")).strip():
-        metadata_path = collect_dir / "demo_metadata.ndjson"
-        if metadata_path.exists():
-            bc_cfg["metadata_path"] = str(metadata_path)
+def _seed_bc_collect_paths(bc_cfg: dict[str, Any]) -> None:
+    """Auto-discover collected token data in the shared BC collect dir."""
+    collect_dir = Path(BC_COLLECT_DIR)
+    for key, filename in [
+        ("token_ticks_path", "token_ticks.bin"),
+        ("map_state_path", "world_map.json"),
+        ("map_states_path", "map_states.json"),
+        ("metadata_path", "demo_metadata.ndjson"),
+    ]:
+        if not str(bc_cfg.get(key, "")).strip():
+            path = collect_dir / filename
+            if path.exists():
+                bc_cfg[key] = str(path)
 
 
 def _detect_obs_dim(ppo_cfg: dict[str, Any]) -> int:
@@ -136,16 +132,16 @@ def _run_sf_ppo(
 ) -> dict[str, Any]:
     """Launch Sample Factory APPO as the PPO stage.
 
-    After training, the best SF checkpoint is converted to MLPGRUPolicy format
+    After training, the best SF checkpoint is converted to QNNPolicy format
     so that evaluation.py can load it without changes.
     """
     from quake_ai.sf.train import register_quake_components, build_sf_cfg, run_sf
-    from quake_ai.sf.checkpoint_converter import sf_to_bc
+    from quake_ai.sf.checkpoint_converter import sf_to_qnn
 
     register_quake_components()
 
-    output_dir = str(Path(ppo_cfg.get("output_dir", "../artifacts/runs/sf_ppo")))
-    scenario = str(ppo_cfg.get("map_id", "dm4"))
+    output_dir = str(Path(ppo_cfg.get("output_dir", "assets/runs/sf_ppo")))
+    scenario = str(ppo_cfg.get("map_id", "procgen"))
     num_workers = int(ppo_cfg.get("num_envs", 8))
     rollout = int(ppo_cfg.get("rollout_steps", 256))
     total_steps = int(ppo_cfg.get("total_steps", 1_000_000))
@@ -161,10 +157,12 @@ def _run_sf_ppo(
     cfg = build_sf_cfg(
         scenario=scenario,
         num_workers=num_workers,
+        num_envs_per_worker=int(ppo_cfg.get("num_envs_per_worker", 1)),
+        worker_num_splits=int(ppo_cfg.get("worker_num_splits", 1)),
         rollout=rollout,
         total_env_steps=total_env_steps,
         output_dir=output_dir,
-        experiment=f"quake_{profile.scenario_id or scenario}",
+        experiment="sf",
         executable=str(worker_path),
         basedir=str(resolved_asset_root),
         native_workdir=str(ppo_cfg.get("native_workdir", "") or ""),
@@ -191,21 +189,42 @@ def _run_sf_ppo(
         gae_lambda=float(ppo_cfg.get("gae_lambda", 0.95)),
         max_grad_norm=float(ppo_cfg.get("max_grad_norm", 0.5)),
         value_coef=float(ppo_cfg.get("value_coef", 0.5)),
+        with_pbt=bool(ppo_cfg.get("with_pbt", False)),
+        num_policies=int(ppo_cfg.get("num_policies", 1)),
+        pbt_period_env_steps=int(ppo_cfg.get("pbt_period_env_steps", 5_000_000)),
+        pbt_start_mutation=int(ppo_cfg.get("pbt_start_mutation", 20_000_000)),
+        pbt_replace_fraction=float(ppo_cfg.get("pbt_replace_fraction", 0.3)),
+        pbt_mutation_rate=float(ppo_cfg.get("pbt_mutation_rate", 0.15)),
+        pbt_optimize_gamma=bool(ppo_cfg.get("pbt_optimize_gamma", False)),
+        record_demos=bool(ppo_cfg.get("record_demos", True)),
     )
 
     sf_result = run_sf(cfg)
 
     import glob as _glob
+    import re as _re
     train_dir = Path(output_dir)
-    exp_name = f"quake_{profile.scenario_id or scenario}"
-    ckpt_pattern = str(train_dir / exp_name / "checkpoint_p0" / "checkpoint_*.pth")
-    ckpt_files = sorted(_glob.glob(ckpt_pattern))
-    sf_ckpt = ckpt_files[-1] if ckpt_files else None
+    exp_dir = train_dir / "sf"
+
+    def _reward_from_name(path: str) -> float:
+        m = _re.search(r"reward_([-\d.]+)\.pth$", path)
+        return float(m.group(1)) if m else float("-inf")
+
+    # Find the best checkpoint across all policies (PBT has checkpoint_p0..pN).
+    best_files = _glob.glob(f"{exp_dir}/checkpoint_p*/best_0*.pth")
+    if best_files:
+        sf_ckpt: str | None = max(best_files, key=_reward_from_name)
+    else:
+        regular_files = sorted(_glob.glob(f"{exp_dir}/checkpoint_p*/checkpoint_*.pth"))
+        sf_ckpt = regular_files[-1] if regular_files else None
 
     if sf_ckpt:
-        bc_ckpt_path = train_dir / exp_name / "best_model.pth"
+        # Write converted model to {profile_root}/best/best_model.pth
+        best_dir = Path(output_dir) / "best"
+        best_dir.mkdir(parents=True, exist_ok=True)
+        bc_ckpt_path = best_dir / "best_model.pth"
         try:
-            bc_policy = sf_to_bc(
+            bc_policy = sf_to_qnn(
                 sf_checkpoint_path=sf_ckpt,
                 obs_dim=ppo_cfg.get("obs_dim", 0) or _detect_obs_dim(ppo_cfg),
                 trunk_hidden=int(ppo_cfg.get("trunk_hidden", 128)),
@@ -235,17 +254,16 @@ def _setup_pipeline(
     asset_root: str | None,
     worker_binary: str,
     rebuild_worker: bool,
-) -> tuple[LiveProfile, dict[str, Any], RuntimePlan, Path, Path, Path, dict, dict, dict, dict]:
+) -> tuple[LiveProfile, dict[str, Any], RuntimePlan, Path, Path, Path, dict, dict, dict]:
     """Common setup for both BC and PPO phases."""
     profile, runtime, plan = build_runtime_plan(profile_name, device)
-    resolved_demo_dir = _resolve_demo_dir(profile, demo_dir)
     resolved_asset_root = _resolve_asset_root(asset_root)
+    resolved_demo_dir = _resolve_demo_dir(profile, demo_dir)
     worker_path = Path(worker_binary)
     needs_live_worker = action in {"check", "ppo", "eval", "eval-bc"} or (action == "bc" and eval_bc)
     if needs_live_worker or rebuild_worker:
         worker_path = _ensure_worker(worker_path, rebuild=rebuild_worker)
-    bc_cfg, ppo_cfg, eval_cfg = load_config_with_runtime(profile, plan, device)
-    _seed_bc_collect_paths(profile, bc_cfg)
+    ppo_cfg, eval_cfg = load_config_with_runtime(profile, plan, device)
     if needs_live_worker:
         _validate_native_mod_assets(resolved_asset_root, ppo_cfg.get("native_args") if isinstance(ppo_cfg.get("native_args"), list) else None)
         _validate_native_mod_assets(resolved_asset_root, eval_cfg.get("native_args") if isinstance(eval_cfg.get("native_args"), list) else None)
@@ -261,7 +279,7 @@ def _setup_pipeline(
         "demo_dir": str(resolved_demo_dir),
     }
 
-    return profile, runtime, plan, resolved_demo_dir, resolved_asset_root, worker_path, bc_cfg, ppo_cfg, eval_cfg, results
+    return profile, runtime, plan, resolved_demo_dir, resolved_asset_root, worker_path, ppo_cfg, eval_cfg, results
 
 
 def run_live_pipeline(
@@ -274,6 +292,8 @@ def run_live_pipeline(
     asset_root: str | None,
     worker_binary: str,
     rebuild_worker: bool,
+    checkpoint_override: str | None = None,
+    record_demos: bool = False,
 ) -> dict[str, Any]:
     profile = PROFILES[profile_name]
 
@@ -296,9 +316,11 @@ def run_live_pipeline(
         print(json.dumps(report, indent=2, sort_keys=True))
         return report
 
-    profile, runtime, plan, resolved_demo_dir, resolved_asset_root, worker_path, bc_cfg, ppo_cfg, eval_cfg, results = _setup_pipeline(
+    profile, runtime, plan, resolved_demo_dir, resolved_asset_root, worker_path, ppo_cfg, eval_cfg, results = _setup_pipeline(
         profile_name, action, eval_bc, device, demo_dir, asset_root, worker_binary, rebuild_worker,
     )
+    if record_demos:
+        eval_cfg["record_demos"] = True
     stage_timings: dict[str, float] = {}
 
     if action == "plan":
@@ -317,9 +339,12 @@ def run_live_pipeline(
         return results
 
     # ------------------------------------------------------------------
-    # BC phase: collect → BC → eval-bc
+    # BC phase: collect → BC → eval-bc (profile-independent)
     # ------------------------------------------------------------------
     if action == "bc":
+        bc_cfg = build_bc_config(profile.runtime_scale, device)
+        _seed_bc_collect_paths(bc_cfg)
+
         # Collect demo tokens if not already available.
         bc_ticks_path = bc_cfg.get("token_ticks_path", "")
         bc_ticks_exist = bool(bc_ticks_path) and Path(str(bc_ticks_path)).exists()
@@ -332,7 +357,7 @@ def run_live_pipeline(
             collect_cfg = CollectConfig(
                 demo_worker_binary=str(demo_worker_path),
                 demo_dir=str(resolved_demo_dir),
-                output_dir=str(Path(profile.collect_out)),
+                output_dir=BC_COLLECT_DIR,
                 map_id=str(bc_cfg.get("map_id", "dm4")),
                 fixed_tick_hz=int(bc_cfg.get("fixed_tick_hz", 0)),
                 asset_root=str(resolved_asset_root),
@@ -364,26 +389,38 @@ def run_live_pipeline(
 
         if eval_bc:
             started = time.monotonic()
-            eval_bc_cfg = dict(eval_cfg)
-            eval_bc_cfg["native_env"] = {"QUAKE_BASEDIR": str(resolved_asset_root)}
-            eval_bc_cfg["native_executable"] = str(worker_path)
-            eval_bc_cfg["checkpoint_path"] = str(Path(bc_cfg["output_dir"]) / "bc_best_model.npz")
-            eval_bc_cfg["output_dir"] = str(_profile_output_root(profile) / "eval_bc")
-            results["eval_bc"] = run_evaluation(EvalConfig(**eval_bc_cfg))
-            stage_timings["eval_bc"] = time.monotonic() - started
-        else:
-            results["eval_bc"] = {"skipped": True, "reason": "--eval-bc not set"}
+            eval_cfg["native_env"] = {"QUAKE_BASEDIR": str(resolved_asset_root)}
+            eval_cfg["native_executable"] = str(worker_path)
+            eval_cfg["checkpoint_path"] = BC_CHECKPOINT
+            eval_cfg["output_dir"] = str(_profile_output_root(profile) / "eval_bc")
+            results["eval"] = run_evaluation(EvalConfig(**eval_cfg))
+            stage_timings["eval"] = time.monotonic() - started
 
     # ------------------------------------------------------------------
     # PPO phase: PPO → eval
     # ------------------------------------------------------------------
     elif action == "ppo":
-        selected_init_ckpt, init_ckpt_note = _resolve_ppo_init_checkpoint(ppo_cfg, bc_cfg)
-        if selected_init_ckpt:
-            ppo_cfg["init_ckpt"] = selected_init_ckpt
-            results["ppo_init_ckpt"] = selected_init_ckpt
-        if init_ckpt_note:
-            results["ppo_init_ckpt_note"] = init_ckpt_note
+        # Prefer latest best SF checkpoint over BC for warm-start.
+        import re as _re
+        profile_root = _profile_output_root(profile)
+        best_dir = profile_root / "best"
+        sf_checkpoints = sorted(best_dir.glob("*.pth")) if best_dir.exists() else []
+        if sf_checkpoints:
+            def _reward_from_name(p: Path) -> float:
+                m = _re.search(r"reward_([-\d.]+)\.pth$", p.name)
+                return float(m.group(1)) if m else float("-inf")
+            # Prefer best_* (have reward in name), fall back to latest checkpoint_*
+            best_files = [f for f in sf_checkpoints if f.name.startswith("best_0")]
+            if best_files:
+                init_ckpt = str(max(best_files, key=_reward_from_name))
+            else:
+                # No best_* files; use the most recent .pth by mtime
+                init_ckpt = str(max(sf_checkpoints, key=lambda p: p.stat().st_mtime))
+        else:
+            init_ckpt = profile.bc_checkpoint
+        if init_ckpt and Path(init_ckpt).exists():
+            ppo_cfg["init_ckpt"] = init_ckpt
+            results["ppo_init_ckpt"] = init_ckpt
 
         started = time.monotonic()
         ppo_cfg["native_env"] = {"QUAKE_BASEDIR": str(resolved_asset_root)}
@@ -398,50 +435,17 @@ def run_live_pipeline(
         stage_timings["eval"] = time.monotonic() - started
 
     # ------------------------------------------------------------------
-    # Individual stage actions (collect, eval-bc, eval) for debugging.
+    # Individual stage actions for debugging.
     # ------------------------------------------------------------------
-    elif action == "collect":
-        started = time.monotonic()
-        demo_worker_path = _ensure_demo_worker(
-            Path(str(worker_path).replace("quake_worker", "quake_demo_worker")),
-            rebuild=rebuild_worker,
-        )
-        collect_cfg = CollectConfig(
-            demo_worker_binary=str(demo_worker_path),
-            demo_dir=str(resolved_demo_dir),
-            output_dir=str(Path(profile.collect_out)),
-            map_id=str(bc_cfg.get("map_id", "dm4")),
-            fixed_tick_hz=int(bc_cfg.get("fixed_tick_hz", 0)),
-            asset_root=str(resolved_asset_root),
-        )
-        collect_result = collect_demo_tokens(collect_cfg)
-        results["collect"] = {
-            "token_ticks_path": collect_result.token_ticks_path,
-            "map_state_path": collect_result.map_state_path,
-            "map_states_path": collect_result.map_states_path,
-            "metadata_path": collect_result.metadata_path,
-            "missing_demos_path": collect_result.missing_demos_path,
-            "source_summary_path": collect_result.source_summary_path,
-            "demos_processed": collect_result.demos_processed,
-            "demos_failed": collect_result.demos_failed,
-            "total_ticks": collect_result.total_ticks,
-        }
-        stage_timings["collect"] = time.monotonic() - started
-
-    elif action == "eval-bc":
-        started = time.monotonic()
-        eval_bc_cfg = dict(eval_cfg)
-        eval_bc_cfg["native_env"] = {"QUAKE_BASEDIR": str(resolved_asset_root)}
-        eval_bc_cfg["native_executable"] = str(worker_path)
-        eval_bc_cfg["checkpoint_path"] = str(Path(bc_cfg["output_dir"]) / "bc_best_model.npz")
-        eval_bc_cfg["output_dir"] = str(_profile_output_root(profile) / "eval_bc")
-        results["eval_bc"] = run_evaluation(EvalConfig(**eval_bc_cfg))
-        stage_timings["eval_bc"] = time.monotonic() - started
-
-    elif action == "eval":
+    elif action in ("eval", "eval-bc"):
         started = time.monotonic()
         eval_cfg["native_env"] = {"QUAKE_BASEDIR": str(resolved_asset_root)}
         eval_cfg["native_executable"] = str(worker_path)
+        if checkpoint_override:
+            eval_cfg["checkpoint_path"] = checkpoint_override
+        elif action == "eval-bc":
+            eval_cfg["checkpoint_path"] = BC_CHECKPOINT
+            eval_cfg["output_dir"] = str(_profile_output_root(profile) / "eval_bc")
         results["eval"] = run_evaluation(EvalConfig(**eval_cfg))
         stage_timings["eval"] = time.monotonic() - started
 
@@ -468,16 +472,18 @@ def main() -> None:
     parser.add_argument("--profile", choices=sorted(PROFILES.keys()), default="combat-bot-multi")
     parser.add_argument(
         "--action",
-        choices=["plan", "report", "check", "collect", "bc", "eval-bc", "ppo", "eval"],
+        choices=["plan", "report", "check", "bc", "eval-bc", "ppo", "eval"],
         default="bc",
-        help="Phase to run: 'bc' (collect+BC; add --eval-bc to run eval-bc), 'ppo' (PPO+eval), or individual stages",
+        help="Phase to run: 'bc' (collect+BC), 'ppo' (PPO+eval), 'eval' (standalone evaluation)",
     )
-    parser.add_argument("--eval-bc", action="store_true", help="When used with --action bc, run eval-bc after behavior cloning")
+    parser.add_argument("--eval-bc", action="store_true", help="When used with --action bc, run eval after behavior cloning")
+    parser.add_argument("--checkpoint", default=None, help="Override checkpoint path for eval")
     parser.add_argument("--device", default="gpu", help="Requested torch device override")
     parser.add_argument("--demo-dir", default=None, help="Override demo directory")
     parser.add_argument("--asset-root", default=None, help="Override Quake asset root")
-    parser.add_argument("--worker-binary", default="../artifacts/bin/quake_worker", help="Path to the live worker binary")
+    parser.add_argument("--worker-binary", default="assets/bin/quake_worker", help="Path to the live worker binary")
     parser.add_argument("--rebuild-worker", action="store_true", help="Force a rebuild of the live worker binary")
+    parser.add_argument("--record-demos", action="store_true", help="Record .dem files during evaluation")
     args = parser.parse_args()
 
     run_live_pipeline(
@@ -489,6 +495,8 @@ def main() -> None:
         asset_root=args.asset_root,
         worker_binary=args.worker_binary,
         rebuild_worker=args.rebuild_worker,
+        checkpoint_override=args.checkpoint,
+        record_demos=args.record_demos,
     )
 
 

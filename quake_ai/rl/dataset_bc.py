@@ -12,7 +12,6 @@ import numpy as np
 from engine.token_protocol import TrustedTokenTick
 from quake_ai.actions import ACTION_HEADS, ActionLabels
 from quake_ai.model.observation import TokenObservationEncoder
-from quake_ai.rl.schemas import MapState
 from quake_ai.utils.io import write_json
 from quake_ai.vocab import MAX_PLAYER_SLOTS
 
@@ -23,7 +22,6 @@ class Sample:
     tick: int
     obs: np.ndarray | Dict[str, np.ndarray]
     action: Dict[str, int]
-    goal_progress: float
     done: bool
     map_id: str = ""
     mode: str = "unknown"
@@ -49,7 +47,7 @@ def randomize_player_slots(
     """
     seen: Dict[int, None] = {}
     for tick in ticks:
-        for obj in tick.object_tokens:
+        for obj in getattr(tick, "object_tokens", ()):
             if obj.player_id > 0 and obj.player_id not in seen:
                 seen[obj.player_id] = None
     if not seen:
@@ -61,14 +59,13 @@ def randomize_player_slots(
         for idx, player_id in enumerate(original_ids)
     }
     for tick in ticks:
-        for obj in tick.object_tokens:
+        for obj in getattr(tick, "object_tokens", ()):
             if obj.player_id > 0:
                 obj.player_id = mapping[obj.player_id]
 
 
 def build_token_samples(
     ticks: Iterable[TrustedTokenTick],
-    map_state: MapState,
     episode_id: str,
     *,
     encoder: TokenObservationEncoder | None = None,
@@ -80,10 +77,6 @@ def build_token_samples(
 ) -> List[Sample]:
     encoder = encoder or TokenObservationEncoder()
     encoder.reset()
-    raw_distances = map_state.metadata.get("distance_to_goal", {})
-    max_distance = float(map_state.metadata.get("max_distance_to_goal", 0.0))
-    if max_distance <= 0.0:
-        max_distance = 1.0
 
     tick_list = list(ticks)
     if shuffle_player_slots:
@@ -96,20 +89,12 @@ def build_token_samples(
             continue
         action = ActionLabels.from_dict(tick.action_label).to_dict()
         obs = encoder.encode(tick)
-        goal_progress = 0.0
-        region_id = tick.current_region_id
-        if region_id < 0:
-            goal_progress = float(tick.done)
-        elif isinstance(raw_distances, dict):
-            distance = float(raw_distances.get(str(region_id), raw_distances.get(region_id, 0.0)))
-            goal_progress = float(max(0.0, min(1.0, 1.0 - (distance / max_distance))))
         samples.append(
             Sample(
                 episode_id=episode_id,
                 tick=tick.tick,
                 obs=obs,
                 action=action,
-                goal_progress=goal_progress,
                 done=tick.done,
                 map_id=map_id,
                 mode=mode,
@@ -174,13 +159,3 @@ def class_weights(
         scaled = np.clip(scaled, float(min_weight), float(max_weight))
         weights[head] = scaled.astype(np.float32)
     return weights
-
-
-def success_proxy(samples: Sequence[Sample]) -> float:
-    if not samples:
-        return 0.0
-    by_episode: Dict[str, float] = {}
-    for sample in samples:
-        by_episode[sample.episode_id] = max(by_episode.get(sample.episode_id, 0.0), sample.goal_progress)
-    values = list(by_episode.values())
-    return float(np.mean(values)) if values else 0.0

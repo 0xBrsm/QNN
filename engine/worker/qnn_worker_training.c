@@ -331,6 +331,14 @@ void PF_qnn_training_note_item(void)
 	VectorCopy(item->v.origin, record->origin);
 }
 
+/* FrikBotNex calls frik_checkextension (#99) at startup.  Return 0 so
+   the bot editor knows no engine extensions are available. */
+
+void PF_qnn_checkextension(void)
+{
+	G_FLOAT(OFS_RETURN) = 0;
+}
+
 void qnn_worker_write_training_extras_binary(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, qboolean reset_flag)
 {
 	float damage_dealt;

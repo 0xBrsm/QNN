@@ -95,17 +95,10 @@ def _pvp_reward_components(
 
 
 def reward_components(
-    previous_distance: float,
-    new_distance: float,
-    item_picked: bool,
-    goal_reached: bool,
-    timed_out: bool,
-    stuck: bool,
     weights: RewardWeights,
     *,
     combat_signals: Mapping[str, float] | None = None,
 ) -> Dict[str, float]:
-    del previous_distance, new_distance, item_picked, goal_reached, timed_out, stuck
     return _pvp_reward_components(
         weights=weights,
         combat_signals=combat_signals or {},
@@ -113,23 +106,11 @@ def reward_components(
 
 
 def shaped_reward(
-    previous_distance: float,
-    new_distance: float,
-    item_picked: bool,
-    goal_reached: bool,
-    timed_out: bool,
-    stuck: bool,
     weights: RewardWeights,
     *,
     combat_signals: Mapping[str, float] | None = None,
 ) -> float:
     return reward_components(
-        previous_distance=previous_distance,
-        new_distance=new_distance,
-        item_picked=item_picked,
-        goal_reached=goal_reached,
-        timed_out=timed_out,
-        stuck=stuck,
         weights=weights,
         combat_signals=combat_signals,
     )["reward_total"]

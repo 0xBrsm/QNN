@@ -9,19 +9,16 @@ services:
       - HOST_WORKSPACE=/workspace
       - PYTHONUNBUFFERED=1
       - QUAKE_AI_DEVICE=${QUAKE_AI_DEVICE:-gpu}
-      - QUAKE_AI_ARTIFACT_ROOT=/artifacts
+      - QUAKE_AI_ARTIFACT_ROOT=/workspace/assets
       - ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-0}
       - HSA_ENABLE_DXG_DETECTION=${HSA_ENABLE_DXG_DETECTION:-1}
       - HIP_VISIBLE_DEVICES
       - ROCR_VISIBLE_DEVICES
     volumes:
       - type: bind
-        source: ${HOST_SRC_ROOT}
+        source: ${HOST_WORKSPACE}
         target: /workspace
         read_only: true
-      - type: bind
-        source: ${HOST_ARTIFACT_ROOT}
-        target: /artifacts
       - type: bind
         source: ${WSL_LIBDXCORE_PATH:-/usr/lib/wsl/lib/libdxcore.so}
         target: /usr/lib/libdxcore.so
@@ -33,6 +30,9 @@ services:
       - type: volume
         source: quake-ai-pip-cache
         target: /home/trainer/.cache/pip
+      - type: volume
+        source: quake-ai-miopen-cache
+        target: /home/trainer/.config/miopen
     devices:
       - /dev/dxg:/dev/dxg
     cap_add:
@@ -51,3 +51,4 @@ services:
 
 volumes:
   quake-ai-pip-cache:
+  quake-ai-miopen-cache:

@@ -169,7 +169,7 @@ def _validate_native_mod_assets(asset_root: Path, native_args: Sequence[str] | N
 def _resolve_demo_dir(profile: LiveProfile, explicit: str | None) -> Path:
     candidates = [Path(explicit)] if explicit else [Path(path) for path in profile.auto_demo_dirs]
     for candidate in candidates:
-        if candidate.is_dir() and any(path.suffix.lower() == ".dem" for path in candidate.iterdir() if path.is_file()):
+        if candidate.is_dir() and any(p.suffix.lower() == ".dem" for p in candidate.iterdir() if p.is_file()):
             return candidate
     if explicit:
         raise RuntimeError(f"Demo directory does not contain .dem files: {explicit}")
@@ -206,9 +206,6 @@ def _references_stage_dir(config: Mapping[str, Any], stage_dir: str | Path) -> b
     return False
 
 
-def _all_action_requires_collect(profile: LiveProfile, *configs: Mapping[str, Any]) -> bool:
-    return any(_references_stage_dir(config, profile.collect_out) for config in configs)
-
 
 def _write_plan(profile: LiveProfile, runtime: Mapping[str, Any], plan: RuntimePlan, demo_dir: Path, asset_root: Path) -> Path:
     target = Path(profile.plan_path)
@@ -235,8 +232,6 @@ def _profile_output_root(profile: LiveProfile) -> Path:
 
 
 def _stage_output_dir(profile: LiveProfile, stage: str) -> Path:
-    if stage == "collect":
-        return Path(profile.collect_out)
     return _profile_output_root(profile) / stage
 
 
@@ -268,29 +263,3 @@ def _checkpoint_obs_dim(checkpoint_path: str | Path | None) -> int | None:
         return None
 
 
-def _resolve_ppo_init_checkpoint(ppo_cfg: Mapping[str, Any], bc_cfg: Mapping[str, Any]) -> tuple[str | None, str | None]:
-    configured = str(ppo_cfg.get("init_ckpt", "")).strip() or None
-    output_dir = str(bc_cfg.get("output_dir", "")).strip()
-    if not output_dir:
-        return configured, None
-
-    local_bc_ckpt = Path(output_dir) / "bc_best_model.npz"
-    if not local_bc_ckpt.exists():
-        return configured, None
-
-    local_bc_value = str(local_bc_ckpt)
-    if configured == local_bc_value:
-        return configured, None
-
-    configured_obs_dim = _checkpoint_obs_dim(configured)
-    local_bc_obs_dim = _checkpoint_obs_dim(local_bc_ckpt)
-    if configured and configured_obs_dim is not None and local_bc_obs_dim is not None and configured_obs_dim != local_bc_obs_dim:
-        return (
-            local_bc_value,
-            f"Switched PPO init_ckpt from {configured} (obs_dim={configured_obs_dim}) to {local_bc_value} (obs_dim={local_bc_obs_dim}).",
-        )
-    if configured and not Path(configured).exists():
-        return local_bc_value, f"Configured PPO init_ckpt {configured} is missing; using {local_bc_value}."
-    if not configured:
-        return local_bc_value, f"No PPO init_ckpt configured; using {local_bc_value}."
-    return configured, None

@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+import numpy as np
+import torch.serialization
+
+# SF checkpoints contain numpy scalars.  PyTorch 2.6+ defaults
+# weights_only=True which rejects them.  Allowlist here because SF
+# spawns the learner as a separate process and this module is imported
+# by the learner subprocess when it builds the model (before loading
+# checkpoints).
+torch.serialization.add_safe_globals([np.core.multiarray.scalar, np.dtype, np.dtypes.Float64DType])
+
 try:
     from sample_factory.model.encoder import Encoder
 except ImportError as exc:

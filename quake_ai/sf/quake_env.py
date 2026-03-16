@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+
+from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
@@ -15,10 +17,16 @@ except ImportError as exc:
 from quake_ai.actions import ACTION_HEADS
 from quake_ai.rl.environment import NativeWorldEnv
 from quake_ai.model.observation import ACTION_HISTORY_DIM, ACTION_HISTORY_LEN, SELF_SCALAR_DIM
+from mapgen.pool import PROCGEN_SENTINEL, MapPool
+
+# Shared map pools keyed by (maps_dir, arena_size, rooms) so envs on the
+# same procgen scenario share a single compile pipeline instead of each
+# running their own.
+_shared_map_pools: dict[tuple, MapPool] = {}
 
 # Deterministic head ordering (Python 3.7+ dict preserves insertion order)
 _HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
-_HEAD_SIZES: list[int] = list(ACTION_HEADS.values())  # [3, 3, 25, 25, 2, 2, 9]
+_HEAD_SIZES: list[int] = list(ACTION_HEADS.values())
 
 
 def multi_discrete_to_heads(action: np.ndarray) -> Dict[str, int]:
@@ -35,8 +43,8 @@ class QuakeEnv(gymnasium.Env):
     """Gymnasium env wrapping NativeWorldEnv for Sample Factory APPO.
 
     Observation space: Dict of self/object/event/spatial token tensors from the inner encoder.
-    Action space: Tuple(Discrete(3), Discrete(3), Discrete(25), Discrete(25), Discrete(2), Discrete(2), Discrete(9))
-                  matching ACTION_HEADS.  SF 2.1.x requires Tuple[Discrete] rather than MultiDiscrete.
+    Action space: Tuple[Discrete] matching ACTION_HEADS. SF 2.1.x requires
+    Tuple[Discrete] rather than MultiDiscrete.
 
     SF passes env_config with at least "worker_index" and "env_id" keys.
     Per-worker scenario assignment uses env_id % len(scenarios) if a scenario
@@ -60,8 +68,9 @@ class QuakeEnv(gymnasium.Env):
         options: Dict[str, object] | None = _parse_json_arg(cfg, "quake_options_json", dict) or None
 
         # Scenario rotation: if quake_scenario_config_json is provided it overrides map_id
-        map_id = str(getattr(cfg, "quake_map_id", "dm6"))
+        map_id = str(getattr(cfg, "quake_map_id", PROCGEN_SENTINEL))
         scenario_cfg_json = getattr(cfg, "quake_scenario_config_json", "") or ""
+        scenario: Dict[str, Any] = {}
         if scenario_cfg_json:
             scenarios: list[Dict[str, Any]] = json.loads(scenario_cfg_json)
             scenario = scenarios[env_id % len(scenarios)]
@@ -70,12 +79,35 @@ class QuakeEnv(gymnasium.Env):
             if "native_args" in scenario:
                 native_args = list(scenario["native_args"])
             if "options" in scenario:
-                options = dict(scenario["options"])
+                # Merge scenario options over base options (preserves deathmatch, etc.)
+                base = dict(options) if options else {}
+                base.update(scenario["options"])
+                options = base
         else:
             self.scenario_id = map_id
 
         basedir = getattr(cfg, "quake_basedir", "") or ""
         workdir = getattr(cfg, "quake_native_workdir", "") or ""
+
+        # Procgen: share one MapPool per scenario config (keyed by
+        # arena_size + rooms).  Avoids N parallel compile pipelines
+        # when N envs use the same procgen settings.
+        map_pool: MapPool | None = None
+        if map_id == PROCGEN_SENTINEL:
+            maps_dir = Path(basedir) / "id1" / "maps" if basedir else Path("assets") / "id1" / "maps"
+            procgen_opts = scenario.get("procgen", {})
+            arena_size = int(procgen_opts.get("arena_size", 3072))
+            rooms = int(procgen_opts.get("rooms", 3))
+            pool_key = (str(maps_dir), arena_size, rooms)
+            if pool_key not in _shared_map_pools:
+                _shared_map_pools[pool_key] = MapPool(
+                    maps_dir,
+                    pool_size=4,
+                    workers=1,
+                    arena_size=arena_size,
+                    rooms=rooms,
+                )
+            map_pool = _shared_map_pools[pool_key]
 
         self.inner_env = NativeWorldEnv(
             executable=str(cfg.quake_executable),
@@ -88,14 +120,53 @@ class QuakeEnv(gymnasium.Env):
             native_args=native_args,
             options=options,
             workdir=workdir or None,
+            map_pool=map_pool,
         )
+
+        # Episode-level accumulators for SF custom metrics
+        self._ep_frags = 0
+        self._ep_deaths = 0
+        self._ep_damage_dealt = 0.0
+        self._ep_damage_taken = 0.0
+        self._ep_steps = 0
+        self._ep_reward = 0.0
+
+        # Demo recording: always record to the same file per env,
+        # overwriting each episode.  Best demo archiving is handled by
+        # the BestCheckpointArchiver observer (observer.py), not here.
+        # Demos go in ``<com_gamedir>/demos/``.  When ``-game X`` is passed,
+        # Quake sets com_gamedir to X (e.g. frikbotnex_train), otherwise id1.
+        self._record_demos = bool(getattr(cfg, "quake_record_demos", False))
+        num_policies = int(getattr(cfg, "num_policies", 1))
+        self._policy_id = env_id % num_policies
+        self._demo_name = f"train_p{self._policy_id}_w{env_id:03d}"
+        game_subdir = "id1"
+        if native_args:
+            for i, arg in enumerate(native_args):
+                if arg == "-game" and i + 1 < len(native_args):
+                    game_subdir = native_args[i + 1]
+                    break
+        gamedir = Path(basedir or "assets") / game_subdir
+        if workdir:
+            gamedir = Path(workdir) / gamedir
+        demos_dir = gamedir / "demos"
+        self._demo_path = demos_dir / f"{self._demo_name}.dem"
+        if self._record_demos:
+            demos_dir.mkdir(parents=True, exist_ok=True)
+            self._inject_record_cmd()
 
         self.observation_space = gymnasium.spaces.Dict({
             "self_scalars": gymnasium.spaces.Box(
                 low=-np.inf, high=np.inf, shape=(SELF_SCALAR_DIM,), dtype=np.float32,
             ),
             "self_weapon_id": gymnasium.spaces.Box(
-                low=0, high=8, shape=(), dtype=np.int32,
+                low=0, high=4, shape=(1,), dtype=np.int32,
+            ),
+            "self_movement_id": gymnasium.spaces.Box(
+                low=0, high=4, shape=(1,), dtype=np.int32,
+            ),
+            "self_cluster_id": gymnasium.spaces.Box(
+                low=0, high=255, shape=(1,), dtype=np.int32,
             ),
             "object_ids": gymnasium.spaces.Box(
                 low=0,
@@ -159,9 +230,18 @@ class QuakeEnv(gymnasium.Env):
             ),
         })
         # SF 2.1.x does not support MultiDiscrete; use Tuple of Discrete instead.
-        # Both produce a flat array of 7 integers — the step() mapping is identical.
+        # Both produce a flat array matching ACTION_HEADS — the step() mapping is identical.
         self.action_space = gymnasium.spaces.Tuple(
             tuple(gymnasium.spaces.Discrete(n) for n in _HEAD_SIZES)
+        )
+
+    def _inject_record_cmd(self) -> None:
+        """Add ``record <demo_name>`` to pre_map_commands so every episode is recorded."""
+        opts = self.inner_env.adapter.reset_options
+        base = str(opts.get("pre_map_commands", ""))
+        record_name = f"demos/{self._demo_name}"
+        opts["pre_map_commands"] = (
+            f"{base}\nrecord {record_name}" if base else f"record {record_name}"
         )
 
     # ------------------------------------------------------------------
@@ -173,6 +253,12 @@ class QuakeEnv(gymnasium.Env):
         seed: int | None = None,
         options: Dict[str, Any] | None = None,
     ):
+        self._ep_frags = 0
+        self._ep_deaths = 0
+        self._ep_damage_dealt = 0.0
+        self._ep_damage_taken = 0.0
+        self._ep_steps = 0
+        self._ep_reward = 0.0
         obs = self.inner_env.reset(seed=seed)
         return obs, {"scenario_id": self.scenario_id}
 
@@ -184,10 +270,33 @@ class QuakeEnv(gymnasium.Env):
         done_reason: str = str(info.get("done_reason", ""))
         truncated = bool(done_reason == "timeout" or info.get("timed_out", False))
         terminated = bool(done) and not truncated
+
+        # Accumulate per-episode combat stats
+        self._ep_frags += int(info.get("frag_delta", 0))
+        self._ep_deaths += 1 if done_reason == "player_died" or info.get("frag_loss", 0) > 0 else 0
+        self._ep_damage_dealt += float(info.get("damage_dealt", 0))
+        self._ep_damage_taken += float(info.get("damage_taken", 0))
+        self._ep_steps += 1
+
+        self._ep_reward += float(reward)
+
+        # SF picks up episode_extra_stats_* from info on terminal/truncated steps
+        if terminated or truncated:
+            info["episode_extra_stats_frags"] = self._ep_frags
+            info["episode_extra_stats_deaths"] = self._ep_deaths
+            info["episode_extra_stats_kd_ratio"] = (
+                self._ep_frags / max(self._ep_deaths, 1)
+            )
+            info["episode_extra_stats_damage_dealt"] = self._ep_damage_dealt
+            info["episode_extra_stats_damage_taken"] = self._ep_damage_taken
+            info["episode_extra_stats_steps"] = self._ep_steps
+
         return obs, float(reward), terminated, truncated, info
 
     def close(self) -> None:
         self.inner_env.close()
+        # Don't close the shared map pool here — other envs may still use it.
+        # Pools are cleaned up at process exit via __del__.
 
     def render(self) -> None:
         pass

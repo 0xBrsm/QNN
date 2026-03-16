@@ -118,11 +118,7 @@ def _corpus_map_state(corpus_map_id: str, map_states: Dict[str, Dict[str, Any]])
         "map_id": corpus_map_id,
         "regions": [],
         "static_objects": [],
-        "spawn_region_ids": [],
-        "goal_region_ids": [],
         "metadata": {
-            "distance_to_goal": {},
-            "max_distance_to_goal": 0.0,
             "map_ids": sorted(map_states.keys()),
             "map_state_count": len(map_states),
             "source": "multi_map_demo_corpus",

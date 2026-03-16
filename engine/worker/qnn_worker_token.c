@@ -1,4 +1,5 @@
 #include "qnn_worker.h"
+#include "qnn_nav_oracle.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -8,7 +9,7 @@
 #include <strings.h>
 
 #define QNN_TOKEN_MAGIC "QTOK"
-#define QNN_TOKEN_VERSION 3
+#define QNN_TOKEN_VERSION 5
 
 #define QNN_TOKEN_FLAG_RESET      0x0001
 #define QNN_TOKEN_FLAG_DONE       0x0002
@@ -96,12 +97,7 @@
 #define QNN_SPATIAL_CEILING 8
 
 #define QNN_FOV_HALF_DEG 60.0f
-#define QNN_OBJECT_RECENCY_S 4.0f
-#define QNN_EVENT_RECENCY_S 0.5f
-#define QNN_DYNAMIC_CONFIDENCE_S 6.0f
-#define QNN_PLAYER_DECAY_S 4.0f
-#define QNN_PROJECTILE_DECAY_S 1.0f
-#define QNN_GENERIC_DYNAMIC_DECAY_S 2.0f
+#define QNN_RECENCY_DECAY_S 4.0f
 
 #define QNN_ITEM_PVS_MATCH_SQ (16.0f * 16.0f)
 #define QNN_ITEM_PICKUP_MATCH_SQ (64.0f * 64.0f)
@@ -111,9 +107,25 @@
 #define QNN_MAX_MATCH_CANDIDATES 4096
 
 #define QNN_NAIL_STREAM_DOT_THRESHOLD 0.97f
-#define QNN_NAIL_STREAM_DENSITY_DIVISOR 8.0f
-#define QNN_NAIL_STREAM_SUPER_WEIGHT 2.0f
 #define QNN_MAX_NAIL_STREAMS 16
+
+#define QNN_SELF_SCALAR_COUNT 23
+#define QNN_SELF_ID_COUNT 3
+#define QNN_OBJECT_SCALAR_COUNT 8
+#define QNN_OBJECT_ID_COUNT 5
+#define QNN_MAX_ROUTE_CLUSTERS 8
+
+#define QNN_SELF_HEALTH_CAP 250.0f
+#define QNN_SELF_ARMOR_CAP 200.0f
+#define QNN_SELF_ARMOR_TYPE_CAP 0.8f
+#define QNN_SELF_SHELLS_CAP 100.0f
+#define QNN_SELF_NAILS_CAP 200.0f
+#define QNN_SELF_ROCKETS_CAP 100.0f
+#define QNN_SELF_CELLS_CAP 100.0f
+#define QNN_SELF_VELOCITY_CAP 2000.0f
+#define QNN_OBJECT_REL_SCALE 1024.0f
+#define QNN_OBJECT_ROUTE_COST_SCALE 30.0f
+#define QNN_SPATIAL_DIST_SCALE 1024.0f
 
 #define QNN_VISUAL_FIRE_SHOT_FIRST 113
 #define QNN_VISUAL_FIRE_SHOT_LAST 118
@@ -146,7 +158,6 @@ typedef struct
 	qboolean is_item;
 	int static_index;
 	int entity_num;
-	uint32_t handle;
 	int subject_id;
 	int qualifier_id;
 	int modality_id;
@@ -159,9 +170,12 @@ typedef struct
 	float confidence;
 	float magnitude;
 	float state;
-	float decay_s;
 	float respawn_s;
 	float pickup_elapsed;
+	int cluster_id;
+	float route_cost;
+	int route_cluster_ids[QNN_MAX_ROUTE_CLUSTERS];
+	int route_cluster_count;
 	qboolean pvs_seen;
 	qboolean surfaced_this_tick;
 } qnn_semantic_object_t;
@@ -169,7 +183,7 @@ typedef struct
 typedef struct
 {
 	qboolean active;
-	uint32_t object_handle;
+	int owner_index;   /* index into qnn_semantic_objects[] */
 	int subject_id;
 	int action_id;
 	int qualifier_id;
@@ -197,8 +211,32 @@ typedef struct
 static qnn_semantic_object_t *qnn_semantic_objects;
 static int qnn_semantic_object_capacity;
 static int qnn_semantic_static_count;
-static uint32_t qnn_semantic_next_handle = 0x90000000u;
 static qnn_semantic_event_atom_t qnn_semantic_events[QNN_WORKER_MAX_EVENT_ATOMS];
+
+/* Maps emitted token slot (0-based) to semantic object array index.
+ * Used by recall to resolve which object the model wants to attend to. */
+static int qnn_prev_object_indices[QNN_WORKER_MAX_TOKEN_OBJECTS];
+static int qnn_prev_object_count = 0;
+
+/* Emission priority: dynamic objects first, then static. Recency tiebreak. */
+static int qnn_object_row_compare(const void *a, const void *b)
+{
+	const qnn_semantic_object_t *oa = *(const qnn_semantic_object_t *const *)a;
+	const qnn_semantic_object_t *ob = *(const qnn_semantic_object_t *const *)b;
+
+	if (oa->is_static != ob->is_static)
+		return oa->is_static ? 1 : -1;
+	if (oa->recency > ob->recency)
+		return -1;
+	if (oa->recency < ob->recency)
+		return 1;
+	return 0;
+}
+
+static int qnn_object_index(const qnn_semantic_object_t *obj)
+{
+	return (int)(obj - qnn_semantic_objects);
+}
 
 extern qboolean SV_RecursiveHullCheck(hull_t *hull, int num, float p1f, float p2f, vec3_t p1, vec3_t p2, trace_t *trace);
 
@@ -342,6 +380,167 @@ static float qnn_clampf(float value, float low, float high)
 	return value;
 }
 
+static float qnn_normalize(float value, float scale)
+{
+	if (scale <= 0.0f)
+		return 0.0f;
+	return value / scale;
+}
+
+static float qnn_angle_sin_deg(float degrees)
+{
+	return (float)sin((double)(degrees * (float)M_PI / 180.0f));
+}
+
+static float qnn_angle_cos_deg(float degrees)
+{
+	return (float)cos((double)(degrees * (float)M_PI / 180.0f));
+}
+
+static float qnn_health_magnitude(float amount)
+{
+	return qnn_normalize(amount, QNN_SELF_HEALTH_CAP);
+}
+
+static float qnn_armor_magnitude(float amount)
+{
+	return qnn_normalize(amount, QNN_SELF_ARMOR_CAP);
+}
+
+static float qnn_shells_magnitude(float amount)
+{
+	return qnn_normalize(amount, QNN_SELF_SHELLS_CAP);
+}
+
+static float qnn_nails_magnitude(float amount)
+{
+	return qnn_normalize(amount, QNN_SELF_NAILS_CAP);
+}
+
+static float qnn_rockets_magnitude(float amount)
+{
+	return qnn_normalize(amount, QNN_SELF_ROCKETS_CAP);
+}
+
+static float qnn_cells_magnitude(float amount)
+{
+	return qnn_normalize(amount, QNN_SELF_CELLS_CAP);
+}
+
+static int qnn_self_weapon_embed_id(int weapon_id)
+{
+	return qnn_weapon_class_from_id(weapon_id);
+}
+
+static int qnn_self_weapon_super(int weapon_id)
+{
+	return (weapon_id == 3 || weapon_id == 5) ? 1 : 0;
+}
+
+static int qnn_self_movement_id(qboolean grounded, int waterlevel)
+{
+	switch (waterlevel)
+	{
+	case 1:
+		return 2;
+	case 2:
+		return 3;
+	case 3:
+		return 4;
+	default:
+		return grounded ? 0 : 1;
+	}
+}
+
+static void qnn_write_self_token_v5(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick_hz, int player_cluster_id)
+{
+	float scalars[QNN_SELF_SCALAR_COUNT];
+	int ids[QNN_SELF_ID_COUNT];
+	int i;
+
+	scalars[0] = qnn_normalize((float)snapshot->health, QNN_SELF_HEALTH_CAP);
+	scalars[1] = qnn_normalize((float)snapshot->armor, QNN_SELF_ARMOR_CAP);
+	scalars[2] = qnn_normalize(snapshot->armor_type, QNN_SELF_ARMOR_TYPE_CAP);
+	scalars[3] = (snapshot->weapons_owned & IT_SHOTGUN) ? 1.0f : 0.0f;
+	scalars[4] = (snapshot->weapons_owned & IT_SUPER_SHOTGUN) ? 1.0f : 0.0f;
+	scalars[5] = (snapshot->weapons_owned & IT_NAILGUN) ? 1.0f : 0.0f;
+	scalars[6] = (snapshot->weapons_owned & IT_SUPER_NAILGUN) ? 1.0f : 0.0f;
+	scalars[7] = (snapshot->weapons_owned & IT_GRENADE_LAUNCHER) ? 1.0f : 0.0f;
+	scalars[8] = (snapshot->weapons_owned & IT_ROCKET_LAUNCHER) ? 1.0f : 0.0f;
+	scalars[9] = (snapshot->weapons_owned & IT_LIGHTNING) ? 1.0f : 0.0f;
+	scalars[10] = (float)qnn_self_weapon_super(snapshot->weapon_id);
+	scalars[11] = qnn_shells_magnitude((float)snapshot->ammo_shells);
+	scalars[12] = qnn_nails_magnitude((float)snapshot->ammo_nails);
+	scalars[13] = qnn_rockets_magnitude((float)snapshot->ammo_rockets);
+	scalars[14] = qnn_cells_magnitude((float)snapshot->ammo_cells);
+	scalars[15] = qnn_normalize(snapshot->player_velocity[0], QNN_SELF_VELOCITY_CAP);
+	scalars[16] = qnn_normalize(snapshot->player_velocity[1], QNN_SELF_VELOCITY_CAP);
+	scalars[17] = qnn_normalize(snapshot->player_velocity[2], QNN_SELF_VELOCITY_CAP);
+	scalars[18] = qnn_angle_sin_deg(snapshot->player_view_angles[1]);
+	scalars[19] = qnn_angle_cos_deg(snapshot->player_view_angles[1]);
+	scalars[20] = qnn_angle_sin_deg(snapshot->player_view_angles[0]);
+	scalars[21] = qnn_angle_cos_deg(snapshot->player_view_angles[0]);
+	scalars[22] = tick_hz > 0 ? (1.0f / (float)tick_hz) : 0.0f;
+
+	ids[0] = qnn_self_weapon_embed_id(snapshot->weapon_id);
+	ids[1] = qnn_self_movement_id(snapshot->grounded, snapshot->waterlevel);
+	ids[2] = player_cluster_id;
+
+	for (i = 0; i < QNN_SELF_SCALAR_COUNT; ++i)
+		qnn_token_write_f32_le(out, scalars[i]);
+	for (i = 0; i < QNN_SELF_ID_COUNT; ++i)
+		qnn_token_write_i32_le(out, ids[i]);
+}
+
+static void qnn_write_object_token_v5(FILE *out, const qnn_semantic_object_t *obj, const vec3_t rel, uint16_t local_event_count, uint16_t local_event_base, uint32_t wire_handle)
+{
+	float scalars[QNN_OBJECT_SCALAR_COUNT];
+	uint16_t ids[QNN_OBJECT_ID_COUNT];
+	int i;
+
+	ids[0] = (uint16_t)obj->subject_id;
+	ids[1] = (uint16_t)obj->qualifier_id;
+	ids[2] = (uint16_t)obj->modality_id;
+	ids[3] = (uint16_t)obj->player_id;
+	ids[4] = (uint16_t)obj->cluster_id;
+
+	scalars[0] = qnn_normalize(rel[0], QNN_OBJECT_REL_SCALE);
+	scalars[1] = qnn_normalize(rel[1], QNN_OBJECT_REL_SCALE);
+	scalars[2] = qnn_normalize(rel[2], QNN_OBJECT_REL_SCALE);
+	scalars[3] = qnn_normalize(obj->route_cost, QNN_OBJECT_ROUTE_COST_SCALE);
+	scalars[4] = obj->recency;
+	scalars[5] = obj->confidence;
+	scalars[6] = obj->magnitude;
+	scalars[7] = obj->state;
+
+	qnn_token_write_u32_le(out, wire_handle);
+	for (i = 0; i < QNN_OBJECT_ID_COUNT; ++i)
+		qnn_token_write_u16_le(out, ids[i]);
+	for (i = 0; i < QNN_OBJECT_SCALAR_COUNT; ++i)
+		qnn_token_write_f32_le(out, scalars[i]);
+	qnn_token_write_u16_le(out, local_event_count);
+	qnn_token_write_u16_le(out, local_event_base);
+	qnn_token_write_u16_le(out, (uint16_t)obj->route_cluster_count);
+	for (i = 0; i < QNN_MAX_ROUTE_CLUSTERS; ++i)
+		qnn_token_write_u16_le(out, (uint16_t)(i < obj->route_cluster_count ? obj->route_cluster_ids[i] : 0));
+}
+
+static void qnn_write_spatial_token_v5(FILE *out, const qnn_spatial_token_t *token)
+{
+	qnn_token_write_u16_le(out, (uint16_t)token->sector_id);
+	qnn_token_write_u16_le(out, 0);
+	qnn_token_write_f32_le(out, qnn_normalize(token->nearest_dist, QNN_SPATIAL_DIST_SCALE));
+	qnn_token_write_f32_le(out, qnn_normalize(token->mean_dist, QNN_SPATIAL_DIST_SCALE));
+	qnn_token_write_f32_le(out, token->openness);
+	qnn_token_write_f32_le(out, token->clearance);
+	qnn_token_write_f32_le(out, token->traversable);
+	qnn_token_write_f32_le(out, token->dropoff);
+	qnn_token_write_f32_le(out, token->solid_frac);
+	qnn_token_write_f32_le(out, token->water_frac);
+	qnn_token_write_f32_le(out, token->slime_frac);
+	qnn_token_write_f32_le(out, token->lava_frac);
+}
+
 static float qnn_dist_sq(const vec3_t a, const vec3_t b)
 {
 	float dx;
@@ -413,71 +612,71 @@ static qboolean qnn_classify_item_subject(const char *classname, int spawnflags,
 		if (spawnflags & 2)
 		{
 			*subject_id = QNN_SUBJECT_MEGAHEALTH;
-			*magnitude = 1.0f;
+			*magnitude = qnn_health_magnitude(100.0f);
 			return true;
 		}
 		*subject_id = QNN_SUBJECT_HEALTH;
-		*magnitude = (spawnflags & 1) ? 0.0f : 1.0f;
+		*magnitude = (spawnflags & 1) ? qnn_health_magnitude(15.0f) : qnn_health_magnitude(25.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_health_rotten"))
 	{
 		*subject_id = QNN_SUBJECT_HEALTH;
-		*magnitude = 0.0f;
+		*magnitude = qnn_health_magnitude(15.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_health_mega"))
 	{
 		*subject_id = QNN_SUBJECT_MEGAHEALTH;
-		*magnitude = 1.0f;
+		*magnitude = qnn_health_magnitude(100.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_armor1"))
 	{
 		*subject_id = QNN_SUBJECT_ARMOR_GREEN;
-		*magnitude = 0.0f;
+		*magnitude = qnn_armor_magnitude(100.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_armor2"))
 	{
 		*subject_id = QNN_SUBJECT_ARMOR_YELLOW;
-		*magnitude = 0.0f;
+		*magnitude = qnn_armor_magnitude(150.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_armorInv"))
 	{
 		*subject_id = QNN_SUBJECT_ARMOR_RED;
-		*magnitude = 0.0f;
+		*magnitude = qnn_armor_magnitude(200.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_shells"))
 	{
 		*subject_id = QNN_SUBJECT_SHELLS;
-		*magnitude = (spawnflags & 1) ? 1.0f : 0.0f;
+		*magnitude = (spawnflags & 1) ? qnn_shells_magnitude(40.0f) : qnn_shells_magnitude(20.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_spikes"))
 	{
 		*subject_id = QNN_SUBJECT_NAILS;
-		*magnitude = (spawnflags & 1) ? 1.0f : 0.0f;
+		*magnitude = (spawnflags & 1) ? qnn_nails_magnitude(50.0f) : qnn_nails_magnitude(25.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_rockets"))
 	{
 		*subject_id = QNN_SUBJECT_ROCKETS;
-		*magnitude = (spawnflags & 1) ? 1.0f : 0.0f;
+		*magnitude = (spawnflags & 1) ? qnn_rockets_magnitude(10.0f) : qnn_rockets_magnitude(5.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_cells"))
 	{
 		*subject_id = QNN_SUBJECT_CELLS;
-		*magnitude = (spawnflags & 1) ? 1.0f : 0.0f;
+		*magnitude = (spawnflags & 1) ? qnn_cells_magnitude(12.0f) : qnn_cells_magnitude(6.0f);
 		return true;
 	}
 	if (!strcasecmp(classname, "weapon_supershotgun"))
 	{
 		*subject_id = QNN_SUBJECT_SHOTGUN;
-		*magnitude = 1.0f;
+		*magnitude = 0.0f;
 		return true;
 	}
 	if (!strcasecmp(classname, "weapon_nailgun"))
@@ -489,7 +688,7 @@ static qboolean qnn_classify_item_subject(const char *classname, int spawnflags,
 	if (!strcasecmp(classname, "weapon_supernailgun"))
 	{
 		*subject_id = QNN_SUBJECT_NAILGUN;
-		*magnitude = 1.0f;
+		*magnitude = 0.0f;
 		return true;
 	}
 	if (!strcasecmp(classname, "weapon_grenadelauncher"))
@@ -513,25 +712,25 @@ static qboolean qnn_classify_item_subject(const char *classname, int spawnflags,
 	if (!strcasecmp(classname, "item_artifact_super_damage"))
 	{
 		*subject_id = QNN_SUBJECT_QUAD;
-		*magnitude = 0.0f;
+		*magnitude = 1.0f;
 		return true;
 	}
 	if (!strcasecmp(classname, "item_artifact_invulnerability"))
 	{
 		*subject_id = QNN_SUBJECT_PENT;
-		*magnitude = 0.0f;
+		*magnitude = 1.0f;
 		return true;
 	}
 	if (!strcasecmp(classname, "item_artifact_invisibility"))
 	{
 		*subject_id = QNN_SUBJECT_RING;
-		*magnitude = 0.0f;
+		*magnitude = 1.0f;
 		return true;
 	}
 	if (!strcasecmp(classname, "item_artifact_envirosuit"))
 	{
 		*subject_id = QNN_SUBJECT_SUIT;
-		*magnitude = 0.0f;
+		*magnitude = 1.0f;
 		return true;
 	}
 	return false;
@@ -615,7 +814,7 @@ static qboolean qnn_classify_visible_subject(const qnn_worker_visible_entity_t *
 	if (!strcmp(ent->model_name, "progs/s_spike.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_PROJECTILE_NAIL;
-		*magnitude = 1.0f;
+		*magnitude = 0.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/grenade.mdl"))
@@ -641,83 +840,92 @@ static qboolean qnn_classify_visible_subject(const qnn_worker_visible_entity_t *
 	if (!strcmp(ent->model_name, "maps/b_bh10.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_HEALTH;
-		*magnitude = 0.0f;
+		*magnitude = qnn_health_magnitude(15.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_bh25.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_HEALTH;
-		*magnitude = 1.0f;
+		*magnitude = qnn_health_magnitude(25.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_bh100.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_MEGAHEALTH;
-		*magnitude = 1.0f;
+		*magnitude = qnn_health_magnitude(100.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/armor.mdl"))
 	{
 		if (ent->skin <= 0)
+		{
 			*subject_id = QNN_SUBJECT_ARMOR_GREEN;
+			*magnitude = qnn_armor_magnitude(100.0f);
+		}
 		else if (ent->skin == 1)
+		{
 			*subject_id = QNN_SUBJECT_ARMOR_YELLOW;
+			*magnitude = qnn_armor_magnitude(150.0f);
+		}
 		else
+		{
 			*subject_id = QNN_SUBJECT_ARMOR_RED;
+			*magnitude = qnn_armor_magnitude(200.0f);
+		}
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_shell0.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_SHELLS;
-		*magnitude = 0.0f;
+		*magnitude = qnn_shells_magnitude(20.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_shell1.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_SHELLS;
-		*magnitude = 1.0f;
+		*magnitude = qnn_shells_magnitude(40.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_nail0.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_NAILS;
-		*magnitude = 0.0f;
+		*magnitude = qnn_nails_magnitude(25.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_nail1.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_NAILS;
-		*magnitude = 1.0f;
+		*magnitude = qnn_nails_magnitude(50.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_rock0.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_ROCKETS;
-		*magnitude = 0.0f;
+		*magnitude = qnn_rockets_magnitude(5.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_rock1.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_ROCKETS;
-		*magnitude = 1.0f;
+		*magnitude = qnn_rockets_magnitude(10.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_batt0.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_CELLS;
-		*magnitude = 0.0f;
+		*magnitude = qnn_cells_magnitude(6.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "maps/b_batt1.bsp"))
 	{
 		*subject_id = QNN_SUBJECT_CELLS;
-		*magnitude = 1.0f;
+		*magnitude = qnn_cells_magnitude(12.0f);
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/g_shot.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_SHOTGUN;
-		*magnitude = 1.0f;
+		*magnitude = 0.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/g_nail.mdl"))
@@ -729,59 +937,54 @@ static qboolean qnn_classify_visible_subject(const qnn_worker_visible_entity_t *
 	if (!strcmp(ent->model_name, "progs/g_nail2.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_NAILGUN;
-		*magnitude = 1.0f;
+		*magnitude = 0.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/g_rock.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_GRENADE_LAUNCHER;
+		*magnitude = 0.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/g_rock2.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_ROCKET_LAUNCHER;
+		*magnitude = 0.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/g_light.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_THUNDERBOLT;
+		*magnitude = 0.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/quaddama.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_QUAD;
+		*magnitude = 1.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/invulner.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_PENT;
+		*magnitude = 1.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/invisibl.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_RING;
+		*magnitude = 1.0f;
 		return true;
 	}
 	if (!strcmp(ent->model_name, "progs/suit.mdl"))
 	{
 		*subject_id = QNN_SUBJECT_SUIT;
+		*magnitude = 1.0f;
 		return true;
 	}
 	if (qnn_classify_item_subject(ent->classname, 0, subject_id, magnitude))
 		return true;
 	return false;
-}
-
-static float qnn_dynamic_decay_s(int subject_id)
-{
-	if (subject_id == QNN_SUBJECT_PLAYER)
-		return QNN_PLAYER_DECAY_S;
-	if (subject_id == QNN_SUBJECT_PROJECTILE_NAIL
-		|| subject_id == QNN_SUBJECT_PROJECTILE_GRENADE
-		|| subject_id == QNN_SUBJECT_PROJECTILE_ROCKET
-		|| subject_id == QNN_SUBJECT_LIGHTNING_BEAM)
-		return QNN_PROJECTILE_DECAY_S;
-	return QNN_GENERIC_DYNAMIC_DECAY_S;
 }
 
 static int qnn_sound_pickup_category(const char *name)
@@ -853,44 +1056,32 @@ static void qnn_relative_frame(const vec3_t view_angles, const vec3_t world_delt
 	out[2] = DotProduct(world_delta, up);
 }
 
-static qnn_semantic_object_t *qnn_object_by_handle(uint32_t handle)
+/* Dynamic objects are stored at qnn_semantic_objects[qnn_semantic_static_count + entity_num].
+ * This gives O(1) lookup by entity_num with no handle indirection. */
+static int qnn_dynamic_index(int entity_num)
 {
-	int i;
-
-	for (i = 0; i < qnn_semantic_object_capacity; ++i)
-	{
-		if (qnn_semantic_objects[i].active && qnn_semantic_objects[i].handle == handle)
-			return &qnn_semantic_objects[i];
-	}
-	return NULL;
+	if (entity_num <= 0 || entity_num >= MAX_EDICTS)
+		return -1;
+	return qnn_semantic_static_count + entity_num;
 }
 
 static qnn_semantic_object_t *qnn_ensure_dynamic_object(int entity_num, int subject_id, int qualifier_id, const vec3_t origin, const vec3_t angles, int region_id, int modality_id, float confidence, float magnitude)
 {
+	int idx;
 	qnn_semantic_object_t *obj;
-	uint32_t handle;
-	int i;
 
-	handle = entity_num > 0 ? (0x80000000u | (uint32_t)entity_num) : qnn_semantic_next_handle++;
-	obj = qnn_object_by_handle(handle);
-	if (obj == NULL)
-	{
-		for (i = qnn_semantic_static_count; i < qnn_semantic_object_capacity; ++i)
-		{
-			if (!qnn_semantic_objects[i].active)
-			{
-				obj = &qnn_semantic_objects[i];
-				memset(obj, 0, sizeof(*obj));
-				obj->active = true;
-				obj->handle = handle;
-				obj->entity_num = entity_num;
-				obj->is_static = false;
-				break;
-			}
-		}
-	}
-	if (obj == NULL)
+	idx = qnn_dynamic_index(entity_num);
+	if (idx < 0 || idx >= qnn_semantic_object_capacity)
 		return NULL;
+
+	obj = &qnn_semantic_objects[idx];
+	if (!obj->active)
+	{
+		memset(obj, 0, sizeof(*obj));
+		obj->active = true;
+		obj->entity_num = entity_num;
+		obj->is_static = false;
+	}
 
 	obj->subject_id = subject_id;
 	obj->qualifier_id = qualifier_id;
@@ -903,7 +1094,6 @@ static qnn_semantic_object_t *qnn_ensure_dynamic_object(int entity_num, int subj
 	obj->confidence = confidence;
 	obj->magnitude = magnitude;
 	obj->state = qnn_subject_is_item(subject_id) ? 1.0f : 0.0f;
-	obj->decay_s = qnn_dynamic_decay_s(subject_id);
 	obj->surfaced_this_tick = true;
 	return obj;
 }
@@ -970,7 +1160,7 @@ static qnn_semantic_object_t *qnn_nearest_dynamic_subject(int subject_id, const 
 	return best;
 }
 
-static void qnn_append_event(uint32_t object_handle, int subject_id, int action_id, int qualifier_id, int modality_id, float confidence, float magnitude)
+static void qnn_append_event(int owner_index, int subject_id, int action_id, int qualifier_id, int modality_id, float confidence, float magnitude)
 {
 	int i;
 	int free_index;
@@ -984,7 +1174,7 @@ static void qnn_append_event(uint32_t object_handle, int subject_id, int action_
 				free_index = i;
 			continue;
 		}
-		if (qnn_semantic_events[i].object_handle == object_handle
+		if (qnn_semantic_events[i].owner_index == owner_index
 			&& qnn_semantic_events[i].subject_id == subject_id
 			&& qnn_semantic_events[i].action_id == action_id
 			&& qnn_semantic_events[i].qualifier_id == qualifier_id
@@ -1002,7 +1192,7 @@ static void qnn_append_event(uint32_t object_handle, int subject_id, int action_
 		return;
 	memset(&qnn_semantic_events[free_index], 0, sizeof(qnn_semantic_events[free_index]));
 	qnn_semantic_events[free_index].active = true;
-	qnn_semantic_events[free_index].object_handle = object_handle;
+	qnn_semantic_events[free_index].owner_index = owner_index;
 	qnn_semantic_events[free_index].subject_id = subject_id;
 	qnn_semantic_events[free_index].action_id = action_id;
 	qnn_semantic_events[free_index].qualifier_id = qualifier_id;
@@ -1025,10 +1215,8 @@ static void qnn_decay_store(float dt)
 			continue;
 		obj->surfaced_this_tick = false;
 		if (obj->recency > 0.0f)
-			obj->recency = qnn_clampf(obj->recency - (dt / QNN_OBJECT_RECENCY_S), 0.0f, 1.0f);
-		if (!obj->is_static && obj->confidence > 0.0f)
-			obj->confidence = qnn_clampf(obj->confidence - (dt / QNN_DYNAMIC_CONFIDENCE_S), 0.0f, 1.0f);
-		if (!obj->is_static && obj->recency <= 0.0f && obj->confidence <= 0.0f)
+			obj->recency = qnn_clampf(obj->recency - (dt / QNN_RECENCY_DECAY_S), 0.0f, 1.0f);
+		if (!obj->is_static && obj->recency <= 0.0f)
 			obj->active = false;
 	}
 
@@ -1036,9 +1224,7 @@ static void qnn_decay_store(float dt)
 	{
 		if (!qnn_semantic_events[i].active)
 			continue;
-		qnn_semantic_events[i].recency = qnn_clampf(qnn_semantic_events[i].recency - (dt / QNN_EVENT_RECENCY_S), 0.0f, 1.0f);
-		if (qnn_semantic_events[i].confidence > 0.0f)
-			qnn_semantic_events[i].confidence = qnn_clampf(qnn_semantic_events[i].confidence - (dt / QNN_DYNAMIC_CONFIDENCE_S), 0.0f, 1.0f);
+		qnn_semantic_events[i].recency = qnn_clampf(qnn_semantic_events[i].recency - (dt / QNN_RECENCY_DECAY_S), 0.0f, 1.0f);
 		if (qnn_semantic_events[i].recency <= 0.0f)
 			qnn_semantic_events[i].active = false;
 	}
@@ -1194,7 +1380,7 @@ static void qnn_handle_item_sound(const qnn_worker_sound_event_t *snd, const cha
 		obj->state = 1.0f;
 		obj->pickup_elapsed = 0.0f;
 		qnn_refresh_static_object(obj, QNN_MODALITY_AUDITORY, 1.0f);
-		qnn_append_event(obj->handle, obj->subject_id, QNN_ACTION_RESPAWN, QNN_QUAL_NONE, QNN_MODALITY_AUDITORY, 1.0f, obj->magnitude);
+		qnn_append_event(qnn_object_index(obj), obj->subject_id, QNN_ACTION_RESPAWN, QNN_QUAL_NONE, QNN_MODALITY_AUDITORY, 1.0f, obj->magnitude);
 		return;
 	}
 
@@ -1209,8 +1395,9 @@ static void qnn_handle_item_sound(const qnn_worker_sound_event_t *snd, const cha
 		{
 			obj->modality_id = QNN_MODALITY_AUDITORY;
 			obj->recency = 1.0f;
-			obj->confidence = snd->entity_num > 0 ? 0.9f : 0.7f;
-			qnn_append_event(obj->handle, QNN_SUBJECT_BACKPACK, QNN_ACTION_PICKUP, QNN_QUAL_NONE, QNN_MODALITY_AUDITORY, obj->confidence, 0.0f);
+			obj->confidence = 1.0f;
+			obj->surfaced_this_tick = true;
+			qnn_append_event(qnn_object_index(obj), QNN_SUBJECT_BACKPACK, QNN_ACTION_PICKUP, QNN_QUAL_NONE, QNN_MODALITY_AUDITORY, 1.0f, 0.0f);
 			return;
 		}
 	}
@@ -1221,7 +1408,7 @@ static void qnn_handle_item_sound(const qnn_worker_sound_event_t *snd, const cha
 	obj->state = 0.0f;
 	obj->pickup_elapsed = 0.0f;
 	qnn_refresh_static_object(obj, QNN_MODALITY_AUDITORY, 1.0f);
-	qnn_append_event(obj->handle, obj->subject_id, QNN_ACTION_PICKUP, QNN_QUAL_NONE, QNN_MODALITY_AUDITORY, 1.0f, obj->magnitude);
+	qnn_append_event(qnn_object_index(obj), obj->subject_id, QNN_ACTION_PICKUP, QNN_QUAL_NONE, QNN_MODALITY_AUDITORY, 1.0f, obj->magnitude);
 }
 
 static const qnn_sound_rule_t *qnn_find_sound_rule(const qnn_sound_rule_t *rules, const char *name)
@@ -1240,40 +1427,34 @@ static void qnn_handle_sound_player(const qnn_worker_sound_event_t *snd, const q
 {
 	vec3_t angles;
 	qnn_semantic_object_t *obj;
-	float confidence;
 
 	VectorCopy(vec3_origin, angles);
-	confidence = snd->entity_num > 0 ? 0.9f : 0.6f;
-	obj = qnn_ensure_dynamic_object(snd->entity_num, QNN_SUBJECT_PLAYER, QNN_QUAL_NONE, snd->origin, angles, -1, QNN_MODALITY_AUDITORY, confidence, 0.0f);
+	obj = qnn_ensure_dynamic_object(snd->entity_num, QNN_SUBJECT_PLAYER, QNN_QUAL_NONE, snd->origin, angles, -1, QNN_MODALITY_AUDITORY, 1.0f, 0.0f);
 	if (obj == NULL)
 		return;
-	qnn_append_event(obj->handle, rule->subject_id, rule->action_id, rule->qualifier_id, QNN_MODALITY_AUDITORY, confidence, rule->magnitude);
+	qnn_append_event(qnn_object_index(obj), rule->subject_id, rule->action_id, rule->qualifier_id, QNN_MODALITY_AUDITORY, 1.0f, rule->magnitude);
 }
 
 static void qnn_handle_sound_weapon(const qnn_worker_sound_event_t *snd, const qnn_sound_rule_t *rule)
 {
 	vec3_t angles;
 	qnn_semantic_object_t *obj;
-	float confidence;
 
 	VectorCopy(vec3_origin, angles);
-	confidence = snd->entity_num > 0 ? 0.9f : 0.6f;
-	obj = qnn_ensure_dynamic_object(snd->entity_num, QNN_SUBJECT_PLAYER, QNN_QUAL_NONE, snd->origin, angles, -1, QNN_MODALITY_AUDITORY, confidence, 0.0f);
+	obj = qnn_ensure_dynamic_object(snd->entity_num, QNN_SUBJECT_PLAYER, QNN_QUAL_NONE, snd->origin, angles, -1, QNN_MODALITY_AUDITORY, 1.0f, 0.0f);
 	if (obj == NULL)
 		return;
-	qnn_append_event(obj->handle, rule->subject_id, rule->action_id, rule->qualifier_id, QNN_MODALITY_AUDITORY, confidence, rule->magnitude);
+	qnn_append_event(qnn_object_index(obj), rule->subject_id, rule->action_id, rule->qualifier_id, QNN_MODALITY_AUDITORY, 1.0f, rule->magnitude);
 }
 
 static void qnn_handle_sound_projectile(const qnn_worker_sound_event_t *snd, const qnn_sound_rule_t *rule)
 {
 	vec3_t angles;
 	qnn_semantic_object_t *obj;
-	float confidence;
 
 	VectorCopy(vec3_origin, angles);
-	confidence = snd->entity_num > 0 ? 0.85f : 0.6f;
 	if (snd->entity_num > 0)
-		obj = qnn_ensure_dynamic_object(snd->entity_num, rule->subject_id, QNN_QUAL_NONE, snd->origin, angles, -1, QNN_MODALITY_AUDITORY, confidence, rule->magnitude);
+		obj = qnn_ensure_dynamic_object(snd->entity_num, rule->subject_id, QNN_QUAL_NONE, snd->origin, angles, -1, QNN_MODALITY_AUDITORY, 1.0f, rule->magnitude);
 	else
 		obj = qnn_nearest_dynamic_subject(rule->subject_id, snd->origin, QNN_PROJECTILE_SOUND_MATCH_SQ);
 	if (obj == NULL)
@@ -1282,10 +1463,10 @@ static void qnn_handle_sound_projectile(const qnn_worker_sound_event_t *snd, con
 	{
 		obj->modality_id = QNN_MODALITY_AUDITORY;
 		obj->recency = 1.0f;
-		if (confidence > obj->confidence)
-			obj->confidence = confidence;
+		obj->confidence = 1.0f;
+		obj->surfaced_this_tick = true;
 	}
-	qnn_append_event(obj->handle, rule->subject_id, rule->action_id, rule->qualifier_id, QNN_MODALITY_AUDITORY, confidence, rule->magnitude);
+	qnn_append_event(qnn_object_index(obj), rule->subject_id, rule->action_id, rule->qualifier_id, QNN_MODALITY_AUDITORY, 1.0f, rule->magnitude);
 }
 
 static void qnn_handle_sound_static(const qnn_worker_sound_event_t *snd, const qnn_sound_rule_t *rule)
@@ -1296,7 +1477,7 @@ static void qnn_handle_sound_static(const qnn_worker_sound_event_t *snd, const q
 	if (obj == NULL)
 		return;
 	qnn_refresh_static_object(obj, QNN_MODALITY_AUDITORY, 1.0f);
-	qnn_append_event(obj->handle, rule->subject_id, rule->action_id, rule->qualifier_id, QNN_MODALITY_AUDITORY, 1.0f, rule->magnitude);
+	qnn_append_event(qnn_object_index(obj), rule->subject_id, rule->action_id, rule->qualifier_id, QNN_MODALITY_AUDITORY, 1.0f, rule->magnitude);
 }
 
 static void qnn_update_from_sounds(const qnn_worker_snapshot_t *snapshot)
@@ -1399,17 +1580,17 @@ static void qnn_maybe_append_visual_fire(const qnn_worker_visible_entity_t *ent,
 		return;
 	if (ent->frame >= QNN_VISUAL_FIRE_SHOT_FIRST && ent->frame <= QNN_VISUAL_FIRE_SHOT_LAST)
 	{
-		qnn_append_event(obj->handle, QNN_SUBJECT_SHOTGUN, QNN_ACTION_FIRE, QNN_QUAL_NONE, QNN_MODALITY_VISUAL, 1.0f, 0.0f);
+		qnn_append_event(qnn_object_index(obj), QNN_SUBJECT_SHOTGUN, QNN_ACTION_FIRE, QNN_QUAL_NONE, QNN_MODALITY_VISUAL, 1.0f, 0.0f);
 		return;
 	}
 	if (ent->frame >= QNN_VISUAL_FIRE_NAIL_FIRST && ent->frame <= QNN_VISUAL_FIRE_NAIL_LAST)
 	{
-		qnn_append_event(obj->handle, QNN_SUBJECT_NAILGUN, QNN_ACTION_FIRE, QNN_QUAL_NONE, QNN_MODALITY_VISUAL, 1.0f, 0.0f);
+		qnn_append_event(qnn_object_index(obj), QNN_SUBJECT_NAILGUN, QNN_ACTION_FIRE, QNN_QUAL_NONE, QNN_MODALITY_VISUAL, 1.0f, 0.0f);
 		return;
 	}
 	if (ent->frame >= QNN_VISUAL_FIRE_LIGHT_FIRST && ent->frame <= QNN_VISUAL_FIRE_LIGHT_LAST)
 	{
-		qnn_append_event(obj->handle, QNN_SUBJECT_THUNDERBOLT, QNN_ACTION_FIRE, QNN_QUAL_NONE, QNN_MODALITY_VISUAL, 1.0f, 0.0f);
+		qnn_append_event(qnn_object_index(obj), QNN_SUBJECT_THUNDERBOLT, QNN_ACTION_FIRE, QNN_QUAL_NONE, QNN_MODALITY_VISUAL, 1.0f, 0.0f);
 		return;
 	}
 }
@@ -1712,10 +1893,10 @@ void qnn_worker_semantic_reset(const qnn_worker_map_state_t *map_state)
 		qnn_semantic_objects = NULL;
 	}
 	qnn_semantic_static_count = map_state->static_object_count;
-	qnn_semantic_object_capacity = map_state->static_object_count + QNN_WORKER_MAX_DYNAMIC_OBJECTS;
+	qnn_semantic_object_capacity = map_state->static_object_count + MAX_EDICTS;
 	qnn_semantic_objects = (qnn_semantic_object_t *)calloc((size_t)qnn_semantic_object_capacity, sizeof(*qnn_semantic_objects));
 	memset(qnn_semantic_events, 0, sizeof(qnn_semantic_events));
-	qnn_semantic_next_handle = 0x90000000u;
+	qnn_prev_object_count = 0;
 	if (qnn_semantic_objects == NULL)
 	{
 		qnn_semantic_object_capacity = 0;
@@ -1738,7 +1919,6 @@ void qnn_worker_semantic_reset(const qnn_worker_map_state_t *map_state)
 		qnn_semantic_objects[i].is_item = is_item;
 		qnn_semantic_objects[i].static_index = i;
 		qnn_semantic_objects[i].entity_num = 0;
-		qnn_semantic_objects[i].handle = (uint32_t)(i + 1);
 		qnn_semantic_objects[i].subject_id = subject_id;
 		qnn_semantic_objects[i].qualifier_id = qualifier_id;
 		qnn_semantic_objects[i].modality_id = QNN_MODALITY_NONE;
@@ -1750,7 +1930,6 @@ void qnn_worker_semantic_reset(const qnn_worker_map_state_t *map_state)
 		qnn_semantic_objects[i].confidence = 1.0f;
 		qnn_semantic_objects[i].magnitude = magnitude;
 		qnn_semantic_objects[i].state = 1.0f;
-		qnn_semantic_objects[i].decay_s = 0.0f;
 		qnn_semantic_objects[i].respawn_s = respawn_s;
 		qnn_semantic_objects[i].pickup_elapsed = 0.0f;
 		qnn_semantic_objects[i].pvs_seen = false;
@@ -1777,13 +1956,40 @@ void qnn_worker_semantic_update(const qnn_worker_map_state_t *map_state, const q
 	qnn_advance_item_timers(dt);
 	qnn_update_from_visible_entities(snapshot);
 	qnn_update_from_sounds(snapshot);
+
+	/* MENTAL recall: refresh recalled objects that aren't already surfaced.
+	 * This runs after all perception updates so surfaced_this_tick is set
+	 * for visual/auditory objects — recall only activates for stale ones. */
+	if (!reset_flag)
+	{
+		int r;
+		for (r = 0; r < 4; ++r)
+		{
+			int target;
+			int target_index;
+			qnn_semantic_object_t *src;
+
+			target = snapshot->action_label.recall[r];
+			if (target <= 0 || target > qnn_prev_object_count)
+				continue;
+			target_index = qnn_prev_object_indices[target - 1];
+			if (target_index < 0 || target_index >= qnn_semantic_object_capacity)
+				continue;
+			src = &qnn_semantic_objects[target_index];
+			if (!src->active || src->surfaced_this_tick)
+				continue;
+			src->modality_id = QNN_MODALITY_MENTAL;
+			src->recency = 1.0f;
+			src->surfaced_this_tick = true;
+		}
+	}
 }
 
 /*
  * Aggregate individual nail projectile tokens into stream tokens.
  * Groups nails by velocity direction (dot > threshold), picks the leading
- * nail (closest to player) as representative, and sets magnitude to
- * threat-weighted density: super nails count 2x, clamped to [0,1].
+ * nail (closest to player) as representative, and preserves the v5 object
+ * magnitude semantics where projectile magnitudes stay at 0.0.
  * Events from absorbed nails are reassigned to the stream leader.
  */
 static void qnn_aggregate_nail_streams(
@@ -1818,14 +2024,11 @@ static void qnn_aggregate_nail_streams(
 		return;
 	}
 
-	/* even a single nail gets density-based magnitude for consistency */
+	/* even a single nail is rewritten so stream copies preserve v5 semantics */
 	if (nail_count == 1)
 	{
-		float w = (object_rows[nail_indices[0]]->magnitude >= 0.5f)
-			? QNN_NAIL_STREAM_SUPER_WEIGHT : 1.0f;
 		stream_copies[0] = *object_rows[nail_indices[0]];
-		stream_copies[0].magnitude = qnn_clampf(
-			w / QNN_NAIL_STREAM_DENSITY_DIVISOR, 0.0f, 1.0f);
+		stream_copies[0].magnitude = 0.0f;
 		object_rows[nail_indices[0]] = &stream_copies[0];
 		*stream_copy_count = 1;
 		return;
@@ -1836,7 +2039,6 @@ static void qnn_aggregate_nail_streams(
 	{
 		int leader_idx;
 		float leader_dsq;
-		float weighted;
 		float max_recency;
 		vec3_t leader_vel;
 		float leader_speed;
@@ -1864,9 +2066,6 @@ static void qnn_aggregate_nail_streams(
 			VectorSubtract(object_rows[ni]->origin, player_origin, d);
 			leader_dsq = DotProduct(d, d);
 		}
-		/* super nails (magnitude 1.0) count as 2, regular as 1 */
-		weighted = (object_rows[ni]->magnitude >= 0.5f)
-			? QNN_NAIL_STREAM_SUPER_WEIGHT : 1.0f;
 		absorbed[ni] = true;
 
 		/* find other nails with similar velocity */
@@ -1891,8 +2090,6 @@ static void qnn_aggregate_nail_streams(
 				continue;
 
 			absorbed[nj] = true;
-			weighted += (object_rows[nj]->magnitude >= 0.5f)
-				? QNN_NAIL_STREAM_SUPER_WEIGHT : 1.0f;
 
 			/* pick the closest nail to player as leader */
 			VectorSubtract(object_rows[nj]->origin, player_origin, d);
@@ -1907,49 +2104,49 @@ static void qnn_aggregate_nail_streams(
 				max_recency = object_rows[nj]->recency;
 		}
 
-		/* create a copy of the leader with stream magnitude */
-		stream_copies[streams] = *object_rows[leader_idx];
-		stream_copies[streams].recency = max_recency;
-		stream_copies[streams].magnitude = qnn_clampf(
-			weighted / QNN_NAIL_STREAM_DENSITY_DIVISOR, 0.0f, 1.0f);
-		/* reassign the slot to point at our copy */
-		object_rows[leader_idx] = &stream_copies[streams];
-		absorbed[leader_idx] = false; /* keep the leader */
-		streams += 1;
-
-		/* reassign events from absorbed nails to leader handle */
-		for (j = 0; j < QNN_WORKER_MAX_EVENT_ATOMS; ++j)
+		/* capture real leader identity before swapping to stack copy */
 		{
-			int k;
+			int leader_owner = qnn_object_index(object_rows[leader_idx]);
 
-			if (!qnn_semantic_events[j].active)
-				continue;
-			for (k = i + 1; k < nail_count; ++k)
+			/* create a copy of the leader with stream magnitude */
+			stream_copies[streams] = *object_rows[leader_idx];
+			stream_copies[streams].recency = max_recency;
+			stream_copies[streams].magnitude = 0.0f;
+			/* reassign the slot to point at our copy */
+			object_rows[leader_idx] = &stream_copies[streams];
+			absorbed[leader_idx] = false; /* keep the leader */
+			streams += 1;
+
+			/* reassign events from absorbed nails to leader */
+			for (j = 0; j < QNN_WORKER_MAX_EVENT_ATOMS; ++j)
 			{
-				int nk = nail_indices[k];
-				if (!absorbed[nk])
+				int k;
+
+				if (!qnn_semantic_events[j].active)
 					continue;
-				if (qnn_semantic_events[j].object_handle == object_rows[nk]->handle)
+				for (k = i + 1; k < nail_count; ++k)
 				{
-					qnn_semantic_events[j].object_handle = stream_copies[streams - 1].handle;
-					break;
+					int nk = nail_indices[k];
+					if (!absorbed[nk])
+						continue;
+					if (qnn_semantic_events[j].owner_index == qnn_object_index(object_rows[nk]))
+					{
+						qnn_semantic_events[j].owner_index = leader_owner;
+						break;
+					}
 				}
 			}
 		}
 	}
 
-	/* rewrite ungrouped nails (no velocity data) to density magnitude */
+	/* rewrite ungrouped nails (no velocity data) to v5 projectile magnitude */
 	for (i = 0; i < nail_count && streams < QNN_MAX_NAIL_STREAMS; ++i)
 	{
-		float w;
 		int ni = nail_indices[i];
 		if (absorbed[ni] || qnn_vec_length(object_rows[ni]->velocity) >= 1.0f)
 			continue;
-		w = (object_rows[ni]->magnitude >= 0.5f)
-			? QNN_NAIL_STREAM_SUPER_WEIGHT : 1.0f;
 		stream_copies[streams] = *object_rows[ni];
-		stream_copies[streams].magnitude = qnn_clampf(
-			w / QNN_NAIL_STREAM_DENSITY_DIVISOR, 0.0f, 1.0f);
+		stream_copies[streams].magnitude = 0.0f;
 		object_rows[ni] = &stream_copies[streams];
 		streams += 1;
 	}
@@ -1967,6 +2164,9 @@ static void qnn_aggregate_nail_streams(
 
 void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, int tick_hz, qboolean reset_flag)
 {
+	/* Collection buffer large enough for all possible eligible objects.
+	 * After priority sort, only the top QNN_WORKER_MAX_TOKEN_OBJECTS survive. */
+	qnn_semantic_object_t *candidate_rows[MAX_EDICTS + 512];
 	qnn_spatial_token_t spatial_tokens[QNN_WORKER_SPATIAL_TOKEN_COUNT];
 	qnn_semantic_object_t *object_rows[QNN_WORKER_MAX_TOKEN_OBJECTS];
 	qnn_semantic_event_atom_t *event_rows[QNN_WORKER_MAX_EVENT_ATOMS];
@@ -1975,11 +2175,16 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 	uint16_t event_count[QNN_WORKER_MAX_TOKEN_OBJECTS];
 	uint16_t flags;
 	int stream_copy_count;
+	int candidate_count;
 	int object_count;
 	int event_total;
 	int i;
 	int j;
+	const qnn_nav_oracle_runtime_t *oracle;
+	int player_area_id;
+	int player_cluster_id;
 
+	candidate_count = 0;
 	object_count = 0;
 	event_total = 0;
 	flags = 0;
@@ -1993,8 +2198,8 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 		|| snapshot->action_label.weapon)
 		flags |= QNN_TOKEN_FLAG_HAS_ACTION;
 
-	/* first pass: collect eligible objects */
-	for (i = 0; i < qnn_semantic_object_capacity && object_count < QNN_WORKER_MAX_TOKEN_OBJECTS; ++i)
+	/* first pass: collect all eligible objects */
+	for (i = 0; i < qnn_semantic_object_capacity; ++i)
 	{
 		int has_event;
 
@@ -2003,7 +2208,7 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 		has_event = 0;
 		for (j = 0; j < QNN_WORKER_MAX_EVENT_ATOMS; ++j)
 		{
-			if (qnn_semantic_events[j].active && qnn_semantic_events[j].object_handle == qnn_semantic_objects[i].handle)
+			if (qnn_semantic_events[j].active && qnn_semantic_events[j].owner_index == i)
 			{
 				has_event = 1;
 				break;
@@ -2011,9 +2216,18 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 		}
 		if (qnn_semantic_objects[i].recency <= 0.0f && !has_event)
 			continue;
-		object_rows[object_count] = &qnn_semantic_objects[i];
-		object_count += 1;
+		if (candidate_count < (int)(sizeof(candidate_rows) / sizeof(candidate_rows[0])))
+			candidate_rows[candidate_count++] = &qnn_semantic_objects[i];
 	}
+
+	/* priority sort: players first, then projectiles, then everything else by recency */
+	if (candidate_count > 1)
+		qsort(candidate_rows, (size_t)candidate_count, sizeof(candidate_rows[0]), qnn_object_row_compare);
+
+	/* truncate to emission budget */
+	object_count = candidate_count < QNN_WORKER_MAX_TOKEN_OBJECTS ? candidate_count : QNN_WORKER_MAX_TOKEN_OBJECTS;
+	for (i = 0; i < object_count; ++i)
+		object_rows[i] = candidate_rows[i];
 
 	/* aggregate nail projectiles into stream tokens */
 	qnn_aggregate_nail_streams(object_rows, &object_count, stream_copies,
@@ -2022,11 +2236,12 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 	/* second pass: collect events for surviving objects */
 	for (i = 0; i < object_count; ++i)
 	{
+		int oi = qnn_object_index(object_rows[i]);
 		event_base[i] = (uint16_t)event_total;
 		event_count[i] = 0;
 		for (j = 0; j < QNN_WORKER_MAX_EVENT_ATOMS && event_total < QNN_WORKER_MAX_EVENT_ATOMS; ++j)
 		{
-			if (!qnn_semantic_events[j].active || qnn_semantic_events[j].object_handle != object_rows[i]->handle)
+			if (!qnn_semantic_events[j].active || qnn_semantic_events[j].owner_index != oi)
 				continue;
 			event_rows[event_total] = &qnn_semantic_events[j];
 			event_total += 1;
@@ -2036,6 +2251,25 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 
 	qnn_build_spatial_tokens(snapshot, spatial_tokens);
 
+	/* Resolve the player's nav area/cluster once for self token and route computation. */
+	oracle = qnn_worker_map_state.nav_oracle;
+	player_area_id = -1;
+	player_cluster_id = 0;
+
+	if (oracle)
+	{
+		qnn_nav_area_result_t player_area;
+		char area_err[128];
+
+		if (qnn_nav_oracle_find_area(oracle, snapshot->player_origin, &player_area, area_err, sizeof(area_err))
+			&& player_area.found)
+		{
+			player_area_id = player_area.area_id;
+			player_cluster_id = player_area.cluster_id;
+		}
+	}
+
+	/* Write header */
 	fwrite(QNN_TOKEN_MAGIC, 1, 4, out);
 	qnn_token_write_u16_le(out, (uint16_t)QNN_TOKEN_VERSION);
 	qnn_token_write_u16_le(out, flags);
@@ -2047,47 +2281,77 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 	qnn_token_write_u16_le(out, (uint16_t)QNN_WORKER_SPATIAL_TOKEN_COUNT);
 	qnn_token_write_u16_le(out, (uint16_t)tick_hz);
 
-	for (i = 0; i < 3; ++i)
-		qnn_token_write_f32_le(out, snapshot->player_origin[i]);
-	for (i = 0; i < 3; ++i)
-		qnn_token_write_f32_le(out, snapshot->player_velocity[i]);
-	for (i = 0; i < 3; ++i)
-		qnn_token_write_f32_le(out, snapshot->player_view_angles[i]);
-	qnn_token_write_i32_le(out, snapshot->health);
-	qnn_token_write_i32_le(out, snapshot->armor);
-	qnn_token_write_f32_le(out, snapshot->armor_type);
-	qnn_token_write_i32_le(out, snapshot->ammo_shells);
-	qnn_token_write_i32_le(out, snapshot->ammo_nails);
-	qnn_token_write_i32_le(out, snapshot->ammo_rockets);
-	qnn_token_write_i32_le(out, snapshot->ammo_cells);
-	qnn_token_write_i32_le(out, snapshot->weapon_id);
-	qnn_token_write_i32_le(out, snapshot->weapons_owned);
-	qnn_token_write_i32_le(out, snapshot->grounded ? 1 : 0);
-	qnn_token_write_i32_le(out, snapshot->waterlevel);
-	qnn_token_write_i32_le(out, snapshot->current_region_id);
+	qnn_write_self_token_v5(out, snapshot, tick_hz, player_cluster_id);
 
+	/* Write object tokens — route computed uniformly for all modalities */
 	for (i = 0; i < object_count; ++i)
 	{
 		vec3_t delta;
 		vec3_t rel;
+		int used_path = 0;
 
-		VectorSubtract(object_rows[i]->origin, snapshot->player_origin, delta);
-		qnn_relative_frame(snapshot->player_view_angles, delta, rel);
-		qnn_token_write_u32_le(out, object_rows[i]->handle);
-		qnn_token_write_u16_le(out, (uint16_t)object_rows[i]->subject_id);
-		qnn_token_write_u16_le(out, (uint16_t)object_rows[i]->qualifier_id);
-		qnn_token_write_u16_le(out, (uint16_t)object_rows[i]->modality_id);
-		qnn_token_write_u16_le(out, (uint16_t)object_rows[i]->player_id);
-		qnn_token_write_f32_le(out, rel[0]);
-		qnn_token_write_f32_le(out, rel[1]);
-		qnn_token_write_f32_le(out, rel[2]);
-		qnn_token_write_f32_le(out, object_rows[i]->recency);
-		qnn_token_write_f32_le(out, object_rows[i]->confidence);
-		qnn_token_write_f32_le(out, object_rows[i]->magnitude);
-		qnn_token_write_f32_le(out, object_rows[i]->state);
-		qnn_token_write_u16_le(out, event_count[i]);
-		qnn_token_write_u16_le(out, event_base[i]);
+		object_rows[i]->cluster_id = 0;
+		object_rows[i]->route_cost = 0.0f;
+		object_rows[i]->route_cluster_count = 0;
+
+		if (oracle && player_area_id >= 0)
+		{
+			qnn_nav_area_result_t obj_area;
+			char obj_err[128];
+
+			if (qnn_nav_oracle_find_area(oracle, object_rows[i]->origin, &obj_area, obj_err, sizeof(obj_err))
+				&& obj_area.found)
+			{
+				float path_rel[3];
+				float route_cost;
+				char path_err[128];
+
+				object_rows[i]->cluster_id = obj_area.cluster_id;
+
+				if (qnn_nav_oracle_path_position(oracle, player_area_id, obj_area.area_id,
+					snapshot->player_origin, object_rows[i]->origin,
+					path_rel, &route_cost, path_err, sizeof(path_err)))
+				{
+					qnn_relative_frame(snapshot->player_view_angles, path_rel, rel);
+					object_rows[i]->route_cost = route_cost;
+					used_path = 1;
+				}
+
+				qnn_nav_oracle_route_clusters(oracle, player_area_id, obj_area.area_id,
+					object_rows[i]->route_cluster_ids, QNN_MAX_ROUTE_CLUSTERS,
+					&object_rows[i]->route_cluster_count);
+			}
+		}
+
+		if (!used_path)
+		{
+			VectorSubtract(object_rows[i]->origin, snapshot->player_origin, delta);
+			qnn_relative_frame(snapshot->player_view_angles, delta, rel);
+		}
+
+		{
+			uint32_t wire_handle;
+			if (object_rows[i] >= qnn_semantic_objects
+				&& object_rows[i] < qnn_semantic_objects + qnn_semantic_object_capacity)
+				wire_handle = (uint32_t)qnn_object_index(object_rows[i]);
+			else
+				wire_handle = (uint32_t)object_rows[i]->entity_num;
+			qnn_write_object_token_v5(out, object_rows[i], rel, event_count[i], event_base[i], wire_handle);
+		}
 	}
+
+	/* Save index mapping for next tick's recall targets.
+	 * Stream copies (nail aggregation) are stack-local and not valid recall
+	 * targets, so store -1 for those — recall will skip them. */
+	for (i = 0; i < object_count && i < QNN_WORKER_MAX_TOKEN_OBJECTS; ++i)
+	{
+		if (object_rows[i] >= qnn_semantic_objects
+			&& object_rows[i] < qnn_semantic_objects + qnn_semantic_object_capacity)
+			qnn_prev_object_indices[i] = qnn_object_index(object_rows[i]);
+		else
+			qnn_prev_object_indices[i] = -1;
+	}
+	qnn_prev_object_count = object_count;
 
 	for (i = 0; i < event_total; ++i)
 	{
@@ -2101,20 +2365,7 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 	}
 
 	for (i = 0; i < QNN_WORKER_SPATIAL_TOKEN_COUNT; ++i)
-	{
-		qnn_token_write_u16_le(out, (uint16_t)spatial_tokens[i].sector_id);
-		qnn_token_write_u16_le(out, 0);
-		qnn_token_write_f32_le(out, spatial_tokens[i].nearest_dist);
-		qnn_token_write_f32_le(out, spatial_tokens[i].mean_dist);
-		qnn_token_write_f32_le(out, spatial_tokens[i].openness);
-		qnn_token_write_f32_le(out, spatial_tokens[i].solid_frac);
-		qnn_token_write_f32_le(out, spatial_tokens[i].water_frac);
-		qnn_token_write_f32_le(out, spatial_tokens[i].slime_frac);
-		qnn_token_write_f32_le(out, spatial_tokens[i].lava_frac);
-		qnn_token_write_f32_le(out, spatial_tokens[i].traversable);
-		qnn_token_write_f32_le(out, spatial_tokens[i].dropoff);
-		qnn_token_write_f32_le(out, spatial_tokens[i].clearance);
-	}
+		qnn_write_spatial_token_v5(out, &spatial_tokens[i]);
 
 	if (snapshot->action_label.move || snapshot->action_label.strafe
 		|| snapshot->action_label.look_yaw || snapshot->action_label.look_pitch

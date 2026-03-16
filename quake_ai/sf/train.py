@@ -3,8 +3,8 @@
 Usage (standalone):
     python -m quake_ai.sf.train \\
         --algo=APPO --env=quake_combat \\
-        --quake_executable=../artifacts/bin/quake_worker \\
-        --quake_basedir=../artifacts/quake \\
+        --quake_executable=assets/bin/quake_worker \\
+        --quake_basedir=assets \\
         --quake_map_id=dm4 \\
         --num_workers=30 --rollout=256
 
@@ -20,6 +20,7 @@ SF hyperparameter defaults are calibrated to match the existing PPO config
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,7 +28,7 @@ from typing import Any, Dict, List, Optional
 try:
     from sample_factory.cfg.arguments import parse_full_cfg, parse_sf_args
     from sample_factory.envs.env_utils import register_env
-    from sample_factory.train import run_rl
+    from sample_factory.train import make_runner
     # SF 2.1.x uses the model_factory pattern; 2.0.x had register_custom_encoder
     try:
         from sample_factory.model.encoder import register_custom_encoder as _register_custom_encoder
@@ -52,31 +53,25 @@ def _make_quake_encoder(cfg: Any, obs_space: Any):
     return make_quake_encoder(cfg, obs_space)
 
 
+def _allow_numpy_in_torch_load() -> None:
+    """Allowlist numpy globals so ``torch.load(weights_only=True)`` works.
+
+    PyTorch 2.6+ defaults weights_only=True, but SF checkpoints contain
+    numpy scalars.  This must run in every process (main + SF subprocesses).
+    """
+    import torch.serialization
+    import numpy as np
+    torch.serialization.add_safe_globals([np.core.multiarray.scalar, np.dtype, np.dtypes.Float64DType])
+
+
+# Run at import time so SF learner subprocesses (which import this module
+# indirectly via the model factory) also get the allowlist.
+_allow_numpy_in_torch_load()
+
+
 def _patch_sample_factory_checkpoint_loading() -> None:
-    """Keep SF resume working under torch 2.6+'s weights_only default."""
-    from sample_factory.algo.learning import learner as learner_mod
-
-    if getattr(learner_mod.Learner.load_checkpoint, "_quake_trusted_patch", False):
-        return
-
-    def _load_checkpoint(checkpoints, device):
-        if len(checkpoints) <= 0:
-            learner_mod.log.warning("No checkpoints found")
-            return None
-
-        latest_checkpoint = checkpoints[-1]
-        num_attempts = 3
-        for attempt in range(num_attempts):
-            try:
-                learner_mod.log.warning("Loading state from checkpoint %s...", latest_checkpoint)
-                return trusted_torch_load(latest_checkpoint, map_location=device)
-            except Exception:
-                learner_mod.log.exception(f"Could not load from checkpoint, attempt {attempt}")
-
-        return None
-
-    _load_checkpoint._quake_trusted_patch = True  # type: ignore[attr-defined]
-    learner_mod.Learner.load_checkpoint = staticmethod(_load_checkpoint)
+    """Ensure numpy globals are allowed for SF checkpoint loading."""
+    _allow_numpy_in_torch_load()
 
 
 def _experiment_dir(cfg: Any) -> Path:
@@ -88,23 +83,65 @@ def _has_existing_sf_checkpoint(cfg: Any) -> bool:
     return any(checkpoint_dir.glob("*.pth"))
 
 
-def _ensure_bc_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
-    bc_ckpt = str(getattr(cfg, "quake_bc_checkpoint", "") or "").strip()
-    if not bc_ckpt:
+def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
+    """Seed SF checkpoint dirs from a warm-start checkpoint.
+
+    Accepts either a BC ``.npz`` (converted to SF format) or an existing
+    SF ``.pth`` (copied directly).  Skipped when the experiment already
+    has checkpoints (i.e. resuming a prior run).
+    """
+    ckpt = str(getattr(cfg, "quake_bc_checkpoint", "") or "").strip()
+    if not ckpt:
         return None
 
     if _has_existing_sf_checkpoint(cfg):
-        print(f"[quake_sf] Found existing SF checkpoints in {_experiment_dir(cfg) / 'checkpoint_p0'}; skipping BC warm-start conversion.")
+        print(f"[quake_sf] Found existing SF checkpoints in {_experiment_dir(cfg) / 'checkpoint_p0'}; skipping warm-start.")
         return None
 
-    from quake_ai.sf.checkpoint_converter import MLPGRUPolicy, save_sf_format
+    # Tell SF to load from best_* (where we place the warm-start seed).
+    cfg.load_checkpoint_kind = "best"
 
-    print(f"[quake_sf] Converting BC checkpoint {bc_ckpt} to SF warm-start format ...")
-    bc_policy = MLPGRUPolicy.load(bc_ckpt, device="cpu")
-    ckpt_path = save_sf_format(bc_policy, _experiment_dir(cfg) / "checkpoint_p0")
-    print(f"[quake_sf] Warm-start checkpoint written: {ckpt_path}")
-    print("[quake_sf] NOTE: verify head key mapping with inspect_sf_action_layout() first.")
-    return ckpt_path
+    exp_dir = _experiment_dir(cfg)
+    num_policies = int(getattr(cfg, "num_policies", 1))
+
+    if ckpt.endswith(".pth"):
+        # Already SF format — copy directly into each policy dir.
+        # Reset best_performance so the learner doesn't think the old
+        # (possibly pre-reward-fix) reward is the bar to beat.
+        import torch
+        print(f"[quake_sf] Using SF checkpoint {ckpt} as warm-start ...")
+        checkpoint = torch.load(ckpt, map_location="cpu", weights_only=False)
+        old_best = checkpoint.get("best_performance", None)
+        checkpoint["best_performance"] = -1e9
+        if old_best is not None:
+            print(f"[quake_sf] Reset best_performance from {old_best} to -1e9")
+        first_path = None
+        # Name follows SF's best checkpoint format: best_{step:09d}_{env_steps}_{metric}_{value}.pth
+        # Use step=0, env_steps=0, reward=-1000000.000 so it sorts FIRST
+        # lexicographically and gets cleaned up by SF's keep=1 as soon as a
+        # real best arrives.
+        warm_name = "best_000000000_0_reward_-1000000.000.pth"
+        for pid in range(num_policies):
+            policy_dir = exp_dir / f"checkpoint_p{pid}"
+            policy_dir.mkdir(parents=True, exist_ok=True)
+            dest = policy_dir / warm_name
+            torch.save(checkpoint, dest)
+            if pid == 0:
+                first_path = dest
+            print(f"[quake_sf] Warm-start checkpoint copied: {dest}")
+        return first_path
+    else:
+        # BC .npz — convert to SF format.
+        from quake_ai.sf.checkpoint_converter import QNNPolicy, save_sf_format
+        print(f"[quake_sf] Converting BC checkpoint {ckpt} to SF warm-start format ...")
+        bc_policy = QNNPolicy.load(ckpt, device="cpu")
+        first_path = None
+        for pid in range(num_policies):
+            p = save_sf_format(bc_policy, exp_dir / f"checkpoint_p{pid}")
+            if pid == 0:
+                first_path = p
+            print(f"[quake_sf] Warm-start checkpoint written: {p}")
+        return first_path
 
 
 def register_quake_components() -> None:
@@ -127,14 +164,14 @@ def register_quake_components() -> None:
 def add_quake_cli_args(parser: Any) -> None:
     """Add Quake-specific CLI arguments to an SF argument parser."""
     # Environment
-    parser.add_argument("--quake_executable", type=str, default="../artifacts/bin/quake_worker",
+    parser.add_argument("--quake_executable", type=str, default="assets/bin/quake_worker",
                         help="Path to the Quake worker binary")
     parser.add_argument("--quake_basedir", type=str, default="",
                         help="QUAKE_BASEDIR — root directory containing id1/")
     parser.add_argument("--quake_native_workdir", type=str, default="",
                         help="Working directory for Quake processes")
-    parser.add_argument("--quake_map_id", type=str, default="dm4",
-                        help="Map name for all workers (overridden by quake_scenario_config_json)")
+    parser.add_argument("--quake_map_id", type=str, default="procgen",
+                        help="Map name for all workers — 'procgen' (default) generates a unique map each episode")
     parser.add_argument("--quake_max_steps_per_episode", type=int, default=1024,
                         help="Episode step limit")
     parser.add_argument("--quake_fixed_tick_hz", type=int, default=20,
@@ -151,6 +188,8 @@ def add_quake_cli_args(parser: Any) -> None:
     # Multi-scenario support (Step 8)
     parser.add_argument("--quake_scenario_config_json", type=str, default="",
                         help="JSON array of scenario dicts with map_id/native_args/options")
+    parser.add_argument("--quake_record_demos", type=int, default=1,
+                        help="Record .dem files during training (1=on, 0=off); best episodes saved as best.dem")
     # Encoder architecture
     parser.add_argument("--quake_trunk_hidden", type=int, default=128,
                         help="Encoder output dimension (feeds GRU input)")
@@ -175,13 +214,15 @@ def add_quake_cli_args(parser: Any) -> None:
 
 
 def build_sf_cfg(
-    scenario: str = "dm4",
+    scenario: str = "procgen",
     num_workers: int = 8,
+    num_envs_per_worker: int = 1,
+    worker_num_splits: int = 1,
     rollout: int = 256,
     total_env_steps: int = 10_000_000,
-    output_dir: str = "../artifacts/runs/sf_ppo",
+    output_dir: str = "assets/runs/sf_ppo",
     experiment: str = "quake_combat",
-    executable: str = "../artifacts/bin/quake_worker",
+    executable: str = "assets/bin/quake_worker",
     basedir: str = "",
     native_workdir: str = "",
     native_args_json: str = '["-game","frikbotnex_train"]',
@@ -211,6 +252,15 @@ def build_sf_cfg(
     value_coef: float = 0.5,
     max_policy_lag: int = 30,
     with_wandb: bool = False,
+    # Population-Based Training
+    with_pbt: bool = False,
+    num_policies: int = 1,
+    pbt_period_env_steps: int = 5_000_000,
+    pbt_start_mutation: int = 20_000_000,
+    pbt_replace_fraction: float = 0.3,
+    pbt_mutation_rate: float = 0.15,
+    pbt_optimize_gamma: bool = False,
+    record_demos: bool = True,
     extra_argv: Optional[List[str]] = None,
 ) -> Any:
     """Build an SF cfg namespace without command-line parsing.
@@ -220,7 +270,7 @@ def build_sf_cfg(
     """
     register_quake_components()
 
-    batch_size = num_workers * rollout
+    batch_size = num_workers * num_envs_per_worker * rollout
 
     argv: List[str] = [
         "--algo=APPO",
@@ -229,9 +279,10 @@ def build_sf_cfg(
         f"--rnn_type=gru",
         f"--rnn_size={gru_hidden}",
         f"--num_workers={num_workers}",
-        f"--num_envs_per_worker=1",
-        "--worker_num_splits=1",
+        f"--num_envs_per_worker={num_envs_per_worker}",
+        f"--worker_num_splits={worker_num_splits}",
         f"--rollout={rollout}",
+        f"--recurrence={rollout}",
         f"--batch_size={batch_size}",
         f"--num_batches_per_epoch=1",
         f"--num_epochs={ppo_epochs}",
@@ -265,6 +316,7 @@ def build_sf_cfg(
         f"--quake_n_layers={n_layers}",
         f"--quake_ffn_dim={ffn_dim}",
         f"--quake_attn_dropout={attn_dropout}",
+        f"--quake_record_demos={1 if record_demos else 0}",
     ]
 
     if options_json:
@@ -272,10 +324,19 @@ def build_sf_cfg(
     if scenario_config_json:
         argv.append(f"--quake_scenario_config_json={scenario_config_json}")
 
+    # Population-Based Training
+    if with_pbt:
+        argv.extend([
+            "--with_pbt=True",
+            f"--num_policies={num_policies}",
+            f"--pbt_period_env_steps={pbt_period_env_steps}",
+            f"--pbt_start_mutation={pbt_start_mutation}",
+            f"--pbt_replace_fraction={pbt_replace_fraction}",
+            f"--pbt_mutation_rate={pbt_mutation_rate}",
+            f"--pbt_optimize_gamma={'True' if pbt_optimize_gamma else 'False'}",
+        ])
+
     if init_checkpoint:
-        # Warm-start runs materialize a seed checkpoint before launch if there
-        # is no prior SF run to resume from.
-        argv.append("--load_checkpoint_kind=latest")
         argv.append(f"--quake_bc_checkpoint={init_checkpoint}")
 
     if extra_argv:
@@ -292,11 +353,48 @@ def build_sf_cfg(
 # ---------------------------------------------------------------------------
 
 
+def _set_sf_report_interval(seconds: float = 60.0) -> None:
+    """Increase SF's log spam interval from the hardcoded 5s default.
+
+    Runner.__init__ hardcodes ``self.report_interval_sec = 5.0`` and then
+    registers a periodic timer with that value.  We patch __init__ to
+    overwrite both the attribute *and* the first timer's period after the
+    original init completes.
+    """
+    try:
+        from sample_factory.algo.runners import runner as runner_mod
+        _orig_init = runner_mod.Runner.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            self.report_interval_sec = seconds
+            # The first timer registered is the report timer.
+            if self.timers:
+                self.timers[0]._interval_sec = seconds
+
+        if not getattr(_patched_init, "_quake_patched", False):
+            _patched_init._quake_patched = True  # type: ignore[attr-defined]
+            runner_mod.Runner.__init__ = _patched_init
+    except Exception:
+        pass
+
+
 def run_sf(cfg: Any) -> Dict[str, Any]:
     """Launch SF APPO training and return a summary dict."""
+    from sample_factory.algo.utils.misc import ExperimentStatus
+    from quake_ai.sf.observer import BestCheckpointArchiver
+
     register_quake_components()
-    _ensure_bc_warm_start_checkpoint(cfg)
-    status = run_rl(cfg)
+    _set_sf_report_interval(60.0)
+    _ensure_warm_start_checkpoint(cfg)
+
+    cfg, runner = make_runner(cfg)
+    runner.register_observer(BestCheckpointArchiver(runner))
+
+    status = runner.init()
+    if status == ExperimentStatus.SUCCESS:
+        status = runner.run()
+
     return {"sf_status": str(status), "train_dir": str(getattr(cfg, "train_dir", ""))}
 
 
@@ -306,12 +404,21 @@ def run_sf(cfg: Any) -> Dict[str, Any]:
 
 
 def main() -> None:
+    from sample_factory.algo.utils.misc import ExperimentStatus
+    from quake_ai.sf.observer import BestCheckpointArchiver
+
     register_quake_components()
     parser, _ = parse_sf_args()
     add_quake_cli_args(parser)
     cfg = parse_full_cfg(parser)
-    _ensure_bc_warm_start_checkpoint(cfg)
-    run_rl(cfg)
+    _ensure_warm_start_checkpoint(cfg)
+
+    cfg, runner = make_runner(cfg)
+    runner.register_observer(BestCheckpointArchiver(runner))
+
+    status = runner.init()
+    if status == ExperimentStatus.SUCCESS:
+        runner.run()
 
 
 if __name__ == "__main__":

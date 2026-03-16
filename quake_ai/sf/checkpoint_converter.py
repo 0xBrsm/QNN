@@ -1,8 +1,8 @@
-"""Checkpoint conversion between MLPGRUPolicy and Sample Factory formats.
+"""Checkpoint conversion between QNNPolicy and Sample Factory formats.
 
 Two conversion directions:
   BC/PPO → SF   : ``bc_to_sf()``  — warm-start APPO from a BC checkpoint.
-  SF → BC/PPO   : ``sf_to_bc()``  — convert SF checkpoint back to MLPGRUPolicy
+  SF → BC/PPO   : ``sf_to_qnn()``  — convert SF checkpoint back to QNNPolicy
                                     format for evaluation.py.
 
 SF 2.1.1 model state_dict layout:
@@ -29,7 +29,20 @@ from typing import Any, Dict
 import torch
 
 from quake_ai.actions import ACTION_HEADS
-from quake_ai.model.policy import MLPGRUPolicy
+from quake_ai.model.observation import (
+    ACTION_HISTORY_DIM,
+    ACTION_HISTORY_LEN,
+    EVENT_ID_DIM,
+    EVENT_SCALAR_DIM,
+    MAX_EVENT_ATOMS,
+    MAX_OBJECT_TOKENS,
+    OBJECT_ID_DIM,
+    OBJECT_SCALAR_DIM,
+    SELF_SCALAR_DIM,
+    SPATIAL_SCALAR_DIM,
+    SPATIAL_TOKEN_COUNT,
+)
+from quake_ai.model.policy import QNNPolicy
 from quake_ai.utils.io import trusted_torch_load
 
 _HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
@@ -53,7 +66,7 @@ def bc_to_sf(
     device: str = "cpu",
 ) -> Dict[str, Any]:
     """Copy weights from a BC/PPO checkpoint into an SF model state dict."""
-    bc_policy = MLPGRUPolicy.load(str(bc_path), device=device)
+    bc_policy = QNNPolicy.load(str(bc_path), device=device)
     bc_state = bc_policy.model.state_dict()
     sf_state = sf_model.state_dict()
 
@@ -65,15 +78,15 @@ def bc_to_sf(
     return sf_state
 
 
-def sf_to_bc(
+def sf_to_qnn(
     sf_checkpoint_path: str | Path,
     obs_dim: int,
     trunk_hidden: int = 128,
     gru_hidden: int = 64,
     use_gru: bool = True,
     device: str = "cpu",
-) -> MLPGRUPolicy:
-    """Load an SF checkpoint and return an MLPGRUPolicy with copied weights."""
+) -> QNNPolicy:
+    """Load an SF checkpoint and return an QNNPolicy with copied weights."""
     payload = trusted_torch_load(str(sf_checkpoint_path), map_location="cpu")
     if not _is_sf_checkpoint(payload):
         raise ValueError(
@@ -82,7 +95,7 @@ def sf_to_bc(
         )
     sf_state: Dict[str, torch.Tensor] = payload["model"]
 
-    bc_policy = MLPGRUPolicy(
+    bc_policy = QNNPolicy(
         obs_dim=obs_dim,
         trunk_hidden=trunk_hidden,
         gru_hidden=gru_hidden,
@@ -103,12 +116,12 @@ def sf_to_bc(
 
 
 def save_sf_format(
-    bc_policy: MLPGRUPolicy,
+    bc_policy: QNNPolicy,
     output_dir: str | Path,
     train_step: int = 0,
     env_steps: int = 0,
 ) -> Path:
-    """Save an MLPGRUPolicy as a minimal SF-compatible checkpoint."""
+    """Save an QNNPolicy as a minimal SF-compatible checkpoint."""
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
@@ -141,11 +154,41 @@ def save_sf_format(
     if head_biases:
         sf_style[f"{_SF_COMBINED_HEAD_KEY}.bias"] = torch.cat(head_biases, dim=0).cpu()
 
+    # SF 2.1.1 ActorCriticSharedWeights expects obs_normalizer and
+    # returns_normalizer running stats.  Seed them at identity (mean=0,
+    # var=1, count=1) so the first training steps fill them in.
+    _add_sf_normalizer_buffers(sf_style)
+
+    # Build a minimal Adam optimizer state dict.  SF creates a single flat
+    # Adam over actor_critic.parameters(); load_state_dict validates that the
+    # saved param_groups[0]['params'] length matches.  Parameters are all
+    # non-normalizer tensors (normalizer buffers are registered_buffers, not
+    # parameters).
+    n_params = sum(
+        1 for k in sf_style
+        if not k.startswith("obs_normalizer.") and not k.startswith("returns_normalizer.")
+    )
     payload_out = {
         "train_step": train_step,
         "env_steps": env_steps,
         "best_performance": -1e9,
         "model": sf_style,
+        "optimizer": {
+            "state": {},
+            "param_groups": [{
+                "lr": 0.00025,
+                "betas": (0.9, 0.999),
+                "eps": 1e-08,
+                "weight_decay": 0,
+                "amsgrad": False,
+                "maximize": False,
+                "foreach": None,
+                "capturable": False,
+                "differentiable": False,
+                "fused": None,
+                "params": list(range(n_params)),
+            }],
+        },
     }
     meta = {
         "obs_dim": bc_policy.obs_dim,
@@ -160,6 +203,46 @@ def save_sf_format(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
     return ckpt_path
+
+
+# ------------------------------------------------------------------
+# SF normalizer buffers
+# ------------------------------------------------------------------
+
+# Observation space shapes that SF's RunningMeanStdInPlace normalizes.
+# Must match QuakeEnv.observation_space exactly.
+_OBS_SHAPES: Dict[str, tuple[int, ...]] = {
+    "self_scalars": (SELF_SCALAR_DIM,),
+    "self_weapon_id": (1,),
+    "self_movement_id": (1,),
+    "self_cluster_id": (1,),
+    "object_ids": (MAX_OBJECT_TOKENS, OBJECT_ID_DIM),
+    "object_scalars": (MAX_OBJECT_TOKENS, OBJECT_SCALAR_DIM),
+    "object_mask": (MAX_OBJECT_TOKENS,),
+    "event_ids": (MAX_EVENT_ATOMS, EVENT_ID_DIM),
+    "event_scalars": (MAX_EVENT_ATOMS, EVENT_SCALAR_DIM),
+    "event_owner": (MAX_EVENT_ATOMS,),
+    "event_mask": (MAX_EVENT_ATOMS,),
+    "spatial_ids": (SPATIAL_TOKEN_COUNT,),
+    "spatial_scalars": (SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM),
+    "action_history": (ACTION_HISTORY_LEN, ACTION_HISTORY_DIM),
+}
+
+
+def _add_sf_normalizer_buffers(sf_state: Dict[str, torch.Tensor]) -> None:
+    """Add zero-initialized SF normalizer entries so load_state_dict(strict=True) works."""
+    # obs_normalizer.running_mean_std is a RunningMeanStdDictInPlace containing
+    # a nn.ModuleDict named running_mean_std (hence the double prefix).
+    for key, shape in _OBS_SHAPES.items():
+        prefix = f"obs_normalizer.running_mean_std.running_mean_std.{key}"
+        sf_state[f"{prefix}.running_mean"] = torch.zeros(shape, dtype=torch.float64)
+        sf_state[f"{prefix}.running_var"] = torch.ones(shape, dtype=torch.float64)
+        sf_state[f"{prefix}.count"] = torch.ones([1], dtype=torch.float64)
+
+    # returns_normalizer (SF default: normalize_returns=True)
+    sf_state["returns_normalizer.running_mean"] = torch.zeros([1], dtype=torch.float64)
+    sf_state["returns_normalizer.running_var"] = torch.ones([1], dtype=torch.float64)
+    sf_state["returns_normalizer.count"] = torch.ones([1], dtype=torch.float64)
 
 
 # ------------------------------------------------------------------
@@ -271,33 +354,31 @@ def main() -> None:
     to_sf.add_argument("output_dir", help="Directory to write SF checkpoint")
     to_sf.add_argument("--device", default="cpu")
 
-    to_bc = sub.add_parser("sf-to-bc", help="Convert an SF checkpoint to MLPGRUPolicy format")
-    to_bc.add_argument("sf_path", help="Input SF checkpoint .pth")
-    to_bc.add_argument("output_path", help="Output .pth path for MLPGRUPolicy")
-    to_bc.add_argument("--obs-dim", type=int, required=True)
-    to_bc.add_argument("--trunk-hidden", type=int, default=128)
-    to_bc.add_argument("--gru-hidden", type=int, default=128)
-    to_bc.add_argument("--no-gru", action="store_true")
-    to_bc.add_argument("--device", default="cpu")
+    to_qnn = sub.add_parser("sf-to-qnn", help="Convert an SF checkpoint to QNNPolicy format")
+    to_qnn.add_argument("sf_path", help="Input SF checkpoint .pth")
+    to_qnn.add_argument("output_path", help="Output .pth path for QNNPolicy")
+    to_qnn.add_argument("--obs-dim", type=int, required=True)
+    to_qnn.add_argument("--trunk-hidden", type=int, default=128)
+    to_qnn.add_argument("--gru-hidden", type=int, default=128)
+    to_qnn.add_argument("--device", default="cpu")
 
     args = parser.parse_args()
 
     if args.cmd == "bc-to-sf":
-        bc_policy = MLPGRUPolicy.load(args.bc_path, device=args.device)
-        ckpt = save_sf_format(bc_policy, args.output_dir)
+        policy = QNNPolicy.load(args.bc_path, device=args.device)
+        ckpt = save_sf_format(policy, args.output_dir)
         print(f"Saved SF-format warm-start checkpoint: {ckpt}")
 
-    elif args.cmd == "sf-to-bc":
-        bc_policy = sf_to_bc(
+    elif args.cmd == "sf-to-qnn":
+        policy = sf_to_qnn(
             sf_checkpoint_path=args.sf_path,
             obs_dim=args.obs_dim,
             trunk_hidden=args.trunk_hidden,
             gru_hidden=args.gru_hidden,
-            use_gru=not args.no_gru,
             device=args.device,
         )
-        bc_policy.save(args.output_path)
-        print(f"Saved MLPGRUPolicy checkpoint: {args.output_path}")
+        policy.save(args.output_path)
+        print(f"Saved QNNPolicy checkpoint: {args.output_path}")
 
 
 if __name__ == "__main__":

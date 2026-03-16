@@ -30,22 +30,16 @@ def _as_mapping(value: Any, field_name: str) -> Dict[str, Any]:
 class RegionNode:
     region_id: int
     center: List[float]
-    neighbors: List[int]
     bounds_min: List[float]
     bounds_max: List[float]
-    object_ids: List[str] = field(default_factory=list)
-    visibility_hints: List[int] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RegionNode":
         record = cls(
             region_id=int(data["region_id"]),
             center=_as_float_list(data["center"], 3, "center"),
-            neighbors=_as_int_list(data.get("neighbors", []), "neighbors"),
             bounds_min=_as_float_list(data["bounds_min"], 3, "bounds_min"),
             bounds_max=_as_float_list(data["bounds_max"], 3, "bounds_max"),
-            object_ids=[str(value) for value in data.get("object_ids", [])],
-            visibility_hints=_as_int_list(data.get("visibility_hints", []), "visibility_hints"),
         )
         record.validate()
         return record
@@ -57,12 +51,6 @@ class RegionNode:
         _require(len(self.bounds_max) == 3, "bounds_max must have length 3")
         for axis in range(3):
             _require(self.bounds_min[axis] <= self.bounds_max[axis], "bounds_min must be <= bounds_max")
-        for neighbor in self.neighbors:
-            _require(neighbor >= 0, "neighbor ids must be >= 0")
-        for object_id in self.object_ids:
-            _require(bool(object_id), "object_ids must be non-empty")
-        for region_id in self.visibility_hints:
-            _require(region_id >= 0, "visibility_hints must be >= 0")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -108,8 +96,6 @@ class MapState:
     map_id: str
     regions: List[RegionNode]
     static_objects: List[StaticObject]
-    spawn_region_ids: List[int]
-    goal_region_ids: List[int]
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -118,8 +104,6 @@ class MapState:
             map_id=str(data["map_id"]),
             regions=[RegionNode.from_dict(row) for row in data.get("regions", [])],
             static_objects=[StaticObject.from_dict(row) for row in data.get("static_objects", [])],
-            spawn_region_ids=_as_int_list(data.get("spawn_region_ids", []), "spawn_region_ids"),
-            goal_region_ids=_as_int_list(data.get("goal_region_ids", []), "goal_region_ids"),
             metadata=_as_mapping(data.get("metadata", {}), "metadata"),
         )
         record.validate()
@@ -135,24 +119,10 @@ class MapState:
 
         for region in self.regions:
             region.validate()
-            for neighbor in region.neighbors:
-                _require(neighbor in known_regions, "region neighbors must reference known regions")
-            for visibility_hint in region.visibility_hints:
-                _require(visibility_hint in known_regions, "visibility_hints must reference known regions")
-
-        known_object_ids = set(object_ids)
-        for region in self.regions:
-            for object_id in region.object_ids:
-                _require(object_id in known_object_ids, "region object_ids must reference known static objects")
 
         for obj in self.static_objects:
             obj.validate()
             _require(obj.region_id in known_regions, "static objects must reference known regions")
-
-        for region_id in self.spawn_region_ids:
-            _require(region_id in known_regions, "spawn_region_ids must reference known regions")
-        for region_id in self.goal_region_ids:
-            _require(region_id in known_regions, "goal_region_ids must reference known regions")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
