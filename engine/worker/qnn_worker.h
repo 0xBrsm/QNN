@@ -216,6 +216,7 @@ int qnn_worker_nearest_region_id(const qnn_worker_map_state_t *map_state, const 
 void qnn_worker_semantic_reset(const qnn_worker_map_state_t *map_state);
 void qnn_worker_semantic_update(const qnn_worker_map_state_t *map_state, const qnn_worker_snapshot_t *snapshot, float dt, qboolean reset_flag);
 void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, int tick_hz, qboolean reset_flag);
+void qnn_worker_write_obs_buffer(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, int tick_hz, qboolean reset_flag);
 void qnn_worker_training_reset_episode(void);
 void qnn_worker_training_reset_tick(void);
 void qnn_worker_write_training_extras_binary(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, qboolean reset_flag);

@@ -17,12 +17,7 @@ except ImportError as exc:
 from quake_ai.actions import ACTION_HEADS
 from quake_ai.rl.environment import NativeWorldEnv
 from quake_ai.model.observation import ACTION_HISTORY_DIM, ACTION_HISTORY_LEN, SELF_SCALAR_DIM
-from mapgen.pool import PROCGEN_SENTINEL, MapPool
-
-# Shared map pools keyed by (maps_dir, arena_size, rooms) so envs on the
-# same procgen scenario share a single compile pipeline instead of each
-# running their own.
-_shared_map_pools: dict[tuple, MapPool] = {}
+from mapgen.pool import PROCGEN_SENTINEL
 
 # Deterministic head ordering (Python 3.7+ dict preserves insertion order)
 _HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
@@ -89,25 +84,16 @@ class QuakeEnv(gymnasium.Env):
         basedir = getattr(cfg, "quake_basedir", "") or ""
         workdir = getattr(cfg, "quake_native_workdir", "") or ""
 
-        # Procgen: share one MapPool per scenario config (keyed by
-        # arena_size + rooms).  Avoids N parallel compile pipelines
-        # when N envs use the same procgen settings.
-        map_pool: MapPool | None = None
+        # Procgen: generate maps inline on each reset() — no background threads.
+        procgen_cfg: dict | None = None
         if map_id == PROCGEN_SENTINEL:
             maps_dir = Path(basedir) / "id1" / "maps" if basedir else Path("assets") / "id1" / "maps"
             procgen_opts = scenario.get("procgen", {})
-            arena_size = int(procgen_opts.get("arena_size", 3072))
-            rooms = int(procgen_opts.get("rooms", 3))
-            pool_key = (str(maps_dir), arena_size, rooms)
-            if pool_key not in _shared_map_pools:
-                _shared_map_pools[pool_key] = MapPool(
-                    maps_dir,
-                    pool_size=4,
-                    workers=1,
-                    arena_size=arena_size,
-                    rooms=rooms,
-                )
-            map_pool = _shared_map_pools[pool_key]
+            procgen_cfg = {
+                "maps_dir": str(maps_dir),
+                "arena_size": int(procgen_opts.get("arena_size", 3072)),
+                "rooms": int(procgen_opts.get("rooms", 3)),
+            }
 
         self.inner_env = NativeWorldEnv(
             executable=str(cfg.quake_executable),
@@ -120,7 +106,7 @@ class QuakeEnv(gymnasium.Env):
             native_args=native_args,
             options=options,
             workdir=workdir or None,
-            map_pool=map_pool,
+            procgen=procgen_cfg,
         )
 
         # Episode-level accumulators for SF custom metrics
@@ -130,6 +116,19 @@ class QuakeEnv(gymnasium.Env):
         self._ep_damage_taken = 0.0
         self._ep_steps = 0
         self._ep_reward = 0.0
+        # Skill metrics
+        self._ep_hits = 0
+        self._ep_shots = 0
+        self._ep_health_pickups = 0.0
+        self._ep_armor_pickups = 0.0
+        self._ep_weapon_pickups = 0.0
+        self._ep_blind_fires = 0
+        self._ep_stuck_steps = 0
+        # Reward decomposition
+        self._ep_reward_frag = 0.0
+        self._ep_reward_death = 0.0
+        self._ep_reward_ehp = 0.0
+        self._ep_reward_edp = 0.0
 
         # Demo recording: always record to the same file per env,
         # overwriting each episode.  Best demo archiving is handled by
@@ -151,6 +150,7 @@ class QuakeEnv(gymnasium.Env):
             gamedir = Path(workdir) / gamedir
         demos_dir = gamedir / "demos"
         self._demo_path = demos_dir / f"{self._demo_name}.dem"
+        self._demo_last_path = demos_dir / f"{self._demo_name}_last.dem"
         if self._record_demos:
             demos_dir.mkdir(parents=True, exist_ok=True)
             self._inject_record_cmd()
@@ -259,6 +259,17 @@ class QuakeEnv(gymnasium.Env):
         self._ep_damage_taken = 0.0
         self._ep_steps = 0
         self._ep_reward = 0.0
+        self._ep_hits = 0
+        self._ep_shots = 0
+        self._ep_health_pickups = 0.0
+        self._ep_armor_pickups = 0.0
+        self._ep_weapon_pickups = 0.0
+        self._ep_blind_fires = 0
+        self._ep_stuck_steps = 0
+        self._ep_reward_frag = 0.0
+        self._ep_reward_death = 0.0
+        self._ep_reward_ehp = 0.0
+        self._ep_reward_edp = 0.0
         obs = self.inner_env.reset(seed=seed)
         return obs, {"scenario_id": self.scenario_id}
 
@@ -277,11 +288,29 @@ class QuakeEnv(gymnasium.Env):
         self._ep_damage_dealt += float(info.get("damage_dealt", 0))
         self._ep_damage_taken += float(info.get("damage_taken", 0))
         self._ep_steps += 1
-
         self._ep_reward += float(reward)
+        # Skill metrics
+        self._ep_hits += int(info.get("hit_count", 0))
+        self._ep_shots += int(info.get("shots_fired", 0))
+        self._ep_health_pickups += float(info.get("health_gain", 0))
+        self._ep_armor_pickups += float(info.get("armor_gain", 0))
+        self._ep_weapon_pickups += float(info.get("weapon_pickups", 0))
+        self._ep_blind_fires += int(info.get("blind_fire", 0))
+        self._ep_stuck_steps += 1 if info.get("stuck") else 0
+        # Reward decomposition
+        self._ep_reward_frag += float(info.get("reward_frag_bonus", 0))
+        self._ep_reward_death += float(info.get("reward_death_penalty", 0))
+        self._ep_reward_ehp += float(info.get("reward_ehp_delta", 0))
+        self._ep_reward_edp += float(info.get("reward_edp_delta", 0))
+
+        # Preserve the completed episode's demo before reset overwrites it.
+        if (terminated or truncated) and self._record_demos and self._demo_path.exists():
+            import shutil
+            shutil.copy2(self._demo_path, self._demo_last_path)
 
         # SF picks up episode_extra_stats_* from info on terminal/truncated steps
         if terminated or truncated:
+            # --- Combat summary ---
             info["episode_extra_stats_frags"] = self._ep_frags
             info["episode_extra_stats_deaths"] = self._ep_deaths
             info["episode_extra_stats_kd_ratio"] = (
@@ -291,12 +320,36 @@ class QuakeEnv(gymnasium.Env):
             info["episode_extra_stats_damage_taken"] = self._ep_damage_taken
             info["episode_extra_stats_steps"] = self._ep_steps
 
+            # --- Skill metrics ---
+            info["episode_extra_stats_accuracy"] = (
+                self._ep_hits / max(self._ep_shots, 1)
+            )
+            info["episode_extra_stats_hits"] = self._ep_hits
+            info["episode_extra_stats_shots_fired"] = self._ep_shots
+            info["episode_extra_stats_damage_per_death"] = (
+                self._ep_damage_dealt / max(self._ep_deaths, 1)
+            )
+            info["episode_extra_stats_health_pickups"] = self._ep_health_pickups
+            info["episode_extra_stats_armor_pickups"] = self._ep_armor_pickups
+            info["episode_extra_stats_weapon_pickups"] = self._ep_weapon_pickups
+            info["episode_extra_stats_blind_fire_rate"] = (
+                self._ep_blind_fires / max(self._ep_shots, 1)
+            )
+            info["episode_extra_stats_stuck_rate"] = (
+                self._ep_stuck_steps / max(self._ep_steps, 1)
+            )
+
+            # --- Reward decomposition ---
+            info["episode_extra_stats_reward_total"] = self._ep_reward
+            info["episode_extra_stats_reward_frags"] = self._ep_reward_frag
+            info["episode_extra_stats_reward_deaths"] = self._ep_reward_death
+            info["episode_extra_stats_reward_ehp"] = self._ep_reward_ehp
+            info["episode_extra_stats_reward_edp"] = self._ep_reward_edp
+
         return obs, float(reward), terminated, truncated, info
 
     def close(self) -> None:
         self.inner_env.close()
-        # Don't close the shared map pool here — other envs may still use it.
-        # Pools are cleaned up at process exit via __del__.
 
     def render(self) -> None:
         pass

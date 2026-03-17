@@ -4,53 +4,53 @@
       "scenario_id": "ffa-dm2-3bot",
       "map_id": "dm2",
       "skill_note": "Compact map — 3 bots at skill 2, lighter pressure.",
-      "options": {"maxplayers": 5, "skill": 2, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100"}
+      "options": {"maxplayers": 5, "skill": 0, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100"}
     },
     {
       "scenario_id": "ffa-dm4-5bot",
       "map_id": "dm4",
       "skill_note": "Open map — 5 bots at skill 2, long sightlines.",
-      "options": {"maxplayers": 7, "skill": 2, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
+      "options": {"maxplayers": 7, "skill": 0, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
     },
     {
       "scenario_id": "ffa-dm3-4bot",
       "map_id": "dm3",
       "skill_note": "Vertical map — 4 bots at skill 2, stacked floors.",
-      "options": {"maxplayers": 6, "skill": 2, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
+      "options": {"maxplayers": 6, "skill": 0, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
     },
     {
       "scenario_id": "ffa-dm6-5bot",
       "map_id": "dm6",
       "skill_note": "Spawn-pressure map — 5 bots at skill 2, contested positions.",
-      "options": {"maxplayers": 7, "skill": 2, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
+      "options": {"maxplayers": 7, "skill": 0, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
     },
     {
       "scenario_id": "ffa-procgen-small-2bot",
       "map_id": "procgen",
       "skill_note": "Small procgen arena — 2 bots, tight dueling.",
       "procgen": {"arena_size": 2048, "rooms": 2},
-      "options": {"maxplayers": 4, "skill": 2, "post_map_commands": "impulse 100\nimpulse 100"}
+      "options": {"maxplayers": 4, "skill": 0, "post_map_commands": "impulse 100\nimpulse 100"}
     },
     {
       "scenario_id": "ffa-procgen-small-4bot",
       "map_id": "procgen",
       "skill_note": "Small procgen arena — 4 bots, crowded.",
       "procgen": {"arena_size": 2048, "rooms": 3},
-      "options": {"maxplayers": 6, "skill": 2, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
+      "options": {"maxplayers": 6, "skill": 0, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
     },
     {
       "scenario_id": "ffa-procgen-med-3bot",
       "map_id": "procgen",
       "skill_note": "Medium procgen arena — 3 bots, balanced.",
       "procgen": {"arena_size": 3072, "rooms": 3},
-      "options": {"maxplayers": 5, "skill": 2, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100"}
+      "options": {"maxplayers": 5, "skill": 0, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100"}
     },
     {
       "scenario_id": "ffa-procgen-large-5bot",
       "map_id": "procgen",
       "skill_note": "Large procgen arena — 5 bots, navigation heavy.",
       "procgen": {"arena_size": 4096, "rooms": 5},
-      "options": {"maxplayers": 7, "skill": 2, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
+      "options": {"maxplayers": 7, "skill": 0, "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"}
     }
   ]
 }

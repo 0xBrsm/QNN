@@ -112,40 +112,40 @@ class BestCheckpointArchiver(AlgoObserver, EventLoopObject):
                 self._smb_copy(best_file)
 
     def _archive_best_demo(self, checkpoint_name: str, policy_id: int = 0) -> None:
-        """Copy the most recent worker demo for *policy_id* to best.dem."""
+        """Copy the most recent worker demo for *policy_id*, named to match the checkpoint."""
         if not self._demos_dir or not self._demos_dir.is_dir():
             return
-        # Find the most recently modified demo for this policy.
-        worker_demos = list(self._demos_dir.glob(f"train_p{policy_id}_w*.dem"))
+        # Find the most recently completed demo for this policy.
+        # Envs save a copy of the finished episode as *_last.dem before reset
+        # overwrites the active demo file.
+        worker_demos = list(self._demos_dir.glob(f"train_p{policy_id}_w*_last.dem"))
         if not worker_demos:
-            # Fall back to old naming convention (pre-PBT).
+            # Fall back to active demos (old naming or pre-PBT).
+            worker_demos = list(self._demos_dir.glob(f"train_p{policy_id}_w*.dem"))
+            # Exclude _last.dem from active list
+            worker_demos = [d for d in worker_demos if "_last" not in d.name]
+        if not worker_demos:
             worker_demos = list(self._demos_dir.glob("train_w*.dem"))
         if not worker_demos:
             return
         newest = max(worker_demos, key=lambda p: p.stat().st_mtime)
-        # Copy demo
-        dest_dem = self._archive_dir / "best.dem"
+        # Name demo to match checkpoint: best_000002890_12231680_reward_-23.041.dem
+        demo_stem = Path(checkpoint_name).stem  # strip .pth
+        dest_dem = self._archive_dir / f"{demo_stem}.dem"
         shutil.copy2(newest, dest_dem)
         # Copy the matching procgen BSP if it exists (read map name from demo)
         try:
-            raw = newest.read_bytes()
-            # Map name appears early in demo as "maps/<name>.bsp"
             import re
+            raw = newest.read_bytes()
             m = re.search(rb"(gen_\d+)", raw[:4096])
             if m:
                 map_id = m.group(1).decode()
-                # Clean up old procgen BSPs in archive
-                for old_bsp in self._archive_dir.glob("gen_*.bsp"):
-                    old_bsp.unlink(missing_ok=True)
-                bsp_src = newest.parent.parent.parent / "id1" / "maps" / f"{map_id}.bsp"
-                if not bsp_src.exists():
-                    # Try basedir
-                    bsp_src = Path(str(getattr(self, "_demos_dir", ""))).parent.parent / "id1" / "maps" / f"{map_id}.bsp"
+                bsp_src = self._demos_dir.parent.parent / "id1" / "maps" / f"{map_id}.bsp"
                 if bsp_src.exists():
-                    shutil.copy2(bsp_src, self._archive_dir / f"{map_id}.bsp")
+                    shutil.copy2(bsp_src, self._archive_dir / f"{demo_stem}.bsp")
         except Exception:
-            pass  # Demo parsing failed — skip BSP copy.
-        log.info("Archived best demo from %s", newest.name)
+            pass
+        log.info("Archived best demo: %s", dest_dem.name)
 
     def _smb_copy(self, src: Path) -> None:
         try:

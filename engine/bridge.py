@@ -28,6 +28,7 @@ from engine.training_protocol import (
 from engine.token_protocol import (
     TOKEN_BINARY_HEADER_SIZE,
     TOKEN_BINARY_MAGIC,
+    TrustedSelfToken,
     TrustedTokenTick,
     decode_binary_token_tick,
 )
@@ -411,6 +412,116 @@ class NativeTokenProcess(NativeProcessBase):
 
 
 # ---------------------------------------------------------------------------
+# NativeObsBufferProcess — direct-pack obs_buffer_v1 binary
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+# Obs buffer layout constants (must match qnn_obs_buffer.h)
+OBS_BUFFER_SIZE = 14612
+
+_OBS_FIELDS = {
+    "self_scalars":             (    0,   92, np.float32, (23,)),
+    "self_weapon_id":           (   92,    4, np.int32,   (1,)),
+    "self_movement_id":         (   96,    4, np.int32,   (1,)),
+    "self_cluster_id":          (  100,    4, np.int32,   (1,)),
+    "object_ids":               (  104, 1280, np.int32,   (64, 5)),
+    "object_scalars":           ( 1384, 2048, np.float32, (64, 8)),
+    "object_mask":              ( 3432,   64, np.uint8,   (64,)),
+    "object_route_cluster_ids": ( 3496, 2048, np.int32,   (64, 8)),
+    "event_ids":                ( 5544, 4096, np.int32,   (256, 4)),
+    "event_scalars":            ( 9640, 3072, np.float32, (256, 3)),
+    "event_owner":              (12712, 1024, np.int32,   (256,)),
+    "event_mask":               (13736,  256, np.uint8,   (256,)),
+    "spatial_ids":              (13992,   36, np.int32,   (9,)),
+    "spatial_scalars":          (14028,  360, np.float32, (9, 10)),
+    "action_history":           (14388,  224, np.float32, (8, 7)),
+}
+
+
+def _unpack_obs_buffer(raw: bytes) -> Dict[str, np.ndarray]:
+    """Zero-copy unpack of the 14612-byte obs buffer into numpy arrays."""
+    obs: Dict[str, np.ndarray] = {}
+    for name, (offset, size, dtype, shape) in _OBS_FIELDS.items():
+        arr = np.frombuffer(raw, dtype=dtype, offset=offset, count=int(np.prod(shape)))
+        # Convert uint8 mask fields to bool to match TokenObservationEncoder output
+        if name in ("object_mask", "event_mask"):
+            obs[name] = arr.astype(np.bool_).reshape(shape)
+        else:
+            obs[name] = arr.reshape(shape).copy()  # copy — raw bytes invalidated next call
+    return obs
+
+
+class NativeObsBufferProcess(NativeProcessBase):
+    """Subprocess bridge that reads direct-pack obs_buffer_v1 binary."""
+
+    _step_format = "obs_buffer_v1"
+    _required_capability = "obs_buffer_v1"
+    _last_obs: Dict[str, np.ndarray] | None = None
+
+    def _read_obs_packet(self) -> Dict[str, np.ndarray]:
+        raw = self._read_exact(OBS_BUFFER_SIZE)
+        obs = _unpack_obs_buffer(raw)
+        self._last_obs = obs
+        # Synthesize a minimal _last_token_tick so _action_request can read weapon_bits
+        # for weapons_owned. Only self_token.weapon_bits is used.
+        scalars = obs["self_scalars"]
+        weapon_bits = [float(scalars[i]) for i in range(3, 10)]
+        self._last_token_tick = TrustedTokenTick(
+            tick=0, steps=0, current_region_id=0,
+            self_token=TrustedSelfToken(
+                health=0, armor=0, armor_type=0,
+                weapon_bits=weapon_bits,
+                weapon_super=0, ammo=[0]*4, velocity=[0]*3,
+                yaw_sin=0, yaw_cos=0, pitch_sin=0, pitch_cos=0,
+                dt=0, weapon_id=0, movement_id=0, cluster_id=0,
+            ),
+            object_tokens=[], spatial_tokens=[],
+        )
+        return obs
+
+    def _request_obs_packet(self, payload: bytes) -> Dict[str, np.ndarray]:
+        proc = self._ensure_running()
+        proc.stdin.write(payload)
+        proc.stdin.flush()
+        return self._read_obs_packet()
+
+    # -- Public API ----------------------------------------------------------
+
+    def reset(
+        self, seed: int | None = None, options: Mapping[str, object] | None = None
+    ) -> Dict[str, np.ndarray]:
+        obs, _ = self.reset_with_training(seed=seed, options=options)
+        return obs
+
+    def reset_with_training(
+        self,
+        seed: int | None = None,
+        options: Mapping[str, object] | None = None,
+    ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
+        if self.proc is None:
+            self.start()
+        payload: Dict[str, Any] = {"op": "reset", "seed": seed if seed is not None else -1}
+        if options:
+            payload["options"] = dict(options)
+        obs = self._request_obs_packet(self._serialize_request(payload))
+        self._current_episode_id = f"{self.map_id}:{0}"
+        return obs, self._maybe_read_training_binary()
+
+    def step(self, action: Mapping[str, int]) -> Dict[str, np.ndarray]:
+        obs, _ = self.step_with_training(action)
+        return obs
+
+    def step_with_training(
+        self, action: Mapping[str, int]
+    ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
+        if self.proc is None:
+            self.start()
+        obs = self._request_obs_packet(self._action_request(action))
+        return obs, self._maybe_read_training_binary()
+
+
+# ---------------------------------------------------------------------------
 # Adapter wrappers — thin public API with reset-option defaults
 # ---------------------------------------------------------------------------
 
@@ -507,6 +618,70 @@ class NativeTokenAdapter:
         raise NativeEngineError(
             "Legacy flat observation API has been removed; use step_tokens() or NativeWorldEnv"
         )
+
+    def close(self) -> None:
+        self.process.shutdown()
+
+
+class NativeObsBufferAdapter:
+    """Control-plane wrapper around a NativeObsBufferProcess.
+
+    Returns pre-packed numpy observations directly from C (no Python tensor packing).
+    Training extras continue via QTRN.
+    """
+
+    def __init__(
+        self,
+        executable: str | Path,
+        map_id: str,
+        fixed_tick_hz: int = 20,
+        workdir: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        extra_args: Sequence[str] | None = None,
+        reset_options: Mapping[str, object] | None = None,
+        training_format: str = "",
+    ) -> None:
+        self.reset_options = dict(reset_options or {})
+        self.process = NativeObsBufferProcess(
+            executable=executable,
+            map_id=map_id,
+            fixed_tick_hz=fixed_tick_hz,
+            workdir=workdir,
+            env=env,
+            extra_args=extra_args,
+            training_format=training_format,
+        )
+        self.process.start()
+
+    def ticks_per_second(self) -> int:
+        return self.process.fixed_tick_hz
+
+    def map_state_snapshot(self) -> MapState | None:
+        return self.process.map_state
+
+    def reset_obs_with_training(
+        self, seed: int | None = None
+    ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
+        return self.process.reset_with_training(seed=seed, options=self.reset_options)
+
+    def step_obs_with_training(
+        self, action: Mapping[str, int]
+    ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
+        return self.process.step_with_training(action)
+
+    def change_map(self, new_map_id: str) -> MapState | None:
+        self.process.shutdown()
+        self.process = NativeObsBufferProcess(
+            executable=self.process.executable,
+            map_id=new_map_id,
+            fixed_tick_hz=self.process.fixed_tick_hz,
+            workdir=self.process.workdir,
+            env=self.process.env,
+            extra_args=self.process.extra_args,
+            training_format=self.process.training_format,
+        )
+        self.process.start()
+        return self.process.map_state
 
     def close(self) -> None:
         self.process.shutdown()

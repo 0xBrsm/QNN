@@ -12,7 +12,7 @@ import numpy as np
 
 import logging
 
-from engine.bridge import NativeEngineError, NativeTokenAdapter
+from engine.bridge import NativeEngineError, NativeObsBufferAdapter, NativeTokenAdapter
 from engine.training_protocol import TrustedTrainingExtrasV1
 from quake_ai.actions import ActionLabels
 from quake_ai.rl.combat_metrics import WEAPON_TOTAL_DEBUG_KEYS, weapon_metric_key
@@ -28,6 +28,30 @@ _HEALTH_CAP = 250.0
 _ARMOR_CAP = 200.0
 _ARMOR_TYPE_CAP = 0.8
 _VEL_CAP = 2000.0
+
+
+@dataclass(frozen=True, slots=True)
+class _SelfInfo:
+    """Self-token fields extracted from the obs buffer for reward computation."""
+    health: float       # normalized [0,1]
+    armor: float        # normalized [0,1]
+    armor_type: float   # normalized [0,1]
+    velocity: list      # [vx, vy, vz] normalized
+    weapon_id: int      # weapon embedding ID
+    ammo: list          # [shells, nails, rockets, cells] normalized
+
+
+def _self_info_from_obs(obs: Dict[str, np.ndarray]) -> _SelfInfo:
+    """Extract self-token fields from the obs buffer numpy dict."""
+    s = obs["self_scalars"]
+    return _SelfInfo(
+        health=float(s[0]),
+        armor=float(s[1]),
+        armor_type=float(s[2]),
+        velocity=[float(s[15]), float(s[16]), float(s[17])],
+        weapon_id=int(obs["self_weapon_id"][0]),
+        ammo=[float(s[11]), float(s[12]), float(s[13]), float(s[14])],
+    )
 
 
 @dataclass(slots=True)
@@ -145,6 +169,7 @@ class NativeWorldEnv:
         options: Mapping[str, object] | None = None,
         encoder: TokenObservationEncoder | None = None,
         map_pool: MapPool | None = None,
+        procgen: dict | None = None,
     ) -> None:
         self.max_steps = max_steps
         resolved_mode = mode.strip().lower() if mode else "pvp"
@@ -156,20 +181,30 @@ class NativeWorldEnv:
             overrides = dict((options or {}).get("reward_overrides", {}))
             self.reward_weights = RewardWeights(mode=resolved_mode, **overrides)
         self.rng = np.random.default_rng(seed)
-        self.encoder = encoder if encoder is not None else TokenObservationEncoder()
+        self.encoder = encoder if encoder is not None else TokenObservationEncoder()  # kept for visible_threat_count shape inference
         self.options = dict(options or {})
         self.map_pool = map_pool
+        self._procgen = procgen
 
-        # If we have a pool, grab the first map from it instead of using the
-        # sentinel ``map_id`` directly.
+        # Procgen: generate the first map inline (no background threads).
         self._maps_dir: Path | None = None
         self._current_map_id: str | None = None
-        if self.map_pool is not None:
+        if self._procgen is not None:
+            from mapgen.pool import generate_bsp
+            self._maps_dir = Path(self._procgen["maps_dir"])
+            seed_val = self.rng.integers(0, 2**31 - 1)
+            map_id, _ = generate_bsp(
+                int(seed_val), self._maps_dir,
+                rooms=self._procgen.get("rooms", 3),
+                arena_size=self._procgen.get("arena_size", 3072),
+            )
+            self._current_map_id = map_id
+        elif self.map_pool is not None:
             map_id = self.map_pool.get(timeout=120.0)
             self._current_map_id = map_id
             self._maps_dir = self.map_pool._maps_dir
 
-        self.adapter = NativeTokenAdapter(
+        self.adapter = NativeObsBufferAdapter(
             executable=executable,
             map_id=map_id,
             fixed_tick_hz=fixed_tick_hz,
@@ -191,20 +226,28 @@ class NativeWorldEnv:
     def reset(self, seed: int | None = None, start_variant: int | None = None) -> Dict[str, np.ndarray]:
         del start_variant
         reset_seed = seed if seed is not None else int(self.rng.integers(0, 2**31 - 1))
-        self.encoder.reset()
 
         # Swap to a fresh procgen map each episode.  Retry with a different map
         # if the engine crashes (e.g. malformed BSP from the generator).
-        if self.map_pool is not None:
+        if self._procgen is not None or self.map_pool is not None:
+            from mapgen.pool import generate_bsp
             old_map_id = self._current_map_id
             last_err: Exception | None = None
             for attempt in range(self._MAX_PROCGEN_RETRIES):
-                new_map_id = self.map_pool.get(timeout=120.0)
+                if self._procgen is not None:
+                    seed_val = int(self.rng.integers(0, 2**31 - 1))
+                    new_map_id, _ = generate_bsp(
+                        seed_val, self._maps_dir,
+                        rooms=self._procgen.get("rooms", 3),
+                        arena_size=self._procgen.get("arena_size", 3072),
+                    )
+                else:
+                    new_map_id = self.map_pool.get(timeout=120.0)
                 try:
                     new_map_state = self.adapter.change_map(new_map_id)
                     if new_map_state is not None:
                         self.map_state = new_map_state
-                    token_tick, training_extras = self.adapter.reset_tokens_with_training(seed=reset_seed)
+                    obs, training_extras = self.adapter.reset_obs_with_training(seed=reset_seed)
                     self._current_map_id = new_map_id
                     last_err = None
                     break
@@ -213,6 +256,10 @@ class NativeWorldEnv:
                         "Procgen map %s failed (attempt %d/%d): %s",
                         new_map_id, attempt + 1, self._MAX_PROCGEN_RETRIES, exc,
                     )
+                    # Clean up the failed map immediately.
+                    if self._maps_dir:
+                        for ext in (".bsp", ".map", ".log", ".prt"):
+                            (self._maps_dir / f"{new_map_id}{ext}").unlink(missing_ok=True)
                     last_err = exc
             if last_err is not None:
                 raise last_err
@@ -222,41 +269,39 @@ class NativeWorldEnv:
                     p = self._maps_dir / f"{old_map_id}{ext}"
                     p.unlink(missing_ok=True)
         else:
-            token_tick, training_extras = self.adapter.reset_tokens_with_training(seed=reset_seed)
+            obs, training_extras = self.adapter.reset_obs_with_training(seed=reset_seed)
         frag_delta = int(training_extras.frag_gain) if training_extras is not None else 0
-        st = token_tick.self_token
+        si = _self_info_from_obs(obs)
         self.state = NativeEnvState(
             steps=0,
-            current_region_id=token_tick.current_region_id,
+            current_region_id=0,
             frags=frag_delta,
-            weapon_id=int(st.weapon_id),
+            weapon_id=si.weapon_id,
             prev_ehp=effective_hp(
-                float(st.health * _HEALTH_CAP),
-                float(st.armor * _ARMOR_CAP),
-                float(st.armor_type * _ARMOR_TYPE_CAP),
+                float(si.health * _HEALTH_CAP),
+                float(si.armor * _ARMOR_CAP),
+                float(si.armor_type * _ARMOR_TYPE_CAP),
             ),
         )
-        return self.encoder.encode(token_tick)
+        return obs
 
     def step(self, action: Mapping[str, int]) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, object]]:
         if self.state is None:
             raise RuntimeError("Call reset() before step()")
 
-        token_tick, training_extras = self.adapter.step_tokens_with_training(action)
-        obs = self.encoder.encode(token_tick)
+        obs, training_extras = self.adapter.step_obs_with_training(action)
 
-        st = token_tick.self_token
+        si = _self_info_from_obs(obs)
         steps = self.state.steps + 1
-        current_region_id = token_tick.current_region_id
-        timed_out = bool(steps >= self.max_steps and not token_tick.done)
-        done = bool(token_tick.done or timed_out)
-        # v5: use velocity magnitude for stuck detection (origin removed from wire)
-        speed = _velocity_magnitude(st.velocity)
-        stuck = speed < 10.0  # units/sec threshold
+        worker_done = training_extras is not None and training_extras.done
+        timed_out = bool(steps >= self.max_steps and not worker_done)
+        done = bool(worker_done or timed_out)
+        speed = _velocity_magnitude(si.velocity)
+        stuck = speed < 10.0
 
-        raw_health = st.health * _HEALTH_CAP
-        raw_armor = st.armor * _ARMOR_CAP
-        raw_armor_type = st.armor_type * _ARMOR_TYPE_CAP
+        raw_health = si.health * _HEALTH_CAP
+        raw_armor = si.armor * _ARMOR_CAP
+        raw_armor_type = si.armor_type * _ARMOR_TYPE_CAP
 
         current_frags = self.state.frags + (int(training_extras.frag_gain) if training_extras is not None else 0) - (int(training_extras.frag_loss) if training_extras is not None else 0)
         visible_threats = visible_threat_count(obs)
@@ -265,7 +310,7 @@ class NativeWorldEnv:
             health=int(raw_health),
             armor=int(raw_armor),
             armor_type=float(raw_armor_type),
-            weapon_id=int(st.weapon_id),
+            weapon_id=si.weapon_id,
             visible_threats=visible_threats,
             fire_pressed=int(action.get("fire", 0)),
         )
@@ -287,9 +332,9 @@ class NativeWorldEnv:
         stored_ehp = 100.0 if player_died else current_ehp
         self.state = NativeEnvState(
             steps=steps,
-            current_region_id=current_region_id,
+            current_region_id=0,
             frags=current_frags,
-            weapon_id=int(st.weapon_id),
+            weapon_id=si.weapon_id,
             prev_ehp=stored_ehp,
         )
 
@@ -298,22 +343,22 @@ class NativeWorldEnv:
             done_reason = "timeout"
         elif training_extras is not None and training_extras.player_died:
             done_reason = "player_died"
-        elif token_tick.done:
+        elif worker_done:
             done_reason = "done"
         info: Dict[str, object] = {}
         info.update(
             {
                 "steps": steps,
-                "current_region_id": current_region_id,
+                "current_region_id": 0,
                 "stuck": stuck,
                 "speed": speed,
                 "done_reason": done_reason,
-                "worker_done": bool(token_tick.done),
+                "worker_done": bool(worker_done),
                 "worker_reward": 0.0,
                 "health": int(raw_health),
                 "armor": int(raw_armor),
-                "ammo": float(sum(st.ammo)),
-                "weapon_id": int(st.weapon_id),
+                "ammo": float(sum(si.ammo)),
+                "weapon_id": si.weapon_id,
                 "scenario_id": str(self.map_state.map_id),
                 "frags": current_frags,
                 "monster_kills": 0,

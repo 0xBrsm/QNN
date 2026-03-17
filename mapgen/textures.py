@@ -43,11 +43,21 @@ TEXTURE_ALIASES = {
 
 
 def materialize_texture_wad(output_dir: Path, wad_name: str = DEFAULT_TEXTURE_WAD) -> Path:
-    """Write the mapgen texture WAD into `output_dir` and return its path."""
+    """Write the mapgen texture WAD into `output_dir` and return its path.
+
+    Skips the write if the WAD already exists (avoids race conditions when
+    multiple processes compile maps into the same directory concurrently).
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     wad_path = output_dir / wad_name
-    _write_wad2(wad_path, _load_required_textures())
+    if not wad_path.exists():
+        tmp_path = wad_path.with_suffix(".wad.tmp")
+        _write_wad2(tmp_path, _load_required_textures())
+        try:
+            os.replace(tmp_path, wad_path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
     return wad_path
 
 

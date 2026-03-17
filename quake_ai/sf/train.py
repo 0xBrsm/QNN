@@ -74,6 +74,7 @@ def _patch_sample_factory_checkpoint_loading() -> None:
     _allow_numpy_in_torch_load()
 
 
+
 def _experiment_dir(cfg: Any) -> Path:
     return Path(getattr(cfg, "train_dir", ".")) / str(getattr(cfg, "experiment", "quake_combat"))
 
@@ -106,26 +107,18 @@ def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
 
     if ckpt.endswith(".pth"):
         # Already SF format — copy directly into each policy dir.
-        # Reset best_performance so the learner doesn't think the old
-        # (possibly pre-reward-fix) reward is the bar to beat.
-        import torch
+        import shutil
         print(f"[quake_sf] Using SF checkpoint {ckpt} as warm-start ...")
-        checkpoint = torch.load(ckpt, map_location="cpu", weights_only=False)
-        old_best = checkpoint.get("best_performance", None)
-        checkpoint["best_performance"] = -1e9
-        if old_best is not None:
-            print(f"[quake_sf] Reset best_performance from {old_best} to -1e9")
+        # Ensure the name starts with "best_" so load_checkpoint_kind=best finds it.
+        name = Path(ckpt).name
+        if not name.startswith("best_"):
+            name = f"best_{name}"
         first_path = None
-        # Name follows SF's best checkpoint format: best_{step:09d}_{env_steps}_{metric}_{value}.pth
-        # Use step=0, env_steps=0, reward=-1000000.000 so it sorts FIRST
-        # lexicographically and gets cleaned up by SF's keep=1 as soon as a
-        # real best arrives.
-        warm_name = "best_000000000_0_reward_-1000000.000.pth"
         for pid in range(num_policies):
             policy_dir = exp_dir / f"checkpoint_p{pid}"
             policy_dir.mkdir(parents=True, exist_ok=True)
-            dest = policy_dir / warm_name
-            torch.save(checkpoint, dest)
+            dest = policy_dir / name
+            shutil.copy2(ckpt, dest)
             if pid == 0:
                 first_path = dest
             print(f"[quake_sf] Warm-start checkpoint copied: {dest}")
@@ -230,6 +223,7 @@ def build_sf_cfg(
     scenario_config_json: str = "",
     mode: str = "pvp",
     max_steps_per_episode: int = 1024,
+    fixed_tick_hz: int = 20,
     seed: int = 17,
     device: str = "gpu",
     init_checkpoint: str = "",
@@ -307,6 +301,7 @@ def build_sf_cfg(
         f"--quake_native_workdir={native_workdir}",
         f"--quake_map_id={scenario}",
         f"--quake_max_steps_per_episode={max_steps_per_episode}",
+        f"--quake_fixed_tick_hz={fixed_tick_hz}",
         f"--quake_mode={mode}",
         f"--quake_seed={seed}",
         f"--quake_native_args_json={native_args_json}",
@@ -388,6 +383,10 @@ def run_sf(cfg: Any) -> Dict[str, Any]:
     _set_sf_report_interval(60.0)
     _ensure_warm_start_checkpoint(cfg)
 
+    # SF's argparse omits "linear_decay" from lr_schedule choices but the
+    # scheduler code supports it.  Set it after argparse runs.
+    cfg.lr_schedule = "linear_decay"
+
     cfg, runner = make_runner(cfg)
     runner.register_observer(BestCheckpointArchiver(runner))
 
@@ -412,6 +411,8 @@ def main() -> None:
     add_quake_cli_args(parser)
     cfg = parse_full_cfg(parser)
     _ensure_warm_start_checkpoint(cfg)
+
+    cfg.lr_schedule = "linear_decay"
 
     cfg, runner = make_runner(cfg)
     runner.register_observer(BestCheckpointArchiver(runner))

@@ -13,6 +13,9 @@
 #define QNN_TRAIN_OUTPUT_NONE 0
 #define QNN_TRAIN_OUTPUT_BINARY_V1 1
 
+#define QNN_STEP_OUTPUT_TOKEN_BINARY_V2 0
+#define QNN_STEP_OUTPUT_OBS_BUFFER_V1   1
+
 typedef struct
 {
 	int	fixed_tick_hz;
@@ -44,6 +47,7 @@ typedef struct
 	int	history_count;
 	char	episode_id[QNN_WORKER_MAX_EPISODE_ID];
 	int	training_output_mode;
+	int	step_output_mode;
 } qnn_worker_runtime_t;
 
 typedef struct
@@ -617,7 +621,7 @@ static qboolean qnn_worker_reset_world(int seed, char *error, size_t error_size)
 
 static void qnn_worker_write_hello_response(void)
 {
-	fprintf(stdout, "{\"capabilities\":[\"listen_local\",\"navmesh_query_v1\",\"reset_options\",\"token_step_v2\",\"training_extras_v1\",\"udp_networking\"],\"map_id\":");
+	fprintf(stdout, "{\"capabilities\":[\"listen_local\",\"navmesh_query_v1\",\"obs_buffer_v1\",\"reset_options\",\"token_step_v2\",\"training_extras_v1\",\"udp_networking\"],\"map_id\":");
 	qnn_worker_write_json_string(stdout, qnn_worker_map_state.requested_map_id);
 	fprintf(stdout, ",\"map_state\":");
 	qnn_worker_write_map_state_json(stdout, &qnn_worker_map_state);
@@ -635,14 +639,20 @@ static void qnn_worker_write_hello_response(void)
 
 static void qnn_worker_write_reset_response(const qnn_worker_snapshot_t *snapshot)
 {
-	qnn_worker_write_token_step_binary(stdout, snapshot, qnn_worker_runtime.tick, qnn_worker_runtime.steps, qnn_worker_runtime.fixed_tick_hz, true);
+	if (qnn_worker_runtime.step_output_mode == QNN_STEP_OUTPUT_OBS_BUFFER_V1)
+		qnn_worker_write_obs_buffer(stdout, snapshot, qnn_worker_runtime.tick, qnn_worker_runtime.steps, qnn_worker_runtime.fixed_tick_hz, true);
+	else
+		qnn_worker_write_token_step_binary(stdout, snapshot, qnn_worker_runtime.tick, qnn_worker_runtime.steps, qnn_worker_runtime.fixed_tick_hz, true);
 	if (qnn_worker_runtime.training_output_mode == QNN_TRAIN_OUTPUT_BINARY_V1)
 		qnn_worker_write_training_extras_binary(stdout, snapshot, qnn_worker_runtime.tick, qnn_worker_runtime.steps, true);
 }
 
 static void qnn_worker_write_step_response(const qnn_worker_snapshot_t *snapshot)
 {
-	qnn_worker_write_token_step_binary(stdout, snapshot, qnn_worker_runtime.tick, qnn_worker_runtime.steps, qnn_worker_runtime.fixed_tick_hz, false);
+	if (qnn_worker_runtime.step_output_mode == QNN_STEP_OUTPUT_OBS_BUFFER_V1)
+		qnn_worker_write_obs_buffer(stdout, snapshot, qnn_worker_runtime.tick, qnn_worker_runtime.steps, qnn_worker_runtime.fixed_tick_hz, false);
+	else
+		qnn_worker_write_token_step_binary(stdout, snapshot, qnn_worker_runtime.tick, qnn_worker_runtime.steps, qnn_worker_runtime.fixed_tick_hz, false);
 	if (qnn_worker_runtime.training_output_mode == QNN_TRAIN_OUTPUT_BINARY_V1)
 		qnn_worker_write_training_extras_binary(stdout, snapshot, qnn_worker_runtime.tick, qnn_worker_runtime.steps, false);
 }
@@ -669,11 +679,20 @@ static int qnn_worker_handle_hello(const char *line)
 	if (qnn_json_extract_string(line, "\"protocol_version\"", protocol_version, sizeof(protocol_version)))
 		requested_protocol_version = qnn_worker_parse_protocol_version(protocol_version, 5);
 	qnn_worker_runtime.training_output_mode = QNN_TRAIN_OUTPUT_NONE;
+	qnn_worker_runtime.step_output_mode = QNN_STEP_OUTPUT_TOKEN_BINARY_V2;
 	if (!qnn_json_extract_string(line, "\"step_format\"", step_format, sizeof(step_format))
-		|| strcmp(step_format, "token_binary_v2") != 0
 		|| requested_protocol_version < 4)
 	{
-		qnn_worker_write_error("Worker requires step_format=token_binary_v2 with protocol_version>=4");
+		qnn_worker_write_error("Worker requires step_format with protocol_version>=4");
+		return 0;
+	}
+	if (strcmp(step_format, "obs_buffer_v1") == 0)
+	{
+		qnn_worker_runtime.step_output_mode = QNN_STEP_OUTPUT_OBS_BUFFER_V1;
+	}
+	else if (strcmp(step_format, "token_binary_v2") != 0)
+	{
+		qnn_worker_write_error("Worker requires step_format=token_binary_v2 or obs_buffer_v1");
 		return 0;
 	}
 	if (qnn_json_extract_string(line, "\"training_format\"", training_format, sizeof(training_format)))

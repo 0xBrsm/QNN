@@ -56,7 +56,7 @@ class LiveProfile:
 _DEFAULT_BOT_NATIVE_ARGS = ["-game", "frikbotnex_train"]
 _DEFAULT_BOT_OPTIONS: Dict[str, Any] = {
     "maxplayers": 7,
-    "skill": 2,
+    "skill": 0,
     "deathmatch": 1,
     "coop": 0,
     "teamplay": 0,
@@ -76,7 +76,7 @@ _BC_DEFAULTS: Dict[str, Any] = {
 }
 _PPO_DEFAULTS: Dict[str, Any] = {
     "mode": "pvp", "native_executable": "assets/bin/quake_worker",
-    "fixed_tick_hz": 20, "gamma": 0.99, "gae_lambda": 0.95,
+    "fixed_tick_hz": 10, "gamma": 0.99, "gae_lambda": 0.95,
     "clip_ratio": 0.2, "policy_lr": 0.00025, "ppo_epochs": 2,
     "value_coef": 0.5, "entropy_coef": 0.02, "max_grad_norm": 0.5,
     "bc_kl_coef": 0.0, "device": "auto",
@@ -98,14 +98,14 @@ _SCALE: Dict[str, Dict[str, Dict[str, Any]]] = {
     },
     "live": {
         "bc":   {"batch_size": 1024, "epochs": 8, "patience": 3, "seed": 11},
-        "ppo":  {"num_envs": 32, "num_envs_per_worker": 2, "worker_num_splits": 2,
-                 "max_steps_per_episode": 6000, "rollout_steps": 128,
+        "ppo":  {"num_envs": 24, "num_envs_per_worker": 2, "worker_num_splits": 2,
+                 "max_steps_per_episode": 1800, "rollout_steps": 128,
                  "total_steps": 10_000_000, "minibatch_size": 1024, "seed": 17,
                  "with_pbt": True, "num_policies": 4,
                  "pbt_period_env_steps": 500_000, "pbt_start_mutation": 1_000_000,
                  "pbt_replace_fraction": 0.3, "pbt_mutation_rate": 0.15,
                  "pbt_optimize_gamma": True},
-        "eval": {"num_episodes": 32, "max_steps_per_episode": 6000, "seed": 23},
+        "eval": {"num_episodes": 32, "max_steps_per_episode": 1800, "seed": 23},
     },
 }
 
@@ -255,7 +255,8 @@ def load_config_with_runtime(
     ppo_cfg["device"] = requested_device
     eval_cfg["device"] = requested_device
 
-    ppo_cfg["num_envs"] = max(int(ppo_cfg.get("num_envs", 1)), plan.num_envs)
+    # Profile num_envs takes priority; fall back to plan if not set.
+    ppo_cfg["num_envs"] = int(ppo_cfg.get("num_envs", 0)) or plan.num_envs
     ppo_cfg["rollout_steps"] = int(ppo_cfg.get("rollout_steps", 0)) or plan.rollout_steps
     ppo_cfg["total_steps"] = max(int(ppo_cfg.get("total_steps", 1)), plan.total_steps)
     ppo_cfg["minibatch_size"] = max(int(ppo_cfg.get("minibatch_size", 1)), plan.minibatch_size)

@@ -90,12 +90,9 @@ def compile_map(
             if "WARNING 19" in line:
                 print(f"  {line.strip()}", file=sys.stderr)
 
-    # 2. vis: optimize PVS (skip if no portal file — map has a leak)
-    if prt_path.exists():
-        _run("vis", [tools["vis"], bsp_path.as_posix()])
-    # else: no .prt = unsealed map, vis not possible — fine for training
-
-    # 3. light: compute lightmaps
-    _run("light", [tools["light"], bsp_path.as_posix()])
+    # 2. vis: optimize PVS — skipped for training maps.  vis is the most
+    #    CPU-intensive step and the agent doesn't benefit from PVS culling.
+    # 3. light: compute lightmaps — skipped for training maps.  The agent
+    #    doesn't use visual rendering; fullbright is fine.
 
     return bsp_path

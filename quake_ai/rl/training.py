@@ -171,6 +171,7 @@ def _run_sf_ppo(
         scenario_config_json=scenario_config_json,
         mode=str(ppo_cfg.get("mode", "pvp")),
         max_steps_per_episode=int(ppo_cfg.get("max_steps_per_episode", 1024)),
+        fixed_tick_hz=int(ppo_cfg.get("fixed_tick_hz", 20)),
         seed=int(ppo_cfg.get("seed", 17)),
         device=device,
         init_checkpoint=str(ppo_cfg.get("init_ckpt", "")),

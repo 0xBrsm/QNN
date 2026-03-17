@@ -2382,3 +2382,383 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 	}
 	fflush(out);
 }
+
+/* ====================================================================
+ * Direct-pack observation buffer writer.
+ *
+ * Produces the fixed-size obs buffer (14612 bytes).  Layout defined in
+ * qnn_obs_buffer.h.  Training extras continue to use the existing QTRN
+ * binary writer (not in the hot path).
+ *
+ * This replaces the QTOK token writer for the obs_buffer_v1 step format.
+ * ==================================================================== */
+
+#include "qnn_obs_buffer.h"
+
+/* Action history ring buffer — maintained across steps, reset on episode reset. */
+static float qnn_action_history[QNN_OBS_ACTION_HISTORY_LEN][QNN_OBS_ACTION_HISTORY_DIM];
+static int qnn_action_history_count = 0;
+
+static void qnn_obs_reset_action_history(void)
+{
+	memset(qnn_action_history, 0, sizeof(qnn_action_history));
+	qnn_action_history_count = 0;
+}
+
+static void qnn_obs_push_action(const qnn_worker_action_t *action)
+{
+	float features[QNN_OBS_ACTION_HISTORY_DIM];
+	int yaw_count, pitch_count;
+	int weapon_clamped;
+	int i;
+
+	features[0] = (float)action->move / 2.0f;
+	features[1] = (float)action->strafe / 2.0f;
+	yaw_count = qnn_mouse_count_from_label(action->look_yaw);
+	pitch_count = qnn_mouse_count_from_label(action->look_pitch);
+	features[2] = (float)yaw_count / (float)QNN_ACTION_LOOK_MAX_ABS_MOUSE;
+	features[3] = (float)pitch_count / (float)QNN_ACTION_LOOK_MAX_ABS_MOUSE;
+	features[4] = (float)action->fire;
+	features[5] = (float)action->jump;
+	/* Clamp weapon to [0, WEAPON_SLOTS] to match Python ActionLabels.from_dict */
+	weapon_clamped = action->weapon > QNN_ACTION_WEAPON_SLOTS ? QNN_ACTION_WEAPON_SLOTS : action->weapon;
+	if (weapon_clamped < 0) weapon_clamped = 0;
+	features[6] = (float)weapon_clamped / (float)QNN_ACTION_WEAPON_SLOTS;
+
+	/* Shift window if full */
+	if (qnn_action_history_count >= QNN_OBS_ACTION_HISTORY_LEN)
+	{
+		memmove(qnn_action_history[0], qnn_action_history[1],
+			(QNN_OBS_ACTION_HISTORY_LEN - 1) * sizeof(qnn_action_history[0]));
+		qnn_action_history_count = QNN_OBS_ACTION_HISTORY_LEN - 1;
+	}
+	for (i = 0; i < QNN_OBS_ACTION_HISTORY_DIM; ++i)
+		qnn_action_history[qnn_action_history_count][i] = features[i];
+	qnn_action_history_count++;
+}
+
+/* Helper: clamp float to [0,1] */
+static float qnn_clamp01(float v)
+{
+	if (v < 0.0f) return 0.0f;
+	if (v > 1.0f) return 1.0f;
+	return v;
+}
+
+/* Helper: write a float32 into a byte buffer at an offset (little-endian) */
+static void qnn_buf_write_f32(uint8_t *buf, int offset, float value)
+{
+	union { float f; uint32_t u; } bits;
+	bits.f = value;
+	buf[offset + 0] = (uint8_t)(bits.u & 0xffu);
+	buf[offset + 1] = (uint8_t)((bits.u >> 8) & 0xffu);
+	buf[offset + 2] = (uint8_t)((bits.u >> 16) & 0xffu);
+	buf[offset + 3] = (uint8_t)((bits.u >> 24) & 0xffu);
+}
+
+static void qnn_buf_write_i32(uint8_t *buf, int offset, int32_t value)
+{
+	uint32_t u = (uint32_t)value;
+	buf[offset + 0] = (uint8_t)(u & 0xffu);
+	buf[offset + 1] = (uint8_t)((u >> 8) & 0xffu);
+	buf[offset + 2] = (uint8_t)((u >> 16) & 0xffu);
+	buf[offset + 3] = (uint8_t)((u >> 24) & 0xffu);
+}
+
+static void qnn_buf_write_u32(uint8_t *buf, int offset, uint32_t value)
+{
+	buf[offset + 0] = (uint8_t)(value & 0xffu);
+	buf[offset + 1] = (uint8_t)((value >> 8) & 0xffu);
+	buf[offset + 2] = (uint8_t)((value >> 16) & 0xffu);
+	buf[offset + 3] = (uint8_t)((value >> 24) & 0xffu);
+}
+
+void qnn_worker_write_obs_buffer(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, int tick_hz, qboolean reset_flag)
+{
+	static uint8_t obs[QNN_OBS_BUFFER_SIZE];
+
+	qnn_semantic_object_t *candidate_rows[MAX_EDICTS + 512];
+	qnn_spatial_token_t spatial_tokens[QNN_WORKER_SPATIAL_TOKEN_COUNT];
+	qnn_semantic_object_t *object_rows[QNN_WORKER_MAX_TOKEN_OBJECTS];
+	qnn_semantic_event_atom_t *event_rows[QNN_WORKER_MAX_EVENT_ATOMS];
+	qnn_semantic_object_t stream_copies[QNN_MAX_NAIL_STREAMS];
+	uint16_t ev_base[QNN_WORKER_MAX_TOKEN_OBJECTS];
+	uint16_t ev_count[QNN_WORKER_MAX_TOKEN_OBJECTS];
+	int stream_copy_count;
+	int candidate_count;
+	int object_count;
+	int event_total;
+	int i, j;
+	const qnn_nav_oracle_runtime_t *oracle;
+	int player_area_id;
+	int player_cluster_id;
+	qboolean has_action;
+	vec3_t object_rel[QNN_WORKER_MAX_TOKEN_OBJECTS];
+
+	/* Zero both buffers */
+	memset(obs, 0, sizeof(obs));
+	(void)tick; (void)steps; /* used by QTRN writer, not obs buffer */
+
+	if (reset_flag)
+		qnn_obs_reset_action_history();
+
+	/* ---- Build phase (same as qnn_worker_write_token_step_binary) ---- */
+
+	candidate_count = 0;
+	object_count = 0;
+	event_total = 0;
+
+	has_action = (snapshot->action_label.move || snapshot->action_label.strafe
+		|| snapshot->action_label.look_yaw || snapshot->action_label.look_pitch
+		|| snapshot->action_label.fire || snapshot->action_label.jump
+		|| snapshot->action_label.weapon);
+
+	/* Collect eligible objects */
+	for (i = 0; i < qnn_semantic_object_capacity; ++i)
+	{
+		int has_event = 0;
+		if (!qnn_semantic_objects[i].active)
+			continue;
+		for (j = 0; j < QNN_WORKER_MAX_EVENT_ATOMS; ++j)
+		{
+			if (qnn_semantic_events[j].active && qnn_semantic_events[j].owner_index == i)
+			{
+				has_event = 1;
+				break;
+			}
+		}
+		if (qnn_semantic_objects[i].recency <= 0.0f && !has_event)
+			continue;
+		if (candidate_count < (int)(sizeof(candidate_rows) / sizeof(candidate_rows[0])))
+			candidate_rows[candidate_count++] = &qnn_semantic_objects[i];
+	}
+
+	if (candidate_count > 1)
+		qsort(candidate_rows, (size_t)candidate_count, sizeof(candidate_rows[0]), qnn_object_row_compare);
+
+	object_count = candidate_count < QNN_WORKER_MAX_TOKEN_OBJECTS ? candidate_count : QNN_WORKER_MAX_TOKEN_OBJECTS;
+	for (i = 0; i < object_count; ++i)
+		object_rows[i] = candidate_rows[i];
+
+	qnn_aggregate_nail_streams(object_rows, &object_count, stream_copies,
+		&stream_copy_count, snapshot->player_origin);
+
+	/* Collect events for surviving objects */
+	for (i = 0; i < object_count; ++i)
+	{
+		int oi = qnn_object_index(object_rows[i]);
+		ev_base[i] = (uint16_t)event_total;
+		ev_count[i] = 0;
+		for (j = 0; j < QNN_WORKER_MAX_EVENT_ATOMS && event_total < QNN_WORKER_MAX_EVENT_ATOMS; ++j)
+		{
+			if (!qnn_semantic_events[j].active || qnn_semantic_events[j].owner_index != oi)
+				continue;
+			event_rows[event_total] = &qnn_semantic_events[j];
+			event_total++;
+			ev_count[i]++;
+		}
+	}
+
+	qnn_build_spatial_tokens(snapshot, spatial_tokens);
+
+	/* Nav oracle */
+	oracle = qnn_worker_map_state.nav_oracle;
+	player_area_id = -1;
+	player_cluster_id = 0;
+	if (oracle)
+	{
+		qnn_nav_area_result_t player_area;
+		char area_err[128];
+		if (qnn_nav_oracle_find_area(oracle, snapshot->player_origin, &player_area, area_err, sizeof(area_err))
+			&& player_area.found)
+		{
+			player_area_id = player_area.area_id;
+			player_cluster_id = player_area.cluster_id;
+		}
+	}
+
+	/* Compute per-object relative positions and nav routes */
+	for (i = 0; i < object_count; ++i)
+	{
+		vec3_t delta;
+		int used_path = 0;
+
+		object_rows[i]->cluster_id = 0;
+		object_rows[i]->route_cost = 0.0f;
+		object_rows[i]->route_cluster_count = 0;
+
+		if (oracle && player_area_id >= 0)
+		{
+			qnn_nav_area_result_t obj_area;
+			char obj_err[128];
+			if (qnn_nav_oracle_find_area(oracle, object_rows[i]->origin, &obj_area, obj_err, sizeof(obj_err))
+				&& obj_area.found)
+			{
+				float path_rel[3];
+				float route_cost;
+				char path_err[128];
+
+				object_rows[i]->cluster_id = obj_area.cluster_id;
+				if (qnn_nav_oracle_path_position(oracle, player_area_id, obj_area.area_id,
+					snapshot->player_origin, object_rows[i]->origin,
+					path_rel, &route_cost, path_err, sizeof(path_err)))
+				{
+					qnn_relative_frame(snapshot->player_view_angles, path_rel, object_rel[i]);
+					object_rows[i]->route_cost = route_cost;
+					used_path = 1;
+				}
+				qnn_nav_oracle_route_clusters(oracle, player_area_id, obj_area.area_id,
+					object_rows[i]->route_cluster_ids, QNN_MAX_ROUTE_CLUSTERS,
+					&object_rows[i]->route_cluster_count);
+			}
+		}
+
+		if (!used_path)
+		{
+			VectorSubtract(object_rows[i]->origin, snapshot->player_origin, delta);
+			qnn_relative_frame(snapshot->player_view_angles, delta, object_rel[i]);
+		}
+	}
+
+	/* Update recall mapping */
+	for (i = 0; i < object_count && i < QNN_WORKER_MAX_TOKEN_OBJECTS; ++i)
+	{
+		if (object_rows[i] >= qnn_semantic_objects
+			&& object_rows[i] < qnn_semantic_objects + qnn_semantic_object_capacity)
+			qnn_prev_object_indices[i] = qnn_object_index(object_rows[i]);
+		else
+			qnn_prev_object_indices[i] = -1;
+	}
+	qnn_prev_object_count = object_count;
+
+	/* ---- Pack observation buffer ---- */
+
+	/* Self scalars [23] */
+	{
+		float scalars[QNN_OBS_SELF_SCALAR_DIM];
+		scalars[0] = qnn_normalize((float)snapshot->health, QNN_SELF_HEALTH_CAP);
+		scalars[1] = qnn_normalize((float)snapshot->armor, QNN_SELF_ARMOR_CAP);
+		scalars[2] = qnn_normalize(snapshot->armor_type, QNN_SELF_ARMOR_TYPE_CAP);
+		scalars[3] = (snapshot->weapons_owned & IT_SHOTGUN) ? 1.0f : 0.0f;
+		scalars[4] = (snapshot->weapons_owned & IT_SUPER_SHOTGUN) ? 1.0f : 0.0f;
+		scalars[5] = (snapshot->weapons_owned & IT_NAILGUN) ? 1.0f : 0.0f;
+		scalars[6] = (snapshot->weapons_owned & IT_SUPER_NAILGUN) ? 1.0f : 0.0f;
+		scalars[7] = (snapshot->weapons_owned & IT_GRENADE_LAUNCHER) ? 1.0f : 0.0f;
+		scalars[8] = (snapshot->weapons_owned & IT_ROCKET_LAUNCHER) ? 1.0f : 0.0f;
+		scalars[9] = (snapshot->weapons_owned & IT_LIGHTNING) ? 1.0f : 0.0f;
+		scalars[10] = (float)qnn_self_weapon_super(snapshot->weapon_id);
+		scalars[11] = qnn_shells_magnitude((float)snapshot->ammo_shells);
+		scalars[12] = qnn_nails_magnitude((float)snapshot->ammo_nails);
+		scalars[13] = qnn_rockets_magnitude((float)snapshot->ammo_rockets);
+		scalars[14] = qnn_cells_magnitude((float)snapshot->ammo_cells);
+		scalars[15] = qnn_normalize(snapshot->player_velocity[0], QNN_SELF_VELOCITY_CAP);
+		scalars[16] = qnn_normalize(snapshot->player_velocity[1], QNN_SELF_VELOCITY_CAP);
+		scalars[17] = qnn_normalize(snapshot->player_velocity[2], QNN_SELF_VELOCITY_CAP);
+		scalars[18] = qnn_angle_sin_deg(snapshot->player_view_angles[1]);
+		scalars[19] = qnn_angle_cos_deg(snapshot->player_view_angles[1]);
+		scalars[20] = qnn_angle_sin_deg(snapshot->player_view_angles[0]);
+		scalars[21] = qnn_angle_cos_deg(snapshot->player_view_angles[0]);
+		scalars[22] = tick_hz > 0 ? (1.0f / (float)tick_hz) : 0.0f;
+		for (i = 0; i < QNN_OBS_SELF_SCALAR_DIM; ++i)
+			qnn_buf_write_f32(obs, QNN_OBS_OFF_SELF_SCALARS + i * 4, scalars[i]);
+	}
+
+	/* Self IDs */
+	qnn_buf_write_i32(obs, QNN_OBS_OFF_SELF_WEAPON_ID, qnn_self_weapon_embed_id(snapshot->weapon_id));
+	qnn_buf_write_i32(obs, QNN_OBS_OFF_SELF_MOVEMENT_ID, qnn_self_movement_id(snapshot->grounded, snapshot->waterlevel));
+	qnn_buf_write_i32(obs, QNN_OBS_OFF_SELF_CLUSTER_ID, player_cluster_id);
+
+	/* Objects [64, 5] ids + [64, 8] scalars + [64] mask + [64, 8] route_cluster_ids */
+	for (i = 0; i < object_count; ++i)
+	{
+		int ids_off = QNN_OBS_OFF_OBJECT_IDS + i * QNN_OBS_OBJECT_ID_DIM * 4;
+		int sc_off = QNN_OBS_OFF_OBJECT_SCALARS + i * QNN_OBS_OBJECT_SCALAR_DIM * 4;
+		int rc_off = QNN_OBS_OFF_OBJECT_ROUTE_IDS + i * QNN_OBS_MAX_ROUTE_CLUSTERS * 4;
+
+		qnn_buf_write_i32(obs, ids_off + 0, object_rows[i]->subject_id);
+		qnn_buf_write_i32(obs, ids_off + 4, object_rows[i]->qualifier_id);
+		qnn_buf_write_i32(obs, ids_off + 8, object_rows[i]->modality_id);
+		qnn_buf_write_i32(obs, ids_off + 12, object_rows[i]->player_id);
+		qnn_buf_write_i32(obs, ids_off + 16, object_rows[i]->cluster_id);
+
+		qnn_buf_write_f32(obs, sc_off + 0, qnn_normalize(object_rel[i][0], QNN_OBJECT_REL_SCALE));
+		qnn_buf_write_f32(obs, sc_off + 4, qnn_normalize(object_rel[i][1], QNN_OBJECT_REL_SCALE));
+		qnn_buf_write_f32(obs, sc_off + 8, qnn_normalize(object_rel[i][2], QNN_OBJECT_REL_SCALE));
+		qnn_buf_write_f32(obs, sc_off + 12, qnn_normalize(object_rows[i]->route_cost, QNN_OBJECT_ROUTE_COST_SCALE));
+		qnn_buf_write_f32(obs, sc_off + 16, object_rows[i]->recency);
+		qnn_buf_write_f32(obs, sc_off + 20, object_rows[i]->confidence);
+		qnn_buf_write_f32(obs, sc_off + 24, object_rows[i]->magnitude);
+		qnn_buf_write_f32(obs, sc_off + 28, object_rows[i]->state);
+
+		obs[QNN_OBS_OFF_OBJECT_MASK + i] = 1;
+
+		for (j = 0; j < QNN_OBS_MAX_ROUTE_CLUSTERS; ++j)
+		{
+			int rc_val = (j < object_rows[i]->route_cluster_count) ? object_rows[i]->route_cluster_ids[j] : 0;
+			qnn_buf_write_i32(obs, rc_off + j * 4, rc_val);
+		}
+	}
+
+	/* Events — flattened with owner tracking */
+	for (i = 0; i < object_count; ++i)
+	{
+		int base = (int)ev_base[i];
+		int count = (int)ev_count[i];
+		for (j = 0; j < count && (base + j) < QNN_OBS_MAX_EVENTS; ++j)
+		{
+			int ei = base + j;
+			int eid_off = QNN_OBS_OFF_EVENT_IDS + ei * QNN_OBS_EVENT_ID_DIM * 4;
+			int esc_off = QNN_OBS_OFF_EVENT_SCALARS + ei * QNN_OBS_EVENT_SCALAR_DIM * 4;
+
+			qnn_buf_write_i32(obs, eid_off + 0, event_rows[ei]->subject_id);
+			qnn_buf_write_i32(obs, eid_off + 4, event_rows[ei]->action_id);
+			qnn_buf_write_i32(obs, eid_off + 8, event_rows[ei]->qualifier_id);
+			qnn_buf_write_i32(obs, eid_off + 12, event_rows[ei]->modality_id);
+
+			qnn_buf_write_f32(obs, esc_off + 0, qnn_clamp01(event_rows[ei]->recency));
+			qnn_buf_write_f32(obs, esc_off + 4, qnn_clamp01(event_rows[ei]->confidence));
+			qnn_buf_write_f32(obs, esc_off + 8, qnn_clamp01(event_rows[ei]->magnitude));
+
+			qnn_buf_write_i32(obs, QNN_OBS_OFF_EVENT_OWNER + ei * 4, i);  /* owner = object slot index */
+			obs[QNN_OBS_OFF_EVENT_MASK + ei] = 1;
+		}
+	}
+
+	/* Spatial [9] ids + [9, 10] scalars */
+	for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i)
+	{
+		int sid_off = QNN_OBS_OFF_SPATIAL_IDS + i * 4;
+		int ssc_off = QNN_OBS_OFF_SPATIAL_SCALARS + i * QNN_OBS_SPATIAL_SCALAR_DIM * 4;
+
+		qnn_buf_write_i32(obs, sid_off, spatial_tokens[i].sector_id);
+		qnn_buf_write_f32(obs, ssc_off + 0, qnn_normalize(spatial_tokens[i].nearest_dist, QNN_SPATIAL_DIST_SCALE));
+		qnn_buf_write_f32(obs, ssc_off + 4, qnn_normalize(spatial_tokens[i].mean_dist, QNN_SPATIAL_DIST_SCALE));
+		qnn_buf_write_f32(obs, ssc_off + 8, spatial_tokens[i].openness);
+		qnn_buf_write_f32(obs, ssc_off + 12, spatial_tokens[i].clearance);
+		qnn_buf_write_f32(obs, ssc_off + 16, spatial_tokens[i].traversable);
+		qnn_buf_write_f32(obs, ssc_off + 20, spatial_tokens[i].dropoff);
+		qnn_buf_write_f32(obs, ssc_off + 24, spatial_tokens[i].solid_frac);
+		qnn_buf_write_f32(obs, ssc_off + 28, spatial_tokens[i].water_frac);
+		qnn_buf_write_f32(obs, ssc_off + 32, spatial_tokens[i].slime_frac);
+		qnn_buf_write_f32(obs, ssc_off + 36, spatial_tokens[i].lava_frac);
+	}
+
+	/* Action history [8, 7] — pack current history BEFORE updating with this tick's action */
+	{
+		int ah_off = QNN_OBS_OFF_ACTION_HISTORY;
+		int n = qnn_action_history_count < QNN_OBS_ACTION_HISTORY_LEN
+			? qnn_action_history_count : QNN_OBS_ACTION_HISTORY_LEN;
+		for (i = 0; i < n; ++i)
+			for (j = 0; j < QNN_OBS_ACTION_HISTORY_DIM; ++j)
+				qnn_buf_write_f32(obs, ah_off + (i * QNN_OBS_ACTION_HISTORY_DIM + j) * 4,
+					qnn_action_history[i][j]);
+	}
+
+	/* Now update action history for next tick (matches Python: encode first, then push) */
+	if (has_action && !reset_flag)
+		qnn_obs_push_action(&snapshot->action_label);
+
+	/* Write obs buffer */
+	fwrite(obs, 1, QNN_OBS_BUFFER_SIZE, out);
+	fflush(out);
+}
