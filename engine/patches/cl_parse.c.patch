@@ -1,0 +1,34 @@
+# cl_parse.c — bounded string copies for server message parsing
+#
+# The original code uses unbounded strcpy/Q_strcpy to copy server-provided
+# strings into fixed-size buffers:
+#   - cl_lightstyle[i].map is MAX_STYLESTRING (64) bytes
+#   - cl.scores[i].name is MAX_SCOREBOARDNAME (32) bytes
+#
+# CHTV spectator demos and multi-view recordings can send strings that
+# exceed these limits, causing a buffer overflow that triggers a SIGABRT
+# (with FORTIFY_SOURCE) or memory corruption.  Replace with bounded copies.
+#
+--- cl_parse.c
++++ cl_parse.c
+@@ -823,7 +823,8 @@
+ 		case svc_lightstyle:
+ 			i = MSG_ReadByte ();
+ 			if (i >= MAX_LIGHTSTYLES)
+ 				Sys_Error ("svc_lightstyle > MAX_LIGHTSTYLES");
+-			Q_strcpy (cl_lightstyle[i].map,  MSG_ReadString());
++			Q_strncpy (cl_lightstyle[i].map, MSG_ReadString(), MAX_STYLESTRING - 1);
++			cl_lightstyle[i].map[MAX_STYLESTRING - 1] = '\0';
+ 			cl_lightstyle[i].length = Q_strlen(cl_lightstyle[i].map);
+ 			break;
+
+@@ -841,7 +842,8 @@
+ 			i = MSG_ReadByte ();
+ 			if (i >= cl.maxclients)
+ 				Host_Error ("CL_ParseServerMessage: svc_updatename > MAX_SCOREBOARD");
+-			strcpy (cl.scores[i].name, MSG_ReadString ());
++			Q_strncpy (cl.scores[i].name, MSG_ReadString (), MAX_SCOREBOARDNAME - 1);
++			cl.scores[i].name[MAX_SCOREBOARDNAME - 1] = '\0';
+ 			break;
+
+ 		case svc_updatefrags:

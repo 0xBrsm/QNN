@@ -89,7 +89,7 @@ Sample Factory settings are built from the PPO dicts inside `quake_ai.rl.trainin
 
 | Path | Purpose |
 |------|---------|
-| `assets/runs/live/` | live training root (`sf/`, `best/`, `eval/`) |
+| `assets/runs/live/` | live training root (`ppo/`, `best/`, `eval/`) |
 | `assets/runs/competitive_bot_multi_verify/` | multi-scenario verify root |
 
 ## Related Docs

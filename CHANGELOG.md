@@ -1,3 +1,20 @@
+# Changelog
+
+## 0.5.0
+
+### Added
+- Autonomous PPO training loops with gated status snapshots, retained run metrics, and hyperparameter history for live PvP runs
+- Multi-seed PBT warm starts, fresh output roots, and explicit PPO launch overrides for retained foundation runs
+
+### Changed
+- Promoted the runtime surface from `sf` to `ppo`, including the APPO env/train entry points and `ppo/` run layout
+- Behavior cloning now trains full sequential episodes with GRU state carry-forward, focal look losses, label smoothing, and auxiliary aim supervision
+- Evaluation and reporting now track richer episode metrics, effective game time, and parallel verify policy modes
+
+### Fixed
+- Best-checkpoint archival and warm-start selection no longer collide or drop retained policies
+- CHTV spectator demo parsing now bounds server string copies to avoid crashes on long names and lightstyles
+
 ## 0.4.0
 
 ### Added

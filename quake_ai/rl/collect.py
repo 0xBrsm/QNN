@@ -135,7 +135,7 @@ def _resolve_parallel_workers(config: CollectConfig, demo_count: int) -> int:
         requested = env_workers
     if requested <= 0:
         cpu_count = os.cpu_count() or 1
-        requested = min(8, max(1, cpu_count // 2))
+        requested = max(1, cpu_count * 3 // 4)
     return max(1, min(int(requested), demo_count))
 
 
@@ -143,32 +143,26 @@ def _build_collect_shards(entries: Sequence[_DemoEntry], worker_count: int) -> l
     if worker_count <= 1 or len(entries) <= 1:
         return [_CollectShard(entries=list(entries))]
 
+    # When we have enough workers, give each demo its own shard for
+    # maximum parallelism.  The BSP reload cost per shard is negligible
+    # compared to the time saved from parallel processing.
+    if worker_count >= len(entries):
+        return [_CollectShard(entries=[entry]) for entry in entries]
+
+    # Otherwise, round-robin entries across shards, grouping same-map
+    # demos together where possible to reuse the worker process.
     groups_by_map: Dict[str, list[_DemoEntry]] = {}
     for entry in entries:
         groups_by_map.setdefault(entry.probe.map_id, []).append(entry)
-    map_groups = [list(group) for group in groups_by_map.values()]
 
-    if len(map_groups) >= worker_count:
-        shards: list[list[_DemoEntry]] = [[] for _ in range(worker_count)]
-        loads = [0] * worker_count
-        for group in sorted(map_groups, key=len, reverse=True):
+    shards: list[list[_DemoEntry]] = [[] for _ in range(worker_count)]
+    loads = [0] * worker_count
+    for group in sorted(groups_by_map.values(), key=len, reverse=True):
+        for entry in group:
             shard_idx = min(range(worker_count), key=lambda idx: (loads[idx], idx))
-            shards[shard_idx].extend(group)
-            loads[shard_idx] += len(group)
-        return [_CollectShard(entries=sorted(shard, key=lambda entry: entry.index)) for shard in shards if shard]
-
-    shards = [_CollectShard(entries=list(group)) for group in map_groups]
-    while len(shards) < worker_count:
-        shard_idx = max(range(len(shards)), key=lambda idx: len(shards[idx].entries))
-        shard_entries = shards[shard_idx].entries
-        if len(shard_entries) < 2:
-            break
-        midpoint = len(shard_entries) // 2
-        shards[shard_idx : shard_idx + 1] = [
-            _CollectShard(entries=shard_entries[:midpoint]),
-            _CollectShard(entries=shard_entries[midpoint:]),
-        ]
-    return shards
+            shards[shard_idx].append(entry)
+            loads[shard_idx] += 1
+    return [_CollectShard(entries=sorted(shard, key=lambda e: e.index)) for shard in shards if shard]
 
 
 def _collect_episode_ticks(

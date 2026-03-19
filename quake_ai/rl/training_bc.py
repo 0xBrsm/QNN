@@ -42,7 +42,7 @@ class BCConfig:
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     batch_size: int = 64
-    sequence_length: int = 64
+    sequence_length: int = 128
     epochs: int = 40
     lr: float = 0.01
     patience: int = 5
@@ -51,7 +51,8 @@ class BCConfig:
     trunk_hidden: int = 128
     class_weight_power: float = 0.5
     class_weight_min: float = 0.5
-    class_weight_max: float = 2.0
+    class_weight_max: float = 8.0
+    action_tick_offset: int = 0  # shift action labels by N ticks (±1 to diagnose timing)
     device: str = "auto"
 
 
@@ -83,11 +84,63 @@ class _PrecomputedEpisode:
     """One episode's observations and actions as contiguous arrays."""
     obs: dict[str, np.ndarray]      # key → (n_samples, ...) arrays
     actions: dict[str, np.ndarray]   # head → (n_samples,) int64
+    aim_target: np.ndarray | None   # (n_samples, 2) yaw/pitch to nearest enemy
     n_samples: int
 
 
-def _pack_samples(samples: List[Sample]) -> _PrecomputedEpisode | None:
-    """Pack a list of Sample objects into contiguous arrays."""
+_PLAYER_SUBJECT_ID = 1  # from vocab.py
+
+
+def _compute_aim_targets(obs: dict[str, np.ndarray], n: int) -> np.ndarray | None:
+    """Compute yaw/pitch angle to nearest enemy for each tick (vectorized).
+
+    Returns (n, 2) array of [yaw, pitch] in [-1, 1] range (normalized by pi),
+    or None if the observation lacks object tokens.
+    """
+    obj_ids = obs.get("object_ids")        # (n, max_obj, id_dim)
+    obj_sc = obs.get("object_scalars")     # (n, max_obj, scalar_dim)
+    obj_mask = obs.get("object_mask")      # (n, max_obj)
+    if obj_ids is None or obj_sc is None or obj_mask is None:
+        return None
+
+    # Mask: visible player objects only
+    is_player = (obj_ids[:, :, 0] == _PLAYER_SUBJECT_ID) & obj_mask  # (n, max_obj)
+
+    rx = obj_sc[:, :, 0]  # (n, max_obj)
+    ry = obj_sc[:, :, 1]
+    rz = obj_sc[:, :, 2]
+    dist_sq = rx * rx + ry * ry + rz * rz
+
+    # Set non-player and empty slots to infinite distance
+    dist_sq = np.where(is_player & (dist_sq > 1e-8), dist_sq, np.inf)
+
+    # Find nearest player per tick
+    nearest = np.argmin(dist_sq, axis=1)  # (n,)
+    tick_idx = np.arange(n)
+
+    best_rx = rx[tick_idx, nearest]
+    best_ry = ry[tick_idx, nearest]
+    best_rz = rz[tick_idx, nearest]
+    has_target = np.isfinite(dist_sq[tick_idx, nearest])
+
+    horiz = np.sqrt(best_rx * best_rx + best_ry * best_ry)
+    yaw = np.where(has_target, np.arctan2(best_ry, best_rx) / np.pi, 0.0)
+    pitch = np.where(has_target & (horiz > 1e-8), np.arctan2(best_rz, horiz) / np.pi, 0.0)
+
+    aim = np.stack([yaw, pitch], axis=1).astype(np.float32)
+    return aim
+
+
+def _pack_samples(
+    samples: List[Sample],
+    action_tick_offset: int = 0,
+) -> _PrecomputedEpisode | None:
+    """Pack a list of Sample objects into contiguous arrays.
+
+    If *action_tick_offset* is non-zero, actions are shifted by that many
+    ticks relative to observations (positive = action comes from a later tick).
+    This is a diagnostic tool for detecting timing misalignment in demo data.
+    """
     if not samples:
         return None
     n = len(samples)
@@ -111,7 +164,38 @@ def _pack_samples(samples: List[Sample]) -> _PrecomputedEpisode | None:
             obs[key][i] = value
         for head in _ACTION_HEAD_NAMES:
             actions[head][i] = int(s.action.get(head, 0))
-    return _PrecomputedEpisode(obs=obs, actions=actions, n_samples=n)
+    # Temporal smoothing for look heads: average mouse delta over ±1 tick
+    # window, then re-quantize to nearest bin.  Reduces label noise from
+    # frame-to-frame jitter in human mouse input.
+    _SMOOTH_HEADS = {"look_yaw", "look_pitch"}
+    from quake_ai.actions import LOOK_MOUSE_BINS, look_label_from_mouse_count, mouse_count_from_look_label
+    for head in _SMOOTH_HEADS:
+        if head not in actions:
+            continue
+        labels = actions[head]
+        mouse_vals = np.array([mouse_count_from_look_label(int(l)) for l in labels], dtype=np.float32)
+        # ±1 tick moving average (3-tap)
+        smoothed = mouse_vals.copy()
+        if n >= 3:
+            smoothed[1:-1] = (mouse_vals[:-2] + mouse_vals[1:-1] + mouse_vals[2:]) / 3.0
+        actions[head] = np.array([look_label_from_mouse_count(int(round(v))) for v in smoothed], dtype=np.int64)
+
+    if action_tick_offset != 0:
+        for head in _ACTION_HEAD_NAMES:
+            actions[head] = np.roll(actions[head], -action_tick_offset)
+        # Trim edges where the shift wraps around.
+        trim = abs(action_tick_offset)
+        if n > 2 * trim:
+            start = trim if action_tick_offset > 0 else 0
+            end = n - trim if action_tick_offset < 0 else n
+            for key in obs:
+                obs[key] = obs[key][start:end]
+            for head in _ACTION_HEAD_NAMES:
+                actions[head] = actions[head][start:end]
+            n = end - start
+    # Compute auxiliary aim target: yaw/pitch angle to nearest enemy.
+    aim_target = _compute_aim_targets(obs, n)
+    return _PrecomputedEpisode(obs=obs, actions=actions, aim_target=aim_target, n_samples=n)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +479,7 @@ def _precompute_split(
     token_ticks_path: str,
     records: Sequence[_EpisodeRecord],
     slot_seed: int,
+    action_tick_offset: int = 0,
 ) -> list[_PrecomputedEpisode]:
     """Precompute all episodes in a split into memory."""
     episodes: list[_PrecomputedEpisode] = []
@@ -409,7 +494,7 @@ def _precompute_split(
                 map_id=record.map_id,
                 source_path=record.source_path,
             )
-            ep = _pack_samples(samples)
+            ep = _pack_samples(samples, action_tick_offset=action_tick_offset)
             if ep is not None:
                 episodes.append(ep)
     return episodes
@@ -447,65 +532,96 @@ def _run_precomputed_supervised(
     if not episodes:
         return _empty
 
-    chunk_indices = _generate_chunk_indices(episodes, sequence_length)
-    if not chunk_indices:
-        return _empty
+    # Process episodes sequentially with GRU hidden state carry-forward.
+    # When sequence_length is 0, process each episode as one full sequence
+    # (no truncation).  Otherwise, chunk into sequence_length windows for
+    # truncated BPTT with hidden state carried across chunks.
+    #
+    # Gradients are accumulated across ACCUM_EPISODES episodes before each
+    # optimizer step to stabilize training (batch_size=1 per chunk is too
+    # noisy for convergence).
+    training = class_weights is not None and lr is not None
+    use_full_episode = int(sequence_length) <= 0
+    _ACCUM_EPISODES = max(1, int(batch_size))  # reuse batch_size config as accum count
 
+    # Shuffle episode order (not tick order within episodes).
+    ep_order: list[int] = list(range(len(episodes)))
     if rng is not None:
-        order = rng.permutation(len(chunk_indices))
-        chunk_indices = [chunk_indices[int(i)] for i in order]
-
-    # Group by chunk length for uniform batching
-    by_length: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
-    for ci in chunk_indices:
-        by_length[ci[2]].append(ci)
-
-    # Flatten into batches
-    batches: list[tuple[int, list[tuple[int, int, int]]]] = []
-    for length, group in by_length.items():
-        seqs_per_batch = max(1, int(batch_size) // max(length, 1))
-        for i in range(0, len(group), seqs_per_batch):
-            batches.append((length, group[i:i + seqs_per_batch]))
-
-    # Shuffle batch order
-    if rng is not None and len(batches) > 1:
-        batch_order = rng.permutation(len(batches))
-        batches = [batches[int(i)] for i in batch_order]
-
-    # Prefetch: prepare next batch on background thread while GPU runs
-    prefetch_queue: Queue[tuple[dict[str, np.ndarray], dict[str, np.ndarray], int] | None] = Queue(maxsize=2)
-
-    def _prefetch_worker() -> None:
-        for seq_len, batch_chunk_indices in batches:
-            obs_b, act_b, rows = _build_batch_from_chunks(episodes, batch_chunk_indices, seq_len)
-            prefetch_queue.put((obs_b, act_b, rows))
-        prefetch_queue.put(_SENTINEL)
+        ep_order = [int(i) for i in rng.permutation(len(episodes))]
 
     total_rows = 0
     total_loss = 0.0
     total_accuracy = 0.0
     total_fuzzy = 0.0
     per_head_totals: Dict[str, float] = {}
-    training = class_weights is not None and lr is not None
+    accum_count = 0
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(_prefetch_worker)
-        while True:
-            item = prefetch_queue.get()
-            if item is _SENTINEL:
-                break
-            obs_batch, action_batch, rows = item
+    if training:
+        model.bc_zero_grad()
+
+    for ep_idx in ep_order:
+        ep = episodes[ep_idx]
+        if ep.n_samples == 0:
+            continue
+
+        hidden = None  # Reset GRU at episode start.
+        chunk_size = ep.n_samples if use_full_episode else max(int(sequence_length), 1)
+
+        for start in range(0, ep.n_samples, chunk_size):
+            end = min(start + chunk_size, ep.n_samples)
+            length = end - start
+
+            # Slice this chunk: shape (length, 1, ...) for batch_size=1
+            obs_chunk: dict[str, np.ndarray] = {}
+            for key, arr in ep.obs.items():
+                obs_chunk[key] = arr[start:end].reshape(length, 1, *arr.shape[1:])
+            act_chunk: dict[str, np.ndarray] = {
+                head: ep.actions[head][start:end].reshape(length, 1)
+                for head in _ACTION_HEAD_NAMES
+            }
+
+            # Slice aim target for this chunk if available.
+            aim_chunk = None
+            if ep.aim_target is not None:
+                aim_chunk = ep.aim_target[start:end].reshape(length, 1, 2)
+
             if training:
-                metrics = model.supervised_step(obs_batch, action_batch, class_weights, lr=lr)
+                metrics = model.supervised_step(
+                    obs_chunk, act_chunk, class_weights, lr=lr,
+                    hidden=hidden,
+                    aim_target=aim_chunk,
+                    accumulate_only=True,
+                )
             else:
-                metrics = model.evaluate_supervised(obs_batch, action_batch)
-            total_rows += rows
-            total_loss += float(metrics["loss"]) * rows
-            total_accuracy += float(metrics["accuracy"]) * rows
-            total_fuzzy += float(metrics.get("fuzzy_accuracy", 0.0)) * rows
+                metrics = model.evaluate_supervised(
+                    obs_chunk, act_chunk,
+                    hidden=hidden,
+                )
+
+            # Carry hidden state forward (detached to truncate BPTT).
+            next_h = metrics.pop("_next_hidden", None)
+            if next_h is not None:
+                hidden = next_h.detach() if hasattr(next_h, "detach") else next_h
+
+            total_rows += length
+            total_loss += float(metrics["loss"]) * length
+            total_accuracy += float(metrics["accuracy"]) * length
+            total_fuzzy += float(metrics.get("fuzzy_accuracy", 0.0)) * length
             for key, val in metrics.items():
                 if key.startswith("acc_"):
-                    per_head_totals[key] = per_head_totals.get(key, 0.0) + float(val) * rows
+                    per_head_totals[key] = per_head_totals.get(key, 0.0) + float(val) * length
+
+        # Step optimizer after accumulating gradients across N episodes.
+        if training:
+            accum_count += 1
+            if accum_count >= _ACCUM_EPISODES:
+                model.bc_step()
+                model.bc_zero_grad()
+                accum_count = 0
+
+    # Flush any remaining accumulated gradients.
+    if training and accum_count > 0:
+        model.bc_step()
 
     denom = max(total_rows, 1)
     result: Dict[str, float] = {
@@ -546,9 +662,12 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
     split = _split_episode_records(records, config.train_ratio, config.val_ratio, config.seed)
 
     # Precompute all episodes once — observations encoded and stored as contiguous arrays.
-    train_episodes = _precompute_split(config.token_ticks_path, split.train, config.seed)
-    val_episodes = _precompute_split(config.token_ticks_path, split.val, config.seed)
-    test_episodes = _precompute_split(config.token_ticks_path, split.test, config.seed)
+    tick_offset = config.action_tick_offset
+    if tick_offset:
+        log.info("Action tick offset: %d (diagnostic mode)", tick_offset)
+    train_episodes = _precompute_split(config.token_ticks_path, split.train, config.seed, tick_offset)
+    val_episodes = _precompute_split(config.token_ticks_path, split.val, config.seed, tick_offset)
+    test_episodes = _precompute_split(config.token_ticks_path, split.test, config.seed, tick_offset)
 
     sample_counts = {
         "train": sum(ep.n_samples for ep in train_episodes),

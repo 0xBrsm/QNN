@@ -1,4 +1,4 @@
-"""Gymnasium wrapper around NativeWorldEnv for Sample Factory."""
+"""Gymnasium wrapper around NativeWorldEnv for PPO training."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ except ImportError as exc:
 
 from quake_ai.actions import ACTION_HEADS
 from quake_ai.rl.environment import NativeWorldEnv
+from quake_ai.rl.metrics import EpisodeStatAccumulator, build_episode_extra_stats as _episode_extra_stats
 from quake_ai.model.observation import ACTION_HISTORY_DIM, ACTION_HISTORY_LEN, SELF_SCALAR_DIM
 from mapgen.pool import PROCGEN_SENTINEL
 
@@ -110,25 +111,7 @@ class QuakeEnv(gymnasium.Env):
         )
 
         # Episode-level accumulators for SF custom metrics
-        self._ep_frags = 0
-        self._ep_deaths = 0
-        self._ep_damage_dealt = 0.0
-        self._ep_damage_taken = 0.0
-        self._ep_steps = 0
-        self._ep_reward = 0.0
-        # Skill metrics
-        self._ep_hits = 0
-        self._ep_shots = 0
-        self._ep_health_pickups = 0.0
-        self._ep_armor_pickups = 0.0
-        self._ep_weapon_pickups = 0.0
-        self._ep_blind_fires = 0
-        self._ep_stuck_steps = 0
-        # Reward decomposition
-        self._ep_reward_frag = 0.0
-        self._ep_reward_death = 0.0
-        self._ep_reward_ehp = 0.0
-        self._ep_reward_edp = 0.0
+        self._episode_stats = EpisodeStatAccumulator()
 
         # Demo recording: always record to the same file per env,
         # overwriting each episode.  Best demo archiving is handled by
@@ -253,23 +236,7 @@ class QuakeEnv(gymnasium.Env):
         seed: int | None = None,
         options: Dict[str, Any] | None = None,
     ):
-        self._ep_frags = 0
-        self._ep_deaths = 0
-        self._ep_damage_dealt = 0.0
-        self._ep_damage_taken = 0.0
-        self._ep_steps = 0
-        self._ep_reward = 0.0
-        self._ep_hits = 0
-        self._ep_shots = 0
-        self._ep_health_pickups = 0.0
-        self._ep_armor_pickups = 0.0
-        self._ep_weapon_pickups = 0.0
-        self._ep_blind_fires = 0
-        self._ep_stuck_steps = 0
-        self._ep_reward_frag = 0.0
-        self._ep_reward_death = 0.0
-        self._ep_reward_ehp = 0.0
-        self._ep_reward_edp = 0.0
+        self._episode_stats = EpisodeStatAccumulator()
         obs = self.inner_env.reset(seed=seed)
         return obs, {"scenario_id": self.scenario_id}
 
@@ -282,69 +249,23 @@ class QuakeEnv(gymnasium.Env):
         truncated = bool(done_reason == "timeout" or info.get("timed_out", False))
         terminated = bool(done) and not truncated
 
-        # Accumulate per-episode combat stats
-        self._ep_frags += int(info.get("frag_delta", 0))
-        self._ep_deaths += 1 if done_reason == "player_died" or info.get("frag_loss", 0) > 0 else 0
-        self._ep_damage_dealt += float(info.get("damage_dealt", 0))
-        self._ep_damage_taken += float(info.get("damage_taken", 0))
-        self._ep_steps += 1
-        self._ep_reward += float(reward)
-        # Skill metrics
-        self._ep_hits += int(info.get("hit_count", 0))
-        self._ep_shots += int(info.get("shots_fired", 0))
-        self._ep_health_pickups += float(info.get("health_gain", 0))
-        self._ep_armor_pickups += float(info.get("armor_gain", 0))
-        self._ep_weapon_pickups += float(info.get("weapon_pickups", 0))
-        self._ep_blind_fires += int(info.get("blind_fire", 0))
-        self._ep_stuck_steps += 1 if info.get("stuck") else 0
-        # Reward decomposition
-        self._ep_reward_frag += float(info.get("reward_frag_bonus", 0))
-        self._ep_reward_death += float(info.get("reward_death_penalty", 0))
-        self._ep_reward_ehp += float(info.get("reward_ehp_delta", 0))
-        self._ep_reward_edp += float(info.get("reward_edp_delta", 0))
+        self._episode_stats.add_step(
+            reward=float(reward),
+            info=info,
+            terminal=terminated or truncated,
+        )
 
         # Preserve the completed episode's demo before reset overwrites it.
         if (terminated or truncated) and self._record_demos and self._demo_path.exists():
             import shutil
             shutil.copy2(self._demo_path, self._demo_last_path)
 
-        # SF picks up episode_extra_stats_* from info on terminal/truncated steps
+        # Sample Factory expects custom episodic stats under info["episode_extra_stats"].
         if terminated or truncated:
-            # --- Combat summary ---
-            info["episode_extra_stats_frags"] = self._ep_frags
-            info["episode_extra_stats_deaths"] = self._ep_deaths
-            info["episode_extra_stats_kd_ratio"] = (
-                self._ep_frags / max(self._ep_deaths, 1)
-            )
-            info["episode_extra_stats_damage_dealt"] = self._ep_damage_dealt
-            info["episode_extra_stats_damage_taken"] = self._ep_damage_taken
-            info["episode_extra_stats_steps"] = self._ep_steps
-
-            # --- Skill metrics ---
-            info["episode_extra_stats_accuracy"] = (
-                self._ep_hits / max(self._ep_shots, 1)
-            )
-            info["episode_extra_stats_hits"] = self._ep_hits
-            info["episode_extra_stats_shots_fired"] = self._ep_shots
-            info["episode_extra_stats_damage_per_death"] = (
-                self._ep_damage_dealt / max(self._ep_deaths, 1)
-            )
-            info["episode_extra_stats_health_pickups"] = self._ep_health_pickups
-            info["episode_extra_stats_armor_pickups"] = self._ep_armor_pickups
-            info["episode_extra_stats_weapon_pickups"] = self._ep_weapon_pickups
-            info["episode_extra_stats_blind_fire_rate"] = (
-                self._ep_blind_fires / max(self._ep_shots, 1)
-            )
-            info["episode_extra_stats_stuck_rate"] = (
-                self._ep_stuck_steps / max(self._ep_steps, 1)
-            )
-
-            # --- Reward decomposition ---
-            info["episode_extra_stats_reward_total"] = self._ep_reward
-            info["episode_extra_stats_reward_frags"] = self._ep_reward_frag
-            info["episode_extra_stats_reward_deaths"] = self._ep_reward_death
-            info["episode_extra_stats_reward_ehp"] = self._ep_reward_ehp
-            info["episode_extra_stats_reward_edp"] = self._ep_reward_edp
+            episode_stats = self._episode_stats.as_dict()
+            info["episode_extra_stats"] = episode_stats
+            for key, value in episode_stats.items():
+                info[f"episode_extra_stats_{key}"] = value
 
         return obs, float(reward), terminated, truncated, info
 

@@ -1,0 +1,62 @@
+{
+  "eval": {
+    "fixed_tick_hz": 20
+  },
+  "ppo": {
+    "bc_kl_coef": 0.0,
+    "clip_ratio": 0.2,
+    "entropy_coef": 0.02,
+    "fixed_tick_hz": 10,
+    "gae_lambda": 0.95,
+    "gamma": 0.99,
+    "max_grad_norm": 0.5,
+    "policy_lr": 0.00025,
+    "ppo_epochs": 2,
+    "value_coef": 0.5
+  },
+  "scale": {
+    "live": {
+      "bc": {
+        "batch_size": 1024,
+        "epochs": 8,
+        "patience": 3,
+        "seed": 11
+      },
+      "eval": {
+        "max_steps_per_episode": 1800,
+        "seed": 23
+      },
+      "ppo": {
+        "max_steps_per_episode": 1800,
+        "num_envs": 80,
+        "num_envs_per_worker": 2,
+        "num_policies": 8,
+        "pbt_mutation_rate": 0.15,
+        "pbt_optimize_gamma": true,
+        "pbt_period_env_steps": 500000,
+        "pbt_replace_fraction": 0.3,
+        "pbt_start_mutation": 1000000,
+        "rollout_steps": 128,
+        "seed": 17,
+        "total_steps": 10000000,
+        "with_pbt": true
+      }
+    },
+    "verify": {
+      "bc": {
+        "batch_size": 512,
+        "epochs": 6,
+        "patience": 2,
+        "seed": 7
+      },
+      "eval": {
+        "max_steps_per_episode": 512,
+        "seed": 19
+      },
+      "ppo": {
+        "max_steps_per_episode": 512,
+        "seed": 11
+      }
+    }
+  }
+}

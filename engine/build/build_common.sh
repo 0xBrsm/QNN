@@ -125,6 +125,7 @@ COMMON_PATCHES=(
   "${ENGINE_DIR}/patches/net_udp.c.patch"
   "${ENGINE_DIR}/patches/pr_edict.c.patch"
   "${ENGINE_DIR}/patches/sv_main.c.patch"
+  "${ENGINE_DIR}/patches/cl_parse.c.patch"
   "${ENGINE_DIR}/patches/64bit/pr_cmds.c.patch"
   "${ENGINE_DIR}/patches/64bit/host_cmd.c.patch"
   "${ENGINE_DIR}/patches/64bit/sv_main.c.patch"

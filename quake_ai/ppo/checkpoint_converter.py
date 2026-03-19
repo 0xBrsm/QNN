@@ -1,4 +1,4 @@
-"""Checkpoint conversion between QNNPolicy and Sample Factory formats.
+"""Checkpoint conversion between QNNPolicy and PPO warm-start formats.
 
 Two conversion directions:
   BC/PPO → SF   : ``bc_to_sf()``  — warm-start APPO from a BC checkpoint.

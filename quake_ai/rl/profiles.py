@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
 
 from quake_ai.utils.io import read_json
@@ -11,7 +12,9 @@ from quake_ai.utils.io import read_json
 if TYPE_CHECKING:
     from quake_ai.rl.planning import RuntimePlan
 
-_SCENARIOS_PATH_DEFAULT = __file__.replace("profiles.py", "configs/combat_bot_scenarios.json")
+_CONFIGS_DIR = Path(__file__).with_name("configs")
+_SCENARIOS_PATH_DEFAULT = str(_CONFIGS_DIR / "combat_bot_scenarios.json")
+_HYPERPARAMS_PATH_DEFAULT = _CONFIGS_DIR / "hyperparams.json"
 
 # ---------------------------------------------------------------------------
 # Shared BC (behaviour cloning) location
@@ -67,47 +70,43 @@ _DEFAULT_BOT_OPTIONS: Dict[str, Any] = {
     "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100",
 }
 
-_BC_DEFAULTS: Dict[str, Any] = {
+# ---------------------------------------------------------------------------
+# Tunable hyperparameters — loaded from JSON so the orchestrator can evolve
+# them without patching Python source.
+# ---------------------------------------------------------------------------
+
+def _load_hyperparams(path: Path | None = None) -> dict[str, Any]:
+    return dict(read_json(path or _HYPERPARAMS_PATH_DEFAULT))
+
+
+_HYPERPARAMS = _load_hyperparams()
+
+# Structural constants that never change between experiments.
+_BC_STRUCTURAL: Dict[str, Any] = {
     "output_dir": BC_OUTPUT_DIR,
     "train_ratio": 0.72, "val_ratio": 0.14, "lr": 0.008,
     "use_gru": True, "gru_hidden": 64, "trunk_hidden": 192,
     "class_weight_power": 0.6, "class_weight_min": 0.5, "class_weight_max": 2.5,
     "device": "auto",
 }
-_PPO_DEFAULTS: Dict[str, Any] = {
+_PPO_STRUCTURAL: Dict[str, Any] = {
     "mode": "pvp", "native_executable": "assets/bin/quake_worker",
-    "fixed_tick_hz": 10, "gamma": 0.99, "gae_lambda": 0.95,
-    "clip_ratio": 0.2, "policy_lr": 0.00025, "ppo_epochs": 2,
-    "value_coef": 0.5, "entropy_coef": 0.02, "max_grad_norm": 0.5,
-    "bc_kl_coef": 0.0, "device": "auto",
+    "device": "auto",
     # Architecture must match BC checkpoint — inherit BC defaults.
     "trunk_hidden": 192, "gru_hidden": 64, "use_gru": True,
 }
-_EVAL_DEFAULTS: Dict[str, Any] = {
+_EVAL_STRUCTURAL: Dict[str, Any] = {
     "mode": "pvp", "native_executable": "assets/bin/quake_worker",
-    "fixed_tick_hz": 20, "policy_modes": ["greedy", "sampled"],
+    "policy_modes": ["greedy", "sampled"],
     "start_mode": "randomized", "holdout_seed_offset": 10000,
     "sample_seed_offset": 20000, "device": "auto",
 }
-_SCALE: Dict[str, Dict[str, Dict[str, Any]]] = {
-    "verify": {
-        "bc":   {"batch_size": 512, "epochs": 6, "patience": 2, "seed": 7},
-        "ppo":  {"num_envs": 4, "max_steps_per_episode": 512, "rollout_steps": 64,
-                 "total_steps": 4096, "minibatch_size": 128, "seed": 11},
-        "eval": {"num_episodes": 16, "max_steps_per_episode": 512, "seed": 19},
-    },
-    "live": {
-        "bc":   {"batch_size": 1024, "epochs": 8, "patience": 3, "seed": 11},
-        "ppo":  {"num_envs": 24, "num_envs_per_worker": 2, "worker_num_splits": 2,
-                 "max_steps_per_episode": 1800, "rollout_steps": 128,
-                 "total_steps": 10_000_000, "minibatch_size": 1024, "seed": 17,
-                 "with_pbt": True, "num_policies": 4,
-                 "pbt_period_env_steps": 500_000, "pbt_start_mutation": 1_000_000,
-                 "pbt_replace_fraction": 0.3, "pbt_mutation_rate": 0.15,
-                 "pbt_optimize_gamma": True},
-        "eval": {"num_episodes": 32, "max_steps_per_episode": 1800, "seed": 23},
-    },
-}
+
+# Merged views used by build_bc_config / load_config_with_runtime.
+_BC_DEFAULTS: Dict[str, Any] = {**_BC_STRUCTURAL}
+_PPO_DEFAULTS: Dict[str, Any] = {**_PPO_STRUCTURAL, **_HYPERPARAMS.get("ppo", {})}
+_EVAL_DEFAULTS: Dict[str, Any] = {**_EVAL_STRUCTURAL, **_HYPERPARAMS.get("eval", {})}
+_SCALE: Dict[str, Dict[str, Dict[str, Any]]] = _HYPERPARAMS.get("scale", {})
 
 
 def _build_scenario_profile(
@@ -255,12 +254,17 @@ def load_config_with_runtime(
     ppo_cfg["device"] = requested_device
     eval_cfg["device"] = requested_device
 
-    # Profile num_envs takes priority; fall back to plan if not set.
-    ppo_cfg["num_envs"] = int(ppo_cfg.get("num_envs", 0)) or plan.num_envs
+    # Single source of truth: plan.num_envs is the hardware-derived worker
+    # count.  Training uses it directly; eval splits it across policy modes
+    # (greedy + sampled run in parallel) and caps each mode at num_episodes.
+    num_envs = int(ppo_cfg.get("num_envs", 0)) or plan.num_envs
+    ppo_cfg["num_envs"] = num_envs
     ppo_cfg["rollout_steps"] = int(ppo_cfg.get("rollout_steps", 0)) or plan.rollout_steps
     ppo_cfg["total_steps"] = max(int(ppo_cfg.get("total_steps", 1)), plan.total_steps)
-    ppo_cfg["minibatch_size"] = max(int(ppo_cfg.get("minibatch_size", 1)), plan.minibatch_size)
-    eval_cfg["num_episodes"] = max(int(eval_cfg.get("num_episodes", 1)), plan.eval_episodes)
-    eval_cfg["num_envs"] = max(int(eval_cfg.get("num_envs", 1)), min(plan.num_envs, int(eval_cfg["num_episodes"])))
+    ppo_cfg["minibatch_size"] = int(ppo_cfg.get("minibatch_size", 0)) or plan.minibatch_size
+    num_eval_modes = max(1, len(eval_cfg.get("policy_modes", ["greedy"])))
+    eval_envs_per_mode = num_envs // num_eval_modes
+    eval_cfg["num_envs"] = eval_envs_per_mode
+    eval_cfg["num_episodes"] = eval_envs_per_mode
 
     return ppo_cfg, eval_cfg

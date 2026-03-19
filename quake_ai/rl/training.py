@@ -8,6 +8,7 @@ import os
 import subprocess
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
@@ -31,6 +32,118 @@ from quake_ai.rl.profiles import (
 from quake_ai.rl.reporting import REPORT_STAGES, _load_existing_runtime_context, _write_run_report
 from quake_ai.rl.training_bc import BCConfig, run_behavior_cloning
 from quake_ai.utils.io import read_json, trusted_torch_load
+
+
+def _is_sf_checkpoint_payload(payload: object) -> bool:
+    return isinstance(payload, dict) and "model" in payload and ("train_step" in payload or "env_steps" in payload)
+
+
+def _reward_from_checkpoint_name(path: Path) -> float:
+    import re as _re
+
+    match = _re.search(r"reward_([-\d.]+)\.pth$", path.name)
+    return float(match.group(1)) if match else float("-inf")
+
+
+def _best_sf_checkpoint(best_dir: Path) -> Path | None:
+    candidates = [path for path in best_dir.glob("best_*.pth") if path.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (_reward_from_checkpoint_name(path), path.stat().st_mtime))
+
+
+def _prepare_eval_checkpoint(profile: LiveProfile, checkpoint_path: str, output_dir: str) -> str:
+    path = Path(checkpoint_path)
+    if not path.exists() and path.name == "best_model.pth":
+        fallback = _best_sf_checkpoint(path.parent)
+        if fallback is not None:
+            path = fallback
+
+    if not path.exists() or path.suffix != ".pth":
+        return str(path)
+
+    try:
+        payload = trusted_torch_load(str(path), map_location="cpu")
+    except Exception:
+        return str(path)
+
+    if not _is_sf_checkpoint_payload(payload):
+        return str(path)
+
+    from quake_ai.model.policy import QNNPolicy
+    from quake_ai.ppo.checkpoint_converter import sf_to_qnn
+
+    bc_policy = QNNPolicy.load(str(profile.bc_checkpoint), device="cpu")
+    converted_dir = Path(output_dir).parent / "_eval_ckpts"
+    converted_dir.mkdir(parents=True, exist_ok=True)
+    converted_path = converted_dir / f"{path.stem}_qnn.pth"
+    sidecar_path = converted_dir / f"{path.stem}_qnn.json"
+
+    if not converted_path.exists() or converted_path.stat().st_mtime < path.stat().st_mtime:
+        policy = sf_to_qnn(
+            sf_checkpoint_path=path,
+            obs_dim=bc_policy.obs_dim,
+            trunk_hidden=bc_policy.trunk_hidden,
+            gru_hidden=bc_policy.gru_hidden,
+            use_gru=bc_policy.use_gru,
+            device="cpu",
+        )
+        policy.save(converted_path)
+        sidecar_path.write_text(
+            json.dumps({"source_checkpoint": str(path), "converted_checkpoint": str(converted_path)}, indent=2),
+            encoding="utf-8",
+        )
+
+    return str(converted_path)
+
+
+def _profile_with_output_root(profile: LiveProfile, output_root: str | None) -> LiveProfile:
+    """Clone a profile so one run can target an explicit retained root."""
+    if not output_root:
+        return profile
+
+    root = Path(output_root)
+    ppo_overrides = dict(profile.ppo_overrides)
+    eval_overrides = dict(profile.eval_overrides)
+
+    ppo_overrides["output_dir"] = str(root)
+    eval_overrides["output_dir"] = str(root / "eval")
+    eval_checkpoint_name = Path(str(eval_overrides.get("checkpoint_path", "best_model.pth"))).name
+    eval_overrides["checkpoint_path"] = str(root / "best" / eval_checkpoint_name)
+
+    return replace(
+        profile,
+        plan_path=str(root / "live_training_plan.json"),
+        ppo_overrides=ppo_overrides,
+        eval_overrides=eval_overrides,
+    )
+
+
+def _assert_fresh_output_root(profile: LiveProfile) -> None:
+    """Guard the canonical fresh-run path from silently resuming old state."""
+    output_root = _profile_output_root(profile)
+    if not output_root.exists():
+        return
+
+    ignorable = {
+        "decision_hook.json",
+        "loop_status.json",
+        "loop_watch.log",
+        "loop_watch.pid",
+        "loop_watch_state.json",
+        "loop_watch_stdout.log",
+    }
+    existing = sorted(path.name for path in output_root.iterdir() if path.name not in ignorable)
+    if not existing:
+        return
+
+    preview = ", ".join(existing[:5])
+    if len(existing) > 5:
+        preview += ", ..."
+    raise RuntimeError(
+        f"Fresh run requested, but {output_root} already contains artifacts ({preview}). "
+        "Choose a new --output-root for the run instead of reusing an existing root."
+    )
 
 
 def _ensure_worker(worker_binary: Path, rebuild: bool) -> Path:
@@ -123,29 +236,31 @@ def _detect_obs_dim(ppo_cfg: dict[str, Any]) -> int:
     return 0
 
 
-def _run_sf_ppo(
+def _run_ppo(
     profile: Any,
     ppo_cfg: dict[str, Any],
     resolved_asset_root: Path,
     worker_path: Path,
     device: str,
 ) -> dict[str, Any]:
-    """Launch Sample Factory APPO as the PPO stage.
+    """Launch APPO as the PPO stage.
 
-    After training, the best SF checkpoint is converted to QNNPolicy format
+    After training, the best PPO checkpoint is converted to QNNPolicy format
     so that evaluation.py can load it without changes.
     """
-    from quake_ai.sf.train import register_quake_components, build_sf_cfg, run_sf
-    from quake_ai.sf.checkpoint_converter import sf_to_qnn
+    from quake_ai.ppo.train import register_quake_components, build_ppo_cfg, run_ppo
+    from quake_ai.ppo.checkpoint_converter import sf_to_qnn
 
     register_quake_components()
 
-    output_dir = str(Path(ppo_cfg.get("output_dir", "assets/runs/sf_ppo")))
+    output_dir = str(Path(ppo_cfg.get("output_dir", "assets/runs/ppo")))
     scenario = str(ppo_cfg.get("map_id", "procgen"))
-    num_workers = int(ppo_cfg.get("num_envs", 8))
+    num_envs = int(ppo_cfg.get("num_envs", 8))
+    num_envs_per_worker = int(ppo_cfg.get("num_envs_per_worker", 1))
+    num_workers = num_envs // num_envs_per_worker
     rollout = int(ppo_cfg.get("rollout_steps", 256))
     total_steps = int(ppo_cfg.get("total_steps", 1_000_000))
-    total_env_steps = total_steps * num_workers
+    total_env_steps = total_steps * num_envs
 
     native_args = ppo_cfg.get("native_args", [])
     options = ppo_cfg.get("options", {})
@@ -154,15 +269,15 @@ def _run_sf_ppo(
     options_json = json.dumps(dict(options)) if options else ""
     scenario_config_json = _scenario_config_json(ppo_cfg)
 
-    cfg = build_sf_cfg(
+    cfg = build_ppo_cfg(
         scenario=scenario,
         num_workers=num_workers,
-        num_envs_per_worker=int(ppo_cfg.get("num_envs_per_worker", 1)),
+        num_envs_per_worker=num_envs_per_worker,
         worker_num_splits=int(ppo_cfg.get("worker_num_splits", 1)),
         rollout=rollout,
         total_env_steps=total_env_steps,
         output_dir=output_dir,
-        experiment="sf",
+        experiment="ppo",
         executable=str(worker_path),
         basedir=str(resolved_asset_root),
         native_workdir=str(ppo_cfg.get("native_workdir", "") or ""),
@@ -175,6 +290,7 @@ def _run_sf_ppo(
         seed=int(ppo_cfg.get("seed", 17)),
         device=device,
         init_checkpoint=str(ppo_cfg.get("init_ckpt", "")),
+        init_checkpoints=ppo_cfg.get("init_ckpts"),
         trunk_hidden=int(ppo_cfg.get("trunk_hidden", 128)),
         gru_hidden=int(ppo_cfg.get("gru_hidden", 128)),
         use_gru=bool(ppo_cfg.get("use_gru", True)),
@@ -197,15 +313,16 @@ def _run_sf_ppo(
         pbt_replace_fraction=float(ppo_cfg.get("pbt_replace_fraction", 0.3)),
         pbt_mutation_rate=float(ppo_cfg.get("pbt_mutation_rate", 0.15)),
         pbt_optimize_gamma=bool(ppo_cfg.get("pbt_optimize_gamma", False)),
+        minibatch_size=int(ppo_cfg.get("minibatch_size", 0)),
         record_demos=bool(ppo_cfg.get("record_demos", True)),
     )
 
-    sf_result = run_sf(cfg)
+    ppo_result = run_ppo(cfg)
 
     import glob as _glob
     import re as _re
     train_dir = Path(output_dir)
-    exp_dir = train_dir / "sf"
+    exp_dir = train_dir / "ppo"
 
     def _reward_from_name(path: str) -> float:
         m = _re.search(r"reward_([-\d.]+)\.pth$", path)
@@ -214,19 +331,19 @@ def _run_sf_ppo(
     # Find the best checkpoint across all policies (PBT has checkpoint_p0..pN).
     best_files = _glob.glob(f"{exp_dir}/checkpoint_p*/best_0*.pth")
     if best_files:
-        sf_ckpt: str | None = max(best_files, key=_reward_from_name)
+        ppo_ckpt: str | None = max(best_files, key=_reward_from_name)
     else:
         regular_files = sorted(_glob.glob(f"{exp_dir}/checkpoint_p*/checkpoint_*.pth"))
-        sf_ckpt = regular_files[-1] if regular_files else None
+        ppo_ckpt = regular_files[-1] if regular_files else None
 
-    if sf_ckpt:
+    if ppo_ckpt:
         # Write converted model to {profile_root}/best/best_model.pth
         best_dir = Path(output_dir) / "best"
         best_dir.mkdir(parents=True, exist_ok=True)
         bc_ckpt_path = best_dir / "best_model.pth"
         try:
             bc_policy = sf_to_qnn(
-                sf_checkpoint_path=sf_ckpt,
+                sf_checkpoint_path=ppo_ckpt,
                 obs_dim=ppo_cfg.get("obs_dim", 0) or _detect_obs_dim(ppo_cfg),
                 trunk_hidden=int(ppo_cfg.get("trunk_hidden", 128)),
                 gru_hidden=int(ppo_cfg.get("gru_hidden", 128)),
@@ -234,12 +351,13 @@ def _run_sf_ppo(
                 device="cpu",
             )
             bc_policy.save(bc_ckpt_path)
-            sf_result["best_model_path"] = str(bc_ckpt_path)
-            sf_result["sf_checkpoint_path"] = sf_ckpt
+            ppo_result["best_model_path"] = str(bc_ckpt_path)
+            ppo_result["ppo_checkpoint_path"] = ppo_ckpt
+            ppo_result["sf_checkpoint_path"] = ppo_ckpt
         except Exception as exc:
-            sf_result["checkpoint_convert_error"] = str(exc)
+            ppo_result["checkpoint_convert_error"] = str(exc)
 
-    return sf_result
+    return ppo_result
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +373,12 @@ def _setup_pipeline(
     asset_root: str | None,
     worker_binary: str,
     rebuild_worker: bool,
+    output_root: str | None = None,
+    fresh_output_root: bool = False,
 ) -> tuple[LiveProfile, dict[str, Any], RuntimePlan, Path, Path, Path, dict, dict, dict]:
     """Common setup for both BC and PPO phases."""
     profile, runtime, plan = build_runtime_plan(profile_name, device)
+    profile = _profile_with_output_root(profile, output_root)
     resolved_asset_root = _resolve_asset_root(asset_root)
     resolved_demo_dir = _resolve_demo_dir(profile, demo_dir)
     worker_path = Path(worker_binary)
@@ -268,6 +389,8 @@ def _setup_pipeline(
     if needs_live_worker:
         _validate_native_mod_assets(resolved_asset_root, ppo_cfg.get("native_args") if isinstance(ppo_cfg.get("native_args"), list) else None)
         _validate_native_mod_assets(resolved_asset_root, eval_cfg.get("native_args") if isinstance(eval_cfg.get("native_args"), list) else None)
+    if fresh_output_root:
+        _assert_fresh_output_root(profile)
     plan_path = _write_plan(profile, runtime, plan, resolved_demo_dir, resolved_asset_root)
 
     results: dict[str, Any] = {
@@ -294,9 +417,16 @@ def run_live_pipeline(
     worker_binary: str,
     rebuild_worker: bool,
     checkpoint_override: str | None = None,
+    seed_checkpoint: str | None = None,
+    seed_checkpoints: list[str] | None = None,
+    output_root: str | None = None,
+    fresh: bool = False,
+    disable_pbt: bool = False,
+    ppo_fixed_tick_hz: int | None = None,
+    ppo_max_steps_per_episode: int | None = None,
     record_demos: bool = False,
 ) -> dict[str, Any]:
-    profile = PROFILES[profile_name]
+    profile = _profile_with_output_root(PROFILES[profile_name], output_root)
 
     # Report mode: load existing artifacts, no execution.
     if action == "report":
@@ -319,9 +449,21 @@ def run_live_pipeline(
 
     profile, runtime, plan, resolved_demo_dir, resolved_asset_root, worker_path, ppo_cfg, eval_cfg, results = _setup_pipeline(
         profile_name, action, eval_bc, device, demo_dir, asset_root, worker_binary, rebuild_worker,
+        output_root=output_root,
+        fresh_output_root=bool(fresh and action == "ppo"),
     )
     if record_demos:
         eval_cfg["record_demos"] = True
+    if action == "ppo" and disable_pbt:
+        ppo_cfg["with_pbt"] = False
+        ppo_cfg["num_policies"] = 1
+        results["ppo_disable_pbt"] = True
+    if action == "ppo" and ppo_fixed_tick_hz is not None:
+        ppo_cfg["fixed_tick_hz"] = int(ppo_fixed_tick_hz)
+        results["ppo_fixed_tick_hz_override"] = int(ppo_fixed_tick_hz)
+    if action == "ppo" and ppo_max_steps_per_episode is not None:
+        ppo_cfg["max_steps_per_episode"] = int(ppo_max_steps_per_episode)
+        results["ppo_max_steps_per_episode_override"] = int(ppo_max_steps_per_episode)
     stage_timings: dict[str, float] = {}
 
     if action == "plan":
@@ -394,6 +536,7 @@ def run_live_pipeline(
             eval_cfg["native_executable"] = str(worker_path)
             eval_cfg["checkpoint_path"] = BC_CHECKPOINT
             eval_cfg["output_dir"] = str(_profile_output_root(profile) / "eval_bc")
+            eval_cfg["checkpoint_path"] = _prepare_eval_checkpoint(profile, str(eval_cfg["checkpoint_path"]), str(eval_cfg["output_dir"]))
             results["eval"] = run_evaluation(EvalConfig(**eval_cfg))
             stage_timings["eval"] = time.monotonic() - started
 
@@ -401,37 +544,59 @@ def run_live_pipeline(
     # PPO phase: PPO → eval
     # ------------------------------------------------------------------
     elif action == "ppo":
-        # Prefer latest best SF checkpoint over BC for warm-start.
-        import re as _re
-        profile_root = _profile_output_root(profile)
-        best_dir = profile_root / "best"
-        sf_checkpoints = sorted(best_dir.glob("*.pth")) if best_dir.exists() else []
-        if sf_checkpoints:
-            def _reward_from_name(p: Path) -> float:
-                m = _re.search(r"reward_([-\d.]+)\.pth$", p.name)
-                return float(m.group(1)) if m else float("-inf")
-            # Prefer best_* (have reward in name), fall back to latest checkpoint_*
-            best_files = [f for f in sf_checkpoints if f.name.startswith("best_0")]
-            if best_files:
-                init_ckpt = str(max(best_files, key=_reward_from_name))
-            else:
-                # No best_* files; use the most recent .pth by mtime
-                init_ckpt = str(max(sf_checkpoints, key=lambda p: p.stat().st_mtime))
+        # Multi-seed PBT: multiple seed checkpoints, one per policy (round-robin).
+        if seed_checkpoints:
+            init_ckpts: list[str] = []
+            for ckpt in seed_checkpoints:
+                if not Path(ckpt).exists():
+                    raise FileNotFoundError(f"Seed checkpoint does not exist: {ckpt}")
+                init_ckpts.append(ckpt)
+            ppo_cfg["init_ckpts"] = init_ckpts
+            results["ppo_init_ckpts"] = init_ckpts
+            # First checkpoint is also recorded as init_ckpt for backward compat.
+            ppo_cfg["init_ckpt"] = init_ckpts[0]
+            results["ppo_init_ckpt"] = init_ckpts[0]
+        elif seed_checkpoint:
+            init_ckpt = seed_checkpoint
+            if not Path(init_ckpt).exists():
+                raise FileNotFoundError(f"Explicit seed checkpoint does not exist: {init_ckpt}")
+            if init_ckpt and Path(init_ckpt).exists():
+                ppo_cfg["init_ckpt"] = init_ckpt
+                results["ppo_init_ckpt"] = init_ckpt
         else:
-            init_ckpt = profile.bc_checkpoint
-        if init_ckpt and Path(init_ckpt).exists():
-            ppo_cfg["init_ckpt"] = init_ckpt
-            results["ppo_init_ckpt"] = init_ckpt
+            # Prefer latest best SF checkpoint over BC for warm-start when resuming an existing root.
+            import re as _re
+
+            profile_root = _profile_output_root(profile)
+            best_dir = profile_root / "best"
+            sf_checkpoints = sorted(best_dir.glob("*.pth")) if best_dir.exists() else []
+            if sf_checkpoints:
+                def _reward_from_name(p: Path) -> float:
+                    m = _re.search(r"reward_([-\d.]+)\.pth$", p.name)
+                    return float(m.group(1)) if m else float("-inf")
+                # Prefer best_* (have reward in name), fall back to latest checkpoint_*
+                best_files = [f for f in sf_checkpoints if f.name.startswith("best_0")]
+                if best_files:
+                    init_ckpt = str(max(best_files, key=_reward_from_name))
+                else:
+                    # No best_* files; use the most recent .pth by mtime
+                    init_ckpt = str(max(sf_checkpoints, key=lambda p: p.stat().st_mtime))
+            else:
+                init_ckpt = profile.bc_checkpoint
+            if init_ckpt and Path(init_ckpt).exists():
+                ppo_cfg["init_ckpt"] = init_ckpt
+                results["ppo_init_ckpt"] = init_ckpt
 
         started = time.monotonic()
         ppo_cfg["native_env"] = {"QUAKE_BASEDIR": str(resolved_asset_root)}
         ppo_cfg["native_executable"] = str(worker_path)
-        results["ppo"] = _run_sf_ppo(profile, ppo_cfg, resolved_asset_root, worker_path, device)
+        results["ppo"] = _run_ppo(profile, ppo_cfg, resolved_asset_root, worker_path, device)
         stage_timings["ppo"] = time.monotonic() - started
 
         started = time.monotonic()
         eval_cfg["native_env"] = {"QUAKE_BASEDIR": str(resolved_asset_root)}
         eval_cfg["native_executable"] = str(worker_path)
+        eval_cfg["checkpoint_path"] = _prepare_eval_checkpoint(profile, str(eval_cfg["checkpoint_path"]), str(eval_cfg["output_dir"]))
         results["eval"] = run_evaluation(EvalConfig(**eval_cfg))
         stage_timings["eval"] = time.monotonic() - started
 
@@ -447,6 +612,7 @@ def run_live_pipeline(
         elif action == "eval-bc":
             eval_cfg["checkpoint_path"] = BC_CHECKPOINT
             eval_cfg["output_dir"] = str(_profile_output_root(profile) / "eval_bc")
+        eval_cfg["checkpoint_path"] = _prepare_eval_checkpoint(profile, str(eval_cfg["checkpoint_path"]), str(eval_cfg["output_dir"]))
         results["eval"] = run_evaluation(EvalConfig(**eval_cfg))
         stage_timings["eval"] = time.monotonic() - started
 
@@ -479,6 +645,18 @@ def main() -> None:
     )
     parser.add_argument("--eval-bc", action="store_true", help="When used with --action bc, run eval after behavior cloning")
     parser.add_argument("--checkpoint", default=None, help="Override checkpoint path for eval")
+    parser.add_argument("--seed-checkpoint", default=None, help="Explicit SF or BC warm-start checkpoint for PPO")
+    parser.add_argument("--seed-checkpoints", default=None, help="Comma-separated seed checkpoints for multi-seed PBT")
+    parser.add_argument("--output-root", default=None, help="Override retained output root for this run")
+    parser.add_argument("--fresh", action="store_true", help="Require an empty output root for PPO instead of resuming")
+    parser.add_argument("--no-pbt", action="store_true", help="Disable PBT for this PPO run")
+    parser.add_argument("--ppo-fixed-tick-hz", type=int, default=None, help="Override PPO fixed tick rate for this run")
+    parser.add_argument(
+        "--ppo-max-steps-per-episode",
+        type=int,
+        default=None,
+        help="Override PPO max steps per episode for this run",
+    )
     parser.add_argument("--device", default="gpu", help="Requested torch device override")
     parser.add_argument("--demo-dir", default=None, help="Override demo directory")
     parser.add_argument("--asset-root", default=None, help="Override Quake asset root")
@@ -497,6 +675,13 @@ def main() -> None:
         worker_binary=args.worker_binary,
         rebuild_worker=args.rebuild_worker,
         checkpoint_override=args.checkpoint,
+        seed_checkpoint=args.seed_checkpoint,
+        seed_checkpoints=[p.strip() for p in args.seed_checkpoints.split(",") if p.strip()] if args.seed_checkpoints else None,
+        output_root=args.output_root,
+        fresh=args.fresh,
+        disable_pbt=args.no_pbt,
+        ppo_fixed_tick_hz=args.ppo_fixed_tick_hz,
+        ppo_max_steps_per_episode=args.ppo_max_steps_per_episode,
         record_demos=args.record_demos,
     )
 

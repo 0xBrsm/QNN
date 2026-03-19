@@ -189,6 +189,7 @@ class NativeWorldEnv:
         # Procgen: generate the first map inline (no background threads).
         self._maps_dir: Path | None = None
         self._current_map_id: str | None = None
+        self._cleanup_generated_maps = bool(self._procgen.get("cleanup_generated_maps", True)) if self._procgen is not None else True
         if self._procgen is not None:
             from mapgen.pool import generate_bsp
             self._maps_dir = Path(self._procgen["maps_dir"])
@@ -235,7 +236,7 @@ class NativeWorldEnv:
             last_err: Exception | None = None
             for attempt in range(self._MAX_PROCGEN_RETRIES):
                 if self._procgen is not None:
-                    seed_val = int(self.rng.integers(0, 2**31 - 1))
+                    seed_val = int(reset_seed + attempt) if seed is not None else int(self.rng.integers(0, 2**31 - 1))
                     new_map_id, _ = generate_bsp(
                         seed_val, self._maps_dir,
                         rooms=self._procgen.get("rooms", 3),
@@ -257,14 +258,14 @@ class NativeWorldEnv:
                         new_map_id, attempt + 1, self._MAX_PROCGEN_RETRIES, exc,
                     )
                     # Clean up the failed map immediately.
-                    if self._maps_dir:
+                    if self._maps_dir and self._cleanup_generated_maps:
                         for ext in (".bsp", ".map", ".log", ".prt"):
                             (self._maps_dir / f"{new_map_id}{ext}").unlink(missing_ok=True)
                     last_err = exc
             if last_err is not None:
                 raise last_err
             # Clean up old map files to avoid filling disk.
-            if old_map_id and self._maps_dir:
+            if old_map_id and self._maps_dir and self._cleanup_generated_maps:
                 for ext in (".bsp", ".map", ".log", ".prt"):
                     p = self._maps_dir / f"{old_map_id}{ext}"
                     p.unlink(missing_ok=True)

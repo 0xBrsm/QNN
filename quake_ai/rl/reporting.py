@@ -13,10 +13,11 @@ from quake_ai.rl.planning import (
     _safe_read_json,
     _stage_output_dir,
 )
+from quake_ai.rl.metrics import EVAL_REPORT_METRICS, PPO_REPORT_METRICS, report_metric_key
 from quake_ai.rl.profiles import PROFILES, LiveProfile
 from quake_ai.utils.io import write_json
 
-REPORT_STAGES = ("bc", "eval_bc", "sf", "best", "eval")
+REPORT_STAGES = ("bc", "eval_bc", "ppo", "best", "eval")
 
 
 def _collect_existing_files(path: Path) -> list[Path]:
@@ -68,7 +69,15 @@ def _load_existing_runtime_context(profile: LiveProfile) -> tuple[Dict[str, Any]
 
 def _stage_report(profile: LiveProfile, stage: str) -> Dict[str, Any]:
     stage_dir = _stage_output_dir(profile, stage)
+    stage_key = stage
     files = _collect_existing_files(stage_dir)
+    if stage == "ppo" and not files:
+        legacy_stage_dir = _stage_output_dir(profile, "sf")
+        legacy_files = _collect_existing_files(legacy_stage_dir)
+        if legacy_files:
+            stage_dir = legacy_stage_dir
+            stage_key = "sf"
+            files = legacy_files
 
     report: Dict[str, Any] = {
         "stage": stage,
@@ -76,6 +85,8 @@ def _stage_report(profile: LiveProfile, stage: str) -> Dict[str, Any]:
         "status": "present" if files else "missing",
         "files": [str(path) for path in files],
     }
+    if stage_key != stage:
+        report["legacy_stage"] = stage_key
 
     if stage == "collect":
         manifest = _safe_read_json(stage_dir / "collect_manifest.json")
@@ -87,8 +98,8 @@ def _stage_report(profile: LiveProfile, stage: str) -> Dict[str, Any]:
         manifest_name = "eval_manifest.json"
         summary_name = "eval_summary.json"
     else:
-        manifest_name = f"{stage}_manifest.json"
-        summary_name = f"{stage}_summary.json"
+        manifest_name = f"{stage_key}_manifest.json"
+        summary_name = f"{stage_key}_summary.json"
     manifest = _safe_read_json(stage_dir / manifest_name)
     summary = _safe_read_json(stage_dir / summary_name)
     if manifest is not None:
@@ -113,18 +124,33 @@ def _metric(report: Mapping[str, Any], *path: str) -> float | None:
     return None
 
 
+def _first_metric(*values: float | None) -> float | None:
+    for value in values:
+        if value is not None:
+            return float(value)
+    return None
+
+
 def _eval_metric(report: Mapping[str, Any], mode: str, key: str) -> float | None:
-    return (
+    return _first_metric(
         _metric(report, "summary", "modes", mode, key)
-        or _metric(report, "manifest", "metrics", "modes", mode, key)
-        or _metric(report, "model_card", "evaluation", "modes", mode, key)
+        , _metric(report, "manifest", "metrics", "modes", mode, key)
+        , _metric(report, "model_card", "evaluation", "modes", mode, key)
     )
 
 
 def _stage_summary_metric(report: Mapping[str, Any], stage: str, key: str) -> float | None:
+    resolved_key = report_metric_key(stage, key)
     if stage.startswith("eval"):
-        return _eval_metric(report, "greedy", key) or _metric(report, "summary", key) or _metric(report, "manifest", "metrics", key)
-    return _metric(report, "summary", key) or _metric(report, "manifest", "metrics", key)
+        return _first_metric(
+            _eval_metric(report, "greedy", resolved_key),
+            _metric(report, "summary", resolved_key),
+            _metric(report, "manifest", "metrics", resolved_key),
+        )
+    return _first_metric(
+        _metric(report, "summary", resolved_key),
+        _metric(report, "manifest", "metrics", resolved_key),
+    )
 
 
 def _comparison_metric_payload(current: float | None, baseline: float | None) -> Dict[str, float] | None:
@@ -140,25 +166,14 @@ def _comparison_metric_payload(current: float | None, baseline: float | None) ->
 def _profile_comparison(current_stage_reports: Mapping[str, Mapping[str, Any]], baseline_profile: LiveProfile) -> Dict[str, Any]:
     baseline_reports = {stage: _stage_report(baseline_profile, stage) for stage in REPORT_STAGES}
     metrics: Dict[str, Dict[str, float]] = {}
-    for stage, key in (
-        ("ppo", "death_rate"),
-        ("ppo", "frag_delta_mean"),
-        ("ppo", "damage_dealt_mean"),
-        ("ppo", "hit_count_mean"),
-        ("ppo", "shots_fired_mean"),
-        ("eval", "death_rate"),
-        ("eval", "frag_delta_mean"),
-        ("eval", "mean_episode_return"),
-        ("eval", "damage_dealt_mean"),
-        ("eval", "hit_count_mean"),
-        ("eval", "shots_fired_mean"),
-    ):
-        payload = _comparison_metric_payload(
-            _stage_summary_metric(current_stage_reports.get(stage, {}), stage, key),
-            _stage_summary_metric(baseline_reports.get(stage, {}), stage, key),
-        )
-        if payload is not None:
-            metrics[f"{stage}_{key}"] = payload
+    for stage, keys in (("ppo", PPO_REPORT_METRICS), ("eval", EVAL_REPORT_METRICS)):
+        for key in keys:
+            payload = _comparison_metric_payload(
+                _stage_summary_metric(current_stage_reports.get(stage, {}), stage, key),
+                _stage_summary_metric(baseline_reports.get(stage, {}), stage, key),
+            )
+            if payload is not None:
+                metrics[f"{stage}_{key}"] = payload
     return {
         "profile": baseline_profile.name,
         "profile_note": baseline_profile.profile_note,
@@ -169,7 +184,7 @@ def _profile_comparison(current_stage_reports: Mapping[str, Mapping[str, Any]], 
 
 def _intra_profile_baseline_comparison(stage_reports: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
     metrics: Dict[str, Dict[str, float]] = {}
-    for key in ("death_rate", "frag_delta_mean", "mean_episode_return", "damage_dealt_mean", "hit_count_mean", "shots_fired_mean"):
+    for key in EVAL_REPORT_METRICS:
         payload = _comparison_metric_payload(
             _stage_summary_metric(stage_reports.get("eval", {}), "eval", key),
             _stage_summary_metric(stage_reports.get("eval_bc", {}), "eval_bc", key),
@@ -214,7 +229,7 @@ def _build_operational_note(
         utilization_parts.append(f"eval_episodes={eval_episodes}")
     utilization_parts.append("direct accelerator utilization sampling not captured")
 
-    sf_report = stage_reports.get("sf", {})
+    ppo_report = stage_reports.get("ppo", {})
     best_report = stage_reports.get("best", {})
     eval_report = stage_reports.get("eval", {})
     eval_bc_report = stage_reports.get("eval_bc", {})
@@ -224,9 +239,8 @@ def _build_operational_note(
     instability_notes: list[str] = []
     if best_report.get("status") == "present":
         instability_notes.append("PPO completed and wrote a checkpoint without a recorded worker crash.")
-    if _metric(eval_report, "manifest", "metrics", "modes", "greedy", "stuck_rate") and _metric(
-        eval_report, "manifest", "metrics", "modes", "greedy", "stuck_rate"
-    ) >= 0.9:
+    eval_greedy_stuck_rate = _stage_summary_metric(eval_report, "eval", "stuck_rate")
+    if eval_greedy_stuck_rate is not None and eval_greedy_stuck_rate >= 0.9:
         instability_notes.append("Evaluation reported a high greedy stuck_rate; this looks like policy quality, not a worker crash.")
     bc_greedy_return = _metric(eval_bc_report, "manifest", "metrics", "modes", "greedy", "mean_episode_return")
     ppo_greedy_return = _metric(eval_report, "manifest", "metrics", "modes", "greedy", "mean_episode_return")
@@ -265,19 +279,43 @@ def _build_operational_note(
         "metrics": {
             "bc_test_accuracy": _metric(bc_report, "summary", "test_accuracy") or _metric(bc_report, "manifest", "metrics", "test_accuracy"),
             "eval_bc_greedy_return": _metric(eval_bc_report, "manifest", "metrics", "modes", "greedy", "mean_episode_return"),
-            "eval_bc_greedy_stuck_rate": _metric(eval_bc_report, "manifest", "metrics", "modes", "greedy", "stuck_rate"),
+            "eval_bc_greedy_stuck_rate": _stage_summary_metric(eval_bc_report, "eval_bc", "stuck_rate"),
+            "eval_bc_greedy_accuracy": _stage_summary_metric(eval_bc_report, "eval_bc", "accuracy"),
+            "eval_bc_greedy_damage_per_death_mean": _stage_summary_metric(eval_bc_report, "eval_bc", "damage_per_death_mean"),
+            "eval_bc_greedy_blind_fire_rate": _stage_summary_metric(eval_bc_report, "eval_bc", "blind_fire_rate"),
             "eval_bc_sampled_return": _metric(eval_bc_report, "manifest", "metrics", "modes", "sampled", "mean_episode_return"),
             "eval_bc_sampled_stuck_rate": _metric(eval_bc_report, "manifest", "metrics", "modes", "sampled", "stuck_rate"),
-            "ppo_steps_done": _metric(sf_report, "summary", "steps_done") or _metric(sf_report, "manifest", "metrics", "steps_done"),
-            "ppo_death_rate": _metric(sf_report, "summary", "death_rate") or _metric(sf_report, "manifest", "metrics", "death_rate"),
-            "ppo_frag_delta_mean": _metric(sf_report, "summary", "frag_delta_mean")
-            or _metric(sf_report, "manifest", "metrics", "frag_delta_mean"),
-            "ppo_episodes_completed": _metric(sf_report, "summary", "episodes_completed")
-            or _metric(sf_report, "manifest", "metrics", "episodes_completed"),
-            "eval_greedy_return": _metric(eval_report, "manifest", "metrics", "modes", "greedy", "mean_episode_return"),
-            "eval_greedy_stuck_rate": _metric(eval_report, "manifest", "metrics", "modes", "greedy", "stuck_rate"),
-            "eval_greedy_death_rate": _metric(eval_report, "manifest", "metrics", "modes", "greedy", "death_rate"),
-            "eval_greedy_frag_delta_mean": _metric(eval_report, "manifest", "metrics", "modes", "greedy", "frag_delta_mean"),
+            "ppo_steps_done": _metric(ppo_report, "summary", "steps_done") or _metric(ppo_report, "manifest", "metrics", "steps_done"),
+            "ppo_effective_game_minutes_per_wall_minute": _stage_summary_metric(
+                ppo_report, "ppo", "effective_game_minutes_per_wall_minute"
+            ),
+            "ppo_death_rate": _stage_summary_metric(ppo_report, "ppo", "death_rate"),
+            "ppo_frag_delta_mean": _stage_summary_metric(ppo_report, "ppo", "frag_delta_mean"),
+            "ppo_damage_dealt_mean": _stage_summary_metric(ppo_report, "ppo", "damage_dealt_mean"),
+            "ppo_hit_count_mean": _stage_summary_metric(ppo_report, "ppo", "hit_count_mean"),
+            "ppo_shots_fired_mean": _stage_summary_metric(ppo_report, "ppo", "shots_fired_mean"),
+            "ppo_accuracy": _stage_summary_metric(ppo_report, "ppo", "accuracy"),
+            "ppo_damage_per_death_mean": _stage_summary_metric(ppo_report, "ppo", "damage_per_death_mean"),
+            "ppo_blind_fire_rate": _stage_summary_metric(ppo_report, "ppo", "blind_fire_rate"),
+            "ppo_reward_total_mean": _stage_summary_metric(ppo_report, "ppo", "reward_total_mean"),
+            "ppo_reward_frags_mean": _stage_summary_metric(ppo_report, "ppo", "reward_frags_mean"),
+            "ppo_reward_deaths_mean": _stage_summary_metric(ppo_report, "ppo", "reward_deaths_mean"),
+            "ppo_reward_ehp_mean": _stage_summary_metric(ppo_report, "ppo", "reward_ehp_mean"),
+            "ppo_reward_edp_mean": _stage_summary_metric(ppo_report, "ppo", "reward_edp_mean"),
+            "ppo_stuck_rate": _stage_summary_metric(ppo_report, "ppo", "stuck_rate"),
+            "ppo_episodes_completed": _metric(ppo_report, "summary", "episodes_completed")
+            or _metric(ppo_report, "manifest", "metrics", "episodes_completed"),
+            "eval_greedy_return": _stage_summary_metric(eval_report, "eval", "mean_episode_return"),
+            "eval_greedy_stuck_rate": _stage_summary_metric(eval_report, "eval", "stuck_rate"),
+            "eval_greedy_death_rate": _stage_summary_metric(eval_report, "eval", "death_rate"),
+            "eval_greedy_frag_delta_mean": _stage_summary_metric(eval_report, "eval", "frag_delta_mean"),
+            "eval_greedy_damage_dealt_mean": _stage_summary_metric(eval_report, "eval", "damage_dealt_mean"),
+            "eval_greedy_hit_count_mean": _stage_summary_metric(eval_report, "eval", "hit_count_mean"),
+            "eval_greedy_shots_fired_mean": _stage_summary_metric(eval_report, "eval", "shots_fired_mean"),
+            "eval_greedy_accuracy": _stage_summary_metric(eval_report, "eval", "accuracy"),
+            "eval_greedy_damage_per_death_mean": _stage_summary_metric(eval_report, "eval", "damage_per_death_mean"),
+            "eval_greedy_blind_fire_rate": _stage_summary_metric(eval_report, "eval", "blind_fire_rate"),
+            "eval_greedy_reward_total_mean": _stage_summary_metric(eval_report, "eval", "reward_total_mean"),
             "eval_sampled_return": _metric(eval_report, "manifest", "metrics", "modes", "sampled", "mean_episode_return"),
             "eval_sampled_stuck_rate": _metric(eval_report, "manifest", "metrics", "modes", "sampled", "stuck_rate"),
             "eval_sampled_death_rate": _metric(eval_report, "manifest", "metrics", "modes", "sampled", "death_rate"),
@@ -353,7 +391,7 @@ def _write_run_report(
         "plan_path": str(plan_path),
         "runtime": dict(runtime),
         "plan": dict(plan),
-        "training_focus": "pvp_transformer_sf",
+        "training_focus": "pvp_transformer_ppo",
         "results": dict(results),
         "stage_timings_seconds": {str(key): float(value) for key, value in stage_timings.items()},
         "stages": stage_reports,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from collections.abc import Mapping as MappingABC
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -14,11 +15,18 @@ import torch
 
 from quake_ai.actions import ACTION_HEADS
 from quake_ai.rl.combat_metrics import iter_weapon_metric_keys
+from quake_ai.rl.metrics import (
+    EpisodeStatAccumulator,
+    append_metric_values,
+    build_eval_summary_aliases,
+    mean_metric_values,
+)
 from quake_ai.model.policy import QNNPolicy
 from quake_ai.model.observation import TokenObservationEncoder, observation_signature_dim
 from quake_ai.rl.environment import NativeWorldEnv
 from quake_ai.utils.io import write_json
 from quake_ai.utils.repro import set_global_seed, write_experiment_manifest
+from mapgen.pool import PROCGEN_SENTINEL
 
 
 @dataclass(slots=True)
@@ -44,7 +52,25 @@ class EvalConfig:
     map_features_path: str = ""
     scenario_config_path: str = ""
     record_demos: bool = False
+    parallel_policy_modes: bool = True
     device: str = "auto"
+
+
+@dataclass(frozen=True, slots=True)
+class _ScenarioSpec:
+    scenario_id: str
+    map_id: str
+    native_args: tuple[str, ...]
+    options: Dict[str, object]
+    procgen_cfg: dict[str, object] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _EpisodeJob:
+    episode_index: int
+    episode_seed: int
+    start_variant: int | None
+    scenario: _ScenarioSpec
 
 
 def _episode_specs(config: EvalConfig) -> List[Tuple[int, int | None]]:
@@ -66,6 +92,7 @@ class _EpisodeState:
     last_info: Mapping[str, object] = field(default_factory=dict)
     rng: torch.Generator | None = None
     hidden: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    metrics: EpisodeStatAccumulator = field(default_factory=EpisodeStatAccumulator)
 
 
 def _stack_obs(obs_list: Sequence[np.ndarray | Dict[str, np.ndarray]]) -> np.ndarray | Dict[str, np.ndarray]:
@@ -88,39 +115,76 @@ def _scenario_entries(config: EvalConfig) -> list[Dict[str, Any]]:
     return [dict(scenario) for scenario in scenarios if isinstance(scenario, MappingABC)]
 
 
-def _eval_env_spec(config: EvalConfig, env_index: int) -> tuple[str, list[str], dict[str, object], str]:
+def _scenario_spec(
+    config: EvalConfig,
+    scenario: Mapping[str, Any] | None,
+) -> _ScenarioSpec:
+    map_id = str((scenario or {}).get("map_id", config.map_id))
+    native_args = list((scenario or {}).get("native_args", config.native_args))
+    merged_options = dict(config.options)
+    merged_options.update(dict((scenario or {}).get("options", {})))
+    scenario_id = str((scenario or {}).get("scenario_id", map_id))
+    procgen_cfg: dict[str, object] | None = None
+    if map_id == PROCGEN_SENTINEL:
+        basedir = str(config.native_env.get("QUAKE_BASEDIR", "")).strip() or "assets"
+        procgen_opts = dict((scenario or {}).get("procgen", {}))
+        procgen_cfg = {
+            "maps_dir": str(Path(basedir) / "id1" / "maps"),
+            "arena_size": int(procgen_opts.get("arena_size", 3072)),
+            "rooms": int(procgen_opts.get("rooms", 3)),
+            "cleanup_generated_maps": False,
+        }
+    return _ScenarioSpec(
+        scenario_id=scenario_id,
+        map_id=map_id,
+        native_args=tuple(str(value) for value in native_args),
+        options=merged_options,
+        procgen_cfg=procgen_cfg,
+    )
+
+
+def _scenario_specs(config: EvalConfig) -> list[_ScenarioSpec]:
     scenarios = _scenario_entries(config)
     if not scenarios:
-        return config.map_id, list(config.native_args), dict(config.options), config.map_id
-
-    scenario = scenarios[env_index % len(scenarios)]
-    map_id = str(scenario.get("map_id", config.map_id))
-    native_args = list(scenario.get("native_args", config.native_args))
-    merged_options = dict(config.options)
-    merged_options.update(dict(scenario.get("options", {})))
-    scenario_id = str(scenario.get("scenario_id", map_id))
-    return map_id, native_args, merged_options, scenario_id
+        return [_scenario_spec(config, None)]
+    return [_scenario_spec(config, scenario) for scenario in scenarios]
 
 
-def _build_eval_env(config: EvalConfig, env_index: int) -> tuple[NativeWorldEnv, str]:
+def _episode_jobs(config: EvalConfig) -> tuple[list[_ScenarioSpec], dict[str, deque[_EpisodeJob]]]:
+    scenarios = _scenario_specs(config)
+    jobs: dict[str, deque[_EpisodeJob]] = {scenario.scenario_id: deque() for scenario in scenarios}
+    for episode_index, (episode_seed, start_variant) in enumerate(_episode_specs(config)):
+        scenario = scenarios[episode_index % len(scenarios)]
+        jobs[scenario.scenario_id].append(
+            _EpisodeJob(
+                episode_index=episode_index,
+                episode_seed=episode_seed,
+                start_variant=start_variant,
+                scenario=scenario,
+            )
+        )
+    return scenarios, jobs
+
+
+def _build_eval_env(config: EvalConfig, scenario: _ScenarioSpec) -> NativeWorldEnv:
     if not config.native_executable:
         raise RuntimeError("Evaluation requires native_executable")
-    map_id, native_args, options, scenario_id = _eval_env_spec(config, env_index)
     return NativeWorldEnv(
         executable=config.native_executable,
-        map_id=map_id,
+        map_id=scenario.map_id,
         max_steps=config.max_steps_per_episode,
         fixed_tick_hz=config.fixed_tick_hz,
         mode=config.mode,
         seed=config.seed,
         workdir=config.native_workdir or None,
         env=config.native_env,
-        native_args=native_args,
-        options=options,
-    ), scenario_id
+        native_args=list(scenario.native_args),
+        options=scenario.options,
+        procgen=scenario.procgen_cfg,
+    )
 
 
-def _set_demo_recording(env: NativeWorldEnv, episode_index: int) -> None:
+def _set_demo_recording(env: NativeWorldEnv, episode_index: int, mode: str) -> None:
     """Inject a ``record`` command into the env's pre_map_commands for this episode.
 
     Quake's ``record`` console command only works when the client is **not**
@@ -129,7 +193,7 @@ def _set_demo_recording(env: NativeWorldEnv, episode_index: int) -> None:
     disconnected and ``record`` succeeds.  ``post_map_commands`` runs after
     connection, which causes ``record`` to be silently rejected.
     """
-    demo_name = f"eval_ep_{episode_index:04d}"
+    demo_name = f"eval_{mode}_ep_{episode_index:04d}"
     base_cmds = env.adapter.reset_options.get("_base_pre_map_commands")
     if base_cmds is None:
         base_cmds = str(env.adapter.reset_options.get("pre_map_commands", ""))
@@ -228,12 +292,13 @@ def _evaluate_mode(
     mode: str,
     episode_specs: Sequence[Tuple[int, int | None]],
 ) -> Dict[str, float]:
+    del episode_specs
     num_envs = max(1, min(config.num_envs, config.num_episodes))
-    env_entries = [_build_eval_env(config, env_index) for env_index in range(num_envs)]
-    envs = [env for env, _ in env_entries]
-    env_scenarios = [scenario_id for _, scenario_id in env_entries]
+    scenarios, job_queues = _episode_jobs(config)
     executor = ThreadPoolExecutor(max_workers=num_envs, thread_name_prefix="nq-eval") if num_envs > 1 else None
 
+    envs: Dict[int, NativeWorldEnv] = {}
+    slot_scenarios: Dict[int, _ScenarioSpec] = {}
     returns: List[float] = []
     end_health: List[int] = []
     end_armor: List[int] = []
@@ -249,17 +314,41 @@ def _evaluate_mode(
     scenario_stuck_steps: Dict[str, int] = {}
     scenario_total_steps: Dict[str, int] = {}
     scenario_aux_metric_sums: Dict[str, Dict[str, float]] = {}
+    scenario_episode_metric_values: Dict[str, Dict[str, List[float]]] = {}
+
+    def _next_job(preferred_scenario_id: str | None = None) -> _EpisodeJob | None:
+        if preferred_scenario_id:
+            preferred = job_queues.get(preferred_scenario_id)
+            if preferred:
+                return preferred.popleft()
+        for scenario in scenarios:
+            queue = job_queues.get(scenario.scenario_id)
+            if queue:
+                return queue.popleft()
+        return None
+
+    def _ensure_env(slot: int, scenario: _ScenarioSpec) -> NativeWorldEnv:
+        current = slot_scenarios.get(slot)
+        if current is not None and current.scenario_id == scenario.scenario_id:
+            return envs[slot]
+        existing = envs.pop(slot, None)
+        if existing is not None:
+            existing.close()
+        env = _build_eval_env(config, scenario)
+        envs[slot] = env
+        slot_scenarios[slot] = scenario
+        return env
 
     try:
         active: Dict[int, _EpisodeState] = {}
-        next_episode = 0
-
-        while next_episode < len(episode_specs) and len(active) < len(envs):
-            episode_seed, start_variant = episode_specs[next_episode]
-            slot = len(active)
+        for slot in range(num_envs):
+            job = _next_job()
+            if job is None:
+                break
+            env = _ensure_env(slot, job.scenario)
             if config.record_demos:
-                _set_demo_recording(envs[slot], next_episode)
-            obs = envs[slot].reset(seed=episode_seed, start_variant=start_variant)
+                _set_demo_recording(env, job.episode_index, mode)
+            obs = env.reset(seed=job.episode_seed, start_variant=job.start_variant)
             if not checked_obs_dim:
                 env_obs_dim = TokenObservationEncoder().obs_dim if isinstance(obs, dict) else int(obs.shape[0])
                 if env_obs_dim != model.obs_dim:
@@ -268,13 +357,12 @@ def _evaluate_mode(
                     )
                 checked_obs_dim = True
             active[len(active)] = _EpisodeState(
-                episode_index=next_episode,
+                episode_index=job.episode_index,
                 obs=obs,
-                scenario_id=env_scenarios[slot],
-                rng=None if mode == "greedy" else _episode_rng(config, mode, next_episode, model.device),
+                scenario_id=job.scenario.scenario_id,
+                rng=None if mode == "greedy" else _episode_rng(config, mode, job.episode_index, model.device),
                 hidden=model.zero_hidden(1)[0].copy(),
             )
-            next_episode += 1
 
         while active:
             slot_ids = sorted(active.keys())
@@ -301,9 +389,11 @@ def _evaluate_mode(
                 state = active[slot]
                 state.hidden = next_hidden[batch_idx].copy()
                 state.step_count += 1
+                terminal = bool(done or state.step_count >= config.max_steps_per_episode)
                 # Reward remains useful even when the episode ends without a special terminal condition.
                 state.return_value += float(reward)
                 state.last_info = info
+                state.metrics.add_step(reward=float(reward), info=info, terminal=terminal)
                 total_steps += 1
                 scenario_id = str(info.get("scenario_id", state.scenario_id))
                 state.scenario_id = scenario_id
@@ -316,7 +406,7 @@ def _evaluate_mode(
                     scenario_metric_sums = scenario_aux_metric_sums.setdefault(scenario_id, {})
                     scenario_metric_sums[key] = scenario_metric_sums.get(key, 0.0) + value
 
-                if done or state.step_count >= config.max_steps_per_episode:
+                if terminal:
                     returns.append(float(state.return_value))
                     end_health.append(int(state.last_info.get("health", 0)))
                     end_armor.append(int(state.last_info.get("armor", 0)))
@@ -326,25 +416,32 @@ def _evaluate_mode(
                     scenario_done_reason_counts[done_reason] = scenario_done_reason_counts.get(done_reason, 0) + 1
                     scenario_episode_counts[state.scenario_id] = scenario_episode_counts.get(state.scenario_id, 0) + 1
                     scenario_returns.setdefault(state.scenario_id, []).append(float(state.return_value))
+                    episode_stats = state.metrics.as_dict()
+                    append_metric_values(episode_metric_values, episode_stats)
+                    append_metric_values(
+                        scenario_episode_metric_values.setdefault(state.scenario_id, {}),
+                        episode_stats,
+                    )
                     for key, value in _iter_aux_metric_items(
                         state.last_info,
                         _EPISODE_AUX_KEYS + _EPISODE_WEAPON_AUX_KEYS,
                     ):
                         episode_metric_values.setdefault(key, []).append(value)
+                        scenario_episode_metric_values.setdefault(state.scenario_id, {}).setdefault(key, []).append(value)
 
-                    if next_episode < len(episode_specs):
-                        episode_seed, start_variant = episode_specs[next_episode]
+                    next_job = _next_job(slot_scenarios[slot].scenario_id)
+                    if next_job is not None:
+                        env = _ensure_env(slot, next_job.scenario)
                         if config.record_demos:
-                            _set_demo_recording(envs[slot], next_episode)
-                        next_obs = envs[slot].reset(seed=episode_seed, start_variant=start_variant)
+                            _set_demo_recording(env, next_job.episode_index, mode)
+                        next_obs = env.reset(seed=next_job.episode_seed, start_variant=next_job.start_variant)
                         active[slot] = _EpisodeState(
-                            episode_index=next_episode,
+                            episode_index=next_job.episode_index,
                             obs=next_obs,
-                            scenario_id=env_scenarios[slot],
-                            rng=None if mode == "greedy" else _episode_rng(config, mode, next_episode, model.device),
+                            scenario_id=next_job.scenario.scenario_id,
+                            rng=None if mode == "greedy" else _episode_rng(config, mode, next_job.episode_index, model.device),
                             hidden=model.zero_hidden(1)[0].copy(),
                         )
-                        next_episode += 1
                     else:
                         del active[slot]
                 else:
@@ -352,10 +449,11 @@ def _evaluate_mode(
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
-        for env in envs:
+        for env in envs.values():
             env.close()
 
     stuck_rate = float(stuck_steps / max(total_steps, 1))
+    episode_metric_means = mean_metric_values(episode_metric_values)
 
     summary = {
         "death_rate": float(done_reasons.get("player_died", 0) / max(config.num_episodes, 1)),
@@ -367,11 +465,8 @@ def _evaluate_mode(
     }
     for metric_key in _AUX_INFO_KEYS + _WEAPON_AUX_KEYS:
         summary[f"{metric_key}_mean"] = float(aux_metric_sums.get(metric_key, 0.0) / max(total_steps, 1))
-    summary["episode_metric_means"] = {
-        key: float(np.mean(values))
-        for key, values in sorted(episode_metric_values.items())
-        if values
-    }
+    summary["episode_metric_means"] = episode_metric_means
+    summary.update(build_eval_summary_aliases(episode_metric_means))
     summary["scenario_metric_means"] = {
         scenario_id: {
             "num_episodes": scenario_episode_counts.get(scenario_id, 0),
@@ -384,10 +479,20 @@ def _evaluate_mode(
                 )
                 for metric_key in ("frag_delta", "damage_dealt", "hit_count", "shots_fired")
             },
+            **build_eval_summary_aliases(mean_metric_values(scenario_episode_metric_values.get(scenario_id, {}))),
         }
         for scenario_id, values in sorted(scenario_returns.items())
     }
     return summary
+
+
+def _evaluate_policy_mode(
+    config: EvalConfig,
+    mode: str,
+) -> tuple[str, Dict[str, float], QNNPolicy]:
+    model = QNNPolicy.load(config.checkpoint_path, device=config.device)
+    summary = _evaluate_mode(config, model, mode, _episode_specs(config))
+    return mode, summary, model
 
 
 def run_evaluation(config: EvalConfig) -> Dict[str, float]:
@@ -395,9 +500,27 @@ def run_evaluation(config: EvalConfig) -> Dict[str, float]:
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    model = QNNPolicy.load(config.checkpoint_path, device=config.device)
-    episode_specs = _episode_specs(config)
-    mode_summaries = {mode: _evaluate_mode(config, model, mode, episode_specs) for mode in config.policy_modes}
+    mode_summaries: Dict[str, Dict[str, float]] = {}
+    model_card_model: QNNPolicy | None = None
+    if len(config.policy_modes) > 1 and config.parallel_policy_modes:
+        with ThreadPoolExecutor(max_workers=len(config.policy_modes), thread_name_prefix="nq-eval-mode") as executor:
+            futures = {
+                mode: executor.submit(_evaluate_policy_mode, config, mode)
+                for mode in config.policy_modes
+            }
+            for mode in config.policy_modes:
+                _, summary, mode_model = futures[mode].result()
+                mode_summaries[mode] = summary
+                if model_card_model is None:
+                    model_card_model = mode_model
+    else:
+        for mode in config.policy_modes:
+            _, summary, mode_model = _evaluate_policy_mode(config, mode)
+            mode_summaries[mode] = summary
+            if model_card_model is None:
+                model_card_model = mode_model
+    if model_card_model is None:
+        raise RuntimeError("Evaluation did not produce a model instance")
 
     if len(config.policy_modes) == 1:
         summary: Dict[str, object] = dict(mode_summaries[config.policy_modes[0]])
@@ -426,13 +549,15 @@ def run_evaluation(config: EvalConfig) -> Dict[str, float]:
         eval_notes.append("Evaluation reports both greedy and stochastic action-selection modes.")
     if config.num_envs > 1:
         eval_notes.append(f"Evaluation parallelizes episodes across {config.num_envs} environments.")
+    if len(config.policy_modes) > 1 and config.parallel_policy_modes:
+        eval_notes.append("Evaluation runs policy modes in parallel with isolated model instances.")
 
     model_card = {
         "model": {
             "checkpoint": str(config.checkpoint_path),
             "architecture": (
-                f"transformer encoder + GRU({model.gru_hidden}) actor-critic"
-                if model.use_gru
+                f"transformer encoder + GRU({model_card_model.gru_hidden}) actor-critic"
+                if model_card_model.use_gru
                 else "transformer encoder actor-critic"
             ),
             "observation_modality": "token dict observation with self/object/event/spatial tensors",

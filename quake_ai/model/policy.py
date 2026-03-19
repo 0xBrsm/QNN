@@ -18,6 +18,51 @@ from quake_ai.model.transformer import TransformerTrunk
 from quake_ai.utils.device import configure_torch_runtime, resolve_torch_device
 from quake_ai.utils.io import trusted_torch_load
 
+_FOCAL_LOSS_HEADS = frozenset({"look_yaw", "look_pitch"})
+_FOCAL_GAMMA = 2.0  # focus parameter — higher = more focus on hard examples
+_LOOK_LABEL_SMOOTH = 0.1  # probability mass spread to ±1 adjacent bins for look heads
+
+
+def _focal_cross_entropy(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    gamma: float = _FOCAL_GAMMA,
+    label_smooth_adjacent: float = 0.0,
+    num_classes: int = 0,
+) -> torch.Tensor:
+    """Focal loss with optional adjacent-bin label smoothing for look heads.
+
+    Focal loss down-weights well-classified examples and amplifies hard ones,
+    addressing class imbalance better than static class weights.
+
+    Adjacent-bin smoothing spreads probability mass to ±1 bins, treating
+    near-neutral bins (-1, 0, +1) as near-equivalent.  This reduces label
+    noise from rounding ambiguity in mouse deltas.
+    """
+    if label_smooth_adjacent > 0 and num_classes > 0:
+        # Build soft targets: main bin gets (1 - 2*smooth), ±1 bins get smooth each
+        soft = torch.zeros(logits.size(0), num_classes, device=logits.device)
+        soft.scatter_(1, target.unsqueeze(1), 1.0 - 2 * label_smooth_adjacent)
+        left = (target - 1).clamp(min=0)
+        right = (target + 1).clamp(max=num_classes - 1)
+        soft.scatter_add_(1, left.unsqueeze(1), torch.full_like(soft[:, :1], label_smooth_adjacent))
+        soft.scatter_add_(1, right.unsqueeze(1), torch.full_like(soft[:, :1], label_smooth_adjacent))
+        log_probs = F.log_softmax(logits, dim=1)
+        if weight is not None:
+            log_probs = log_probs * weight.unsqueeze(0)
+        ce = -(soft * log_probs).sum(dim=1)
+        probs_at_target = log_probs.exp().gather(1, target.unsqueeze(1)).squeeze(1)
+        focal_weight = (1.0 - probs_at_target) ** gamma
+        return (focal_weight * ce).mean()
+
+    log_probs = F.log_softmax(logits, dim=1)
+    ce = F.nll_loss(log_probs, target, weight=weight, reduction="none")
+    probs = log_probs.exp().gather(1, target.unsqueeze(1)).squeeze(1)
+    focal_weight = (1.0 - probs) ** gamma
+    return (focal_weight * ce).mean()
+
+
 HEAD_LOSS_WEIGHTS: Dict[str, float] = {
     "move": 1.5,
     "strafe": 1.0,
@@ -76,6 +121,14 @@ class _ActorCriticNet(nn.Module):
             head_in = trunk_hidden
         self.policy_heads = nn.ModuleDict({head: nn.Linear(head_in, size) for head, size in ACTION_HEADS.items()})
         self.value_head = nn.Linear(head_in, 1)
+        # Auxiliary aim head: predicts yaw/pitch angle to nearest enemy.
+        # Teaches the trunk to attend to enemy-relative geometry.
+        self.aim_aux_head = nn.Sequential(
+            nn.Linear(head_in, head_in // 2),
+            nn.ReLU(),
+            nn.Linear(head_in // 2, 2),  # [yaw, pitch] in [-1, 1]
+            nn.Tanh(),
+        )
 
     def _run_gru(
         self,
@@ -380,6 +433,18 @@ class QNNPolicy:
     def _value_parameters(self) -> list[nn.Parameter]:
         return list(self.model.value_head.parameters())
 
+    def bc_zero_grad(self) -> None:
+        """Zero gradients on the BC optimizer (for gradient accumulation)."""
+        opt = self._optimizers.get("bc")
+        if opt is not None:
+            opt.zero_grad()
+
+    def bc_step(self) -> None:
+        """Step the BC optimizer (after accumulating gradients)."""
+        opt = self._optimizers.get("bc")
+        if opt is not None:
+            opt.step()
+
     def _optimizer(self, name: str, params: Iterable[nn.Parameter], lr: float) -> torch.optim.Optimizer:
         optimizer = self._optimizers.get(name)
         if optimizer is None:
@@ -497,12 +562,15 @@ class QNNPolicy:
         *,
         hidden: np.ndarray | torch.Tensor | None = None,
         masks: np.ndarray | torch.Tensor | None = None,
+        aim_target: np.ndarray | torch.Tensor | None = None,
+        accumulate_only: bool = False,
     ) -> Dict[str, float]:
         self.model.train()
         optimizer = self._optimizer("bc", self.model.parameters(), lr)
-        optimizer.zero_grad()
+        if not accumulate_only:
+            optimizer.zero_grad()
 
-        _, logits, _, _ = self._forward_tensors(obs, hidden=hidden, masks=masks)
+        features, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
 
         losses = []
         combat_accuracies = []
@@ -512,7 +580,14 @@ class QNNPolicy:
             head_logits = self._flatten_logits(logits[head])
             target = self._action_targets_for_head(actions, head, head_logits)
             weights = self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
-            head_loss = F.cross_entropy(head_logits, target, weight=weights, reduction="mean")
+            if head in _FOCAL_LOSS_HEADS:
+                head_loss = _focal_cross_entropy(
+                    head_logits, target, weight=weights,
+                    label_smooth_adjacent=_LOOK_LABEL_SMOOTH,
+                    num_classes=ACTION_HEADS[head],
+                )
+            else:
+                head_loss = F.cross_entropy(head_logits, target, weight=weights, reduction="mean")
             head_loss = head_loss * HEAD_LOSS_WEIGHTS.get(head, 1.0)
             losses.append(head_loss)
             if head in _COMBAT_HEADS:
@@ -525,12 +600,25 @@ class QNNPolicy:
                 else:
                     fuzzy_accuracies.append(exact)
 
+        # Auxiliary aim loss: predict angle to nearest enemy.
+        aim_loss_val = 0.0
+        if aim_target is not None:
+            flat_features = features.reshape(-1, features.shape[-1])
+            aim_pred = self.model.aim_aux_head(flat_features)
+            aim_t = self._tensor(aim_target, dtype=torch.float32).reshape(-1, 2)
+            aim_loss = F.mse_loss(aim_pred, aim_t)
+            losses.append(aim_loss * 0.5)  # lower weight so it doesn't dominate
+            aim_loss_val = float(aim_loss.item())
+
         loss = torch.stack(losses).mean()
         loss.backward()
-        optimizer.step()
+        if not accumulate_only:
+            optimizer.step()
 
         result: Dict[str, float] = {
             "loss": float(loss.item()),
+            "aim_aux_loss": aim_loss_val,
+            "_next_hidden": next_hidden.detach(),
             "accuracy": float(np.mean(combat_accuracies) if combat_accuracies else 0.0),
             "fuzzy_accuracy": float(np.mean(fuzzy_accuracies) if fuzzy_accuracies else 0.0),
         }
@@ -547,7 +635,7 @@ class QNNPolicy:
         masks: np.ndarray | torch.Tensor | None = None,
     ) -> Dict[str, float]:
         with torch.inference_mode():
-            _, logits, _, _ = self._forward_tensors(obs, hidden=hidden, masks=masks)
+            _, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
             losses = []
             combat_accuracies = []
             fuzzy_accuracies = []
@@ -570,6 +658,7 @@ class QNNPolicy:
             "loss": float(np.mean(losses) if losses else 0.0),
             "accuracy": float(np.mean(combat_accuracies) if combat_accuracies else 0.0),
             "fuzzy_accuracy": float(np.mean(fuzzy_accuracies) if fuzzy_accuracies else 0.0),
+            "_next_hidden": next_hidden.detach(),
         }
         for head, acc in per_head_acc.items():
             result[f"acc_{head}"] = acc

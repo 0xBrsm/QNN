@@ -1,4 +1,4 @@
-"""Sample Factory encoder wrapping the native token transformer trunk."""
+"""PPO encoder wrapping the native token transformer trunk."""
 
 from __future__ import annotations
 

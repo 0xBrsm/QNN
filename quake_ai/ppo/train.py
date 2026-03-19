@@ -1,7 +1,7 @@
-"""Sample Factory APPO training entry point for Quake combat bot.
+"""PPO APPO training entry point for the Quake combat bot.
 
 Usage (standalone):
-    python -m quake_ai.sf.train \\
+    python -m quake_ai.ppo.train \\
         --algo=APPO --env=quake_combat \\
         --quake_executable=assets/bin/quake_worker \\
         --quake_basedir=assets \\
@@ -9,19 +9,17 @@ Usage (standalone):
         --num_workers=30 --rollout=256
 
 Usage (programmatic, from training.py):
-    from quake_ai.sf.train import register_quake_components, build_sf_cfg, run_sf
+    from quake_ai.ppo.train import register_quake_components, build_ppo_cfg, run_ppo
     register_quake_components()
-    cfg = build_sf_cfg(scenario="dm4", num_workers=8, ...)
-    run_sf(cfg)
+    cfg = build_ppo_cfg(scenario="dm4", num_workers=8, ...)
+    run_ppo(cfg)
 
-SF hyperparameter defaults are calibrated to match the existing PPO config
-(ppo_combat_bot_live.yaml) so that a side-by-side comparison is meaningful.
+Sample Factory hyperparameter defaults are calibrated to match the existing
+PPO config (ppo_combat_bot_live.yaml) so that comparisons stay meaningful.
 """
 
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,9 +37,10 @@ try:
 except ImportError as exc:
     raise ImportError("sample-factory is required: pip install sample-factory>=2.0.0") from exc
 
-from quake_ai.sf.quake_encoder import QuakeTransformerEncoder, make_quake_encoder
-from quake_ai.sf.quake_env import make_quake_env
-from quake_ai.utils.io import trusted_torch_load
+from quake_ai.ppo.quake_encoder import QuakeTransformerEncoder, make_quake_encoder
+from quake_ai.ppo.quake_env import make_quake_env
+from quake_ai.rl.metrics import effective_game_minutes_per_wall_minute
+from quake_ai.utils.io import write_json
 
 
 # ---------------------------------------------------------------------------
@@ -79,61 +78,282 @@ def _experiment_dir(cfg: Any) -> Path:
     return Path(getattr(cfg, "train_dir", ".")) / str(getattr(cfg, "experiment", "quake_combat"))
 
 
-def _has_existing_sf_checkpoint(cfg: Any) -> bool:
+def _summary_dir(cfg: Any) -> Path:
+    return Path(getattr(cfg, "train_dir", ".")) / ".summary"
+
+
+def _has_existing_ppo_checkpoint(cfg: Any) -> bool:
     checkpoint_dir = _experiment_dir(cfg) / "checkpoint_p0"
     return any(checkpoint_dir.glob("*.pth"))
 
 
-def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
-    """Seed SF checkpoint dirs from a warm-start checkpoint.
+_PPO_SCALAR_TAGS = {
+    "mean_episode_return": "reward/reward",
+    "episode_len_mean": "len/len",
+    "true_objective_mean": "policy_stats/avg_true_objective",
+    "frags_mean": "policy_stats/avg_frags",
+    "deaths_mean": "policy_stats/avg_deaths",
+    "damage_dealt_mean": "policy_stats/avg_damage_dealt",
+    "damage_taken_mean": "policy_stats/avg_damage_taken",
+    "accuracy": "policy_stats/avg_accuracy",
+    "hit_count_mean": "policy_stats/avg_hits",
+    "shots_fired_mean": "policy_stats/avg_shots_fired",
+    "damage_per_death_mean": "policy_stats/avg_damage_per_death",
+    "health_pickups_mean": "policy_stats/avg_health_pickups",
+    "armor_pickups_mean": "policy_stats/avg_armor_pickups",
+    "weapon_pickups_mean": "policy_stats/avg_weapon_pickups",
+    "blind_fire_rate": "policy_stats/avg_blind_fire_rate",
+    "stuck_rate": "policy_stats/avg_stuck_rate",
+    "reward_total_mean": "policy_stats/avg_reward_total",
+    "reward_frags_mean": "policy_stats/avg_reward_frags",
+    "reward_deaths_mean": "policy_stats/avg_reward_deaths",
+    "reward_ehp_mean": "policy_stats/avg_reward_ehp",
+    "reward_edp_mean": "policy_stats/avg_reward_edp",
+    "policy_loss": "train/policy_loss",
+    "value_loss": "train/value_loss",
+    "entropy": "train/entropy",
+    "kl_divergence": "train/kl_divergence",
+    "fraction_clipped": "train/fraction_clipped",
+    "grad_norm": "train/grad_norm",
+    "learning_rate": "train/lr",
+    "actual_learning_rate": "train/actual_lr",
+    "fps": "perf/_fps",
+    "sample_throughput": "perf/_sample_throughput",
+}
 
-    Accepts either a BC ``.npz`` (converted to SF format) or an existing
+
+def _read_latest_scalars(summary_dir: Path) -> Dict[str, Dict[str, float]]:
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    accumulator = EventAccumulator(str(summary_dir), size_guidance={"scalars": 0})
+    accumulator.Reload()
+
+    latest: Dict[str, Dict[str, float]] = {}
+    for tag in accumulator.Tags().get("scalars", []):
+        events = accumulator.Scalars(tag)
+        if not events:
+            continue
+        tail = events[-1]
+        latest[tag] = {
+            "step": float(tail.step),
+            "value": float(tail.value),
+            "wall_time": float(tail.wall_time),
+        }
+    return latest
+
+
+def _policy_summary_from_scalars(policy_id: int, latest_scalars: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+    metrics: Dict[str, float] = {}
+    steps_done = 0
+    for tag, payload in latest_scalars.items():
+        steps_done = max(steps_done, int(payload["step"]))
+    for metric_name, tag in _PPO_SCALAR_TAGS.items():
+        payload = latest_scalars.get(tag)
+        if payload is not None:
+            metrics[metric_name] = float(payload["value"])
+
+    effective_minutes = effective_game_minutes_per_wall_minute(
+        metrics.get("fps"),
+        getattr(cfg, "quake_fixed_tick_hz", None),
+    )
+    if effective_minutes is not None:
+        metrics["effective_game_minutes_per_wall_minute"] = float(effective_minutes)
+
+    frags_mean = metrics.get("frags_mean")
+    deaths_mean = metrics.get("deaths_mean")
+    if frags_mean is not None and deaths_mean is not None:
+        metrics["frag_delta_mean"] = float(frags_mean - deaths_mean)
+    if deaths_mean is not None:
+        metrics["death_rate"] = float(deaths_mean)
+
+    return {
+        "policy_id": policy_id,
+        "steps_done": steps_done,
+        "metrics": metrics,
+        "raw_scalars": {tag: float(payload["value"]) for tag, payload in sorted(latest_scalars.items())},
+    }
+
+
+def _select_reference_policy(policy_summaries: Dict[int, Dict[str, Any]]) -> int | None:
+    if not policy_summaries:
+        return None
+
+    def _score(item: tuple[int, Dict[str, Any]]) -> tuple[float, int, int]:
+        policy_id, payload = item
+        metrics = payload.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        reward = metrics.get("true_objective_mean")
+        if reward is None:
+            reward = metrics.get("mean_episode_return")
+        score = float(reward) if isinstance(reward, (int, float)) else float("-inf")
+        return (score, int(payload.get("steps_done", 0)), -policy_id)
+
+    return max(policy_summaries.items(), key=_score)[0]
+
+
+def write_ppo_stage_artifacts(cfg: Any, status: Any, runner: Any | None = None) -> Dict[str, Any]:
+    """Retain a compact PPO summary next to the experiment checkpoints."""
+    experiment_dir = _experiment_dir(cfg)
+    summary_root = _summary_dir(cfg)
+    policy_summaries: Dict[int, Dict[str, Any]] = {}
+    errors: list[str] = []
+
+    if summary_root.exists():
+        for child in sorted(summary_root.iterdir()):
+            if not child.is_dir() or not child.name.isdigit():
+                continue
+            policy_id = int(child.name)
+            try:
+                policy_summary = _policy_summary_from_scalars(policy_id, _read_latest_scalars(child))
+                if runner is not None:
+                    env_steps = getattr(runner, "env_steps", {})
+                    if isinstance(env_steps, dict):
+                        policy_summary["steps_done"] = max(
+                            int(policy_summary.get("steps_done", 0)),
+                            int(env_steps.get(policy_id, 0)),
+                        )
+                policy_summaries[policy_id] = policy_summary
+            except Exception as exc:  # pragma: no cover - defensive artifact export
+                errors.append(f"{child}: {exc}")
+
+    selected_policy_id = _select_reference_policy(policy_summaries)
+    selected = policy_summaries.get(selected_policy_id, {}) if selected_policy_id is not None else {}
+    selected_metrics = selected.get("metrics", {}) if isinstance(selected.get("metrics"), dict) else {}
+    aggregate_fps = sum(
+        float(payload.get("metrics", {}).get("fps", 0.0))
+        for payload in policy_summaries.values()
+        if isinstance(payload.get("metrics"), dict) and isinstance(payload.get("metrics", {}).get("fps"), (int, float))
+    )
+    aggregate_effective_minutes = effective_game_minutes_per_wall_minute(
+        aggregate_fps if aggregate_fps > 0.0 else None,
+        getattr(cfg, "quake_fixed_tick_hz", None),
+    )
+
+    summary: Dict[str, Any] = {
+        "status": str(status),
+        "experiment": str(getattr(cfg, "experiment", "ppo")),
+        "train_dir": str(getattr(cfg, "train_dir", "")),
+        "experiment_dir": str(experiment_dir),
+        "summary_dir": str(summary_root),
+        "policy_count": len(policy_summaries),
+        "selected_policy_id": selected_policy_id,
+        "steps_done": selected.get("steps_done"),
+        "policies": {str(policy_id): payload for policy_id, payload in policy_summaries.items()},
+    }
+    summary.update({key: value for key, value in selected_metrics.items() if isinstance(value, (int, float))})
+    if aggregate_fps > 0.0:
+        summary["aggregate_fps"] = float(aggregate_fps)
+    if aggregate_effective_minutes is not None:
+        summary["effective_game_minutes_per_wall_minute"] = float(aggregate_effective_minutes)
+    if errors:
+        summary["errors"] = errors
+
+    manifest = {
+        "stage": "ppo",
+        "status": str(status),
+        "experiment": str(getattr(cfg, "experiment", "ppo")),
+        "output_dir": str(experiment_dir),
+        "summary_dir": str(summary_root),
+        "selected_policy_id": selected_policy_id,
+        "metrics": {key: value for key, value in summary.items() if isinstance(value, (int, float))},
+        "policy_count": len(policy_summaries),
+        "policies": {
+            str(policy_id): {
+                "steps_done": int(payload.get("steps_done", 0)),
+                "metrics": dict(payload.get("metrics", {})),
+            }
+            for policy_id, payload in policy_summaries.items()
+        },
+        "source_summary_dirs": [str(path) for path in sorted(summary_root.iterdir()) if path.is_dir()] if summary_root.exists() else [],
+    }
+    if errors:
+        manifest["errors"] = errors
+
+    summary_path = experiment_dir / "ppo_summary.json"
+    manifest_path = experiment_dir / "ppo_manifest.json"
+    write_json(summary_path, summary)
+    write_json(manifest_path, manifest)
+
+    return {
+        "summary_path": str(summary_path),
+        "manifest_path": str(manifest_path),
+        "selected_policy_id": selected_policy_id,
+        "metrics": manifest["metrics"],
+    }
+
+
+def _warm_start_policy(
+    pid: int,
+    ckpt: str,
+    exp_dir: Path,
+) -> Path:
+    """Seed a single policy dir from a checkpoint. Returns the dest path."""
+    import shutil
+
+    policy_dir = exp_dir / f"checkpoint_p{pid}"
+    policy_dir.mkdir(parents=True, exist_ok=True)
+
+    if ckpt.endswith(".pth"):
+        # Name the seed as checkpoint_*, never best_*.  SF reserves
+        # best_*.pth for its own save_best tracking — if the seed
+        # occupies that name, SF's new-best writes silently collide
+        # with the seed file and the checkpoint is lost.
+        name = Path(ckpt).name.replace("best_", "checkpoint_")
+        dest = policy_dir / name
+        shutil.copy2(ckpt, dest)
+        print(f"[quake_ppo] Policy {pid} warm-start copied: {ckpt} → {dest}")
+        return dest
+    else:
+        from quake_ai.ppo.checkpoint_converter import QNNPolicy, save_sf_format
+        bc_policy = QNNPolicy.load(ckpt, device="cpu")
+        dest = save_sf_format(bc_policy, policy_dir)
+        print(f"[quake_ppo] Policy {pid} warm-start converted: {ckpt} → {dest}")
+        return dest
+
+
+def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
+    """Seed SF checkpoint dirs from warm-start checkpoint(s).
+
+    Supports both single-seed (all policies from one checkpoint) and
+    multi-seed PBT (round-robin assignment from a list of checkpoints).
+
+    Accepts either BC ``.npz`` (converted to SF format) or existing
     SF ``.pth`` (copied directly).  Skipped when the experiment already
     has checkpoints (i.e. resuming a prior run).
     """
-    ckpt = str(getattr(cfg, "quake_bc_checkpoint", "") or "").strip()
-    if not ckpt:
+    # Multi-seed takes priority over single-seed.
+    multi_raw = str(getattr(cfg, "quake_bc_checkpoints", "") or "").strip()
+    multi_ckpts = [p.strip() for p in multi_raw.split(",") if p.strip()] if multi_raw else []
+    single_ckpt = str(getattr(cfg, "quake_bc_checkpoint", "") or "").strip()
+
+    if not multi_ckpts and not single_ckpt:
         return None
 
-    if _has_existing_sf_checkpoint(cfg):
-        print(f"[quake_sf] Found existing SF checkpoints in {_experiment_dir(cfg) / 'checkpoint_p0'}; skipping warm-start.")
+    if _has_existing_ppo_checkpoint(cfg):
+        print(f"[quake_ppo] Found existing PPO checkpoints in {_experiment_dir(cfg) / 'checkpoint_p0'}; skipping warm-start.")
         return None
 
-    # Tell SF to load from best_* (where we place the warm-start seed).
-    cfg.load_checkpoint_kind = "best"
-
+    cfg.load_checkpoint_kind = "latest"
     exp_dir = _experiment_dir(cfg)
     num_policies = int(getattr(cfg, "num_policies", 1))
 
-    if ckpt.endswith(".pth"):
-        # Already SF format — copy directly into each policy dir.
-        import shutil
-        print(f"[quake_sf] Using SF checkpoint {ckpt} as warm-start ...")
-        # Ensure the name starts with "best_" so load_checkpoint_kind=best finds it.
-        name = Path(ckpt).name
-        if not name.startswith("best_"):
-            name = f"best_{name}"
+    if multi_ckpts:
+        print(f"[quake_ppo] Multi-seed warm-start: {len(multi_ckpts)} seed(s) across {num_policies} policies (round-robin)")
         first_path = None
         for pid in range(num_policies):
-            policy_dir = exp_dir / f"checkpoint_p{pid}"
-            policy_dir.mkdir(parents=True, exist_ok=True)
-            dest = policy_dir / name
-            shutil.copy2(ckpt, dest)
+            ckpt = multi_ckpts[pid % len(multi_ckpts)]
+            dest = _warm_start_policy(pid, ckpt, exp_dir)
             if pid == 0:
                 first_path = dest
-            print(f"[quake_sf] Warm-start checkpoint copied: {dest}")
         return first_path
     else:
-        # BC .npz — convert to SF format.
-        from quake_ai.sf.checkpoint_converter import QNNPolicy, save_sf_format
-        print(f"[quake_sf] Converting BC checkpoint {ckpt} to SF warm-start format ...")
-        bc_policy = QNNPolicy.load(ckpt, device="cpu")
+        print(f"[quake_ppo] Single-seed warm-start: {single_ckpt} → {num_policies} policies")
         first_path = None
         for pid in range(num_policies):
-            p = save_sf_format(bc_policy, exp_dir / f"checkpoint_p{pid}")
+            dest = _warm_start_policy(pid, single_ckpt, exp_dir)
             if pid == 0:
-                first_path = p
-            print(f"[quake_sf] Warm-start checkpoint written: {p}")
+                first_path = dest
         return first_path
 
 
@@ -199,6 +419,8 @@ def add_quake_cli_args(parser: Any) -> None:
     # BC warm-start
     parser.add_argument("--quake_bc_checkpoint", type=str, default="",
                         help="Path to BC/PPO checkpoint for warm-start initialisation")
+    parser.add_argument("--quake_bc_checkpoints", type=str, default="",
+                        help="Comma-separated BC/PPO checkpoints for multi-seed PBT warm-start")
 
 
 # ---------------------------------------------------------------------------
@@ -206,14 +428,14 @@ def add_quake_cli_args(parser: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_sf_cfg(
+def build_ppo_cfg(
     scenario: str = "procgen",
     num_workers: int = 8,
     num_envs_per_worker: int = 1,
     worker_num_splits: int = 1,
     rollout: int = 256,
     total_env_steps: int = 10_000_000,
-    output_dir: str = "assets/runs/sf_ppo",
+    output_dir: str = "assets/runs/ppo",
     experiment: str = "quake_combat",
     executable: str = "assets/bin/quake_worker",
     basedir: str = "",
@@ -227,6 +449,7 @@ def build_sf_cfg(
     seed: int = 17,
     device: str = "gpu",
     init_checkpoint: str = "",
+    init_checkpoints: Optional[List[str]] = None,
     trunk_hidden: int = 128,
     gru_hidden: int = 128,
     use_gru: bool = True,
@@ -244,6 +467,7 @@ def build_sf_cfg(
     gae_lambda: float = 0.95,
     max_grad_norm: float = 0.5,
     value_coef: float = 0.5,
+    minibatch_size: int = 0,
     max_policy_lag: int = 30,
     with_wandb: bool = False,
     # Population-Based Training
@@ -257,14 +481,15 @@ def build_sf_cfg(
     record_demos: bool = True,
     extra_argv: Optional[List[str]] = None,
 ) -> Any:
-    """Build an SF cfg namespace without command-line parsing.
+    """Build a PPO cfg namespace without command-line parsing.
 
-    Maps PPOConfig fields to their SF equivalents so training.py can
-    call SF programmatically with the same hyperparameters it used for run_ppo.
+    Maps PPOConfig fields to their Sample Factory equivalents so training.py can
+    call PPO programmatically with the same hyperparameters it used for run_ppo.
     """
     register_quake_components()
 
     batch_size = num_workers * num_envs_per_worker * rollout
+    num_batches_per_epoch = max(1, batch_size // minibatch_size) if minibatch_size else 1
 
     argv: List[str] = [
         "--algo=APPO",
@@ -278,7 +503,7 @@ def build_sf_cfg(
         f"--rollout={rollout}",
         f"--recurrence={rollout}",
         f"--batch_size={batch_size}",
-        f"--num_batches_per_epoch=1",
+        f"--num_batches_per_epoch={num_batches_per_epoch}",
         f"--num_epochs={ppo_epochs}",
         f"--ppo_clip_ratio={clip_ratio}",
         f"--learning_rate={lr}",
@@ -320,10 +545,10 @@ def build_sf_cfg(
         argv.append(f"--quake_scenario_config_json={scenario_config_json}")
 
     # Population-Based Training
+    argv.append(f"--num_policies={num_policies}")
     if with_pbt:
         argv.extend([
             "--with_pbt=True",
-            f"--num_policies={num_policies}",
             f"--pbt_period_env_steps={pbt_period_env_steps}",
             f"--pbt_start_mutation={pbt_start_mutation}",
             f"--pbt_replace_fraction={pbt_replace_fraction}",
@@ -331,7 +556,9 @@ def build_sf_cfg(
             f"--pbt_optimize_gamma={'True' if pbt_optimize_gamma else 'False'}",
         ])
 
-    if init_checkpoint:
+    if init_checkpoints:
+        argv.append(f"--quake_bc_checkpoints={','.join(init_checkpoints)}")
+    elif init_checkpoint:
         argv.append(f"--quake_bc_checkpoint={init_checkpoint}")
 
     if extra_argv:
@@ -348,8 +575,8 @@ def build_sf_cfg(
 # ---------------------------------------------------------------------------
 
 
-def _set_sf_report_interval(seconds: float = 60.0) -> None:
-    """Increase SF's log spam interval from the hardcoded 5s default.
+def _set_ppo_report_interval(seconds: float = 60.0) -> None:
+    """Increase Sample Factory's log spam interval from the hardcoded 5s default.
 
     Runner.__init__ hardcodes ``self.report_interval_sec = 5.0`` and then
     registers a periodic timer with that value.  We patch __init__ to
@@ -374,13 +601,13 @@ def _set_sf_report_interval(seconds: float = 60.0) -> None:
         pass
 
 
-def run_sf(cfg: Any) -> Dict[str, Any]:
-    """Launch SF APPO training and return a summary dict."""
+def run_ppo(cfg: Any) -> Dict[str, Any]:
+    """Launch PPO training and retain a compact summary artifact."""
     from sample_factory.algo.utils.misc import ExperimentStatus
-    from quake_ai.sf.observer import BestCheckpointArchiver
+    from quake_ai.ppo.observer import BestCheckpointArchiver
 
     register_quake_components()
-    _set_sf_report_interval(60.0)
+    _set_ppo_report_interval(60.0)
     _ensure_warm_start_checkpoint(cfg)
 
     # SF's argparse omits "linear_decay" from lr_schedule choices but the
@@ -394,7 +621,16 @@ def run_sf(cfg: Any) -> Dict[str, Any]:
     if status == ExperimentStatus.SUCCESS:
         status = runner.run()
 
-    return {"sf_status": str(status), "train_dir": str(getattr(cfg, "train_dir", ""))}
+    stage_artifacts = write_ppo_stage_artifacts(cfg, status, runner)
+    return {
+        "ppo_status": str(status),
+        "train_dir": str(getattr(cfg, "train_dir", "")),
+        "experiment_dir": str(_experiment_dir(cfg)),
+        "ppo_summary_path": stage_artifacts["summary_path"],
+        "ppo_manifest_path": stage_artifacts["manifest_path"],
+        "selected_policy_id": stage_artifacts["selected_policy_id"],
+        "metrics": stage_artifacts["metrics"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +640,7 @@ def run_sf(cfg: Any) -> Dict[str, Any]:
 
 def main() -> None:
     from sample_factory.algo.utils.misc import ExperimentStatus
-    from quake_ai.sf.observer import BestCheckpointArchiver
+    from quake_ai.ppo.observer import BestCheckpointArchiver
 
     register_quake_components()
     parser, _ = parse_sf_args()
@@ -419,7 +655,9 @@ def main() -> None:
 
     status = runner.init()
     if status == ExperimentStatus.SUCCESS:
-        runner.run()
+        status = runner.run()
+    write_ppo_stage_artifacts(cfg, status, runner)
+
 
 
 if __name__ == "__main__":

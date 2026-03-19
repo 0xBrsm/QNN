@@ -24,6 +24,18 @@ from .textures import materialize_texture_wad
 PROCGEN_SENTINEL = "procgen"
 
 _MAX_LAYOUT_ATTEMPTS = 10
+_GENERATE_LOCKS: dict[tuple[str, int], threading.Lock] = {}
+_GENERATE_LOCKS_GUARD = threading.Lock()
+
+
+def _generation_lock(output_dir: Path, seed: int) -> threading.Lock:
+    key = (str(output_dir.resolve()), int(seed))
+    with _GENERATE_LOCKS_GUARD:
+        lock = _GENERATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _GENERATE_LOCKS[key] = lock
+        return lock
 
 
 def generate_bsp(
@@ -37,39 +49,43 @@ def generate_bsp(
 
     Returns ``(map_id, bsp_path)``.
     """
-    rng = random.Random(seed)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    best_layout = None
-    best_unreachable = float("inf")
-    for attempt in range(_MAX_LAYOUT_ATTEMPTS):
-        layout = generate_layout(rng, arena_size=arena_size, max_depth=rooms)
-        result = validate_layout_graph(layout)
-        if result.connected:
-            best_layout = layout
-            break
-        if len(result.unreachable_rooms) < best_unreachable:
-            best_unreachable = len(result.unreachable_rooms)
-            best_layout = layout
-        if attempt < _MAX_LAYOUT_ATTEMPTS - 1:
-            rng = random.Random(seed + attempt + 1)
-
-    layout = best_layout  # type: ignore[assignment]
-
     map_id = f"gen_{seed}"
     map_path = output_dir / f"{map_id}.map"
+    bsp_path = output_dir / f"{map_id}.bsp"
 
-    m = MapFile()
-    m.worldspawn.properties["message"] = map_id
-    build_layout(m, layout)
-    populate(m, layout, rng)
-    materialize_texture_wad(output_dir)
+    with _generation_lock(output_dir, seed):
+        if bsp_path.exists():
+            return map_id, bsp_path
 
-    with open(map_path, "w") as f:
-        m.write(f)
+        rng = random.Random(seed)
+        best_layout = None
+        best_unreachable = float("inf")
+        for attempt in range(_MAX_LAYOUT_ATTEMPTS):
+            layout = generate_layout(rng, arena_size=arena_size, max_depth=rooms)
+            result = validate_layout_graph(layout)
+            if result.connected:
+                best_layout = layout
+                break
+            if len(result.unreachable_rooms) < best_unreachable:
+                best_unreachable = len(result.unreachable_rooms)
+                best_layout = layout
+            if attempt < _MAX_LAYOUT_ATTEMPTS - 1:
+                rng = random.Random(seed + attempt + 1)
 
-    bsp_path = compile_map(map_path, output_dir=output_dir)
-    return map_id, bsp_path
+        layout = best_layout  # type: ignore[assignment]
+
+        m = MapFile()
+        m.worldspawn.properties["message"] = map_id
+        build_layout(m, layout)
+        populate(m, layout, rng)
+        materialize_texture_wad(output_dir)
+
+        with open(map_path, "w") as f:
+            m.write(f)
+
+        bsp_path = compile_map(map_path, output_dir=output_dir)
+        return map_id, bsp_path
 
 
 class MapPool:

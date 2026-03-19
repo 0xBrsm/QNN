@@ -43,6 +43,9 @@ class RuntimePlan:
 
 
 def _runtime_plan(profile: LiveProfile, runtime: Mapping[str, Any]) -> RuntimePlan:
+    # ---------------------------------------------------------------------------
+    # Hardware detection
+    # ---------------------------------------------------------------------------
     cpu_count = max(int(runtime.get("cpu_affinity_count") or runtime.get("cpu_count") or 1), 1)
     gpu_memory_bytes = 0
     devices = runtime.get("devices")
@@ -52,36 +55,37 @@ def _runtime_plan(profile: LiveProfile, runtime: Mapping[str, Any]) -> RuntimePl
             default=0,
         )
 
-    reserve = 2 if cpu_count > 8 else 1
-    env_cap = 8 if profile.runtime_scale == "verify" else 30
-    num_envs = max(2, min(cpu_count - reserve, env_cap))
+    # ---------------------------------------------------------------------------
+    # CPU-first sizing: every idle core is wasted wall clock.
+    #
+    # Quake workers are lightweight enough to oversubscribe — empirically ~3x
+    # the core count is fine (e.g. 90 workers on 32 cores).  We target that
+    # ratio minus a small reserve.  GPU VRAM is not the bottleneck (APU with
+    # shared memory, GPU underutilised), so batch sizes go as large as the
+    # rollout buffer allows.
+    # ---------------------------------------------------------------------------
+    WORKERS_PER_CORE = 3
+    CPU_RESERVE = 2
+    available_cores = max(1, cpu_count - CPU_RESERVE)
+    num_envs = max(2, available_cores * WORKERS_PER_CORE)
+    # Eval runs greedy + sampled in parallel; each mode gets half the workers.
+    EVAL_MODES = 2
+    eval_episodes = num_envs // EVAL_MODES
 
     if profile.runtime_scale == "verify":
         rollout_steps = 64
         total_steps = max(4_096, num_envs * rollout_steps * 8)
-        eval_episodes = 32
     else:
-        # Live PvP runs need longer PPO windows to expose long-horizon behavior,
-        # but evaluation stays bounded so retained runs complete in practical time.
-        rollout_steps = 256 if gpu_memory_bytes >= 12 * GIB else 128
+        rollout_steps = 256
         total_steps = max(262_144, num_envs * rollout_steps * 64)
-        eval_episodes = 32
 
-    if gpu_memory_bytes >= 24 * GIB:
-        bc_batch_size = 8_192 if profile.runtime_scale == "live" else 4_096
-        minibatch_cap = 2_048
-    elif gpu_memory_bytes >= 12 * GIB:
-        bc_batch_size = 4_096 if profile.runtime_scale == "live" else 2_048
-        minibatch_cap = 1_024
-    elif gpu_memory_bytes >= 8 * GIB:
-        bc_batch_size = 2_048 if profile.runtime_scale == "live" else 1_024
-        minibatch_cap = 512
-    else:
-        bc_batch_size = 1_024 if profile.runtime_scale == "live" else 512
-        minibatch_cap = 256
+    # Minibatch size: 4096 is standard for PPO and fits comfortably in GPU
+    # memory on APU shared-memory systems.  PPO is insensitive to this —
+    # smaller batches just mean more update steps per rollout.
+    minibatch_size = 4096 if profile.runtime_scale == "live" else 2048
 
-    minibatch_size = max(32, min(num_envs * rollout_steps // 2, minibatch_cap))
-    minibatch_size = max(32, _power_of_two_floor(minibatch_size))
+    # BC batch sizes: go large, GPU can handle it.
+    bc_batch_size = 8_192 if profile.runtime_scale == "live" else 2_048
 
     return RuntimePlan(
         requested_device=str(runtime.get("requested_device", "auto")),
@@ -261,5 +265,4 @@ def _checkpoint_obs_dim(checkpoint_path: str | Path | None) -> int | None:
         return int(obs_dim)
     except (TypeError, ValueError):
         return None
-
 

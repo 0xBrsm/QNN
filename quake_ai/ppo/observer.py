@@ -7,7 +7,7 @@ copy) and to the NAS share over SMB.
 
 Usage::
 
-    from quake_ai.sf.observer import BestCheckpointArchiver
+    from quake_ai.ppo.observer import BestCheckpointArchiver
     runner.register_observer(BestCheckpointArchiver(runner))
 """
 
@@ -112,7 +112,13 @@ class BestCheckpointArchiver(AlgoObserver, EventLoopObject):
                 self._smb_copy(best_file)
 
     def _archive_best_demo(self, checkpoint_name: str, policy_id: int = 0) -> None:
-        """Copy the most recent worker demo for *policy_id*, named to match the checkpoint."""
+        """Copy the most recent worker demo for *policy_id*, named to match the checkpoint.
+
+        Layout:
+            best/*.pth
+            best/demos/*.dem
+            best/demos/maps/*.bsp   (original map name, e.g. gen_1234567.bsp)
+        """
         if not self._demos_dir or not self._demos_dir.is_dir():
             return
         # Find the most recently completed demo for this policy.
@@ -131,18 +137,26 @@ class BestCheckpointArchiver(AlgoObserver, EventLoopObject):
         newest = max(worker_demos, key=lambda p: p.stat().st_mtime)
         # Name demo to match checkpoint: best_000002890_12231680_reward_-23.041.dem
         demo_stem = Path(checkpoint_name).stem  # strip .pth
-        dest_dem = self._archive_dir / f"{demo_stem}.dem"
+        demos_dir = self._archive_dir / "demos"
+        demos_dir.mkdir(exist_ok=True)
+        dest_dem = demos_dir / f"{demo_stem}.dem"
         shutil.copy2(newest, dest_dem)
-        # Copy the matching procgen BSP if it exists (read map name from demo)
+        # Copy the matching procgen BSP if it exists (read map name from demo).
+        # Keep the original map name so it can be loaded for replay.
         try:
             import re
             raw = newest.read_bytes()
             m = re.search(rb"(gen_\d+)", raw[:4096])
             if m:
                 map_id = m.group(1).decode()
-                bsp_src = self._demos_dir.parent.parent / "id1" / "maps" / f"{map_id}.bsp"
+                # Maps live under <game_dir>/maps/, same parent as demos dir.
+                bsp_src = self._demos_dir.parent / "maps" / f"{map_id}.bsp"
                 if bsp_src.exists():
-                    shutil.copy2(bsp_src, self._archive_dir / f"{demo_stem}.bsp")
+                    maps_dir = demos_dir / "maps"
+                    maps_dir.mkdir(exist_ok=True)
+                    dest_bsp = maps_dir / f"{map_id}.bsp"
+                    if not dest_bsp.exists():
+                        shutil.copy2(bsp_src, dest_bsp)
         except Exception:
             pass
         log.info("Archived best demo: %s", dest_dem.name)
