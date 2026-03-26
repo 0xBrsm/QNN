@@ -16,7 +16,9 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, Mapping, NoReturn, Sequence
 
-from quake_ai.actions import ActionLabels, legacy_weapon_switch_from_head, mouse_count_from_look_label
+from quake_ai.actions import (
+    ActionLabels,
+)
 from quake_ai.rl.schemas import MapState
 
 from engine.training_protocol import (
@@ -41,7 +43,17 @@ class NativeEngineError(RuntimeError):
 # Keep as alias for the token path; same error hierarchy.
 NativeTokenError = NativeEngineError
 
-_ACTION_KEYS = ("move", "strafe", "look_yaw", "look_pitch", "fire", "jump", "weapon")
+_ACTION_KEYS = (
+    "move",
+    "look",
+    "fire",
+    "jump",
+    "switch",
+    "recall_0",
+    "recall_1",
+    "recall_2",
+    "recall_3",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +74,8 @@ class NativeProcessBase:
         executable: str | Path,
         map_id: str,
         fixed_tick_hz: int = 20,
+        resample_hz: int = 0,
+        movement_threshold: float = 0.0,
         workdir: str | Path | None = None,
         env: Mapping[str, str] | None = None,
         extra_args: Sequence[str] | None = None,
@@ -70,6 +84,8 @@ class NativeProcessBase:
         self.executable = str(executable)
         self.map_id = str(map_id)
         self.fixed_tick_hz = int(fixed_tick_hz)
+        self.resample_hz = int(resample_hz)
+        self.movement_threshold = float(movement_threshold)
         self.workdir = None if workdir is None else str(workdir)
         self.env = dict(env or {})
         self.extra_args = tuple(str(arg) for arg in (extra_args or ()))
@@ -83,16 +99,19 @@ class NativeProcessBase:
         self._last_training_extras: TrustedTrainingExtrasV1 | None = None
         self._last_token_tick: TrustedTokenTick | None = None
         self._current_episode_id = ""
-        self._hello_request = self._serialize_request(
-            {
-                "op": "hello",
-                "map_id": self.map_id,
-                "tick_hz": self.fixed_tick_hz,
-                "protocol_version": "v5",
-                "step_format": self._step_format,
-                "training_format": self.training_format,
-            }
-        )
+        hello_payload: Dict[str, Any] = {
+            "op": "hello",
+            "map_id": self.map_id,
+            "tick_hz": self.fixed_tick_hz,
+            "protocol_version": "v6",
+            "step_format": self._step_format,
+            "training_format": self.training_format,
+        }
+        if self.resample_hz > 0:
+            hello_payload["resample_hz"] = self.resample_hz
+        if self.movement_threshold > 0:
+            hello_payload["movement_threshold"] = int(self.movement_threshold)
+        self._hello_request = self._serialize_request(hello_payload)
         self._shutdown_request = self._serialize_request({"op": "shutdown"})
 
     # -- Serialization / IO --------------------------------------------------
@@ -160,31 +179,12 @@ class NativeProcessBase:
 
     # -- Action helpers ------------------------------------------------------
 
-    def _action_request(self, action: Mapping[str, int], op: str = "step") -> bytes:
+    def _action_request(self, action: Mapping[str, object], op: str = "step") -> bytes:
         labels = ActionLabels.from_dict(action)
-        weapons_owned = None
-        if self._last_token_tick is not None:
-            # Reconstruct bitmask from v5 weapon_bits (7 floats, order: SG SSG NG SNG GL RL LG)
-            bits = self._last_token_tick.self_token.weapon_bits
-            weapons_owned = sum(int(b > 0.5) << i for i, b in enumerate(bits))
         return self._serialize_request(
             {
                 "op": op,
-                "action": {
-                    "move": labels.move,
-                    "strafe": labels.strafe,
-                    "look_yaw": labels.look_yaw,
-                    "look_pitch": labels.look_pitch,
-                    "look_yaw_count": mouse_count_from_look_label(labels.look_yaw),
-                    "look_pitch_count": mouse_count_from_look_label(labels.look_pitch),
-                    "fire": labels.fire,
-                    "jump": labels.jump,
-                    "weapon": legacy_weapon_switch_from_head(labels.weapon, weapons_owned=weapons_owned),
-                    "recall_0": labels.recall_0,
-                    "recall_1": labels.recall_1,
-                    "recall_2": labels.recall_2,
-                    "recall_3": labels.recall_3,
-                },
+                "action": labels.to_dict(),
             }
         )
 

@@ -110,7 +110,7 @@ class TokenObservationEncoder:
             self.reset()
 
         # --- self token (single row, no loop) ---
-        # v5: all scalars arrive pre-normalized from the C worker.
+        # All scalars arrive pre-normalized from the C worker.
         st = tick.self_token
         self_cluster_id = int(st.cluster_id)
         self_scalars = np.array([
@@ -145,7 +145,7 @@ class TokenObservationEncoder:
                 ids_buf[i, 2] = obj.modality_id
                 ids_buf[i, 3] = obj.player_id
                 ids_buf[i, 4] = int(obj.cluster_id)
-                # v5: rel_x/y/z and route_cost arrive pre-normalized from C worker
+                # rel_x/y/z and route_cost arrive pre-normalized from the C worker.
                 sc_buf[i, 0] = obj.rel_x
                 sc_buf[i, 1] = obj.rel_y
                 sc_buf[i, 2] = obj.rel_z
@@ -209,7 +209,7 @@ class TokenObservationEncoder:
                 sp_buf[i, 7] = sp.water_frac
                 sp_buf[i, 8] = sp.slime_frac
                 sp_buf[i, 9] = sp.lava_frac
-            # v5: spatial scalars arrive pre-normalized from C worker
+            # Spatial scalars arrive pre-normalized from the C worker.
             spatial_scalars[:n_sp] = sp_buf
 
         action_history = np.zeros((ACTION_HISTORY_LEN, ACTION_HISTORY_DIM), dtype=np.float32)

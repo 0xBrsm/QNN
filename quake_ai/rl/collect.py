@@ -17,13 +17,15 @@ from quake_ai.utils.io import write_json, write_ndjson
 
 
 _IDLE_ACTION = {
-    "move": 0,
-    "strafe": 0,
-    "look_yaw": 12,
-    "look_pitch": 12,
+    "move": [0.0, 0.0],
+    "look": [0.0, 0.0],
     "fire": 0,
     "jump": 0,
-    "weapon": 0,
+    "switch": 0,
+    "recall_0": 0,
+    "recall_1": 0,
+    "recall_2": 0,
+    "recall_3": 0,
 }
 
 
@@ -34,6 +36,8 @@ class CollectConfig:
     output_dir: str
     map_id: str
     fixed_tick_hz: int = 0
+    resample_hz: int = 0  # >0 = downsample to fixed rate with action merging; 0 = pass-through
+    movement_threshold: float = 0.0  # >0 = override move label threshold; 0 = use default (4.0)
     asset_root: str = ""
     max_ticks_per_demo: int | None = None
     parallel_workers: int = 0
@@ -216,6 +220,8 @@ def _collect_shard(
             executable=config.demo_worker_binary,
             map_id=map_id,
             fixed_tick_hz=config.fixed_tick_hz,
+            resample_hz=config.resample_hz,
+            movement_threshold=config.movement_threshold,
             env=env,
         )
         current_proc.start()

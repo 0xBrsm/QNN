@@ -3,30 +3,24 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define QNN_WORKER_PROTOCOL "v5"
+#define QNN_WORKER_PROTOCOL "v6"
 #define QNN_WORKER_SERVER_NAME "quake-demo-worker"
 #define QNN_WORKER_UPSTREAM_COMMIT "bf4ac424ce754894ac8f1dae6a3981954bc9852d"
 #define QNN_WORKER_MAX_LINE 8192
 #define QNN_WORKER_MAX_COMMAND_TEXT 1024
 
 #define QNN_DEMO_MOUSE_DEGREES_PER_COUNT 0.066f
-#define QNN_DEMO_MOVEMENT_THRESHOLD 4.0f
+#define QNN_DEMO_MOVEMENT_THRESHOLD_DEFAULT 4.0f
 #define QNN_DEMO_JUMP_VELOCITY_THRESHOLD 160.0f
 #define QNN_DEMO_BASE_DT (1.0f / 20.0f)
-
-static const int qnn_demo_look_bins[] = {
-	-128, -96, -72, -56, -40, -28, -20, -14, -10, -6, -3, -1,
-	0,
-	1, 3, 6, 10, 14, 20, 28, 40, 56, 72, 96, 128
-};
-#define QNN_DEMO_LOOK_BIN_COUNT (sizeof(qnn_demo_look_bins) / sizeof(qnn_demo_look_bins[0]))
-#define QNN_DEMO_LOOK_NEUTRAL 12
 
 typedef struct
 {
 	int	fixed_tick_hz;
 	float	fixed_dt;
 	qboolean auto_detect_tick_hz;
+	int	resample_hz;	/* requested resample target; 0 = use detected rate */
+	float	movement_threshold;	/* position delta threshold for move labels */
 	int	seed;
 	int	tick;
 	int	steps;
@@ -52,28 +46,6 @@ static qboolean qnn_demo_client_ready(void)
 		&& cl.viewentity < MAX_EDICTS) ? true : false;
 }
 
-static int qnn_demo_nearest_look_bin(int mouse_count)
-{
-	int best_index;
-	int best_dist;
-	int i;
-
-	best_index = QNN_DEMO_LOOK_NEUTRAL;
-	best_dist = abs(qnn_demo_look_bins[QNN_DEMO_LOOK_NEUTRAL] - mouse_count);
-	for (i = 0; i < (int)QNN_DEMO_LOOK_BIN_COUNT; ++i)
-	{
-		int dist;
-
-		dist = abs(qnn_demo_look_bins[i] - mouse_count);
-		if (dist < best_dist)
-		{
-			best_dist = dist;
-			best_index = i;
-		}
-	}
-	return best_index;
-}
-
 static float qnn_demo_normalize_yaw(float delta)
 {
 	while (delta <= -180.0f)
@@ -88,7 +60,7 @@ static float qnn_demo_movement_threshold_for_dt(float dt)
 	float step_dt;
 
 	step_dt = dt > 0.0f ? dt : QNN_DEMO_BASE_DT;
-	return QNN_DEMO_MOVEMENT_THRESHOLD * (step_dt / QNN_DEMO_BASE_DT);
+	return qnn_demo_runtime.movement_threshold * (step_dt / QNN_DEMO_BASE_DT);
 }
 
 static void qnn_demo_infer_action(qnn_worker_action_t *action, const qnn_worker_snapshot_t *snapshot)
@@ -109,8 +81,6 @@ static void qnn_demo_infer_action(qnn_worker_action_t *action, const qnn_worker_
 	int mouse_pitch;
 
 	qnn_worker_clear_action(action);
-	action->look_yaw = QNN_DEMO_LOOK_NEUTRAL;
-	action->look_pitch = QNN_DEMO_LOOK_NEUTRAL;
 
 	if (!qnn_demo_runtime.has_prev)
 		return;
@@ -118,10 +88,13 @@ static void qnn_demo_infer_action(qnn_worker_action_t *action, const qnn_worker_
 	yaw_delta = qnn_demo_normalize_yaw(snapshot->player_view_angles[1] - qnn_demo_runtime.prev_view_angles[1]);
 	pitch_delta = snapshot->player_view_angles[0] - qnn_demo_runtime.prev_view_angles[0];
 
+	/* Accumulate look deltas for resampling (degrees, converted at emission). */
+	qnn_resample_accumulate_look(yaw_delta, pitch_delta);
+
 	mouse_yaw = (int)roundf(-yaw_delta / QNN_DEMO_MOUSE_DEGREES_PER_COUNT);
 	mouse_pitch = (int)roundf(pitch_delta / QNN_DEMO_MOUSE_DEGREES_PER_COUNT);
-	action->look_yaw = qnn_demo_nearest_look_bin(mouse_yaw);
-	action->look_pitch = qnn_demo_nearest_look_bin(mouse_pitch);
+	action->look[0] = qnn_look_axis_from_mouse_count(mouse_yaw);
+	action->look[1] = qnn_look_axis_from_mouse_count(mouse_pitch);
 
 	yaw_rad = (float)(qnn_demo_runtime.prev_view_angles[1] * M_PI / 180.0);
 	forward_x = cosf(yaw_rad);
@@ -133,17 +106,18 @@ static void qnn_demo_infer_action(qnn_worker_action_t *action, const qnn_worker_
 	dy = snapshot->player_origin[1] - qnn_demo_runtime.prev_origin[1];
 	forward_proj = dx * forward_x + dy * forward_y;
 	left_proj = dx * left_x + dy * left_y;
-	movement_threshold = qnn_demo_movement_threshold_for_dt(qnn_demo_runtime.fixed_dt);
+	movement_threshold = qnn_demo_movement_threshold_for_dt(
+		qnn_resample.target_hz > 0 ? qnn_resample.target_dt : qnn_demo_runtime.fixed_dt);
 
 	if (forward_proj > movement_threshold)
-		action->move = 1;
+		action->move[0] = 1.0f;
 	else if (forward_proj < -movement_threshold)
-		action->move = 2;
+		action->move[0] = -1.0f;
 
 	if (left_proj > movement_threshold)
-		action->strafe = 1;
+		action->move[1] = -1.0f;
 	else if (left_proj < -movement_threshold)
-		action->strafe = 2;
+		action->move[1] = 1.0f;
 
 	action->fire = (snapshot->ammo < qnn_demo_runtime.prev_ammo) ? 1 : 0;
 
@@ -151,7 +125,7 @@ static void qnn_demo_infer_action(qnn_worker_action_t *action, const qnn_worker_
 		action->jump = 1;
 
 	if (snapshot->weapon_id != qnn_demo_runtime.prev_weapon_id && snapshot->weapon_id > 0)
-		action->weapon = qnn_weapon_class_from_id(snapshot->weapon_id) + 1;
+		action->switch_slot = qnn_switch_slot_from_weapon_id(snapshot->weapon_id);
 }
 
 static void qnn_demo_save_prev(const qnn_worker_snapshot_t *snapshot)
@@ -170,6 +144,7 @@ static void qnn_demo_runtime_reset(void)
 	qnn_demo_runtime.fixed_tick_hz = 20;
 	qnn_demo_runtime.fixed_dt = 1.0f / 20.0f;
 	qnn_demo_runtime.auto_detect_tick_hz = false;
+	qnn_demo_runtime.movement_threshold = QNN_DEMO_MOVEMENT_THRESHOLD_DEFAULT;
 }
 
 #define QNN_DEMO_DETECT_PROBE_DT 0.001f
@@ -334,6 +309,16 @@ static int qnn_worker_handle_hello(const char *line)
 	}
 	qnn_demo_runtime.fixed_dt = 1.0f / (float)qnn_demo_runtime.fixed_tick_hz;
 
+	/* Resample target Hz: stored for use after auto-detect during reset.
+	 * >0 = fixed target, 0 = use auto-detected source rate. */
+	qnn_demo_runtime.resample_hz = qnn_json_extract_int(line, "\"resample_hz\"", 0);
+
+	{
+		float mt = (float)qnn_json_extract_int(line, "\"movement_threshold\"", 0);
+		if (mt > 0.0f)
+			qnn_demo_runtime.movement_threshold = mt;
+	}
+
 	if (!qnn_worker_prepare_map(map_id, error, sizeof(error)))
 	{
 		qnn_worker_write_error(error);
@@ -365,10 +350,14 @@ static int qnn_worker_handle_reset(const char *line)
 		return 0;
 	}
 
+	/* Init resampler for step-by-step mode too. */
+	qnn_resample_init(qnn_demo_runtime.resample_hz);
+
 	qnn_worker_capture_snapshot(&snapshot, true);
 	qnn_demo_save_prev(&snapshot);
 	qnn_worker_semantic_update(&qnn_worker_map_state, &snapshot, qnn_demo_runtime.fixed_dt, true);
-	qnn_worker_write_token_step_binary(stdout, &snapshot, qnn_demo_runtime.tick, qnn_demo_runtime.steps, qnn_demo_runtime.fixed_tick_hz, true);
+	qnn_worker_write_token_step_binary(stdout, &snapshot, qnn_demo_runtime.tick, qnn_demo_runtime.steps,
+		qnn_resample.target_hz > 0 ? qnn_resample.target_hz : qnn_demo_runtime.fixed_tick_hz, true);
 	return 0;
 }
 
@@ -422,6 +411,13 @@ static int qnn_worker_handle_collect(const char *line)
 		return 0;
 	}
 
+	/* Init resampler. resample_hz=0 means pass-through (emit every frame
+	 * at native recording FPS). resample_hz>0 means downsample to target. */
+	qnn_resample_init(qnn_demo_runtime.resample_hz);
+	if (qnn_demo_runtime.resample_hz > 0)
+		fprintf(stderr, "[demo] resample target: %d Hz (source: %d Hz)\n",
+			qnn_demo_runtime.resample_hz, qnn_demo_runtime.fixed_tick_hz);
+
 	qnn_worker_capture_snapshot(&snapshot, true);
 	qnn_demo_save_prev(&snapshot);
 	qnn_worker_semantic_update(&qnn_worker_map_state, &snapshot, qnn_demo_runtime.fixed_dt, true);
@@ -435,10 +431,26 @@ static int qnn_worker_handle_collect(const char *line)
 		if (!cls.demoplayback || cls.state == ca_disconnected)
 			qnn_demo_runtime.done = true;
 		qnn_worker_capture_snapshot(&snapshot, false);
-		qnn_demo_infer_action(&snapshot.action_label, &snapshot);
-		qnn_demo_save_prev(&snapshot);
 		qnn_worker_semantic_update(&qnn_worker_map_state, &snapshot, qnn_demo_runtime.fixed_dt, false);
-		qnn_worker_write_token_step_binary(stdout, &snapshot, qnn_demo_runtime.tick, qnn_demo_runtime.steps, qnn_demo_runtime.fixed_tick_hz, false);
+
+		qnn_resample_accumulate(&snapshot, qnn_demo_runtime.fixed_dt);
+		if (qnn_resample_should_emit() || qnn_demo_runtime.done)
+		{
+			/* Compute action label from full window (emission-to-emission).
+			 * prev_origin/prev_view_angles are from the last emission point,
+			 * so deltas naturally span the entire resample window. */
+			qnn_demo_infer_action(&snapshot.action_label, &snapshot);
+			qnn_resample_apply_action_merge(&snapshot);
+			qnn_worker_write_token_step_binary(stdout, &snapshot, qnn_demo_runtime.tick, qnn_demo_runtime.steps,
+				qnn_resample.target_hz > 0 ? qnn_resample.target_hz : qnn_demo_runtime.fixed_tick_hz, false);
+			qnn_demo_save_prev(&snapshot);
+		}
+		else if (qnn_resample.target_hz <= 0)
+		{
+			/* No resampling: original per-frame behavior. */
+			qnn_demo_infer_action(&snapshot.action_label, &snapshot);
+			qnn_demo_save_prev(&snapshot);
+		}
 	}
 	fflush(stdout);
 	return 0;

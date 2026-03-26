@@ -24,7 +24,7 @@ from quake_ai.rl.metrics import (
 from quake_ai.model.policy import QNNPolicy
 from quake_ai.model.observation import TokenObservationEncoder, observation_signature_dim
 from quake_ai.rl.environment import NativeWorldEnv
-from quake_ai.utils.io import write_json
+from quake_ai.utils.io import trusted_torch_load, write_json
 from quake_ai.utils.repro import set_global_seed, write_experiment_manifest
 from mapgen.pool import PROCGEN_SENTINEL
 
@@ -33,27 +33,29 @@ from mapgen.pool import PROCGEN_SENTINEL
 class EvalConfig:
     checkpoint_path: str
     output_dir: str
-    map_id: str = "dm4"
-    native_executable: str = ""
-    native_workdir: str = ""
-    fixed_tick_hz: int = 20
-    native_env: Dict[str, str] = field(default_factory=dict)
-    native_args: List[str] = field(default_factory=list)
-    options: Dict[str, object] = field(default_factory=dict)
-    mode: str = ""
-    seed: int = 19
-    num_episodes: int = 100
-    num_envs: int = 1
-    max_steps_per_episode: int = 256
-    policy_modes: List[str] = field(default_factory=lambda: ["greedy"])
-    start_mode: str = "sequential"
-    holdout_seed_offset: int = 10_000
-    sample_seed_offset: int = 20_000
-    map_features_path: str = ""
-    scenario_config_path: str = ""
-    record_demos: bool = False
-    parallel_policy_modes: bool = True
-    device: str = "auto"
+    map_id: str
+    native_executable: str
+    native_workdir: str
+    fixed_tick_hz: int
+    native_env: Dict[str, str]
+    native_args: List[str]
+    options: Dict[str, object]
+    mode: str
+    seed: int
+    num_episodes: int
+    num_envs: int
+    max_steps_per_episode: int
+    policy_modes: List[str]
+    start_mode: str
+    holdout_seed_offset: int
+    sample_seed_offset: int
+    map_features_path: str
+    procgen: Dict[str, object] | None
+    scenario_config_path: str
+    reward_json_path: str
+    record_demos: bool
+    parallel_policy_modes: bool
+    device: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,20 +121,26 @@ def _scenario_spec(
     config: EvalConfig,
     scenario: Mapping[str, Any] | None,
 ) -> _ScenarioSpec:
-    map_id = str((scenario or {}).get("map_id", config.map_id))
-    native_args = list((scenario or {}).get("native_args", config.native_args))
+    map_id = str(scenario["map_id"]) if scenario is not None else str(config.map_id)
+    native_args = list(scenario["native_args"]) if scenario is not None and "native_args" in scenario else list(config.native_args)
     merged_options = dict(config.options)
-    merged_options.update(dict((scenario or {}).get("options", {})))
-    scenario_id = str((scenario or {}).get("scenario_id", map_id))
+    if scenario is not None and "options" in scenario:
+        merged_options.update(dict(scenario["options"]))
+    scenario_id = str(scenario["scenario_id"]) if scenario is not None else map_id
     procgen_cfg: dict[str, object] | None = None
     if map_id == PROCGEN_SENTINEL:
-        basedir = str(config.native_env.get("QUAKE_BASEDIR", "")).strip() or "assets"
-        procgen_opts = dict((scenario or {}).get("procgen", {}))
+        basedir = str(config.native_env.get("QUAKE_BASEDIR", "")).strip()
+        if not basedir:
+            raise RuntimeError("Evaluation procgen requires native_env['QUAKE_BASEDIR']")
+        procgen_opts_source = scenario["procgen"] if scenario is not None and "procgen" in scenario else config.procgen
+        if not isinstance(procgen_opts_source, Mapping):
+            raise RuntimeError("Procgen evaluation requires an explicit procgen config with arena_size, rooms, and cleanup_generated_maps")
+        procgen_opts = dict(procgen_opts_source)
         procgen_cfg = {
             "maps_dir": str(Path(basedir) / "id1" / "maps"),
-            "arena_size": int(procgen_opts.get("arena_size", 3072)),
-            "rooms": int(procgen_opts.get("rooms", 3)),
-            "cleanup_generated_maps": False,
+            "arena_size": int(procgen_opts["arena_size"]),
+            "rooms": int(procgen_opts["rooms"]),
+            "cleanup_generated_maps": bool(procgen_opts["cleanup_generated_maps"]),
         }
     return _ScenarioSpec(
         scenario_id=scenario_id,
@@ -169,11 +177,14 @@ def _episode_jobs(config: EvalConfig) -> tuple[list[_ScenarioSpec], dict[str, de
 def _build_eval_env(config: EvalConfig, scenario: _ScenarioSpec) -> NativeWorldEnv:
     if not config.native_executable:
         raise RuntimeError("Evaluation requires native_executable")
+    from quake_ai.rl.reward import RewardWeights
+
     return NativeWorldEnv(
         executable=config.native_executable,
         map_id=scenario.map_id,
         max_steps=config.max_steps_per_episode,
         fixed_tick_hz=config.fixed_tick_hz,
+        reward_weights=RewardWeights.from_json(config.reward_json_path),
         mode=config.mode,
         seed=config.seed,
         workdir=config.native_workdir or None,
@@ -217,7 +228,7 @@ def _select_actions_batch(
     obs_batch: np.ndarray | Dict[str, np.ndarray],
     mode: str,
     states: Sequence[_EpisodeState],
-    ) -> tuple[List[Mapping[str, int]], np.ndarray]:
+) -> tuple[List[Mapping[str, object]], np.ndarray]:
     hidden_batch = np.stack([state.hidden for state in states], axis=0) if states else model.zero_hidden(0)
     if mode == "greedy":
         action_batch = model.act(obs_batch, mode=mode, hidden=hidden_batch)
@@ -231,7 +242,17 @@ def _select_actions_batch(
 
     batch_size = next(iter(obs_batch.values())).shape[0] if isinstance(obs_batch, dict) else obs_batch.shape[0]
     actions = [
-        {head: int(action_batch.actions[head][idx]) for head in ACTION_HEADS}
+        (
+            {
+                "move": action_batch.actions["move"][idx].astype(np.float32, copy=False).tolist(),
+                "look": action_batch.actions["look"][idx].astype(np.float32, copy=False).tolist(),
+                **{
+                    head: int(action_batch.actions[head][idx])
+                    for head in ACTION_HEADS
+                    if head not in {"move", "look"}
+                },
+            }
+        )
         for idx in range(batch_size)
     ]
     next_hidden = action_batch.next_hidden.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -350,11 +371,16 @@ def _evaluate_mode(
                 _set_demo_recording(env, job.episode_index, mode)
             obs = env.reset(seed=job.episode_seed, start_variant=job.start_variant)
             if not checked_obs_dim:
-                env_obs_dim = TokenObservationEncoder().obs_dim if isinstance(obs, dict) else int(obs.shape[0])
-                if env_obs_dim != model.obs_dim:
-                    raise RuntimeError(
-                        f"Evaluation checkpoint obs_dim={model.obs_dim} does not match environment obs_dim={env_obs_dim}"
-                    )
+                # For transformer models, obs_dim is the self_scalars dimension
+                # (e.g. 23), not the full flattened observation space.  Skip
+                # the dimension check for dict (token) observations since the
+                # transformer handles variable-length token sequences natively.
+                if not isinstance(obs, dict):
+                    env_obs_dim = int(obs.shape[0])
+                    if env_obs_dim != model.obs_dim:
+                        raise RuntimeError(
+                            f"Evaluation checkpoint obs_dim={model.obs_dim} does not match environment obs_dim={env_obs_dim}"
+                        )
                 checked_obs_dim = True
             active[len(active)] = _EpisodeState(
                 episode_index=job.episode_index,
@@ -486,11 +512,79 @@ def _evaluate_mode(
     return summary
 
 
+def _is_sf_checkpoint(path: str | Path) -> bool:
+    """Return True if *path* is a Sample Factory format checkpoint (.pth with 'model' key)."""
+    p = Path(path)
+    if p.suffix != ".pth" or not p.exists():
+        return False
+    try:
+        payload = trusted_torch_load(str(p), map_location="cpu")
+        return isinstance(payload, dict) and "model" in payload and ("train_step" in payload or "env_steps" in payload)
+    except Exception:
+        return False
+
+
+def _load_sf_checkpoint_as_qnn(path: str | Path, device: str = "cpu") -> QNNPolicy:
+    """Convert an SF checkpoint to a QNNPolicy in-memory (no temp files)."""
+    from quake_ai.ppo.checkpoint_converter import sf_to_qnn
+
+    p = Path(path)
+    # Check for a sidecar JSON with architecture metadata.
+    sidecar = p.with_suffix(".json")
+    if not sidecar.exists():
+        raise RuntimeError(f"SF checkpoint evaluation requires architecture sidecar metadata: {sidecar}")
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    if not isinstance(meta, dict):
+        raise RuntimeError(f"SF checkpoint sidecar must be a JSON object: {sidecar}")
+
+    required_keys = (
+        "obs_dim",
+        "trunk_hidden",
+        "gru_hidden",
+        "use_gru",
+        "d_model",
+        "n_heads",
+        "n_layers",
+        "ffn_dim",
+        "action_history_tokens",
+        "attn_dropout",
+        "readout",
+    )
+    missing = [key for key in required_keys if key not in meta]
+    if missing:
+        raise RuntimeError(
+            f"SF checkpoint sidecar is missing architecture fields ({', '.join(missing)}): {sidecar}"
+        )
+
+    return sf_to_qnn(
+        sf_checkpoint_path=p,
+        obs_dim=int(meta["obs_dim"]),
+        trunk_hidden=int(meta["trunk_hidden"]),
+        gru_hidden=int(meta["gru_hidden"]),
+        use_gru=bool(meta["use_gru"]),
+        device=device,
+        d_model=int(meta["d_model"]),
+        n_heads=int(meta["n_heads"]),
+        n_layers=int(meta["n_layers"]),
+        ffn_dim=int(meta["ffn_dim"]),
+        action_history_tokens=int(meta["action_history_tokens"]),
+        attn_dropout=float(meta["attn_dropout"]),
+        readout=str(meta["readout"]),
+    )
+
+
+def _load_checkpoint(path: str | Path, device: str = "cpu") -> QNNPolicy:
+    """Load a checkpoint in either QNN (.npz/.pth) or SF (.pth) format."""
+    if _is_sf_checkpoint(path):
+        return _load_sf_checkpoint_as_qnn(path, device=device)
+    return QNNPolicy.load(str(path), device=device)
+
+
 def _evaluate_policy_mode(
     config: EvalConfig,
     mode: str,
 ) -> tuple[str, Dict[str, float], QNNPolicy]:
-    model = QNNPolicy.load(config.checkpoint_path, device=config.device)
+    model = _load_checkpoint(config.checkpoint_path, device=config.device)
     summary = _evaluate_mode(config, model, mode, _episode_specs(config))
     return mode, summary, model
 

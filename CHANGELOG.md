@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.7.0
+
+### Changed
+- Training pipeline standardized on `run.json` single entry point, flat `reward.json` per run, unified `checkpoint_path`
+- Container simplified to single compose file; vendored FrikBotNex QC at repo root
+
+### Added
+- Arena mode with flat box map, all-weapons spawn, Red Armor, LG default, and `self_damage_penalty` reward
+- 4-way parallel PPO learning-rate sweep watchdog and host metrics collector
+
+### Fixed
+- Worker segfault on spatial raytrace; FrikBots invisible to model via server-side actor detection
+
+## 0.6.0
+
+### Changed
+- Final BC model form: 2-layer transformer (d_model 64, 1 head, FFN 256), self-readout, GRU temporal core, 2 action history tokens
+- Full sequential episode training with GRU carry-forward, per-chunk gradient accumulation, and TBPTT
+- Ablation phases 1–6: 2 action tokens win (+72%), GRU redundant with action tokens, trunk sizing and focal loss evaluated
+- Cosine LR decay, regression-based stopping on MAE sum, resumable checkpoints with NAS archival
+
+### Added
+- Step-level BC dashboard, Prometheus metrics exporter, memory-mapped episode cache with parallel precompute
+- 6-class weapon embeddings with axe class; configurable readout, look smoothing, and tick resampling
+
+### Fixed
+- Action labels computed at emission points; look deltas accumulated across resampling window
+- Val MAE sum for early stopping; zeroed heads excluded from eval loss mean
+
 ## 0.5.0
 
 ### Added

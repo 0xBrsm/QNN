@@ -14,7 +14,7 @@ try:
 except ImportError as exc:
     raise ImportError("gymnasium is required: pip install gymnasium>=0.29.0") from exc
 
-from quake_ai.actions import ACTION_HEADS
+from quake_ai.actions import ACTION_HEADS, ActionLabels
 from quake_ai.rl.environment import NativeWorldEnv
 from quake_ai.rl.metrics import EpisodeStatAccumulator, build_episode_extra_stats as _episode_extra_stats
 from quake_ai.model.observation import ACTION_HISTORY_DIM, ACTION_HISTORY_LEN, SELF_SCALAR_DIM
@@ -22,25 +22,67 @@ from mapgen.pool import PROCGEN_SENTINEL
 
 # Deterministic head ordering (Python 3.7+ dict preserves insertion order)
 _HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
-_HEAD_SIZES: list[int] = list(ACTION_HEADS.values())
+_MOVE_DIM = ACTION_HEADS["move"]
+_LOOK_DIM = ACTION_HEADS["look"]
+_DISCRETE_HEAD_ORDER = [
+    "jump",
+    "fire",
+    "switch",
+    "recall_0",
+    "recall_1",
+    "recall_2",
+    "recall_3",
+]
 
 
-def multi_discrete_to_heads(action: np.ndarray) -> Dict[str, int]:
-    """Convert a SF MultiDiscrete action array to an action_heads dict."""
-    return {head: int(action[i]) for i, head in enumerate(_HEAD_ORDER)}
+def tuple_action_to_heads(action: np.ndarray | Sequence) -> Dict[str, object]:
+    """Convert an SF Tuple action to the canonical action dict.
+
+    SF 2.1.1 passes a tuple/list of sub-arrays: (Box(2), Box(2), Discrete, ...).
+    Flatten into a single array for consistent indexing.
+    """
+    parts = [np.asarray(a, dtype=np.float32).reshape(-1) for a in action]
+    flat = np.concatenate(parts)
+    expected = _MOVE_DIM + _LOOK_DIM + len(_DISCRETE_HEAD_ORDER)
+    if flat.size != expected:
+        raise ValueError(f"Expected {expected} action values, got {flat.size}")
+    payload: Dict[str, object] = {
+        "move": flat[0:_MOVE_DIM].astype(np.float32, copy=False).tolist(),
+        "look": flat[_MOVE_DIM:_MOVE_DIM + _LOOK_DIM].astype(np.float32, copy=False).tolist(),
+    }
+    discrete_offset = _MOVE_DIM + _LOOK_DIM
+    for head_index, head in enumerate(_DISCRETE_HEAD_ORDER):
+        payload[head] = int(round(float(flat[discrete_offset + head_index])))
+    return ActionLabels.from_dict(payload).to_dict()
 
 
-def heads_to_multi_discrete(heads: Dict[str, int]) -> np.ndarray:
-    """Convert an action_heads dict to a MultiDiscrete array."""
-    return np.array([heads[head] for head in _HEAD_ORDER], dtype=np.int64)
+def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
+    """Convert a canonical action dict to the flat Tuple array expected by SF."""
+    labels = ActionLabels.from_dict(heads)
+    return np.asarray(
+        [
+            float(labels.move[0]),
+            float(labels.move[1]),
+            float(labels.look[0]),
+            float(labels.look[1]),
+            int(labels.jump),
+            int(labels.fire),
+            int(labels.switch),
+            int(labels.recall_0),
+            int(labels.recall_1),
+            int(labels.recall_2),
+            int(labels.recall_3),
+        ],
+        dtype=np.float32,
+    )
 
 
 class QuakeEnv(gymnasium.Env):
     """Gymnasium env wrapping NativeWorldEnv for Sample Factory APPO.
 
     Observation space: Dict of self/object/event/spatial token tensors from the inner encoder.
-    Action space: Tuple[Discrete] matching ACTION_HEADS. SF 2.1.x requires
-    Tuple[Discrete] rather than MultiDiscrete.
+    Action space: Tuple(Box(2), Box(2), Discrete...) for move/look vectors,
+    discrete jump/fire/switch, and four discrete recall heads.
 
     SF passes env_config with at least "worker_index" and "env_id" keys.
     Per-worker scenario assignment uses env_id % len(scenarios) if a scenario
@@ -60,18 +102,23 @@ class QuakeEnv(gymnasium.Env):
         env_id: int = int(env_config.get("env_id", 0))
 
         # Native args / options may be JSON-encoded strings from CLI or plain objects
-        native_args: Sequence[str] | None = _parse_json_arg(cfg, "quake_native_args_json", list) or None
-        options: Dict[str, object] | None = _parse_json_arg(cfg, "quake_options_json", dict) or None
+        native_args = _parse_json_arg(cfg, "quake_native_args_json", list)
+        if native_args is None:
+            raise RuntimeError("QuakeEnv requires quake_native_args_json")
+        options = _parse_json_arg(cfg, "quake_options_json", dict)
+        if options is None:
+            raise RuntimeError("QuakeEnv requires quake_options_json")
+        procgen_base = _parse_json_arg(cfg, "quake_procgen_json", dict)
 
         # Scenario rotation: if quake_scenario_config_json is provided it overrides map_id
-        map_id = str(getattr(cfg, "quake_map_id", PROCGEN_SENTINEL))
-        scenario_cfg_json = getattr(cfg, "quake_scenario_config_json", "") or ""
+        map_id = str(cfg.quake_map_id)
+        scenario_cfg_json = getattr(cfg, "quake_scenario_config_json", None) or ""
         scenario: Dict[str, Any] = {}
         if scenario_cfg_json:
             scenarios: list[Dict[str, Any]] = json.loads(scenario_cfg_json)
             scenario = scenarios[env_id % len(scenarios)]
-            map_id = str(scenario.get("map_id", map_id))
-            self.scenario_id = str(scenario.get("scenario_id", map_id))
+            map_id = str(scenario["map_id"])
+            self.scenario_id = str(scenario["scenario_id"])
             if "native_args" in scenario:
                 native_args = list(scenario["native_args"])
             if "options" in scenario:
@@ -82,28 +129,42 @@ class QuakeEnv(gymnasium.Env):
         else:
             self.scenario_id = map_id
 
-        basedir = getattr(cfg, "quake_basedir", "") or ""
-        workdir = getattr(cfg, "quake_native_workdir", "") or ""
+        basedir = str(cfg.quake_basedir)
+        workdir = str(cfg.quake_native_workdir)
+        if not basedir.strip():
+            raise RuntimeError("QuakeEnv requires quake_basedir")
 
         # Procgen: generate maps inline on each reset() — no background threads.
         procgen_cfg: dict | None = None
         if map_id == PROCGEN_SENTINEL:
-            maps_dir = Path(basedir) / "id1" / "maps" if basedir else Path("assets") / "id1" / "maps"
-            procgen_opts = scenario.get("procgen", {})
+            procgen_opts = scenario.get("procgen", procgen_base)
+            if not isinstance(procgen_opts, dict):
+                raise RuntimeError(
+                    "Procgen training requires an explicit procgen config with arena_size, rooms, and cleanup_generated_maps"
+                )
             procgen_cfg = {
-                "maps_dir": str(maps_dir),
-                "arena_size": int(procgen_opts.get("arena_size", 3072)),
-                "rooms": int(procgen_opts.get("rooms", 3)),
+                "maps_dir": str(Path(basedir) / "id1" / "maps"),
+                "arena_size": int(procgen_opts["arena_size"]),
+                "rooms": int(procgen_opts["rooms"]),
+                "cleanup_generated_maps": bool(procgen_opts["cleanup_generated_maps"]),
             }
+
+        # Reward weights from the run's config/reward.json.
+        reward_json_path = str(getattr(cfg, "reward_json_path", "")).strip()
+        if not reward_json_path:
+            raise RuntimeError("QuakeEnv requires reward_json_path")
+        from quake_ai.rl.reward import RewardWeights
+        reward_weights = RewardWeights.from_json(reward_json_path)
 
         self.inner_env = NativeWorldEnv(
             executable=str(cfg.quake_executable),
             map_id=map_id,
-            max_steps=int(getattr(cfg, "quake_max_steps_per_episode", 1024)),
-            fixed_tick_hz=int(getattr(cfg, "quake_fixed_tick_hz", 20)),
-            mode=str(getattr(cfg, "quake_mode", "")),
-            seed=int(getattr(cfg, "quake_seed", 7)) + env_id,
-            env={"QUAKE_BASEDIR": basedir} if basedir else None,
+            max_steps=int(cfg.quake_max_steps_per_episode),
+            fixed_tick_hz=int(cfg.quake_fixed_tick_hz),
+            reward_weights=reward_weights,
+            mode=str(cfg.quake_mode),
+            seed=int(cfg.quake_seed) + env_id,
+            env={"QUAKE_BASEDIR": basedir},
             native_args=native_args,
             options=options,
             workdir=workdir or None,
@@ -112,31 +173,6 @@ class QuakeEnv(gymnasium.Env):
 
         # Episode-level accumulators for SF custom metrics
         self._episode_stats = EpisodeStatAccumulator()
-
-        # Demo recording: always record to the same file per env,
-        # overwriting each episode.  Best demo archiving is handled by
-        # the BestCheckpointArchiver observer (observer.py), not here.
-        # Demos go in ``<com_gamedir>/demos/``.  When ``-game X`` is passed,
-        # Quake sets com_gamedir to X (e.g. frikbotnex_train), otherwise id1.
-        self._record_demos = bool(getattr(cfg, "quake_record_demos", False))
-        num_policies = int(getattr(cfg, "num_policies", 1))
-        self._policy_id = env_id % num_policies
-        self._demo_name = f"train_p{self._policy_id}_w{env_id:03d}"
-        game_subdir = "id1"
-        if native_args:
-            for i, arg in enumerate(native_args):
-                if arg == "-game" and i + 1 < len(native_args):
-                    game_subdir = native_args[i + 1]
-                    break
-        gamedir = Path(basedir or "assets") / game_subdir
-        if workdir:
-            gamedir = Path(workdir) / gamedir
-        demos_dir = gamedir / "demos"
-        self._demo_path = demos_dir / f"{self._demo_name}.dem"
-        self._demo_last_path = demos_dir / f"{self._demo_name}_last.dem"
-        if self._record_demos:
-            demos_dir.mkdir(parents=True, exist_ok=True)
-            self._inject_record_cmd()
 
         self.observation_space = gymnasium.spaces.Dict({
             "self_scalars": gymnasium.spaces.Box(
@@ -212,19 +248,18 @@ class QuakeEnv(gymnasium.Env):
                 dtype=np.float32,
             ),
         })
-        # SF 2.1.x does not support MultiDiscrete; use Tuple of Discrete instead.
-        # Both produce a flat array matching ACTION_HEADS — the step() mapping is identical.
         self.action_space = gymnasium.spaces.Tuple(
-            tuple(gymnasium.spaces.Discrete(n) for n in _HEAD_SIZES)
-        )
-
-    def _inject_record_cmd(self) -> None:
-        """Add ``record <demo_name>`` to pre_map_commands so every episode is recorded."""
-        opts = self.inner_env.adapter.reset_options
-        base = str(opts.get("pre_map_commands", ""))
-        record_name = f"demos/{self._demo_name}"
-        opts["pre_map_commands"] = (
-            f"{base}\nrecord {record_name}" if base else f"record {record_name}"
+            (
+                gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_MOVE_DIM,), dtype=np.float32),
+                gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_LOOK_DIM,), dtype=np.float32),
+                gymnasium.spaces.Discrete(ACTION_HEADS["jump"]),
+                gymnasium.spaces.Discrete(ACTION_HEADS["fire"]),
+                gymnasium.spaces.Discrete(ACTION_HEADS["switch"]),
+                gymnasium.spaces.Discrete(ACTION_HEADS["recall_0"]),
+                gymnasium.spaces.Discrete(ACTION_HEADS["recall_1"]),
+                gymnasium.spaces.Discrete(ACTION_HEADS["recall_2"]),
+                gymnasium.spaces.Discrete(ACTION_HEADS["recall_3"]),
+            )
         )
 
     # ------------------------------------------------------------------
@@ -241,7 +276,7 @@ class QuakeEnv(gymnasium.Env):
         return obs, {"scenario_id": self.scenario_id}
 
     def step(self, action: np.ndarray):
-        action_dict = multi_discrete_to_heads(action)
+        action_dict = tuple_action_to_heads(action)
         obs, reward, done, info = self.inner_env.step(action_dict)
         info = dict(info)
         info.setdefault("scenario_id", self.scenario_id)
@@ -254,11 +289,6 @@ class QuakeEnv(gymnasium.Env):
             info=info,
             terminal=terminated or truncated,
         )
-
-        # Preserve the completed episode's demo before reset overwrites it.
-        if (terminated or truncated) and self._record_demos and self._demo_path.exists():
-            import shutil
-            shutil.copy2(self._demo_path, self._demo_last_path)
 
         # Sample Factory expects custom episodic stats under info["episode_extra_stats"].
         if terminated or truncated:

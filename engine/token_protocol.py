@@ -15,29 +15,29 @@ from quake_ai.vocab import (
 )
 
 TOKEN_BINARY_MAGIC = b"QTOK"
-TOKEN_BINARY_VERSION = 5
+TOKEN_BINARY_VERSION = 6
 
 _HEADER_STRUCT = struct.Struct("<4sHHIIiHHHH")
 TOKEN_BINARY_HEADER_SIZE = _HEADER_STRUCT.size
 
-# v5 self token: 23 floats (scalars) + 3 int32s (embedding IDs)
+# v6 self token: 23 floats (scalars) + 3 int32s (embedding IDs)
 _SELF_STRUCT = struct.Struct("<23f3i")
-# v5 object token: u32 handle + 5 u16 IDs + 8 floats (scalars) + u16 event_count + u16 event_base + u16 route_cluster_count + 8 u16 route_cluster_ids
+# v6 object token: u32 handle + 5 u16 IDs + 8 floats (scalars) + u16 event_count + u16 event_base + u16 route_cluster_count + 8 u16 route_cluster_ids
 _OBJECT_STRUCT = struct.Struct("<I5H8f2H9H")
 _EVENT_STRUCT = struct.Struct("<HHHH3f")
-# v5 spatial: u16 sector_id + u16 reserved + 10 floats (reordered)
+# v6 spatial: u16 sector_id + u16 reserved + 10 floats (reordered)
 _SPATIAL_STRUCT = struct.Struct("<HH10f")
 
 _FLAG_RESET = 1 << 0
 _FLAG_DONE = 1 << 1
 _FLAG_HAS_ACTION = 1 << 2
 
-_ACTION_STRUCT = struct.Struct("<7H")
+_ACTION_STRUCT = struct.Struct("<4f7H")
 
 
 @dataclass(slots=True)
 class TrustedSelfToken:
-    """V5 self token — pre-normalized scalars + embedding IDs."""
+    """V6 self token — pre-normalized scalars + embedding IDs."""
     health: float
     armor: float
     armor_type: float
@@ -185,7 +185,7 @@ class TrustedTokenTick:
     done: bool = False
     reset: bool = False
     tick_hz: int = 20
-    action_label: Dict[str, int] = field(default_factory=dict)
+    action_label: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -222,7 +222,7 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
     if version != TOKEN_BINARY_VERSION:
         raise ValueError(f"Unsupported token packet version {version}")
 
-    # v5 self token: 23 scalars + 3 IDs
+    # v6 self token: 23 scalars + 3 IDs
     self_values = _SELF_STRUCT.unpack(read_exact(_SELF_STRUCT.size))
     self_token = TrustedSelfToken(
         health=float(self_values[0]),
@@ -242,7 +242,7 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
         cluster_id=int(self_values[25]),
     )
 
-    # v5 object tokens: u32 handle + 5 u16 IDs + 8 floats + u16 event_count + u16 event_base
+    # v6 object tokens: u32 handle + 5 u16 IDs + 8 floats + u16 event_count + u16 event_base
     raw_objects = []
     for _ in range(object_count):
         raw_objects.append(_OBJECT_STRUCT.unpack(read_exact(_OBJECT_STRUCT.size)))
@@ -310,7 +310,7 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
             )
         )
 
-    # v5 spatial: reordered geometry→traversability→content
+    # v6 spatial: reordered geometry→traversability→content
     spatial_tokens: List[TrustedSpatialToken] = []
     for _ in range(spatial_count):
         (
@@ -343,19 +343,33 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
             )
         )
 
-    action_label: Dict[str, int] = {}
+    action_label: Dict[str, Any] = {}
     if flags & _FLAG_HAS_ACTION:
-        move, strafe, look_yaw, look_pitch, fire, jump, weapon = _ACTION_STRUCT.unpack(
+        (
+            move_forward,
+            move_strafe,
+            look_yaw,
+            look_pitch,
+            fire,
+            jump,
+            switch,
+            recall_0,
+            recall_1,
+            recall_2,
+            recall_3,
+        ) = _ACTION_STRUCT.unpack(
             read_exact(_ACTION_STRUCT.size)
         )
         action_label = {
-            "move": int(move),
-            "strafe": int(strafe),
-            "look_yaw": int(look_yaw),
-            "look_pitch": int(look_pitch),
+            "move": [float(move_forward), float(move_strafe)],
+            "look": [float(look_yaw), float(look_pitch)],
             "fire": int(fire),
             "jump": int(jump),
-            "weapon": int(weapon),
+            "switch": int(switch),
+            "recall_0": int(recall_0),
+            "recall_1": int(recall_1),
+            "recall_2": int(recall_2),
+            "recall_3": int(recall_3),
         }
 
     return TrustedTokenTick(
@@ -373,7 +387,7 @@ def decode_binary_token_tick(header: bytes, read_exact) -> TrustedTokenTick:
 
 
 def encode_binary_token_tick(tick: TrustedTokenTick) -> bytes:
-    """Encode a TrustedTokenTick back to the QTOK v5 binary wire format."""
+    """Encode a TrustedTokenTick back to the QTOK v6 binary wire format."""
     all_events: List[TrustedEventAtom] = []
     event_bases: List[int] = []
     for obj in tick.object_tokens:
@@ -476,15 +490,21 @@ def encode_binary_token_tick(tick: TrustedTokenTick) -> bytes:
             )
         )
     if tick.action_label:
+        move = tick.action_label.get("move", (0.0, 0.0))
+        look = tick.action_label.get("look", (0.0, 0.0))
         parts.append(
             _ACTION_STRUCT.pack(
-                tick.action_label.get("move", 0),
-                tick.action_label.get("strafe", 0),
-                tick.action_label.get("look_yaw", 0),
-                tick.action_label.get("look_pitch", 0),
+                float(move[0]),
+                float(move[1]),
+                float(look[0]),
+                float(look[1]),
                 tick.action_label.get("fire", 0),
                 tick.action_label.get("jump", 0),
-                tick.action_label.get("weapon", 0),
+                tick.action_label.get("switch", 0),
+                tick.action_label.get("recall_0", 0),
+                tick.action_label.get("recall_1", 0),
+                tick.action_label.get("recall_2", 0),
+                tick.action_label.get("recall_3", 0),
             )
         )
     return b"".join(parts)

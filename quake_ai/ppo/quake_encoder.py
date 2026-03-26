@@ -27,11 +27,12 @@ class QuakeTransformerEncoder(Encoder):
         super().__init__(cfg)
 
         d_model: int = int(getattr(cfg, "quake_d_model", 64))
-        n_heads: int = int(getattr(cfg, "quake_n_heads", 2))
+        n_heads: int = int(getattr(cfg, "quake_n_heads", 1))
         n_layers: int = int(getattr(cfg, "quake_n_layers", 2))
         ffn_dim: int = int(getattr(cfg, "quake_ffn_dim", 256))
-        output_dim: int = int(getattr(cfg, "quake_trunk_hidden", 128))
         dropout: float = float(getattr(cfg, "quake_attn_dropout", 0.0))
+        readout: str = str(getattr(cfg, "quake_readout", "self") or "self")
+        action_history_tokens: int = int(getattr(cfg, "quake_action_history_tokens", 0))
 
         self.trunk = TransformerTrunk(
             obs_dim=0,
@@ -39,10 +40,11 @@ class QuakeTransformerEncoder(Encoder):
             n_heads=n_heads,
             n_layers=n_layers,
             ffn_dim=ffn_dim,
-            output_dim=output_dim,
             dropout=dropout,
+            readout=readout,
+            action_history_tokens=action_history_tokens,
         )
-        self.encoder_out_size: int = output_dim
+        self.encoder_out_size: int = d_model
 
     def forward(self, obs_dict):
         return self.trunk(obs_dict)

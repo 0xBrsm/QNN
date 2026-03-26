@@ -11,12 +11,11 @@ SF 2.1.1 model state_dict layout:
     encoder.trunk.tokenizer.*                — input token projections + embeddings
     encoder.trunk.blocks.*                   — transformer block weights
     encoder.trunk.final_ln.*                 — final layer norm
-    encoder.trunk.output_proj.*              — CLS+history → output_dim
 
   Shared:
     core.core.{weight_ih_l0, ...}            — single-layer GRU
     action_parameterization.distribution_linear.{weight,bias}
-                                             — combined Linear(hidden, 69)
+                                             — combined Linear(hidden, sum mixed-head params)
     critic_linear.{weight,bias}              — value head (hidden → 1)
 """
 
@@ -28,7 +27,7 @@ from typing import Any, Dict
 
 import torch
 
-from quake_ai.actions import ACTION_HEADS
+from quake_ai.actions import ACTION_HEADS, CONTINUOUS_ACTION_HEADS
 from quake_ai.model.observation import (
     ACTION_HISTORY_DIM,
     ACTION_HISTORY_LEN,
@@ -81,9 +80,16 @@ def bc_to_sf(
 def sf_to_qnn(
     sf_checkpoint_path: str | Path,
     obs_dim: int,
-    trunk_hidden: int = 128,
-    gru_hidden: int = 64,
-    use_gru: bool = True,
+    trunk_hidden: int,
+    gru_hidden: int,
+    use_gru: bool,
+    d_model: int,
+    n_heads: int,
+    n_layers: int,
+    ffn_dim: int,
+    action_history_tokens: int,
+    attn_dropout: float,
+    readout: str,
     device: str = "cpu",
 ) -> QNNPolicy:
     """Load an SF checkpoint and return an QNNPolicy with copied weights."""
@@ -102,6 +108,13 @@ def sf_to_qnn(
         use_gru=use_gru and gru_hidden > 0,
         seed=0,
         device=device,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        ffn_dim=ffn_dim,
+        action_history_tokens=action_history_tokens,
+        attn_dropout=attn_dropout,
+        readout=readout,
     )
     bc_state = bc_policy.model.state_dict()
 
@@ -147,12 +160,27 @@ def save_sf_format(
             sf_style[f"{_SF_VALUE_PREFIX}.{suffix}"] = bc_state[bc_key].cpu()
 
     # Combined policy head
-    head_weights = [bc_state[f"policy_heads.{h}.weight"] for h in _HEAD_ORDER if f"policy_heads.{h}.weight" in bc_state]
-    head_biases = [bc_state[f"policy_heads.{h}.bias"] for h in _HEAD_ORDER if f"policy_heads.{h}.bias" in bc_state]
-    if head_weights:
-        sf_style[f"{_SF_COMBINED_HEAD_KEY}.weight"] = torch.cat(head_weights, dim=0).cpu()
-    if head_biases:
-        sf_style[f"{_SF_COMBINED_HEAD_KEY}.bias"] = torch.cat(head_biases, dim=0).cpu()
+    combined_w_parts = []
+    combined_b_parts = []
+    for head in _HEAD_ORDER:
+        weight_key = f"policy_heads.{head}.weight"
+        bias_key = f"policy_heads.{head}.bias"
+        if weight_key not in bc_state or bias_key not in bc_state:
+            continue
+        head_weight = bc_state[weight_key]
+        head_bias = bc_state[bias_key]
+        if head in CONTINUOUS_ACTION_HEADS:
+            log_std_key = f"continuous_log_std.{head}"
+            log_std = bc_state[log_std_key] if log_std_key in bc_state else torch.full_like(head_bias, -1.0)
+            combined_w_parts.extend([head_weight, torch.zeros_like(head_weight)])
+            combined_b_parts.extend([head_bias, log_std])
+        else:
+            combined_w_parts.append(head_weight)
+            combined_b_parts.append(head_bias)
+    if combined_w_parts:
+        sf_style[f"{_SF_COMBINED_HEAD_KEY}.weight"] = torch.cat(combined_w_parts, dim=0).cpu()
+    if combined_b_parts:
+        sf_style[f"{_SF_COMBINED_HEAD_KEY}.bias"] = torch.cat(combined_b_parts, dim=0).cpu()
 
     # SF 2.1.1 ActorCriticSharedWeights expects obs_normalizer and
     # returns_normalizer running stats.  Seed them at identity (mean=0,
@@ -195,6 +223,12 @@ def save_sf_format(
         "trunk_hidden": bc_policy.trunk_hidden,
         "gru_hidden": bc_policy.gru_hidden,
         "use_gru": bc_policy.use_gru,
+        "n_heads": bc_policy.n_heads,
+        "n_layers": bc_policy.n_layers,
+        "ffn_dim": bc_policy.ffn_dim,
+        "action_history_tokens": bc_policy.action_history_tokens,
+        "attn_dropout": bc_policy.attn_dropout,
+        "readout": bc_policy.readout,
         "source": "bc_to_sf_converter",
     }
     ckpt_path = output / "checkpoint_000000000_0.pth"
@@ -304,9 +338,28 @@ def _copy_value_head(src: Dict, dst: Dict, device: str, reverse: bool = False) -
 
 
 def _copy_bc_heads_to_sf_combined(bc_state: Dict, sf_state: Dict, device: str) -> None:
-    """Concatenate BC's 7 per-head Linear layers into SF's single combined Linear."""
-    weights = [bc_state[f"policy_heads.{h}.weight"].to(device) for h in _HEAD_ORDER if f"policy_heads.{h}.weight" in bc_state]
-    biases = [bc_state[f"policy_heads.{h}.bias"].to(device) for h in _HEAD_ORDER if f"policy_heads.{h}.bias" in bc_state]
+    """Concatenate BC heads into SF's single combined Linear."""
+    weights = []
+    biases = []
+    for head in _HEAD_ORDER:
+        weight_key = f"policy_heads.{head}.weight"
+        bias_key = f"policy_heads.{head}.bias"
+        if weight_key not in bc_state or bias_key not in bc_state:
+            continue
+        head_weight = bc_state[weight_key].to(device)
+        head_bias = bc_state[bias_key].to(device)
+        if head in CONTINUOUS_ACTION_HEADS:
+            log_std_key = f"continuous_log_std.{head}"
+            log_std = (
+                bc_state[log_std_key].to(device)
+                if log_std_key in bc_state
+                else torch.full_like(head_bias, -1.0)
+            )
+            weights.extend([head_weight, torch.zeros_like(head_weight)])
+            biases.extend([head_bias, log_std])
+        else:
+            weights.append(head_weight)
+            biases.append(head_bias)
     if not weights:
         return
     combined_w = torch.cat(weights, dim=0)
@@ -320,7 +373,7 @@ def _copy_bc_heads_to_sf_combined(bc_state: Dict, sf_state: Dict, device: str) -
 
 
 def _copy_sf_combined_to_bc_heads(sf_state: Dict, bc_state: Dict, device: str) -> None:
-    """Split SF's combined Linear into BC's 7 per-head Linear layers."""
+    """Split SF's combined Linear into BC heads and continuous log-stds."""
     sf_w_key = f"{_SF_COMBINED_HEAD_KEY}.weight"
     sf_b_key = f"{_SF_COMBINED_HEAD_KEY}.bias"
     if sf_w_key not in sf_state:
@@ -331,6 +384,20 @@ def _copy_sf_combined_to_bc_heads(sf_state: Dict, bc_state: Dict, device: str) -
     for head, size in zip(_HEAD_ORDER, _HEAD_SIZES):
         w_key = f"policy_heads.{head}.weight"
         b_key = f"policy_heads.{head}.bias"
+        if head in CONTINUOUS_ACTION_HEADS:
+            mean_rows = combined_w[row : row + size]
+            std_rows = combined_w[row + size : row + (2 * size)]
+            if w_key in bc_state:
+                bc_state[w_key].copy_(mean_rows)
+            if b_key in bc_state and combined_b is not None:
+                bc_state[b_key].copy_(combined_b[row : row + size])
+            log_std_key = f"continuous_log_std.{head}"
+            if log_std_key in bc_state and combined_b is not None:
+                bc_state[log_std_key].copy_(combined_b[row + size : row + (2 * size)])
+            row += 2 * size
+            _ = std_rows  # state-dependent std weights are intentionally ignored for QNNPolicy
+            continue
+
         if w_key in bc_state:
             bc_state[w_key].copy_(combined_w[row : row + size])
         if b_key in bc_state and combined_b is not None:
@@ -358,8 +425,16 @@ def main() -> None:
     to_qnn.add_argument("sf_path", help="Input SF checkpoint .pth")
     to_qnn.add_argument("output_path", help="Output .pth path for QNNPolicy")
     to_qnn.add_argument("--obs-dim", type=int, required=True)
-    to_qnn.add_argument("--trunk-hidden", type=int, default=128)
-    to_qnn.add_argument("--gru-hidden", type=int, default=128)
+    to_qnn.add_argument("--trunk-hidden", type=int, required=True)
+    to_qnn.add_argument("--gru-hidden", type=int, required=True)
+    to_qnn.add_argument("--use-gru", choices=["true", "false"], required=True)
+    to_qnn.add_argument("--d-model", type=int, required=True)
+    to_qnn.add_argument("--n-heads", type=int, required=True)
+    to_qnn.add_argument("--n-layers", type=int, required=True)
+    to_qnn.add_argument("--ffn-dim", type=int, required=True)
+    to_qnn.add_argument("--action-history-tokens", type=int, required=True)
+    to_qnn.add_argument("--attn-dropout", type=float, required=True)
+    to_qnn.add_argument("--readout", required=True)
     to_qnn.add_argument("--device", default="cpu")
 
     args = parser.parse_args()
@@ -375,7 +450,15 @@ def main() -> None:
             obs_dim=args.obs_dim,
             trunk_hidden=args.trunk_hidden,
             gru_hidden=args.gru_hidden,
+            use_gru=str(args.use_gru).lower() == "true",
             device=args.device,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            ffn_dim=args.ffn_dim,
+            action_history_tokens=args.action_history_tokens,
+            attn_dropout=args.attn_dropout,
+            readout=args.readout,
         )
         policy.save(args.output_path)
         print(f"Saved QNNPolicy checkpoint: {args.output_path}")

@@ -1,0 +1,8 @@
+{
+  "death_penalty": -2.0,
+  "ehp_delta_weight": 0.5,
+  "edp_delta_weight": 0.6,
+  "frag_bonus": 3.0,
+  "fire_penalty": 0.0,
+  "self_damage_penalty": 0.0
+}

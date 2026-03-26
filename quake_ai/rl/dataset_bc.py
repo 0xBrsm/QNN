@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 
 from engine.token_protocol import TrustedTokenTick
-from quake_ai.actions import ACTION_HEADS, ActionLabels
+from quake_ai.actions import ACTION_HEADS, ActionLabels, CONTINUOUS_ACTION_HEADS, DISCRETE_ACTION_HEADS
 from quake_ai.model.observation import TokenObservationEncoder
 from quake_ai.utils.io import write_json
 from quake_ai.vocab import MAX_PLAYER_SLOTS
@@ -21,7 +21,7 @@ class Sample:
     episode_id: str
     tick: int
     obs: np.ndarray | Dict[str, np.ndarray]
-    action: Dict[str, int]
+    action: Dict[str, object]
     done: bool
     map_id: str = ""
     mode: str = "unknown"
@@ -151,6 +151,10 @@ def class_weights(
 ) -> Dict[str, np.ndarray]:
     weights: Dict[str, np.ndarray] = {}
     for head, size in ACTION_HEADS.items():
+        if head in CONTINUOUS_ACTION_HEADS:
+            continue
+        if head not in DISCRETE_ACTION_HEADS:
+            continue
         counts = np.ones(size, dtype=np.float32)
         for sample in samples:
             counts[int(sample.action.get(head, 0))] += 1.0

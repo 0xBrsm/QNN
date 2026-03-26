@@ -801,15 +801,13 @@ static qboolean qnn_worker_parse_entities(
 
 void qnn_worker_clear_action(qnn_worker_action_t *action)
 {
-	action->move = 0;
-	action->strafe = 0;
-	action->look_yaw = QNN_WORKER_LOOK_NEUTRAL_LABEL;
-	action->look_pitch = QNN_WORKER_LOOK_NEUTRAL_LABEL;
-	action->look_yaw_count = 0;
-	action->look_pitch_count = 0;
+	action->move[0] = 0.0f;
+	action->move[1] = 0.0f;
+	action->look[0] = 0.0f;
+	action->look[1] = 0.0f;
 	action->fire = 0;
 	action->jump = 0;
-	action->weapon = 0;
+	action->switch_slot = 0;
 	action->recall[0] = 0;
 	action->recall[1] = 0;
 	action->recall[2] = 0;

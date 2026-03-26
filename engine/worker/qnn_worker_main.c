@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define QNN_WORKER_PROTOCOL "v5"
+#define QNN_WORKER_PROTOCOL "v6"
 #define QNN_WORKER_SERVER_NAME "quake-worker"
 #define QNN_WORKER_UPSTREAM_COMMIT "bf4ac424ce754894ac8f1dae6a3981954bc9852d"
 #define QNN_WORKER_MAX_LINE 8192
@@ -60,12 +60,16 @@ typedef struct
 	int	fraglimit;
 	int	timelimit;
 	int	samelevel;
+	int	arena_mode;
 	char	pre_map_commands[QNN_WORKER_MAX_COMMAND_TEXT];
 	char	post_map_commands[QNN_WORKER_MAX_COMMAND_TEXT];
 } qnn_worker_reset_options_t;
 
 static qnn_worker_runtime_t qnn_worker_runtime;
 static qnn_worker_reset_options_t qnn_worker_reset_options;
+
+/* Arena mode cvar: when 1, PutClientInServer gives all weapons/ammo on spawn. */
+static cvar_t qnn_arena_mode_cvar = {"qnn_arena_mode", "0", false, false};
 
 static qboolean qnn_worker_client_ready(void)
 {
@@ -87,12 +91,13 @@ static void qnn_worker_reset_options_defaults(qnn_worker_reset_options_t *option
 	memset(options, 0, sizeof(*options));
 	options->maxplayers = 1;
 	options->skill = 0;
-	options->deathmatch = 0;
+	options->deathmatch = 1;
 	options->coop = 0;
 	options->teamplay = 0;
 	options->fraglimit = 0;
 	options->timelimit = 0;
 	options->samelevel = 1;
+	options->arena_mode = 0;
 }
 
 static void qnn_worker_parse_reset_options(const char *line, qnn_worker_reset_options_t *options)
@@ -108,6 +113,7 @@ static void qnn_worker_parse_reset_options(const char *line, qnn_worker_reset_op
 	options->fraglimit = qnn_json_extract_int(line, "\"fraglimit\"", options->fraglimit);
 	options->timelimit = qnn_json_extract_int(line, "\"timelimit\"", options->timelimit);
 	options->samelevel = qnn_json_extract_int(line, "\"samelevel\"", options->samelevel);
+	options->arena_mode = qnn_json_extract_int(line, "\"arena_mode\"", options->arena_mode);
 	qnn_json_extract_string(line, "\"pre_map_commands\"", options->pre_map_commands, sizeof(options->pre_map_commands));
 	qnn_json_extract_string(line, "\"post_map_commands\"", options->post_map_commands, sizeof(options->post_map_commands));
 }
@@ -499,6 +505,11 @@ static qboolean qnn_worker_reset_world(int seed, char *error, size_t error_size)
 		qnn_worker_reset_options.fraglimit,
 		qnn_worker_reset_options.timelimit,
 		qnn_worker_reset_options.samelevel);
+	/* Set arena_mode cvar via engine API so QuakeC PutClientInServer can
+	   read it.  Cvar_Set creates and registers the cvar if needed, and it
+	   persists across map changes (unlike console commands in pre_map). */
+	Cvar_Set("qnn_arena_mode", qnn_worker_reset_options.arena_mode ? "1" : "0");
+
 	qnn_worker_append_command(command, sizeof(command), qnn_worker_reset_options.pre_map_commands);
 	snprintf(command + strlen(command), sizeof(command) - strlen(command),
 		"map %s\n",
@@ -551,41 +562,9 @@ static qboolean qnn_worker_reset_world(int seed, char *error, size_t error_size)
 		}
 	}
 
-	/* Bot spawns via ``impulse 100`` can kill the player (FrikBot
-	   side-effect).  If health <= 0 after post_map_commands, restart
-	   the map and re-issue the bot connect commands so the player
-	   spawns alive with bots present. */
-	if (cl.stats[STAT_HEALTH] <= 0)
-	{
-		Cbuf_AddText("restart\n");
-		for (frame = 0; frame < 64; ++frame)
-			Host_Frame(qnn_worker_runtime.fixed_dt);
-		/* Re-issue post_map_commands (bot connects) after restart. */
-		{
-			const char *p = qnn_worker_reset_options.post_map_commands;
-			while (*p)
-			{
-				const char *nl = strchr(p, '\n');
-				size_t len = nl ? (size_t)(nl - p) : strlen(p);
-				if (len > 0)
-				{
-					char line[256];
-					if (len >= sizeof(line))
-						len = sizeof(line) - 1;
-					memcpy(line, p, len);
-					line[len] = '\0';
-					Cbuf_AddText(line);
-					Cbuf_AddText("\n");
-					for (frame = 0; frame < 32; ++frame)
-						Host_Frame(qnn_worker_runtime.fixed_dt);
-				}
-				p += len;
-				if (*p == '\n')
-					p++;
-			}
-		}
-		/* If still dead after second attempt, accept it. */
-	}
+	/* Bot spawns via ``impulse 100`` can telefrag the player.
+	   Just let the player respawn naturally — bots are already
+	   connected and demo recording continues uninterrupted. */
 
 	qnn_worker_runtime.tick = 0;
 	qnn_worker_runtime.steps = 0;
@@ -705,6 +684,8 @@ static int qnn_worker_handle_hello(const char *line)
 		qnn_worker_runtime.fixed_tick_hz = 20;
 	qnn_worker_runtime.fixed_dt = 1.0f / (float)qnn_worker_runtime.fixed_tick_hz;
 
+	qnn_resample_init(qnn_json_extract_int(line, "\"resample_hz\"", 0));
+
 	if (!qnn_worker_prepare_map(map_id, error, sizeof(error)))
 	{
 		qnn_worker_write_error(error);
@@ -752,15 +733,11 @@ static int qnn_worker_handle_step(const char *line)
 	}
 
 	qnn_worker_clear_action(&action);
-	action.move = qnn_json_extract_int(line, "\"move\"", 0);
-	action.strafe = qnn_json_extract_int(line, "\"strafe\"", 0);
-	action.look_yaw = qnn_json_extract_int(line, "\"look_yaw\"", QNN_WORKER_LOOK_NEUTRAL_LABEL);
-	action.look_pitch = qnn_json_extract_int(line, "\"look_pitch\"", QNN_WORKER_LOOK_NEUTRAL_LABEL);
-	action.look_yaw_count = qnn_json_extract_int(line, "\"look_yaw_count\"", 0);
-	action.look_pitch_count = qnn_json_extract_int(line, "\"look_pitch_count\"", 0);
+	qnn_json_extract_vec2(line, "\"move\"", action.move);
+	qnn_json_extract_vec2(line, "\"look\"", action.look);
 	action.fire = qnn_json_extract_int(line, "\"fire\"", 0);
 	action.jump = qnn_json_extract_int(line, "\"jump\"", 0);
-	action.weapon = qnn_json_extract_int(line, "\"weapon\"", 0);
+	action.switch_slot = qnn_json_extract_int(line, "\"switch\"", 0);
 	action.recall[0] = qnn_json_extract_int(line, "\"recall_0\"", 0);
 	action.recall[1] = qnn_json_extract_int(line, "\"recall_1\"", 0);
 	action.recall[2] = qnn_json_extract_int(line, "\"recall_2\"", 0);
@@ -770,9 +747,25 @@ static int qnn_worker_handle_step(const char *line)
 
 	if (!qnn_worker_runtime.done)
 	{
-		Host_Frame(qnn_worker_runtime.fixed_dt);
-		qnn_worker_runtime.tick += 1;
-		qnn_worker_runtime.steps += 1;
+		if (qnn_resample.target_hz > 0 && qnn_resample.target_hz < qnn_worker_runtime.fixed_tick_hz)
+		{
+			/* Run multiple engine frames per step to reach the resample interval.
+			 * The pending action is held constant across all sub-frames. */
+			int sub_frames = qnn_worker_runtime.fixed_tick_hz / qnn_resample.target_hz;
+			int i;
+			for (i = 0; i < sub_frames && !qnn_worker_runtime.done; i++)
+			{
+				Host_Frame(qnn_worker_runtime.fixed_dt);
+				qnn_worker_runtime.tick += 1;
+				qnn_worker_runtime.steps += 1;
+			}
+		}
+		else
+		{
+			Host_Frame(qnn_worker_runtime.fixed_dt);
+			qnn_worker_runtime.tick += 1;
+			qnn_worker_runtime.steps += 1;
+		}
 	}
 
 	qnn_worker_capture_snapshot(&snapshot, &action, false);
@@ -800,6 +793,7 @@ int main(int argc, char **argv)
 	parms.membase = malloc(parms.memsize);
 	parms.basedir = basedir;
 	Host_Init(&parms);
+	Cvar_RegisterVariable(&qnn_arena_mode_cvar);
 	cls.demonum = -1;
 
 	while (fgets(line, sizeof(line), stdin) != NULL)

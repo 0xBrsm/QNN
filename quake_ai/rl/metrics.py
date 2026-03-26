@@ -39,7 +39,7 @@ EVAL_REPORT_ALIASES = {
 PPO_REPORT_METRICS = (
     "mean_episode_return",
     "effective_game_minutes_per_wall_minute",
-    "death_rate",
+    "deaths_mean",
     "frag_delta_mean",
     "damage_dealt_mean",
     "hit_count_mean",
@@ -165,7 +165,13 @@ class EpisodeStatAccumulator:
     def add_step(self, *, reward: float, info: Mapping[str, object], terminal: bool) -> None:
         done_reason = str(info.get("done_reason", ""))
         self.frags += int(info.get("frag_delta", 0))
-        if terminal and (done_reason == "player_died" or float(info.get("frag_loss", 0.0)) > 0.0):
+        del terminal
+        player_died = (
+            bool(info.get("player_died"))
+            or done_reason == "player_died"
+            or float(info.get("frag_loss", 0.0)) > 0.0
+        )
+        if player_died:
             self.deaths += 1
         self.damage_dealt += float(info.get("damage_dealt", 0.0))
         self.damage_taken += float(info.get("damage_taken", 0.0))

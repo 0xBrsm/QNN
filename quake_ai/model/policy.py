@@ -13,70 +13,44 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from quake_ai.actions import ACTION_HEADS
+from quake_ai.actions import (
+    ACTION_HEADS,
+    CONTINUOUS_ACTION_HEADS,
+    DISCRETE_ACTION_HEADS,
+)
 from quake_ai.model.transformer import TransformerTrunk
 from quake_ai.utils.device import configure_torch_runtime, resolve_torch_device
 from quake_ai.utils.io import trusted_torch_load
 
-_FOCAL_LOSS_HEADS = frozenset({"look_yaw", "look_pitch"})
-_FOCAL_GAMMA = 2.0  # focus parameter — higher = more focus on hard examples
-_LOOK_LABEL_SMOOTH = 0.1  # probability mass spread to ±1 adjacent bins for look heads
+HEAD_LOSS_WEIGHTS: Dict[str, float] = {
+    "move": 1.5,
+    "look": 1.25,
+    "fire": 2.0,
+    "jump": 1.5,
+    "switch": 1.0,
+}
+_CONTINUOUS_HEAD_STD_INIT = -1.0
 
 
 def _focal_cross_entropy(
     logits: torch.Tensor,
     target: torch.Tensor,
+    gamma: float,
     weight: torch.Tensor | None = None,
-    gamma: float = _FOCAL_GAMMA,
-    label_smooth_adjacent: float = 0.0,
-    num_classes: int = 0,
 ) -> torch.Tensor:
-    """Focal loss with optional adjacent-bin label smoothing for look heads.
+    """Cross-entropy with optional focal modulation.
 
-    Focal loss down-weights well-classified examples and amplifies hard ones,
-    addressing class imbalance better than static class weights.
-
-    Adjacent-bin smoothing spreads probability mass to ±1 bins, treating
-    near-neutral bins (-1, 0, +1) as near-equivalent.  This reduces label
-    noise from rounding ambiguity in mouse deltas.
+    When *gamma* is 0 this is equivalent to ``F.cross_entropy``.
+    When *gamma* > 0 each sample's loss is scaled by ``(1 - p_t)^gamma``,
+    down-weighting easy/confident examples so rare-class samples dominate.
     """
-    if label_smooth_adjacent > 0 and num_classes > 0:
-        # Build soft targets: main bin gets (1 - 2*smooth), ±1 bins get smooth each
-        soft = torch.zeros(logits.size(0), num_classes, device=logits.device)
-        soft.scatter_(1, target.unsqueeze(1), 1.0 - 2 * label_smooth_adjacent)
-        left = (target - 1).clamp(min=0)
-        right = (target + 1).clamp(max=num_classes - 1)
-        soft.scatter_add_(1, left.unsqueeze(1), torch.full_like(soft[:, :1], label_smooth_adjacent))
-        soft.scatter_add_(1, right.unsqueeze(1), torch.full_like(soft[:, :1], label_smooth_adjacent))
-        log_probs = F.log_softmax(logits, dim=1)
-        if weight is not None:
-            log_probs = log_probs * weight.unsqueeze(0)
-        ce = -(soft * log_probs).sum(dim=1)
-        probs_at_target = log_probs.exp().gather(1, target.unsqueeze(1)).squeeze(1)
-        focal_weight = (1.0 - probs_at_target) ** gamma
-        return (focal_weight * ce).mean()
-
-    log_probs = F.log_softmax(logits, dim=1)
-    ce = F.nll_loss(log_probs, target, weight=weight, reduction="none")
-    probs = log_probs.exp().gather(1, target.unsqueeze(1)).squeeze(1)
-    focal_weight = (1.0 - probs) ** gamma
-    return (focal_weight * ce).mean()
-
-
-HEAD_LOSS_WEIGHTS: Dict[str, float] = {
-    "move": 1.5,
-    "strafe": 1.0,
-    "look_yaw": 1.25,
-    "look_pitch": 1.1,
-    "fire": 2.0,
-    "jump": 1.5,
-    "weapon": 1.0,
-}
-
-# Heads used for the primary accuracy metric (excludes recall which is always 0 in BC)
-_COMBAT_HEADS = frozenset(HEAD_LOSS_WEIGHTS.keys())
-# Look heads get ±1 bin tolerance for the "fuzzy" accuracy metric.
-_FUZZY_TOLERANCE_HEADS = frozenset({"look_yaw", "look_pitch"})
+    if gamma <= 0.0:
+        return F.cross_entropy(logits, target, weight=weight, reduction="mean")
+    # Per-sample CE (unreduced) with optional class weights.
+    ce = F.cross_entropy(logits, target, weight=weight, reduction="none")
+    p_t = torch.exp(-ce)  # p_t = softmax probability of the true class
+    focal = ((1.0 - p_t) ** gamma) * ce
+    return focal.mean()
 
 
 @dataclass(slots=True)
@@ -88,6 +62,40 @@ class PolicyActionBatch:
     next_hidden: torch.Tensor
 
 
+def _normal_from_mean_log_std(mean: torch.Tensor, log_std: torch.Tensor, temperature: float = 1.0) -> torch.distributions.Independent:
+    safe_temperature = max(float(temperature), 1e-3)
+    std = torch.exp(log_std).unsqueeze(0).expand_as(mean) * safe_temperature
+    return torch.distributions.Independent(torch.distributions.Normal(mean, std), 1)
+
+
+def _continuous_head_metrics(
+    head: str,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> Dict[str, float]:
+    """Compute L1 metrics for continuous heads entirely on GPU; single .item() per scalar."""
+    l1 = torch.abs(pred.detach() - target.detach())
+    n = l1.shape[0]
+
+    if head == "move":
+        s0, s1, st = l1[:, 0].sum(), l1[:, 1].sum(), l1.sum()
+        return {
+            "n_move": n,
+            "l1_sum_move_forward": s0.item(), "l1_sum_move_strafe": s1.item(), "l1_sum_move": st.item(),
+            "mae_move_forward": (s0 / n).item(), "mae_move_strafe": (s1 / n).item(), "mae_move": (st / n).item(),
+        }
+
+    if head == "look":
+        s0, s1, st = l1[:, 0].sum(), l1[:, 1].sum(), l1.sum()
+        return {
+            "n_look": n,
+            "l1_sum_look_yaw": s0.item(), "l1_sum_look_pitch": s1.item(), "l1_sum_look": st.item(),
+            "mae_look_yaw": (s0 / n).item(), "mae_look_pitch": (s1 / n).item(), "mae_look": (st / n).item(),
+        }
+
+    raise ValueError(f"Unsupported continuous head for metrics: {head}")
+
+
 class _ActorCriticNet(nn.Module):
     def __init__(
         self,
@@ -95,40 +103,46 @@ class _ActorCriticNet(nn.Module):
         trunk_hidden: int,
         gru_hidden: int,
         use_gru: bool,
-        d_model: int = 64,
-        n_heads: int = 2,
+        d_model: int | None = None,
+        n_heads: int = 1,
+        n_layers: int = 2,
         ffn_dim: int = 256,
         attn_dropout: float = 0.0,
+        readout: str = "self",
+        action_history_tokens: int = 0,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
-        self.trunk_hidden = trunk_hidden
+        self.d_model = int(d_model if d_model is not None else trunk_hidden)
+        self.trunk_hidden = self.d_model
         self.use_gru = bool(use_gru and gru_hidden > 0)
         self.gru_hidden = int(gru_hidden if self.use_gru else 0)
+        self.readout = str(readout) if readout else "cls"
         self.trunk = TransformerTrunk(
             obs_dim=obs_dim,
-            d_model=d_model,
+            d_model=self.d_model,
             n_heads=n_heads,
+            n_layers=n_layers,
             ffn_dim=ffn_dim,
-            output_dim=trunk_hidden,
             dropout=attn_dropout,
+            readout=self.readout,
+            action_history_tokens=action_history_tokens,
         )
         if self.use_gru:
-            self.gru = nn.GRU(input_size=trunk_hidden, hidden_size=self.gru_hidden, num_layers=1)
-            head_in = self.gru_hidden
+            self.gru = nn.GRU(input_size=self.d_model, hidden_size=self.gru_hidden, num_layers=1)
+            head_in = self.d_model + self.gru_hidden
         else:
             self.gru = None
-            head_in = trunk_hidden
+            head_in = self.d_model
+        self.head_hidden = head_in
         self.policy_heads = nn.ModuleDict({head: nn.Linear(head_in, size) for head, size in ACTION_HEADS.items()})
-        self.value_head = nn.Linear(head_in, 1)
-        # Auxiliary aim head: predicts yaw/pitch angle to nearest enemy.
-        # Teaches the trunk to attend to enemy-relative geometry.
-        self.aim_aux_head = nn.Sequential(
-            nn.Linear(head_in, head_in // 2),
-            nn.ReLU(),
-            nn.Linear(head_in // 2, 2),  # [yaw, pitch] in [-1, 1]
-            nn.Tanh(),
+        self.continuous_log_std = nn.ParameterDict(
+            {
+                head: nn.Parameter(torch.full((ACTION_HEADS[head],), _CONTINUOUS_HEAD_STD_INIT))
+                for head in CONTINUOUS_ACTION_HEADS
+            }
         )
+        self.value_head = nn.Linear(head_in, 1)
 
     def _run_gru(
         self,
@@ -167,7 +181,7 @@ class _ActorCriticNet(nn.Module):
                 key: value.reshape(seq_len * batch_size, *value.shape[2:])
                 for key, value in obs.items()
             }
-            trunk_features = self.trunk(flat_obs).reshape(seq_len, batch_size, self.trunk_hidden)
+            trunk_features = self.trunk(flat_obs).reshape(seq_len, batch_size, self.d_model)
         else:
             batch_size = int(sample.shape[0])
             trunk_features = self.trunk(obs)
@@ -179,13 +193,14 @@ class _ActorCriticNet(nn.Module):
                 device=sample.device,
             )
             if input_is_sequence:
-                features, next_hidden = self._run_gru(trunk_features, hidden_t, masks=masks)
+                gru_features, next_hidden = self._run_gru(trunk_features, hidden_t, masks=masks)
+                features = torch.cat([trunk_features, gru_features], dim=-1)
             else:
                 seq_masks = None
                 if masks is not None:
                     seq_masks = masks.reshape(1, batch_size)
                 seq_features, next_hidden = self._run_gru(trunk_features.unsqueeze(0), hidden_t, masks=seq_masks)
-                features = seq_features.squeeze(0)
+                features = torch.cat([trunk_features, seq_features.squeeze(0)], dim=-1)
         else:
             features = trunk_features
             next_hidden = torch.zeros((batch_size, 0), dtype=sample.dtype, device=sample.device)
@@ -212,20 +227,31 @@ class QNNPolicy:
     def __init__(
         self,
         obs_dim: int,
-        trunk_hidden: int = 128,
-        gru_hidden: int = 128,
+        trunk_hidden: int = 64,
+        gru_hidden: int = 64,
         use_gru: bool = True,
         seed: int = 0,
         device: str = "auto",
-        d_model: int = 64,
-        n_heads: int = 2,
+        d_model: int | None = None,
+        n_heads: int = 1,
+        n_layers: int = 2,
         ffn_dim: int = 256,
         attn_dropout: float = 0.0,
+        readout: str = "self",
+        action_history_tokens: int = 0,
     ) -> None:
         self.obs_dim = obs_dim
-        self.trunk_hidden = trunk_hidden
+        self.d_model = int(d_model if d_model is not None else trunk_hidden)
+        self.trunk_hidden = self.d_model
         self.use_gru = bool(use_gru and gru_hidden > 0)
         self.gru_hidden = int(gru_hidden if self.use_gru else 0)
+        self.n_heads = int(n_heads)
+        self.n_layers = int(n_layers)
+        self.ffn_dim = int(ffn_dim)
+        self.attn_dropout = float(attn_dropout)
+        self.readout = str(readout) if readout else "cls"
+        self.action_history_tokens = int(action_history_tokens)
+        self.head_hidden = self.d_model + self.gru_hidden if self.use_gru else self.d_model
         self.seed = seed
         self.device_spec = resolve_torch_device(device)
         configure_torch_runtime(self.device_spec)
@@ -241,13 +267,16 @@ class QNNPolicy:
         torch.manual_seed(seed)
         self.model = _ActorCriticNet(
             obs_dim=obs_dim,
-            trunk_hidden=trunk_hidden,
+            trunk_hidden=self.trunk_hidden,
             gru_hidden=self.gru_hidden,
             use_gru=self.use_gru,
-            d_model=d_model,
-            n_heads=n_heads,
-            ffn_dim=ffn_dim,
-            attn_dropout=attn_dropout,
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            n_layers=self.n_layers,
+            ffn_dim=self.ffn_dim,
+            attn_dropout=self.attn_dropout,
+            readout=self.readout,
+            action_history_tokens=self.action_history_tokens,
         ).to(self.device)
         self.model.train()
         self._optimizers: Dict[str, torch.optim.Optimizer] = {}
@@ -279,6 +308,37 @@ class QNNPolicy:
             )
 
         return torch.multinomial(probs, 1, replacement=True, generator=generator).squeeze(1)
+
+    @staticmethod
+    def _sample_normal(
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        generator: torch.Generator | None = None,
+        row_generators: Sequence[torch.Generator | None] | None = None,
+    ) -> torch.Tensor:
+        if row_generators is not None:
+            if len(row_generators) != mean.shape[0]:
+                raise ValueError("row_generators must match the batch size")
+            samples = []
+            for row_idx, row_generator in enumerate(row_generators):
+                row_mean = mean[row_idx]
+                row_std = std[row_idx]
+                noise = torch.randn(
+                    row_mean.shape,
+                    generator=row_generator,
+                    device=row_mean.device if row_generator is None or row_generator.device.type == row_mean.device.type else "cpu",
+                    dtype=row_mean.dtype,
+                )
+                if noise.device != row_mean.device:
+                    noise = noise.to(device=row_mean.device, dtype=row_mean.dtype)
+                samples.append(row_mean + (row_std * noise))
+            return torch.stack(samples, dim=0)
+
+        if generator is not None and generator.device.type != mean.device.type:
+            noise = torch.randn(mean.shape, generator=generator, device="cpu", dtype=mean.dtype).to(device=mean.device)
+        else:
+            noise = torch.randn(mean.shape, generator=generator, device=mean.device, dtype=mean.dtype)
+        return mean + (std * noise)
 
     @staticmethod
     def _log_prob_entropy_from_logits(logits: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -369,6 +429,27 @@ class QNNPolicy:
             )
         return self._flatten_targets(self._tensor(source, dtype=torch.long))
 
+    def _continuous_targets_for_head(
+        self,
+        actions: Mapping[str, np.ndarray | torch.Tensor],
+        head: str,
+        head_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        source = actions.get(head)
+        flat_shape = self._flatten_logits(head_logits).shape
+        if source is None:
+            return torch.zeros(flat_shape, dtype=torch.float32, device=self.device)
+        target = self._tensor(source, dtype=torch.float32)
+        if target.ndim == 3:
+            target = target.reshape(-1, target.shape[-1])
+        elif target.ndim == 2:
+            target = target.reshape(-1, target.shape[-1])
+        else:
+            raise ValueError(f"Continuous head {head} expects rank-2 or rank-3 targets")
+        if target.shape != flat_shape:
+            raise ValueError(f"Expected continuous target shape {flat_shape} for {head}, got {target.shape}")
+        return target
+
     def _class_weights_for_head(
         self,
         class_weights: Mapping[str, np.ndarray | torch.Tensor],
@@ -428,6 +509,7 @@ class QNNPolicy:
         if self.model.gru is not None:
             params.extend(self.model.gru.parameters())
         params.extend(self.model.policy_heads.parameters())
+        params.extend(self.model.continuous_log_std.parameters())
         return params
 
     def _value_parameters(self) -> list[nn.Parameter]:
@@ -463,7 +545,10 @@ class QNNPolicy:
             optimizer = torch.optim.Adam(
                 [
                     {"params": shared_params, "lr": policy_lr},
-                    {"params": list(self.model.policy_heads.parameters()), "lr": policy_lr},
+                    {
+                        "params": list(self.model.policy_heads.parameters()) + list(self.model.continuous_log_std.parameters()),
+                        "lr": policy_lr,
+                    },
                     {"params": list(self.model.value_head.parameters()), "lr": value_lr},
                 ]
             )
@@ -522,6 +607,28 @@ class QNNPolicy:
 
             for head in ACTION_HEADS:
                 head_logits = logits[head]
+                if head in CONTINUOUS_ACTION_HEADS:
+                    head_mean = torch.tanh(head_logits)
+                    temperature = float(sample_temperatures.get(head, 1.0)) if sample_temperatures else 1.0
+                    dist = _normal_from_mean_log_std(head_mean, self.model.continuous_log_std[head], temperature=temperature)
+                    if mode == "greedy":
+                        action_tensor = head_mean
+                    elif mode == "sampled":
+                        std = torch.exp(self.model.continuous_log_std[head]).unsqueeze(0).expand_as(head_mean) * max(temperature, 1e-3)
+                        action_tensor = self._sample_normal(
+                            head_mean,
+                            std,
+                            generator=generator,
+                            row_generators=row_generators,
+                        )
+                        action_tensor = torch.clamp(action_tensor, min=-1.0, max=1.0)
+                    else:
+                        raise ValueError(f"Unsupported policy mode {mode}")
+                    action_tensors[head] = action_tensor
+                    log_probs.append(dist.log_prob(action_tensor))
+                    entropies[head] = dist.entropy()
+                    continue
+
                 if mode == "sampled":
                     head_logits = self._sampling_logits(head_logits, float(sample_temperatures.get(head, 1.0)) if sample_temperatures else 1.0)
                 if mode == "greedy":
@@ -544,7 +651,11 @@ class QNNPolicy:
 
         return PolicyActionBatch(
             actions={
-                head: tensor.detach().cpu().numpy().astype(np.int64, copy=False)
+                head: (
+                    tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+                    if head in CONTINUOUS_ACTION_HEADS
+                    else tensor.detach().cpu().numpy().astype(np.int64, copy=False)
+                )
                 for head, tensor in action_tensors.items()
             },
             log_probs=torch.stack(log_probs, dim=0).sum(dim=0),
@@ -552,6 +663,81 @@ class QNNPolicy:
             entropies=entropies,
             next_hidden=next_hidden,
         )
+
+    def _compute_head_losses_and_metrics(
+        self,
+        logits: Dict[str, torch.Tensor],
+        actions: Mapping[str, np.ndarray | torch.Tensor],
+        class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
+        head_loss_weights: Mapping[str, float] | None = None,
+        focal_gamma: float = 0.0,
+    ) -> tuple[list[torch.Tensor], Dict[str, float]]:
+        """Shared per-head loss + metrics for both train and eval.
+
+        Returns (losses_list, metrics_dict).  Discrete head raw counts are
+        batched into a single GPU tensor to minimise CPU syncs.
+        """
+        weights_map = head_loss_weights or HEAD_LOSS_WEIGHTS
+        losses: list[torch.Tensor] = []
+        accuracy_components: list[float] = []
+        metrics: Dict[str, float] = {}
+
+        # Accumulate discrete stats on GPU, sync once at the end.
+        discrete_stats: list[tuple[str, torch.Tensor]] = []
+
+        for head in ACTION_HEADS:
+            head_logits = self._flatten_logits(logits[head])
+            if head in CONTINUOUS_ACTION_HEADS:
+                pred = torch.tanh(head_logits)
+                target = self._continuous_targets_for_head(actions, head, head_logits)
+                head_loss = F.smooth_l1_loss(pred, target)
+                metrics.update(_continuous_head_metrics(head, pred, target))
+            else:
+                target = self._action_targets_for_head(actions, head, head_logits)
+                if class_weights is not None:
+                    w = self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
+                    head_loss = _focal_cross_entropy(head_logits, target, focal_gamma, weight=w)
+                else:
+                    head_loss = _focal_cross_entropy(head_logits, target, focal_gamma)
+                pred = torch.argmax(head_logits, dim=1)
+                match = pred == target
+                # Stack 7 scalars into one tensor: n, correct, tp, fp, fn, target_pos, pred_pos
+                n_t = torch.tensor(float(pred.shape[0]), device=pred.device)
+                correct = match.float().sum()
+                pos_pred = (pred != 0)
+                pos_target = (target != 0)
+                tp = (pos_pred & match).float().sum()
+                fp = (pos_pred & ~match).float().sum()
+                fn = (pos_target & ~match).float().sum()
+                target_pos = pos_target.float().sum()
+                pred_pos = pos_pred.float().sum()
+                discrete_stats.append((head, torch.stack([n_t, correct, tp, fp, fn, target_pos, pred_pos])))
+                accuracy_components.append(correct / n_t)
+            head_loss = head_loss * weights_map.get(head, 1.0)
+            losses.append(head_loss)
+
+        # Single GPU→CPU sync for all discrete heads.
+        if discrete_stats:
+            all_stats = torch.stack([s for _, s in discrete_stats]).cpu().numpy()
+            for i, (head, _) in enumerate(discrete_stats):
+                n, correct, tp, fp, fn, target_pos, pred_pos = all_stats[i]
+                metrics[f"n_{head}"] = int(n)
+                metrics[f"correct_{head}"] = float(correct)
+                metrics[f"acc_{head}"] = float(correct / max(n, 1))
+                metrics[f"tp_{head}"] = float(tp)
+                metrics[f"fp_{head}"] = float(fp)
+                metrics[f"fn_{head}"] = float(fn)
+                metrics[f"target_pos_{head}"] = float(target_pos)
+                metrics[f"pred_pos_{head}"] = float(pred_pos)
+
+        # Resolve accuracy_components (mix of tensors and floats).
+        if accuracy_components:
+            acc_tensor = torch.stack(accuracy_components) if isinstance(accuracy_components[0], torch.Tensor) else None
+            metrics["accuracy"] = float(acc_tensor.mean().item()) if acc_tensor is not None else float(np.mean([float(a) for a in accuracy_components]))
+        else:
+            metrics["accuracy"] = 0.0
+
+        return losses, metrics
 
     def supervised_step(
         self,
@@ -562,69 +748,28 @@ class QNNPolicy:
         *,
         hidden: np.ndarray | torch.Tensor | None = None,
         masks: np.ndarray | torch.Tensor | None = None,
-        aim_target: np.ndarray | torch.Tensor | None = None,
         accumulate_only: bool = False,
+        head_loss_weights: Mapping[str, float] | None = None,
+        focal_gamma: float = 0.0,
     ) -> Dict[str, float]:
-        self.model.train()
         optimizer = self._optimizer("bc", self.model.parameters(), lr)
         if not accumulate_only:
             optimizer.zero_grad()
 
-        features, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
-
-        losses = []
-        combat_accuracies = []
-        fuzzy_accuracies = []
-        per_head_acc: Dict[str, float] = {}
-        for head in ACTION_HEADS:
-            head_logits = self._flatten_logits(logits[head])
-            target = self._action_targets_for_head(actions, head, head_logits)
-            weights = self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
-            if head in _FOCAL_LOSS_HEADS:
-                head_loss = _focal_cross_entropy(
-                    head_logits, target, weight=weights,
-                    label_smooth_adjacent=_LOOK_LABEL_SMOOTH,
-                    num_classes=ACTION_HEADS[head],
-                )
-            else:
-                head_loss = F.cross_entropy(head_logits, target, weight=weights, reduction="mean")
-            head_loss = head_loss * HEAD_LOSS_WEIGHTS.get(head, 1.0)
-            losses.append(head_loss)
-            if head in _COMBAT_HEADS:
-                pred = torch.argmax(head_logits, dim=1)
-                exact = float((pred == target).float().mean().item())
-                combat_accuracies.append(exact)
-                per_head_acc[head] = exact
-                if head in _FUZZY_TOLERANCE_HEADS:
-                    fuzzy_accuracies.append(float(((pred - target).abs() <= 1).float().mean().item()))
-                else:
-                    fuzzy_accuracies.append(exact)
-
-        # Auxiliary aim loss: predict angle to nearest enemy.
-        aim_loss_val = 0.0
-        if aim_target is not None:
-            flat_features = features.reshape(-1, features.shape[-1])
-            aim_pred = self.model.aim_aux_head(flat_features)
-            aim_t = self._tensor(aim_target, dtype=torch.float32).reshape(-1, 2)
-            aim_loss = F.mse_loss(aim_pred, aim_t)
-            losses.append(aim_loss * 0.5)  # lower weight so it doesn't dominate
-            aim_loss_val = float(aim_loss.item())
+        _, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
+        losses, metrics = self._compute_head_losses_and_metrics(
+            logits, actions, class_weights=class_weights, head_loss_weights=head_loss_weights,
+            focal_gamma=focal_gamma,
+        )
 
         loss = torch.stack(losses).mean()
         loss.backward()
         if not accumulate_only:
             optimizer.step()
 
-        result: Dict[str, float] = {
-            "loss": float(loss.item()),
-            "aim_aux_loss": aim_loss_val,
-            "_next_hidden": next_hidden.detach(),
-            "accuracy": float(np.mean(combat_accuracies) if combat_accuracies else 0.0),
-            "fuzzy_accuracy": float(np.mean(fuzzy_accuracies) if fuzzy_accuracies else 0.0),
-        }
-        for head, acc in per_head_acc.items():
-            result[f"acc_{head}"] = acc
-        return result
+        metrics["loss"] = float(loss.item())
+        metrics["_next_hidden"] = next_hidden.detach()
+        return metrics
 
     def evaluate_supervised(
         self,
@@ -633,36 +778,20 @@ class QNNPolicy:
         *,
         hidden: np.ndarray | torch.Tensor | None = None,
         masks: np.ndarray | torch.Tensor | None = None,
+        head_loss_weights: Mapping[str, float] | None = None,
+        focal_gamma: float = 0.0,
     ) -> Dict[str, float]:
         with torch.inference_mode():
             _, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
-            losses = []
-            combat_accuracies = []
-            fuzzy_accuracies = []
-            per_head_acc: Dict[str, float] = {}
-            for head in ACTION_HEADS:
-                head_logits = self._flatten_logits(logits[head])
-                target = self._action_targets_for_head(actions, head, head_logits)
-                head_loss = F.cross_entropy(head_logits, target, reduction="mean")
-                losses.append(float(head_loss.item()))
-                if head in _COMBAT_HEADS:
-                    pred = torch.argmax(head_logits, dim=1)
-                    exact = float((pred == target).float().mean().item())
-                    combat_accuracies.append(exact)
-                    per_head_acc[head] = exact
-                    if head in _FUZZY_TOLERANCE_HEADS:
-                        fuzzy_accuracies.append(float(((pred - target).abs() <= 1).float().mean().item()))
-                    else:
-                        fuzzy_accuracies.append(exact)
-        result: Dict[str, float] = {
-            "loss": float(np.mean(losses) if losses else 0.0),
-            "accuracy": float(np.mean(combat_accuracies) if combat_accuracies else 0.0),
-            "fuzzy_accuracy": float(np.mean(fuzzy_accuracies) if fuzzy_accuracies else 0.0),
-            "_next_hidden": next_hidden.detach(),
-        }
-        for head, acc in per_head_acc.items():
-            result[f"acc_{head}"] = acc
-        return result
+            losses, metrics = self._compute_head_losses_and_metrics(
+                logits, actions, head_loss_weights=head_loss_weights,
+                focal_gamma=focal_gamma,
+            )
+
+        nonzero_losses = [l.item() for l in losses if l.item() != 0.0]
+        metrics["loss"] = float(np.mean(nonzero_losses) if nonzero_losses else 0.0)
+        metrics["_next_hidden"] = next_hidden.detach()
+        return metrics
 
     def ppo_step(
         self,
@@ -697,8 +826,18 @@ class QNNPolicy:
         log_probs = []
         entropies = []
         for head in ACTION_HEADS:
+            head_logits = self._flatten_logits(logits[head])
+            if head in CONTINUOUS_ACTION_HEADS:
+                target = self._continuous_targets_for_head(actions, head, head_logits)
+                mean = torch.tanh(head_logits)
+                temperature = float(sample_temperatures.get(head, 1.0)) if sample_temperatures else 1.0
+                dist = _normal_from_mean_log_std(mean, self.model.continuous_log_std[head], temperature=temperature)
+                log_probs.append(dist.log_prob(target))
+                entropies.append(dist.entropy())
+                continue
+
             head_logits = self._sampling_logits(
-                self._flatten_logits(logits[head]),
+                head_logits,
                 float(sample_temperatures.get(head, 1.0)) if sample_temperatures else 1.0,
             )
             target = self._action_targets_for_head(actions, head, head_logits)
@@ -723,6 +862,23 @@ class QNNPolicy:
                 )
             per_head_kl = []
             for head in ACTION_HEADS:
+                if head in CONTINUOUS_ACTION_HEADS:
+                    temperature = float(sample_temperatures.get(head, 1.0)) if sample_temperatures else 1.0
+                    reference_mean = torch.tanh(reference_policy._flatten_logits(reference_logits[head]))
+                    current_mean = torch.tanh(self._flatten_logits(logits[head]))
+                    reference_dist = _normal_from_mean_log_std(
+                        reference_mean,
+                        reference_policy.model.continuous_log_std[head],
+                        temperature=temperature,
+                    )
+                    current_dist = _normal_from_mean_log_std(
+                        current_mean,
+                        self.model.continuous_log_std[head],
+                        temperature=temperature,
+                    )
+                    per_head_kl.append(torch.distributions.kl_divergence(reference_dist, current_dist))
+                    continue
+
                 temperature = float(sample_temperatures.get(head, 1.0)) if sample_temperatures else 1.0
                 reference_head_logits = self._sampling_logits(reference_policy._flatten_logits(reference_logits[head]), temperature)
                 current_head_logits = self._sampling_logits(self._flatten_logits(logits[head]), temperature)
@@ -776,7 +932,16 @@ class QNNPolicy:
             "trunk_hidden": self.trunk_hidden,
             "gru_hidden": self.gru_hidden,
             "use_gru": self.use_gru,
-            "model_version": 6,
+            "d_model": self.d_model,
+            "head_hidden": self.head_hidden,
+            "n_heads": self.n_heads,
+            "n_layers": self.n_layers,
+            "ffn_dim": self.ffn_dim,
+            "attn_dropout": self.attn_dropout,
+            "readout": self.readout,
+            "action_history_tokens": self.action_history_tokens,
+            "model_version": 9,
+            "action_schema_version": 1,
             "backend": "pytorch",
             "requested_device": self.device_spec.requested,
             "resolved_device": self.device_spec.resolved,
@@ -798,13 +963,28 @@ class QNNPolicy:
         meta = dict(payload["meta"])
         model = cls(
             obs_dim=int(meta.get("obs_dim", 0)),
-            trunk_hidden=int(meta["trunk_hidden"]),
+            trunk_hidden=int(meta.get("d_model", meta["trunk_hidden"])),
             gru_hidden=int(meta.get("gru_hidden", 0)),
             use_gru=bool(meta.get("use_gru", False)),
             seed=0,
             device=device,
+            d_model=int(meta.get("d_model", meta["trunk_hidden"])),
+            n_heads=int(meta.get("n_heads", 2)),
+            n_layers=int(meta.get("n_layers", 2)),
+            ffn_dim=int(meta.get("ffn_dim", 256)),
+            attn_dropout=float(meta.get("attn_dropout", 0.0)),
+            readout=str(meta.get("readout", "cls")),
+            action_history_tokens=int(meta.get("action_history_tokens", 0)),
         )
-        model.model.load_state_dict(payload["state_dict"])
+        try:
+            model.model.load_state_dict(payload["state_dict"])
+        except RuntimeError as exc:
+            version = meta.get("model_version", "unknown")
+            raise ValueError(
+                f"Incompatible checkpoint architecture for {source} (model_version={version}). "
+                "This code expects the transformer-summary + fused-GRU policy layout; "
+                "retrain or re-export the checkpoint for the current model."
+            ) from exc
         model.model.to(model.device)
         return model
 
@@ -830,6 +1010,12 @@ class QNNPolicy:
             use_gru=target_use_gru,
             seed=0,
             device=device,
+            d_model=loaded.d_model,
+            n_heads=loaded.n_heads,
+            n_layers=loaded.n_layers,
+            ffn_dim=loaded.ffn_dim,
+            attn_dropout=loaded.attn_dropout,
+            readout=loaded.readout,
         )
         target_state = target.model.state_dict()
         for key, target_value in target_state.items():

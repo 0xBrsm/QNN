@@ -126,12 +126,8 @@ class BestCheckpointArchiver(AlgoObserver, EventLoopObject):
         # overwrites the active demo file.
         worker_demos = list(self._demos_dir.glob(f"train_p{policy_id}_w*_last.dem"))
         if not worker_demos:
-            # Fall back to active demos (old naming or pre-PBT).
             worker_demos = list(self._demos_dir.glob(f"train_p{policy_id}_w*.dem"))
-            # Exclude _last.dem from active list
             worker_demos = [d for d in worker_demos if "_last" not in d.name]
-        if not worker_demos:
-            worker_demos = list(self._demos_dir.glob("train_w*.dem"))
         if not worker_demos:
             return
         newest = max(worker_demos, key=lambda p: p.stat().st_mtime)

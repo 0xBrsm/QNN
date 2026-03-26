@@ -14,7 +14,7 @@ import logging
 
 from engine.bridge import NativeEngineError, NativeObsBufferAdapter, NativeTokenAdapter
 from engine.training_protocol import TrustedTrainingExtrasV1
-from quake_ai.actions import ActionLabels
+from quake_ai.actions import ActionLabels, CONTINUOUS_ACTION_HEADS
 from quake_ai.rl.combat_metrics import WEAPON_TOTAL_DEBUG_KEYS, weapon_metric_key
 from quake_ai.model.observation import TokenObservationEncoder, visible_threat_count
 from quake_ai.rl.reward import WEAPON_TIER_VALUES, RewardWeights, effective_hp, reward_components
@@ -64,7 +64,7 @@ class NativeEnvState:
 
 
 def _velocity_magnitude(vel_norm: List[float]) -> float:
-    """Planar speed from normalized velocity (v5 self_token.velocity / 2000)."""
+    """Planar speed from normalized velocity (`self_token.velocity / 2000`)."""
     return float(hypot(vel_norm[0] * _VEL_CAP, vel_norm[1] * _VEL_CAP))
 
 
@@ -128,6 +128,19 @@ def _apply_training_extras(
             continue
         weapon_pickup_value += WEAPON_TIER_VALUES.get(int(record.weapon_id), 1.0)
 
+    # Split damage into self (rocket splash etc.) vs other (enemy hits).
+    self_ent = training_extras.self_entity_num
+    damage_self = 0.0
+    damage_other = 0.0
+    for record in training_extras.damage_records:
+        if record.attacker_entity_num != self_ent:
+            continue
+        delta = record.damage_health + record.damage_armor
+        if record.target_entity_num == self_ent:
+            damage_self += delta
+        else:
+            damage_other += delta
+
     combat_signals = dict(combat_signals)
     combat_signals.update(
         {
@@ -135,6 +148,8 @@ def _apply_training_extras(
             "frag_loss": float(training_extras.frag_loss),
             "damage_taken": float(training_extras.damage_taken),
             "damage_dealt": float(training_extras.damage_dealt),
+            "damage_dealt_self": float(damage_self),
+            "damage_dealt_other": float(damage_other),
             "hit_count": float(training_extras.hit_count),
             "shots_fired": float(training_extras.shots_fired),
             "health_gain": float(training_extras.pickup_health),
@@ -158,46 +173,39 @@ class NativeWorldEnv:
         self,
         executable: str | Path,
         map_id: str,
-        max_steps: int = 256,
-        fixed_tick_hz: int = 20,
-        reward_weights: RewardWeights | None = None,
-        mode: str = "",
-        seed: int = 7,
+        max_steps: int,
+        fixed_tick_hz: int,
+        reward_weights: RewardWeights,
+        mode: str,
+        seed: int,
+        env: Mapping[str, str],
+        native_args: Sequence[str],
+        options: Mapping[str, object],
         workdir: str | Path | None = None,
-        env: Mapping[str, str] | None = None,
-        native_args: Sequence[str] | None = None,
-        options: Mapping[str, object] | None = None,
         encoder: TokenObservationEncoder | None = None,
         map_pool: MapPool | None = None,
         procgen: dict | None = None,
     ) -> None:
         self.max_steps = max_steps
-        resolved_mode = mode.strip().lower() if mode else "pvp"
-        if resolved_mode != "pvp":
-            raise ValueError(f"Unsupported env mode {mode!r}; only 'pvp' is supported")
-        if reward_weights is not None:
-            self.reward_weights = reward_weights
-        else:
-            overrides = dict((options or {}).get("reward_overrides", {}))
-            self.reward_weights = RewardWeights(mode=resolved_mode, **overrides)
+        self.reward_weights = reward_weights
         self.rng = np.random.default_rng(seed)
         self.encoder = encoder if encoder is not None else TokenObservationEncoder()  # kept for visible_threat_count shape inference
-        self.options = dict(options or {})
+        self.options = dict(options)
         self.map_pool = map_pool
         self._procgen = procgen
 
         # Procgen: generate the first map inline (no background threads).
         self._maps_dir: Path | None = None
         self._current_map_id: str | None = None
-        self._cleanup_generated_maps = bool(self._procgen.get("cleanup_generated_maps", True)) if self._procgen is not None else True
+        self._cleanup_generated_maps = bool(self._procgen["cleanup_generated_maps"]) if self._procgen is not None else True
         if self._procgen is not None:
             from mapgen.pool import generate_bsp
             self._maps_dir = Path(self._procgen["maps_dir"])
             seed_val = self.rng.integers(0, 2**31 - 1)
             map_id, _ = generate_bsp(
                 int(seed_val), self._maps_dir,
-                rooms=self._procgen.get("rooms", 3),
-                arena_size=self._procgen.get("arena_size", 3072),
+                rooms=int(self._procgen["rooms"]),
+                arena_size=int(self._procgen["arena_size"]),
             )
             self._current_map_id = map_id
         elif self.map_pool is not None:
@@ -239,8 +247,8 @@ class NativeWorldEnv:
                     seed_val = int(reset_seed + attempt) if seed is not None else int(self.rng.integers(0, 2**31 - 1))
                     new_map_id, _ = generate_bsp(
                         seed_val, self._maps_dir,
-                        rooms=self._procgen.get("rooms", 3),
-                        arena_size=self._procgen.get("arena_size", 3072),
+                        rooms=int(self._procgen["rooms"]),
+                        arena_size=int(self._procgen["arena_size"]),
                     )
                 else:
                     new_map_id = self.map_pool.get(timeout=120.0)
@@ -369,6 +377,8 @@ class NativeWorldEnv:
                 "monster_kill_delta": float(combat_signals["monster_kills"]),
                 "damage_taken": float(combat_signals["damage_taken"]),
                 "damage_dealt": float(combat_signals["damage_dealt"]),
+                "damage_dealt_self": float(combat_signals.get("damage_dealt_self", 0)),
+                "damage_dealt_other": float(combat_signals.get("damage_dealt_other", 0)),
                 "hit_count": float(combat_signals["hit_count"]),
                 "shots_fired": float(combat_signals["shots_fired"]),
                 "health_gain": float(combat_signals["health_gain"]),
@@ -413,13 +423,14 @@ class NativeVectorEnv:
         executable: str | Path,
         map_id: str,
         max_steps: int,
+        fixed_tick_hz: int,
+        reward_weights: RewardWeights,
         seed: int,
-        fixed_tick_hz: int = 20,
+        env: Mapping[str, str],
+        mode: str,
+        native_args: Sequence[str],
+        options: Mapping[str, object],
         workdir: str | Path | None = None,
-        env: Mapping[str, str] | None = None,
-        mode: str = "",
-        native_args: Sequence[str] | None = None,
-        options: Mapping[str, object] | None = None,
     ) -> None:
         self.envs = [
             NativeWorldEnv(
@@ -427,6 +438,7 @@ class NativeVectorEnv:
                 map_id=map_id,
                 max_steps=max_steps,
                 fixed_tick_hz=fixed_tick_hz,
+                reward_weights=reward_weights,
                 mode=mode,
                 seed=seed + i,
                 workdir=workdir,
@@ -454,7 +466,7 @@ class NativeVectorEnv:
     @staticmethod
     def _step_env(
         env: NativeWorldEnv,
-        action: Mapping[str, int],
+        action: Mapping[str, object],
     ) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, object]]:
         obs, reward, done, info = env.step(action)
         if done:
@@ -462,10 +474,15 @@ class NativeVectorEnv:
         return obs, reward, done, info
 
     def step(self, action_batch: Mapping[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, List[Dict[str, object]]]:
-        actions = [
-            ActionLabels.from_dict({head: int(values[idx]) for head, values in action_batch.items()}).to_dict()
-            for idx in range(self.num_envs)
-        ]
+        actions = []
+        for idx in range(self.num_envs):
+            payload: dict[str, object] = {}
+            for head, values in action_batch.items():
+                if head in CONTINUOUS_ACTION_HEADS:
+                    payload[head] = np.asarray(values[idx], dtype=np.float32).tolist()
+                else:
+                    payload[head] = int(values[idx])
+            actions.append(ActionLabels.from_dict(payload).to_dict())
         futures = [
             self._executor.submit(self._step_env, env, action)
             for env, action in zip(self.envs, actions)

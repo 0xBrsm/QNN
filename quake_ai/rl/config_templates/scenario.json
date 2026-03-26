@@ -1,0 +1,72 @@
+{
+  "note": "Multi-scenario PvP training across the full bot ladder.",
+  "map_id": "dm2",
+  "native_args": [
+    "-game",
+    "frikbotnex_train"
+  ],
+  "options": {
+    "maxplayers": 7,
+    "skill": 0,
+    "deathmatch": 1,
+    "coop": 0,
+    "teamplay": 0,
+    "fraglimit": 0,
+    "timelimit": 0,
+    "samelevel": 1,
+    "pre_map_commands": "",
+    "post_map_commands": "cl_forwardspeed 320\ncl_backspeed 320\ncl_sidespeed 320\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"
+  },
+  "scenarios": [
+    {
+      "scenario_id": "ffa-dm2-3bot",
+      "map_id": "dm2",
+      "skill_note": "Compact map - 3 bots at skill 2, lighter pressure.",
+      "options": {
+        "maxplayers": 5,
+        "skill": 0,
+        "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100"
+      }
+    },
+    {
+      "scenario_id": "ffa-dm4-5bot",
+      "map_id": "dm4",
+      "skill_note": "Open map - 5 bots at skill 2, long sightlines.",
+      "options": {
+        "maxplayers": 7,
+        "skill": 0,
+        "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"
+      }
+    },
+    {
+      "scenario_id": "ffa-dm3-4bot",
+      "map_id": "dm3",
+      "skill_note": "Vertical map - 4 bots at skill 2, stacked floors.",
+      "options": {
+        "maxplayers": 6,
+        "skill": 0,
+        "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100"
+      }
+    },
+    {
+      "scenario_id": "ffa-dm6-5bot",
+      "map_id": "dm6",
+      "skill_note": "Spawn-pressure map - 5 bots at skill 2, contested positions.",
+      "options": {
+        "maxplayers": 7,
+        "skill": 0,
+        "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"
+      }
+    },
+    {
+      "scenario_id": "arena-1v1-box",
+      "map_id": "arena_box",
+      "skill_note": "Tiny box arena - 1v1, all weapons, pure combat training.",
+      "options": {
+        "maxplayers": 3,
+        "skill": 0,
+        "post_map_commands": "impulse 9\nimpulse 109"
+      }
+    }
+  ]
+}

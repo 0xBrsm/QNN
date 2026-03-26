@@ -1,7 +1,7 @@
 """Transformer trunk for the native token observation contract.
 
-Token attention reads self, object, event, and spatial groups. A rolling action
-history is concatenated after the [CLS] readout before the final projection.
+Token attention reads self, object, event, and spatial groups and emits a
+current-frame summary vector from the configured readout token.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from quake_ai.model.observation import (
     EVENT_ID_DIM,
     EVENT_SCALAR_DIM,
     MAX_OBJECT_TOKENS,
-    MAX_ROUTE_CLUSTERS,
     OBJECT_ID_DIM,
     OBJECT_SCALAR_DIM,
     SELF_SCALAR_DIM,
@@ -27,23 +26,27 @@ from quake_ai.vocab import ACTION_IDS, MAX_PLAYER_SLOTS, MODALITY_IDS, QUALIFIER
 _TOKEN_KIND_SELF = 0
 _TOKEN_KIND_OBJECT = 1
 _TOKEN_KIND_SPATIAL = 2
-_ACTION_HISTORY_FEATURES = ACTION_HISTORY_LEN * ACTION_HISTORY_DIM
+_TOKEN_KIND_ACTION = 3
 
 
 class TokenObservationTokenizer(nn.Module):
     """Convert packed token observations into d_model transformer tokens."""
 
-    def __init__(self, d_model: int) -> None:
+    def __init__(self, d_model: int, action_history_tokens: int = 0) -> None:
         super().__init__()
         self.d_model = int(d_model)
+        self.action_history_tokens = min(int(action_history_tokens), ACTION_HISTORY_LEN)
 
         self.self_proj = nn.Linear(SELF_SCALAR_DIM, d_model)
         self.object_proj = nn.Linear(OBJECT_SCALAR_DIM, d_model)
         self.event_proj = nn.Linear(EVENT_SCALAR_DIM, d_model)
         self.spatial_proj = nn.Linear(SPATIAL_SCALAR_DIM, d_model)
+        if self.action_history_tokens > 0:
+            self.action_proj = nn.Linear(ACTION_HISTORY_DIM, d_model)
+            self.action_pos_embed = nn.Embedding(ACTION_HISTORY_LEN, d_model)
 
-        self.kind_embed = nn.Embedding(3, d_model)
-        self.weapon_embed = nn.Embedding(5, d_model)
+        self.kind_embed = nn.Embedding(4, d_model)  # self, object, spatial, action
+        self.weapon_embed = nn.Embedding(6, d_model)  # 0=axe,1=SG/SSG,2=nails,3=GL,4=RL,5=LG
         self.movement_embed = nn.Embedding(5, d_model)
         self.cluster_embed = nn.Embedding(256, d_model)
         self.subject_embed = nn.Embedding(max(SUBJECT_IDS.values()) + 1, d_model)
@@ -56,7 +59,7 @@ class TokenObservationTokenizer(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
-        self.n_tokens = 1 + 1 + MAX_OBJECT_TOKENS + SPATIAL_TOKEN_COUNT
+        self.n_tokens = 1 + 1 + MAX_OBJECT_TOKENS + SPATIAL_TOKEN_COUNT + self.action_history_tokens
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         self_scalars = obs_dict["self_scalars"]
@@ -138,11 +141,30 @@ class TokenObservationTokenizer(nn.Module):
         )
 
         cls = self.cls_token.expand(batch, -1, -1)
-        tokens = torch.cat([cls, self_token, object_token, spatial_token], dim=1)
 
-        prefix = torch.zeros((batch, 2), dtype=torch.bool, device=device)
-        spatial_valid = torch.ones((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
-        key_padding_mask = torch.cat([prefix, ~object_mask, ~spatial_valid], dim=1)
+        if self.action_history_tokens > 0:
+            action_history = obs_dict["action_history"]  # (batch, ACTION_HISTORY_LEN, ACTION_HISTORY_DIM)
+            # Take the most recent N ticks.
+            n = self.action_history_tokens
+            action_slice = action_history[:, -n:, :]  # (batch, n, ACTION_HISTORY_DIM)
+            action_token = self.action_proj(action_slice)  # (batch, n, d_model)
+            action_token = action_token + self.kind_embed(
+                torch.full((batch, n), _TOKEN_KIND_ACTION, dtype=torch.long, device=device)
+            )
+            pos_ids = torch.arange(ACTION_HISTORY_LEN - n, ACTION_HISTORY_LEN, dtype=torch.long, device=device)
+            action_token = action_token + self.action_pos_embed(pos_ids).unsqueeze(0)
+            # Mask: action history entry is valid if any feature is nonzero.
+            action_valid = action_slice.abs().sum(dim=-1) > 0  # (batch, n)
+            tokens = torch.cat([cls, self_token, object_token, spatial_token, action_token], dim=1)
+            prefix = torch.zeros((batch, 2), dtype=torch.bool, device=device)
+            spatial_valid = torch.ones((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
+            key_padding_mask = torch.cat([prefix, ~object_mask, ~spatial_valid, ~action_valid], dim=1)
+        else:
+            tokens = torch.cat([cls, self_token, object_token, spatial_token], dim=1)
+            prefix = torch.zeros((batch, 2), dtype=torch.bool, device=device)
+            spatial_valid = torch.ones((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
+            key_padding_mask = torch.cat([prefix, ~object_mask, ~spatial_valid], dim=1)
+
         return tokens, key_padding_mask
 
 
@@ -161,7 +183,13 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         normed = self.ln1(x)
-        attn_out, _ = self.attn(normed, normed, normed, key_padding_mask=key_padding_mask)
+        attn_out, _ = self.attn(
+            normed,
+            normed,
+            normed,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         x = x + self.drop(attn_out)
         normed = self.ln2(x)
         return x + self.drop(self.ffn(normed))
@@ -177,19 +205,19 @@ class TransformerTrunk(nn.Module):
         n_heads: int = 2,
         n_layers: int = 2,
         ffn_dim: int = 256,
-        output_dim: int = 128,
         dropout: float = 0.0,
+        readout: str = "self",  # "cls" or "self"
+        action_history_tokens: int = 0,
     ) -> None:
         super().__init__()
         del obs_dim
-        self.output_dim = int(output_dim)
-        self.tokenizer = TokenObservationTokenizer(d_model=d_model)
+        self.output_dim = int(d_model)
+        self._readout = readout
+        self.tokenizer = TokenObservationTokenizer(d_model=d_model, action_history_tokens=action_history_tokens)
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model=d_model, n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout) for _ in range(n_layers)]
         )
         self.final_ln = nn.LayerNorm(d_model)
-        self.output_proj = nn.Linear(d_model + _ACTION_HISTORY_FEATURES, output_dim)
-        self.output_act = nn.Tanh()
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -200,11 +228,10 @@ class TransformerTrunk(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        action_history = obs_dict["action_history"]
         tokens, key_padding_mask = self.tokenizer(obs_dict)
         transformed = tokens
         for block in self.blocks:
             transformed = block(transformed, key_padding_mask=key_padding_mask)
-        cls_output = self.final_ln(transformed[:, 0, :])
-        history_features = action_history.reshape(action_history.shape[0], _ACTION_HISTORY_FEATURES).to(dtype=cls_output.dtype)
-        return self.output_act(self.output_proj(torch.cat([cls_output, history_features], dim=1)))
+        # CLS is position 0, self token is position 1.
+        readout_idx = 0 if self._readout == "cls" else 1
+        return self.final_ln(transformed[:, readout_idx, :])

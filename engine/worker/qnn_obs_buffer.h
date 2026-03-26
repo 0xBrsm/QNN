@@ -100,22 +100,6 @@
 
 /* ---- Action history normalization (must match actions.py) ---- */
 
-#define QNN_ACTION_LOOK_NEUTRAL_LABEL 12
-#define QNN_ACTION_LOOK_MAX_ABS_MOUSE 128
-#define QNN_ACTION_WEAPON_SLOTS 5
-
-/* LOOK_MOUSE_BINS table (25 entries, matches actions.py) */
-static const int qnn_look_mouse_bins[25] = {
-	-128, -96, -72, -56, -40, -28, -20, -14, -10, -6,
-	-3, -1, 0, 1, 3, 6, 10, 14, 20, 28,
-	40, 56, 72, 96, 128,
-};
-
-static inline int qnn_mouse_count_from_label(int label)
-{
-	if (label < 0 || label >= 25)
-		return 0;
-	return qnn_look_mouse_bins[label];
-}
+#define QNN_ACTION_SWITCH_SLOTS 5
 
 #endif /* QNN_OBS_BUFFER_H */

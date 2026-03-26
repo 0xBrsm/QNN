@@ -9,10 +9,12 @@ This repo is centered on one training path: competitive BC warm start plus Sampl
 | Observation contract | token dict with `self`, `object`, `event`, and `spatial` tensors |
 | Policy | transformer trunk + GRU actor-critic |
 | PPO backend | Sample Factory 2.1.1 APPO |
-| Default profile | `combat-bot-multi` |
-| Wire format | v5 (see `token-spec.md`) |
-| Warm start | `assets/runs/live/best/best_model.pth` |
-| Scenario source | `quake_ai/rl/configs/combat_bot_scenarios.json` |
+| Run entry point | `runs/<name>/run.json` |
+| Wire format | v6 (see `token-spec.md`) |
+| Resume control | explicit `run.json.resume` |
+| Warm start | explicit `run.json.checkpoint_path` when PPO has no retained checkpoint to resume |
+| Scenario source | `runs/<name>/config/scenario.json` |
+| PPO artifact root | `run.json.output.checkpoints` directly, with only SF `checkpoint_p*` subdirs underneath |
 
 The old campaign and E1M1 lanes are gone from the supported surface.
 
@@ -20,8 +22,8 @@ The old campaign and E1M1 lanes are gone from the supported surface.
 
 - `overview.md` is the source of truth for architecture and observation layout.
 - `quake_ai.rl.training` is the promoted orchestration entry point.
-- `scripts/container.sh` is the promoted runtime wrapper for engine-backed work.
-- The public profile surface is only `combat-bot-multi[-verify]` plus `combat-bot-<scenario>[-verify]`.
+- `Training containers use `docker compose -f src/docker/compose.yaml`.
+- Every training and eval action is driven by a frozen run directory under `runs/`.
 
 ## Install
 
@@ -48,25 +50,15 @@ For AMD GPUs, use the training container instead of modifying the editor environ
 From the repo root:
 
 ```bash
-scripts/container.sh check
-scripts/container.sh shell
-scripts/container.sh run scripts/train.sh --bc
-scripts/container.sh run scripts/train.sh --bc --eval-bc
-scripts/container.sh run scripts/train.sh --ppo
-scripts/container.sh run scripts/train.sh --check
-```
-
-Direct invocation remains available:
-
-```bash
-python -m quake_ai.rl.training --profile combat-bot-multi --action plan --device gpu
-python -m quake_ai.rl.training --profile combat-bot-multi --action ppo --device gpu
-python -m quake_ai.rl.training --profile combat-bot-multi --action eval --device gpu
+docker compose -f src/docker/compose.yaml run --build trainer python -m quake_ai.utils.check_accelerator --device gpu
+docker compose -f src/docker/compose.yaml run --build trainer bash
+python scripts/init_run.py --name <run_name> --mode ppo --runtime-scale live --resume false --checkpoint-path <ckpt> --trainer src/quake_ai/rl/configs/trainer.json --scenario src/quake_ai/rl/configs/scenario.json --reward src/quake_ai/rl/configs/reward.json --machine src/quake_ai/rl/configs/machine.json --model src/quake_ai/rl/configs/model.json
+scripts/container.sh run scripts/train.sh runs/<run_name>
 ```
 
 ## Scenario Ladder
 
-The ladder is defined in `quake_ai/rl/configs/combat_bot_scenarios.json`.
+The ladder is defined in `quake_ai/rl/configs/scenario.json`.
 
 | Scenario | Map | Purpose |
 |----------|-----|---------|
@@ -75,22 +67,28 @@ The ladder is defined in `quake_ai/rl/configs/combat_bot_scenarios.json`.
 | `vertical-dm3` | `dm3` | vertical pickup timing and route choice |
 | `pressure-dm6` | `dm6` | spawn pressure and repeated explosive trades |
 
-`combat-bot-multi[-verify]` trains across all four scenarios in one run and emits per-scenario evaluation metrics.
+The frozen `scenario.json` in each run defines the full multi-scenario ladder and emits per-scenario evaluation metrics.
 
 ## Config Surface
 
-BC, PPO, and eval hyperparameters are inlined as module-level dicts in `quake_ai.rl.training` and overridable via `LiveProfile` override dicts. The only external config file is the scenario ladder:
+Training config is split by concern under `quake_ai/rl/configs/`:
 
-- `quake_ai/rl/configs/combat_bot_scenarios.json`
+- `machine.json`: flat run-mode machine config
+- `scenario.json`: flat run-mode scenario surface
+- `model.json`: flat architecture config
+- `trainer.json`: flat run-mode trainer config
+- `reward.json`: reward weights
+- `run.json`: run manifest template copied into each run directory, including explicit `resume`
 
-Sample Factory settings are built from the PPO dicts inside `quake_ai.rl.training`; there are no separate YAML entry points.
+See [`docs/training-config-matrix.md`](docs/training-config-matrix.md) for the required key matrix and the list of removed hidden defaults.
 
 ## Outputs That Matter
 
 | Path | Purpose |
 |------|---------|
-| `assets/runs/live/` | live training root (`ppo/`, `best/`, `eval/`) |
-| `assets/runs/competitive_bot_multi_verify/` | multi-scenario verify root |
+| `runs/<name>/checkpoints/` | BC outputs, PPO checkpoints, retained best checkpoint |
+| `runs/<name>/metrics/` | eval summaries and metrics |
+| `runs/<name>/logs/` | watcher and runtime logs |
 
 ## Related Docs
 

@@ -19,7 +19,6 @@ typedef struct qnn_nav_oracle_runtime_s qnn_nav_oracle_runtime_t;
 #define QNN_WORKER_MAX_OBJECT_ID 32
 #define QNN_WORKER_MAX_MAP_ID 64
 #define QNN_WORKER_MAX_MODEL_NAME 64
-#define QNN_WORKER_LOOK_NEUTRAL_LABEL 12
 #define QNN_WORKER_MAX_SOUNDS 16
 #define QNN_WORKER_MAX_SOUND_NAME 64
 #define QNN_WORKER_MAX_VISIBLE 64
@@ -107,15 +106,11 @@ typedef struct
 
 typedef struct
 {
-	int	move;
-	int	strafe;
-	int	look_yaw;
-	int	look_pitch;
-	int	look_yaw_count;
-	int	look_pitch_count;
+	float	move[2];
+	float	look[2];
 	int	fire;
 	int	jump;
-	int	weapon;
+	int	switch_slot;
 	int	recall[4];
 } qnn_worker_action_t;
 
@@ -184,6 +179,34 @@ typedef struct
 } qnn_worker_snapshot_t;
 
 extern qnn_worker_action_t qnn_worker_pending_action;
+
+/* ── Tick resampling gate ─────────────────────────────────────────
+ * Accumulates engine frames and emits at a fixed target Hz.
+ * Call qnn_resample_init() once, then qnn_resample_should_emit()
+ * every frame.  When it returns true, emit the token tick.
+ * Action labels are merged across the window: fire/jump use OR,
+ * look accumulates mouse-count deltas, move uses latest value.
+ */
+typedef struct
+{
+	int	target_hz;		/* 0 = disabled (emit every frame) */
+	float	target_dt;		/* 1.0 / target_hz */
+	float	accumulated_dt;		/* time since last emission */
+	int	fire_any;		/* OR accumulator for fire */
+	int	jump_any;		/* OR accumulator for jump */
+	float	look_yaw_degrees;	/* accumulated yaw delta (degrees) across window */
+	float	look_pitch_degrees;	/* accumulated pitch delta (degrees) across window */
+} qnn_resample_state_t;
+
+extern qnn_resample_state_t qnn_resample;
+
+#define QNN_DEMO_MOUSE_DEGREES_PER_COUNT 0.066f
+
+void qnn_resample_init(int target_hz);
+void qnn_resample_accumulate(const qnn_worker_snapshot_t *snapshot, float frame_dt);
+void qnn_resample_accumulate_look(float yaw_degrees, float pitch_degrees);
+qboolean qnn_resample_should_emit(void);
+void qnn_resample_apply_action_merge(qnn_worker_snapshot_t *snapshot);
 extern qnn_worker_sound_event_t qnn_worker_sound_buffer[QNN_WORKER_MAX_SOUNDS];
 extern int qnn_worker_sound_count;
 
@@ -197,7 +220,12 @@ extern char *cachedir;
 void qnn_worker_resolve_basedir(char *out, size_t out_size);
 int qnn_json_extract_int(const char *line, const char *key, int fallback);
 qboolean qnn_json_extract_string(const char *line, const char *key, char *out, size_t out_size);
+qboolean qnn_json_extract_vec2(const char *line, const char *key, float out[2]);
 qboolean qnn_json_extract_vec3(const char *line, const char *key, vec3_t out);
+float qnn_look_axis_from_mouse_count(int mouse_count);
+int qnn_mouse_count_from_look_axis(float axis);
+int qnn_switch_slot_from_weapon_id(int weapon_id);
+int qnn_switch_impulse_from_slot(int switch_slot, int weapons_owned);
 qboolean qnn_worker_prepare_map(const char *requested_map_id, char *error, size_t error_size);
 void qnn_worker_write_json_string(FILE *out, const char *text);
 void qnn_worker_write_error(const char *message);
@@ -222,17 +250,23 @@ void qnn_worker_training_reset_tick(void);
 void qnn_worker_write_training_extras_binary(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, qboolean reset_flag);
 int qnn_worker_handle_nav_query(const char *line);
 
-/* Map Quake weapon_id (1-8) to v5 weapon class (0-4).
+/* Map Quake weapon_id (1-8) to the canonical weapon class embedding (0-4).
    Axe/SG/SSG → 0 (Shotgun), NG/SNG → 1, GL → 2, RL → 3, LG → 4. */
+/* Weapon classes from weapon_id (bit-position of IT_ flag):
+   1=SG, 2=SSG, 3=NG, 4=SNG, 5=GL, 6=RL, 7=LG, 13=Axe.
+   Classes: 0=axe, 1=hitscan(SG/SSG), 2=nails(NG/SNG),
+            3=explosive(GL), 4=rocket(RL), 5=lightning(LG). */
+#define QNN_WEAPON_CLASS_COUNT 6
 static inline int qnn_weapon_class_from_id(int weapon_id)
 {
 	switch (weapon_id)
 	{
-	case 4: case 5: return 1;
-	case 6: return 2;
-	case 7: return 3;
-	case 8: return 4;
-	default: return 0;
+	case 1: case 2: return 1;  /* SG, SSG */
+	case 3: case 4: return 2;  /* NG, SNG */
+	case 5: return 3;          /* GL */
+	case 6: return 4;          /* RL */
+	case 7: return 5;          /* LG */
+	default: return 0;         /* Axe */
 	}
 }
 

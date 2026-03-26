@@ -27,16 +27,17 @@ try:
     from sample_factory.cfg.arguments import parse_full_cfg, parse_sf_args
     from sample_factory.envs.env_utils import register_env
     from sample_factory.train import make_runner
+    from sample_factory.algo.utils.context import global_model_factory
     # SF 2.1.x uses the model_factory pattern; 2.0.x had register_custom_encoder
     try:
         from sample_factory.model.encoder import register_custom_encoder as _register_custom_encoder
         _HAS_REGISTER_CUSTOM_ENCODER = True
     except ImportError:
-        from sample_factory.algo.utils.context import global_model_factory
         _HAS_REGISTER_CUSTOM_ENCODER = False
 except ImportError as exc:
     raise ImportError("sample-factory is required: pip install sample-factory>=2.0.0") from exc
 
+from quake_ai.ppo.quake_core import make_quake_core
 from quake_ai.ppo.quake_encoder import QuakeTransformerEncoder, make_quake_encoder
 from quake_ai.ppo.quake_env import make_quake_env
 from quake_ai.rl.metrics import effective_game_minutes_per_wall_minute
@@ -50,6 +51,10 @@ from quake_ai.utils.io import write_json
 
 def _make_quake_encoder(cfg: Any, obs_space: Any):
     return make_quake_encoder(cfg, obs_space)
+
+
+def _make_quake_core(cfg: Any, core_input_size: int):
+    return make_quake_core(cfg, core_input_size)
 
 
 def _allow_numpy_in_torch_load() -> None:
@@ -80,11 +85,6 @@ def _experiment_dir(cfg: Any) -> Path:
 
 def _summary_dir(cfg: Any) -> Path:
     return Path(getattr(cfg, "train_dir", ".")) / ".summary"
-
-
-def _has_existing_ppo_checkpoint(cfg: Any) -> bool:
-    checkpoint_dir = _experiment_dir(cfg) / "checkpoint_p0"
-    return any(checkpoint_dir.glob("*.pth"))
 
 
 _PPO_SCALAR_TAGS = {
@@ -142,7 +142,11 @@ def _read_latest_scalars(summary_dir: Path) -> Dict[str, Dict[str, float]]:
     return latest
 
 
-def _policy_summary_from_scalars(policy_id: int, latest_scalars: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+def _policy_summary_from_scalars(
+    cfg: Any,
+    policy_id: int,
+    latest_scalars: Dict[str, Dict[str, float]],
+) -> Dict[str, Any]:
     metrics: Dict[str, float] = {}
     steps_done = 0
     for tag, payload in latest_scalars.items():
@@ -163,8 +167,6 @@ def _policy_summary_from_scalars(policy_id: int, latest_scalars: Dict[str, Dict[
     deaths_mean = metrics.get("deaths_mean")
     if frags_mean is not None and deaths_mean is not None:
         metrics["frag_delta_mean"] = float(frags_mean - deaths_mean)
-    if deaths_mean is not None:
-        metrics["death_rate"] = float(deaths_mean)
 
     return {
         "policy_id": policy_id,
@@ -205,7 +207,7 @@ def write_ppo_stage_artifacts(cfg: Any, status: Any, runner: Any | None = None) 
                 continue
             policy_id = int(child.name)
             try:
-                policy_summary = _policy_summary_from_scalars(policy_id, _read_latest_scalars(child))
+                policy_summary = _policy_summary_from_scalars(cfg, policy_id, _read_latest_scalars(child))
                 if runner is not None:
                     env_steps = getattr(runner, "env_steps", {})
                     if isinstance(env_steps, dict):
@@ -319,20 +321,20 @@ def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
     multi-seed PBT (round-robin assignment from a list of checkpoints).
 
     Accepts either BC ``.npz`` (converted to SF format) or existing
-    SF ``.pth`` (copied directly).  Skipped when the experiment already
-    has checkpoints (i.e. resuming a prior run).
+    SF ``.pth`` (copied directly). The caller decides whether this launch
+    is resuming an existing PPO experiment or seeding a fresh one.
     """
     # Multi-seed takes priority over single-seed.
     multi_raw = str(getattr(cfg, "quake_bc_checkpoints", "") or "").strip()
     multi_ckpts = [p.strip() for p in multi_raw.split(",") if p.strip()] if multi_raw else []
     single_ckpt = str(getattr(cfg, "quake_bc_checkpoint", "") or "").strip()
 
-    if not multi_ckpts and not single_ckpt:
+    if bool(getattr(cfg, "quake_resume", False)):
+        print(f"[quake_ppo] Resume requested; using existing PPO checkpoints in {_experiment_dir(cfg)}")
         return None
 
-    if _has_existing_ppo_checkpoint(cfg):
-        print(f"[quake_ppo] Found existing PPO checkpoints in {_experiment_dir(cfg) / 'checkpoint_p0'}; skipping warm-start.")
-        return None
+    if not multi_ckpts and not single_ckpt:
+        raise RuntimeError("Fresh PPO runs require an explicit warm-start checkpoint")
 
     cfg.load_checkpoint_kind = "latest"
     exp_dir = _experiment_dir(cfg)
@@ -367,6 +369,7 @@ def register_quake_components() -> None:
     else:
         # SF 2.1+: register via model factory
         global_model_factory().register_encoder_factory(_make_quake_encoder)  # type: ignore[name-defined]
+    global_model_factory().register_model_core_factory(_make_quake_core)  # type: ignore[name-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -377,50 +380,85 @@ def register_quake_components() -> None:
 def add_quake_cli_args(parser: Any) -> None:
     """Add Quake-specific CLI arguments to an SF argument parser."""
     # Environment
-    parser.add_argument("--quake_executable", type=str, default="assets/bin/quake_worker",
+    parser.add_argument("--quake_executable", type=str, default=None,
                         help="Path to the Quake worker binary")
-    parser.add_argument("--quake_basedir", type=str, default="",
+    parser.add_argument("--quake_basedir", type=str, default=None,
                         help="QUAKE_BASEDIR — root directory containing id1/")
-    parser.add_argument("--quake_native_workdir", type=str, default="",
+    parser.add_argument("--quake_native_workdir", type=str, default=None,
                         help="Working directory for Quake processes")
-    parser.add_argument("--quake_map_id", type=str, default="procgen",
-                        help="Map name for all workers — 'procgen' (default) generates a unique map each episode")
-    parser.add_argument("--quake_max_steps_per_episode", type=int, default=1024,
+    parser.add_argument("--quake_map_id", type=str, default=None,
+                        help="Map name for all workers")
+    parser.add_argument("--quake_max_steps_per_episode", type=int, default=None,
                         help="Episode step limit")
-    parser.add_argument("--quake_fixed_tick_hz", type=int, default=20,
+    parser.add_argument("--quake_fixed_tick_hz", type=int, default=None,
                         help="Quake tick rate (ticks per second)")
-    parser.add_argument("--quake_mode", type=str, default="pvp",
+    parser.add_argument("--quake_mode", type=str, default=None,
                         help="Reward mode passed to NativeWorldEnv")
-    parser.add_argument("--quake_seed", type=int, default=17,
+    parser.add_argument("--quake_seed", type=int, default=None,
                         help="Base RNG seed; each worker adds its env_id")
     # Native args / options encoded as JSON strings
-    parser.add_argument("--quake_native_args_json", type=str, default='["-game","frikbotnex_train"]',
+    parser.add_argument("--quake_native_args_json", type=str, default=None,
                         help='JSON array of extra Quake CLI args, e.g. ["-game","frikbotnex_train"]')
-    parser.add_argument("--quake_options_json", type=str, default="",
+    parser.add_argument("--quake_options_json", type=str, default=None,
                         help="JSON object of Quake server options, e.g. {\"skill\":0}")
+    parser.add_argument("--quake_procgen_json", type=str, default=None,
+                        help="JSON object of procgen settings for single-map procgen runs")
     # Multi-scenario support (Step 8)
-    parser.add_argument("--quake_scenario_config_json", type=str, default="",
+    parser.add_argument("--quake_scenario_config_json", type=str, default=None,
                         help="JSON array of scenario dicts with map_id/native_args/options")
-    parser.add_argument("--quake_record_demos", type=int, default=1,
-                        help="Record .dem files during training (1=on, 0=off); best episodes saved as best.dem")
+    parser.add_argument("--reward_json_path", type=str, default=None,
+                        help="Path to flat reward.json with reward weights")
     # Encoder architecture
-    parser.add_argument("--quake_trunk_hidden", type=int, default=128,
-                        help="Encoder output dimension (feeds GRU input)")
-    parser.add_argument("--quake_d_model", type=int, default=64,
+    parser.add_argument("--quake_d_model", type=int, default=None,
                         help="Transformer token dimension (transformer only)")
-    parser.add_argument("--quake_n_heads", type=int, default=2,
+    parser.add_argument("--quake_n_heads", type=int, default=None,
                         help="Number of attention heads (transformer only)")
-    parser.add_argument("--quake_n_layers", type=int, default=2,
+    parser.add_argument("--quake_readout", type=str, default=None,
+                        help="Transformer readout token: cls or self")
+    parser.add_argument("--quake_n_layers", type=int, default=None,
                         help="Number of transformer blocks (transformer only)")
-    parser.add_argument("--quake_ffn_dim", type=int, default=256,
+    parser.add_argument("--quake_ffn_dim", type=int, default=None,
                         help="FFN inner dimension (transformer only)")
-    parser.add_argument("--quake_attn_dropout", type=float, default=0.0,
+    parser.add_argument("--quake_attn_dropout", type=float, default=None,
                         help="Attention dropout rate (transformer only)")
+    parser.add_argument("--quake_action_history_tokens", type=int, default=None,
+                        help="Number of action history tokens fed to transformer")
     # BC warm-start
-    parser.add_argument("--quake_bc_checkpoint", type=str, default="",
+    parser.add_argument("--quake_bc_checkpoint", type=str, default=None,
                         help="Path to BC/PPO checkpoint for warm-start initialisation")
-    parser.add_argument("--quake_bc_checkpoints", type=str, default="",
+    parser.add_argument("--quake_bc_checkpoints", type=str, default=None,
                         help="Comma-separated BC/PPO checkpoints for multi-seed PBT warm-start")
+
+
+def _validate_quake_cfg(cfg: Any) -> None:
+    required_attrs = (
+        "quake_executable",
+        "quake_basedir",
+        "quake_native_workdir",
+        "quake_map_id",
+        "quake_max_steps_per_episode",
+        "quake_fixed_tick_hz",
+        "quake_mode",
+        "quake_seed",
+        "quake_native_args_json",
+        "quake_options_json",
+        "quake_scenario_config_json",
+        "quake_d_model",
+        "quake_n_heads",
+        "quake_readout",
+        "quake_n_layers",
+        "quake_ffn_dim",
+        "quake_attn_dropout",
+        "quake_action_history_tokens",
+        "reward_json_path",
+    )
+    missing = [name for name in required_attrs if getattr(cfg, name, None) is None]
+    if missing:
+        raise RuntimeError("Missing required Quake PPO config fields: " + ", ".join(sorted(missing)))
+    if not str(cfg.reward_json_path).strip():
+        raise RuntimeError("Quake PPO runs require reward_json_path")
+    if str(cfg.quake_map_id) == "procgen" and not (cfg.quake_scenario_config_json or cfg.quake_procgen_json):
+        raise RuntimeError("Procgen PPO runs require either quake_scenario_config_json or quake_procgen_json")
 
 
 # ---------------------------------------------------------------------------
@@ -429,62 +467,68 @@ def add_quake_cli_args(parser: Any) -> None:
 
 
 def build_ppo_cfg(
-    scenario: str = "procgen",
-    num_workers: int = 8,
-    num_envs_per_worker: int = 1,
-    worker_num_splits: int = 1,
-    rollout: int = 256,
-    total_env_steps: int = 10_000_000,
-    output_dir: str = "assets/runs/ppo",
-    experiment: str = "quake_combat",
-    executable: str = "assets/bin/quake_worker",
-    basedir: str = "",
-    native_workdir: str = "",
-    native_args_json: str = '["-game","frikbotnex_train"]',
-    options_json: str = "",
-    scenario_config_json: str = "",
-    mode: str = "pvp",
-    max_steps_per_episode: int = 1024,
-    fixed_tick_hz: int = 20,
-    seed: int = 17,
-    device: str = "gpu",
-    init_checkpoint: str = "",
-    init_checkpoints: Optional[List[str]] = None,
-    trunk_hidden: int = 128,
-    gru_hidden: int = 128,
-    use_gru: bool = True,
-    d_model: int = 64,
-    n_heads: int = 2,
-    n_layers: int = 2,
-    ffn_dim: int = 256,
-    attn_dropout: float = 0.0,
-    ppo_epochs: int = 2,
-    lr: float = 0.00025,
-    entropy_coef: float = 0.002,
-    bc_kl_coef: float = 0.05,
-    clip_ratio: float = 0.2,
-    gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    max_grad_norm: float = 0.5,
-    value_coef: float = 0.5,
-    minibatch_size: int = 0,
+    *,
+    scenario: str,
+    num_workers: int,
+    num_envs_per_worker: int,
+    worker_num_splits: int,
+    rollout: int,
+    total_env_steps: int,
+    output_dir: str,
+    experiment: str,
+    executable: str,
+    basedir: str,
+    native_workdir: str,
+    native_args_json: str,
+    options_json: str,
+    procgen_json: str,
+    scenario_config_json: str,
+    mode: str,
+    max_steps_per_episode: int,
+    fixed_tick_hz: int,
+    seed: int,
+    device: str,
+    trunk_hidden: int,
+    gru_hidden: int,
+    use_gru: bool,
+    d_model: int,
+    n_heads: int,
+    readout: str,
+    n_layers: int,
+    ffn_dim: int,
+    action_history_tokens: int,
+    attn_dropout: float,
+    ppo_epochs: int,
+    lr: float,
+    entropy_coef: float,
+    bc_kl_coef: float,
+    clip_ratio: float,
+    gamma: float,
+    gae_lambda: float,
+    max_grad_norm: float,
+    value_coef: float,
+    minibatch_size: int,
+    policy_workers_per_policy: int = 1,
     max_policy_lag: int = 30,
     with_wandb: bool = False,
     # Population-Based Training
-    with_pbt: bool = False,
-    num_policies: int = 1,
-    pbt_period_env_steps: int = 5_000_000,
-    pbt_start_mutation: int = 20_000_000,
-    pbt_replace_fraction: float = 0.3,
-    pbt_mutation_rate: float = 0.15,
-    pbt_optimize_gamma: bool = False,
-    record_demos: bool = True,
+    with_pbt: bool,
+    num_policies: int,
+    pbt_period_env_steps: int,
+    pbt_start_mutation: int,
+    pbt_replace_fraction: float,
+    pbt_mutation_rate: float,
+    pbt_optimize_gamma: bool,
+    reward_json_path: str,
+    init_checkpoint: str = "",
+    init_checkpoints: Optional[List[str]] = None,
+    resume: bool = False,
     extra_argv: Optional[List[str]] = None,
 ) -> Any:
     """Build a PPO cfg namespace without command-line parsing.
 
-    Maps PPOConfig fields to their Sample Factory equivalents so training.py can
-    call PPO programmatically with the same hyperparameters it used for run_ppo.
+    Maps explicit PPO config fields to their Sample Factory equivalents so
+    training.py can call PPO programmatically with the same resolved config.
     """
     register_quake_components()
 
@@ -514,7 +558,13 @@ def build_ppo_cfg(
         f"--value_loss_coeff={value_coef}",
         f"--exploration_loss_coeff={entropy_coef}",
         f"--kl_loss_coeff={bc_kl_coef}",
+        "--adaptive_stddev=False",
+        "--continuous_tanh_scale=1.0",
+        "--initial_stddev=0.2",
+        f"--policy_workers_per_policy={policy_workers_per_policy}",
         f"--max_policy_lag={max_policy_lag}",
+        "--keep_checkpoints=10",
+        "--save_milestones_sec=600",
         f"--with_wandb={'True' if with_wandb else 'False'}",
         f"--experiment={experiment}",
         f"--train_dir={output_dir}",
@@ -530,19 +580,21 @@ def build_ppo_cfg(
         f"--quake_mode={mode}",
         f"--quake_seed={seed}",
         f"--quake_native_args_json={native_args_json}",
-        f"--quake_trunk_hidden={trunk_hidden}",
         f"--quake_d_model={d_model}",
         f"--quake_n_heads={n_heads}",
+        f"--quake_readout={readout}",
         f"--quake_n_layers={n_layers}",
         f"--quake_ffn_dim={ffn_dim}",
         f"--quake_attn_dropout={attn_dropout}",
-        f"--quake_record_demos={1 if record_demos else 0}",
+        f"--quake_action_history_tokens={action_history_tokens}",
     ]
 
-    if options_json:
-        argv.append(f"--quake_options_json={options_json}")
-    if scenario_config_json:
-        argv.append(f"--quake_scenario_config_json={scenario_config_json}")
+    argv.append(f"--quake_options_json={options_json}")
+    argv.append(f"--quake_procgen_json={procgen_json}")
+    argv.append(f"--quake_scenario_config_json={scenario_config_json}")
+
+    # Reward weights
+    argv.append(f"--reward_json_path={reward_json_path}")
 
     # Population-Based Training
     argv.append(f"--num_policies={num_policies}")
@@ -567,6 +619,8 @@ def build_ppo_cfg(
     parser, _ = parse_sf_args(argv=argv)
     add_quake_cli_args(parser)
     cfg = parse_full_cfg(parser, argv=argv)
+    cfg.quake_resume = bool(resume)
+    _validate_quake_cfg(cfg)
     return cfg
 
 
@@ -646,6 +700,7 @@ def main() -> None:
     parser, _ = parse_sf_args()
     add_quake_cli_args(parser)
     cfg = parse_full_cfg(parser)
+    _validate_quake_cfg(cfg)
     _ensure_warm_start_checkpoint(cfg)
 
     cfg.lr_schedule = "linear_decay"

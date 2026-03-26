@@ -1,23 +1,36 @@
-"""Run reporting, operational notes, and metric comparisons."""
+"""Run reporting helpers for the run-dir training workflow."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
-from quake_ai.rl.planning import (
-    GIB,
-    _profile_output_root,
-    _safe_read_json,
-    _stage_output_dir,
-)
 from quake_ai.rl.metrics import EVAL_REPORT_METRICS, PPO_REPORT_METRICS, report_metric_key
-from quake_ai.rl.profiles import PROFILES, LiveProfile
+from quake_ai.utils.io import safe_read_json as _safe_read_json
 from quake_ai.utils.io import write_json
 
-REPORT_STAGES = ("bc", "eval_bc", "ppo", "best", "eval")
+REPORT_STAGES = ("collect", "bc", "ppo", "best", "eval", "eval_bc")
+
+
+def _assert_supported_layout(run_root: Path) -> None:
+    legacy_dir = run_root / "checkpoints" / "ppo"
+    if legacy_dir.exists():
+        raise RuntimeError(
+            f"Legacy PPO checkpoint layout is unsupported: {legacy_dir}. "
+            "PPO artifacts now live directly under run.json.output.checkpoints."
+        )
+
+
+def _stage_dir(run_root: Path, stage: str) -> Path:
+    if stage in {"bc", "ppo"}:
+        return run_root / "checkpoints"
+    if stage in {"collect", "best"}:
+        return run_root / "checkpoints" / stage
+    if stage in {"eval", "eval_bc"}:
+        return run_root / "metrics" / stage
+    raise RuntimeError(f"Unsupported report stage: {stage}")
 
 
 def _collect_existing_files(path: Path) -> list[Path]:
@@ -34,7 +47,7 @@ def _mtime_window_seconds(paths: list[Path]) -> float | None:
     return float(max(mtimes) - min(mtimes))
 
 
-def _first_device_summary(runtime: Mapping[str, Any]) -> Dict[str, Any]:
+def _first_device_summary(runtime: Mapping[str, Any]) -> dict[str, Any]:
     devices = runtime.get("devices")
     if not isinstance(devices, list) or not devices:
         return {}
@@ -48,45 +61,19 @@ def _device_label(runtime: Mapping[str, Any]) -> str:
     device = _first_device_summary(runtime)
     if not device:
         return str(runtime.get("resolved_device", "unknown"))
-    name = str(device.get("name", runtime.get("resolved_device", "unknown")))
-    total_memory = int(device.get("total_memory", 0))
-    if total_memory <= 0:
-        return name
-    return f"{name} ({round(total_memory / GIB, 2)} GiB)"
+    return str(device.get("name", runtime.get("resolved_device", "unknown")))
 
 
-def _load_existing_runtime_context(profile: LiveProfile) -> tuple[Dict[str, Any], Dict[str, Any], Path]:
-    plan_path = Path(profile.plan_path)
-    payload = _safe_read_json(plan_path) or {}
-    runtime = payload.get("runtime", {})
-    plan = payload.get("plan", {})
-    return (
-        dict(runtime) if isinstance(runtime, Mapping) else {},
-        dict(plan) if isinstance(plan, Mapping) else {},
-        plan_path,
-    )
-
-
-def _stage_report(profile: LiveProfile, stage: str) -> Dict[str, Any]:
-    stage_dir = _stage_output_dir(profile, stage)
-    stage_key = stage
+def _stage_report(run_root: Path, stage: str) -> dict[str, Any]:
+    stage_dir = _stage_dir(run_root, stage)
     files = _collect_existing_files(stage_dir)
-    if stage == "ppo" and not files:
-        legacy_stage_dir = _stage_output_dir(profile, "sf")
-        legacy_files = _collect_existing_files(legacy_stage_dir)
-        if legacy_files:
-            stage_dir = legacy_stage_dir
-            stage_key = "sf"
-            files = legacy_files
 
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "stage": stage,
         "output_dir": str(stage_dir),
         "status": "present" if files else "missing",
         "files": [str(path) for path in files],
     }
-    if stage_key != stage:
-        report["legacy_stage"] = stage_key
 
     if stage == "collect":
         manifest = _safe_read_json(stage_dir / "collect_manifest.json")
@@ -98,8 +85,8 @@ def _stage_report(profile: LiveProfile, stage: str) -> Dict[str, Any]:
         manifest_name = "eval_manifest.json"
         summary_name = "eval_summary.json"
     else:
-        manifest_name = f"{stage_key}_manifest.json"
-        summary_name = f"{stage_key}_summary.json"
+        manifest_name = f"{stage}_manifest.json"
+        summary_name = f"{stage}_summary.json"
     manifest = _safe_read_json(stage_dir / manifest_name)
     summary = _safe_read_json(stage_dir / summary_name)
     if manifest is not None:
@@ -133,9 +120,9 @@ def _first_metric(*values: float | None) -> float | None:
 
 def _eval_metric(report: Mapping[str, Any], mode: str, key: str) -> float | None:
     return _first_metric(
-        _metric(report, "summary", "modes", mode, key)
-        , _metric(report, "manifest", "metrics", "modes", mode, key)
-        , _metric(report, "model_card", "evaluation", "modes", mode, key)
+        _metric(report, "summary", "modes", mode, key),
+        _metric(report, "manifest", "metrics", "modes", mode, key),
+        _metric(report, "model_card", "evaluation", "modes", mode, key),
     )
 
 
@@ -153,260 +140,89 @@ def _stage_summary_metric(report: Mapping[str, Any], stage: str, key: str) -> fl
     )
 
 
-def _comparison_metric_payload(current: float | None, baseline: float | None) -> Dict[str, float] | None:
-    if current is None or baseline is None:
-        return None
-    return {
-        "current": float(current),
-        "baseline": float(baseline),
-        "delta": float(current - baseline),
-    }
+def _format_operational_note(note: Mapping[str, Any]) -> str:
+    lines = [
+        f"generated_at_utc: {note.get('generated_at_utc', '')}",
+        f"run_root: {note.get('run_root', '')}",
+        f"action: {note.get('action', '')}",
+        f"runtime_scale: {note.get('runtime_scale', '')}",
+        f"device: {note.get('device', '')}",
+        f"elapsed_seconds: {note.get('elapsed_seconds', '')}",
+        "",
+        "summary:",
+        f"  {note.get('summary', '')}",
+    ]
+    metrics = note.get("metrics", {})
+    if isinstance(metrics, Mapping) and metrics:
+        lines.append("")
+        lines.append("metrics:")
+        for key in sorted(metrics):
+            value = metrics[key]
+            if isinstance(value, (int, float)):
+                lines.append(f"  {key}: {value}")
+    return "\n".join(lines) + "\n"
 
 
-def _profile_comparison(current_stage_reports: Mapping[str, Mapping[str, Any]], baseline_profile: LiveProfile) -> Dict[str, Any]:
-    baseline_reports = {stage: _stage_report(baseline_profile, stage) for stage in REPORT_STAGES}
-    metrics: Dict[str, Dict[str, float]] = {}
-    for stage, keys in (("ppo", PPO_REPORT_METRICS), ("eval", EVAL_REPORT_METRICS)):
-        for key in keys:
-            payload = _comparison_metric_payload(
-                _stage_summary_metric(current_stage_reports.get(stage, {}), stage, key),
-                _stage_summary_metric(baseline_reports.get(stage, {}), stage, key),
-            )
-            if payload is not None:
-                metrics[f"{stage}_{key}"] = payload
-    return {
-        "profile": baseline_profile.name,
-        "profile_note": baseline_profile.profile_note,
-        "stage_status": {stage: baseline_reports[stage]["status"] for stage in REPORT_STAGES},
-        "metrics": metrics,
-    }
-
-
-def _intra_profile_baseline_comparison(stage_reports: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
-    metrics: Dict[str, Dict[str, float]] = {}
-    for key in EVAL_REPORT_METRICS:
-        payload = _comparison_metric_payload(
-            _stage_summary_metric(stage_reports.get("eval", {}), "eval", key),
-            _stage_summary_metric(stage_reports.get("eval_bc", {}), "eval_bc", key),
-        )
-        if payload is not None:
-            metrics[key] = payload
-    return {
-        "baseline": "eval_bc",
-        "metrics": metrics,
-    }
-
-
-def _build_operational_note(
+def write_run_report(
     *,
-    profile: LiveProfile,
+    run_root: str | Path,
     action: str,
+    runtime_scale: str,
     runtime: Mapping[str, Any],
     plan: Mapping[str, Any],
-    stage_reports: Mapping[str, Mapping[str, Any]],
+    results: Mapping[str, Any],
     stage_timings: Mapping[str, float],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
+    root = Path(run_root)
+    _assert_supported_layout(root)
+    stage_reports = {stage: _stage_report(root, stage) for stage in REPORT_STAGES}
+
     all_files: list[Path] = []
     for stage in REPORT_STAGES:
-        all_files.extend(_collect_existing_files(_stage_output_dir(profile, stage)))
+        all_files.extend(_collect_existing_files(_stage_dir(root, stage)))
 
     elapsed_source = "measured" if stage_timings else "artifact_mtime_window"
     elapsed_seconds = sum(stage_timings.values()) if stage_timings else _mtime_window_seconds(all_files)
 
-    worker_count = int(plan.get("num_envs", 0) or 0)
-    rollout_steps = int(plan.get("rollout_steps", 0) or 0)
-    bc_batch_size = int(plan.get("bc_batch_size", 0) or 0)
-    eval_episodes = int(plan.get("eval_episodes", 0) or 0)
-
-    utilization_parts = [f"backend={runtime.get('backend', 'unknown')}", f"device={_device_label(runtime)}"]
-    if worker_count > 0:
-        utilization_parts.append(f"ppo_workers={worker_count}")
-    if rollout_steps > 0:
-        utilization_parts.append(f"rollout_steps={rollout_steps}")
-    if bc_batch_size > 0:
-        utilization_parts.append(f"bc_batch_size={bc_batch_size}")
-    if eval_episodes > 0:
-        utilization_parts.append(f"eval_episodes={eval_episodes}")
-    utilization_parts.append("direct accelerator utilization sampling not captured")
-
-    ppo_report = stage_reports.get("ppo", {})
-    best_report = stage_reports.get("best", {})
-    eval_report = stage_reports.get("eval", {})
-    eval_bc_report = stage_reports.get("eval_bc", {})
-    bc_report = stage_reports.get("bc", {})
-    baseline_compare = _intra_profile_baseline_comparison(stage_reports)
-
-    instability_notes: list[str] = []
-    if best_report.get("status") == "present":
-        instability_notes.append("PPO completed and wrote a checkpoint without a recorded worker crash.")
-    eval_greedy_stuck_rate = _stage_summary_metric(eval_report, "eval", "stuck_rate")
-    if eval_greedy_stuck_rate is not None and eval_greedy_stuck_rate >= 0.9:
-        instability_notes.append("Evaluation reported a high greedy stuck_rate; this looks like policy quality, not a worker crash.")
-    bc_greedy_return = _metric(eval_bc_report, "manifest", "metrics", "modes", "greedy", "mean_episode_return")
-    ppo_greedy_return = _metric(eval_report, "manifest", "metrics", "modes", "greedy", "mean_episode_return")
-    if bc_greedy_return is not None and ppo_greedy_return is not None:
-        delta = ppo_greedy_return - bc_greedy_return
-        if delta > 0.0:
-            instability_notes.append(f"PPO improved greedy return over the BC checkpoint by {delta:.3f}.")
-        elif delta < 0.0:
-            instability_notes.append(f"PPO regressed greedy return relative to the BC checkpoint by {abs(delta):.3f}.")
-        else:
-            instability_notes.append("PPO matched the BC checkpoint on greedy return in this retained run.")
-    damage_delta = baseline_compare["metrics"].get("damage_dealt_mean")
-    if isinstance(damage_delta, Mapping):
-        instability_notes.append(
-            f"Greedy evaluation damage_dealt_mean delta versus eval_bc: {float(damage_delta.get('delta', 0.0)):.3f}."
-        )
-    if not instability_notes:
-        instability_notes.append("No instability was recorded in the retained artifacts.")
+    metrics: dict[str, float] = {}
+    for stage, keys in (("ppo", PPO_REPORT_METRICS), ("eval", EVAL_REPORT_METRICS)):
+        for key in keys:
+            value = _stage_summary_metric(stage_reports.get(stage, {}), stage, key)
+            if value is not None:
+                metrics[f"{stage}_{key}"] = value
 
     note = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "profile": profile.name,
-        "profile_group": profile.profile_group,
-        "profile_note": profile.profile_note,
-        "scenario_id": profile.scenario_id,
-        "retained_role": profile.retained_role,
+        "run_root": str(root),
         "action": action,
-        "worker_count": worker_count,
+        "runtime_scale": runtime_scale,
+        "device": _device_label(runtime),
         "elapsed_seconds": elapsed_seconds,
         "elapsed_source": elapsed_source,
-        "runtime_backend": str(runtime.get("backend", "unknown")),
-        "device": _device_label(runtime),
-        "rough_utilization": "; ".join(utilization_parts),
-        "instability_observations": instability_notes,
-        "determinism_drift": "This run did not record in-process drift metrics; explicit drift coverage lives in the asset-gated parity and churn tests.",
-        "metrics": {
-            "bc_test_accuracy": _metric(bc_report, "summary", "test_accuracy") or _metric(bc_report, "manifest", "metrics", "test_accuracy"),
-            "eval_bc_greedy_return": _metric(eval_bc_report, "manifest", "metrics", "modes", "greedy", "mean_episode_return"),
-            "eval_bc_greedy_stuck_rate": _stage_summary_metric(eval_bc_report, "eval_bc", "stuck_rate"),
-            "eval_bc_greedy_accuracy": _stage_summary_metric(eval_bc_report, "eval_bc", "accuracy"),
-            "eval_bc_greedy_damage_per_death_mean": _stage_summary_metric(eval_bc_report, "eval_bc", "damage_per_death_mean"),
-            "eval_bc_greedy_blind_fire_rate": _stage_summary_metric(eval_bc_report, "eval_bc", "blind_fire_rate"),
-            "eval_bc_sampled_return": _metric(eval_bc_report, "manifest", "metrics", "modes", "sampled", "mean_episode_return"),
-            "eval_bc_sampled_stuck_rate": _metric(eval_bc_report, "manifest", "metrics", "modes", "sampled", "stuck_rate"),
-            "ppo_steps_done": _metric(ppo_report, "summary", "steps_done") or _metric(ppo_report, "manifest", "metrics", "steps_done"),
-            "ppo_effective_game_minutes_per_wall_minute": _stage_summary_metric(
-                ppo_report, "ppo", "effective_game_minutes_per_wall_minute"
-            ),
-            "ppo_death_rate": _stage_summary_metric(ppo_report, "ppo", "death_rate"),
-            "ppo_frag_delta_mean": _stage_summary_metric(ppo_report, "ppo", "frag_delta_mean"),
-            "ppo_damage_dealt_mean": _stage_summary_metric(ppo_report, "ppo", "damage_dealt_mean"),
-            "ppo_hit_count_mean": _stage_summary_metric(ppo_report, "ppo", "hit_count_mean"),
-            "ppo_shots_fired_mean": _stage_summary_metric(ppo_report, "ppo", "shots_fired_mean"),
-            "ppo_accuracy": _stage_summary_metric(ppo_report, "ppo", "accuracy"),
-            "ppo_damage_per_death_mean": _stage_summary_metric(ppo_report, "ppo", "damage_per_death_mean"),
-            "ppo_blind_fire_rate": _stage_summary_metric(ppo_report, "ppo", "blind_fire_rate"),
-            "ppo_reward_total_mean": _stage_summary_metric(ppo_report, "ppo", "reward_total_mean"),
-            "ppo_reward_frags_mean": _stage_summary_metric(ppo_report, "ppo", "reward_frags_mean"),
-            "ppo_reward_deaths_mean": _stage_summary_metric(ppo_report, "ppo", "reward_deaths_mean"),
-            "ppo_reward_ehp_mean": _stage_summary_metric(ppo_report, "ppo", "reward_ehp_mean"),
-            "ppo_reward_edp_mean": _stage_summary_metric(ppo_report, "ppo", "reward_edp_mean"),
-            "ppo_stuck_rate": _stage_summary_metric(ppo_report, "ppo", "stuck_rate"),
-            "ppo_episodes_completed": _metric(ppo_report, "summary", "episodes_completed")
-            or _metric(ppo_report, "manifest", "metrics", "episodes_completed"),
-            "eval_greedy_return": _stage_summary_metric(eval_report, "eval", "mean_episode_return"),
-            "eval_greedy_stuck_rate": _stage_summary_metric(eval_report, "eval", "stuck_rate"),
-            "eval_greedy_death_rate": _stage_summary_metric(eval_report, "eval", "death_rate"),
-            "eval_greedy_frag_delta_mean": _stage_summary_metric(eval_report, "eval", "frag_delta_mean"),
-            "eval_greedy_damage_dealt_mean": _stage_summary_metric(eval_report, "eval", "damage_dealt_mean"),
-            "eval_greedy_hit_count_mean": _stage_summary_metric(eval_report, "eval", "hit_count_mean"),
-            "eval_greedy_shots_fired_mean": _stage_summary_metric(eval_report, "eval", "shots_fired_mean"),
-            "eval_greedy_accuracy": _stage_summary_metric(eval_report, "eval", "accuracy"),
-            "eval_greedy_damage_per_death_mean": _stage_summary_metric(eval_report, "eval", "damage_per_death_mean"),
-            "eval_greedy_blind_fire_rate": _stage_summary_metric(eval_report, "eval", "blind_fire_rate"),
-            "eval_greedy_reward_total_mean": _stage_summary_metric(eval_report, "eval", "reward_total_mean"),
-            "eval_sampled_return": _metric(eval_report, "manifest", "metrics", "modes", "sampled", "mean_episode_return"),
-            "eval_sampled_stuck_rate": _metric(eval_report, "manifest", "metrics", "modes", "sampled", "stuck_rate"),
-            "eval_sampled_death_rate": _metric(eval_report, "manifest", "metrics", "modes", "sampled", "death_rate"),
-            "eval_sampled_frag_delta_mean": _metric(eval_report, "manifest", "metrics", "modes", "sampled", "frag_delta_mean"),
-        },
+        "summary": "Run report generated from retained artifacts.",
+        "metrics": metrics,
+        "plan": dict(plan),
     }
-    return note
-
-
-def _format_operational_note(note: Mapping[str, Any]) -> str:
-    elapsed_seconds = note.get("elapsed_seconds")
-    elapsed_text = "unknown"
-    if isinstance(elapsed_seconds, (int, float)):
-        elapsed_text = f"{elapsed_seconds:.2f}s"
-
-    lines = [
-        "# Live Training Operational Note",
-        "",
-        f"- Profile: {note.get('profile', 'unknown')}",
-        f"- Scenario: {note.get('scenario_id', 'n/a')}",
-        f"- Note: {note.get('profile_note', '') or 'n/a'}",
-        f"- Action: {note.get('action', 'unknown')}",
-        f"- Worker count: {note.get('worker_count', 0)}",
-        f"- Elapsed time: {elapsed_text} ({note.get('elapsed_source', 'unknown')})",
-        f"- Runtime: {note.get('runtime_backend', 'unknown')} on {note.get('device', 'unknown')}",
-        f"- Rough utilization: {note.get('rough_utilization', 'unknown')}",
-        "- Stability observations:",
-    ]
-    for item in note.get("instability_observations", []):
-        lines.append(f"  - {item}")
-    lines.append(f"- Determinism drift: {note.get('determinism_drift', 'unknown')}")
-
-    metrics = note.get("metrics", {})
-    if isinstance(metrics, Mapping):
-        rendered = [f"{key}={value}" for key, value in metrics.items() if value is not None]
-        if rendered:
-            lines.append(f"- Metrics: {', '.join(rendered)}")
-
-    return "\n".join(lines) + "\n"
-
-
-def _write_run_report(
-    *,
-    profile: LiveProfile,
-    action: str,
-    runtime: Mapping[str, Any],
-    plan: Mapping[str, Any],
-    plan_path: Path,
-    results: Mapping[str, Any],
-    stage_timings: Mapping[str, float],
-) -> Dict[str, Any]:
-    output_root = _profile_output_root(profile)
-    stage_reports = {stage: _stage_report(profile, stage) for stage in REPORT_STAGES}
-    comparison_reports = {
-        baseline_name: _profile_comparison(stage_reports, PROFILES[baseline_name])
-        for baseline_name in profile.comparison_profiles
-        if baseline_name in PROFILES
-    }
-    baseline_compare = _intra_profile_baseline_comparison(stage_reports)
-    note = _build_operational_note(
-        profile=profile,
-        action=action,
-        runtime=runtime,
-        plan=plan,
-        stage_reports=stage_reports,
-        stage_timings=stage_timings,
-    )
 
     report = {
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "profile": profile.name,
+        "generated_at_utc": note["generated_at_utc"],
+        "run_root": str(root),
         "action": action,
-        "plan_path": str(plan_path),
+        "runtime_scale": runtime_scale,
         "runtime": dict(runtime),
         "plan": dict(plan),
-        "training_focus": "pvp_transformer_ppo",
         "results": dict(results),
-        "stage_timings_seconds": {str(key): float(value) for key, value in stage_timings.items()},
-        "stages": stage_reports,
-        "baseline_comparison": baseline_compare,
-        "comparison_profiles": comparison_reports,
+        "stage_reports": stage_reports,
+        "metrics": metrics,
         "operational_note": note,
     }
 
-    report_path = output_root / "live_run_report.json"
-    note_json_path = output_root / "operational_note.json"
-    note_md_path = output_root / "operational_note.md"
+    report_path = root / "live_run_report.json"
+    note_json_path = root / "operational_note.json"
+    note_md_path = root / "operational_note.md"
     write_json(report_path, report)
     write_json(note_json_path, note)
     note_md_path.write_text(_format_operational_note(note), encoding="utf-8")
-
     return {
         "report": report,
         "report_path": str(report_path),

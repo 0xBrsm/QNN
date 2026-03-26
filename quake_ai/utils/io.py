@@ -38,6 +38,14 @@ def write_json(path: str | Path, data: Mapping[str, Any]) -> None:
         handle.write("\n")
 
 
+def safe_read_json(path: str | Path) -> Dict[str, Any] | None:
+    """Read JSON if the file exists, otherwise return None."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    return read_json(p)
+
+
 def load_config(path: str | Path) -> Dict[str, Any]:
     """Load config from JSON-compatible YAML file.
 

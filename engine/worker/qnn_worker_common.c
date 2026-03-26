@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 /* ── shared globals ──────────────────────────────────────────────── */
 
 qnn_worker_map_state_t qnn_worker_map_state;
+qnn_resample_state_t qnn_resample;
 char qnn_worker_basedir_storage[MAX_OSPATH] = ".";
 
 qboolean isDedicated;
@@ -318,6 +320,48 @@ qboolean qnn_json_extract_string(const char *line, const char *key, char *out, s
 	return true;
 }
 
+qboolean qnn_json_extract_vec2(const char *line, const char *key, float out[2])
+{
+	const char *match;
+	const char *colon;
+	const char *cursor;
+	char *endptr;
+	int axis;
+
+	match = strstr(line, key);
+	if (match == NULL)
+		return false;
+	colon = strchr(match, ':');
+	if (colon == NULL)
+		return false;
+	cursor = strchr(colon, '[');
+	if (cursor == NULL)
+		return false;
+	cursor += 1;
+
+	for (axis = 0; axis < 2; ++axis)
+	{
+		while (*cursor && isspace((unsigned char)*cursor))
+			cursor += 1;
+		out[axis] = (float)strtod(cursor, &endptr);
+		if (endptr == cursor)
+			return false;
+		cursor = endptr;
+		while (*cursor && isspace((unsigned char)*cursor))
+			cursor += 1;
+		if (axis < 1)
+		{
+			if (*cursor != ',')
+				return false;
+			cursor += 1;
+		}
+	}
+
+	while (*cursor && isspace((unsigned char)*cursor))
+		cursor += 1;
+	return *cursor == ']' ? true : false;
+}
+
 qboolean qnn_json_extract_vec3(const char *line, const char *key, vec3_t out)
 {
 	const char *match;
@@ -358,6 +402,127 @@ qboolean qnn_json_extract_vec3(const char *line, const char *key, vec3_t out)
 	while (*cursor && isspace((unsigned char)*cursor))
 		cursor += 1;
 	return *cursor == ']' ? true : false;
+}
+
+static float qnn_clamp_unit(float value)
+{
+	if (value < -1.0f)
+		return -1.0f;
+	if (value > 1.0f)
+		return 1.0f;
+	return value;
+}
+
+#define QNN_LOOK_DEADZONE 0.03f
+#define QNN_LOOK_BASE_COUNT 256.0f
+#define QNN_LOOK_HIGH_GAIN 2.0f
+
+static float qnn_look_count_curve(float magnitude)
+{
+	float clamped;
+
+	clamped = magnitude;
+	if (clamped < 0.0f)
+		clamped = 0.0f;
+	if (clamped > 1.0f)
+		clamped = 1.0f;
+	return QNN_LOOK_BASE_COUNT * clamped * (1.0f + ((QNN_LOOK_HIGH_GAIN - 1.0f) * clamped * clamped));
+}
+
+static float qnn_look_magnitude_from_count(float count_magnitude)
+{
+	float target;
+	float lo;
+	float hi;
+	int i;
+
+	target = count_magnitude / QNN_LOOK_BASE_COUNT;
+	if (target < 0.0f)
+		target = 0.0f;
+	if (target > QNN_LOOK_HIGH_GAIN)
+		target = QNN_LOOK_HIGH_GAIN;
+	lo = 0.0f;
+	hi = 1.0f;
+	for (i = 0; i < 24; ++i)
+	{
+		float mid = 0.5f * (lo + hi);
+		float value = mid * (1.0f + ((QNN_LOOK_HIGH_GAIN - 1.0f) * mid * mid));
+		if (value < target)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	return 0.5f * (lo + hi);
+}
+
+int qnn_mouse_count_from_look_axis(float axis)
+{
+	float clamped;
+	float magnitude;
+	float normalized;
+	float sign;
+
+	clamped = qnn_clamp_unit(axis);
+	sign = clamped < 0.0f ? -1.0f : 1.0f;
+	magnitude = fabsf(clamped);
+	if (magnitude <= QNN_LOOK_DEADZONE)
+		return 0;
+	normalized = (magnitude - QNN_LOOK_DEADZONE) / (1.0f - QNN_LOOK_DEADZONE);
+	return (int)roundf(sign * qnn_look_count_curve(normalized));
+}
+
+float qnn_look_axis_from_mouse_count(int mouse_count)
+{
+	float normalized;
+	float axis;
+	float sign;
+
+	if (mouse_count == 0)
+		return 0.0f;
+	sign = mouse_count < 0 ? -1.0f : 1.0f;
+	normalized = qnn_look_magnitude_from_count((float)abs(mouse_count));
+	axis = QNN_LOOK_DEADZONE + ((1.0f - QNN_LOOK_DEADZONE) * normalized);
+	return sign * qnn_clamp_unit(axis);
+}
+
+int qnn_switch_slot_from_weapon_id(int weapon_id)
+{
+	if (weapon_id <= 0)
+		return 0;
+	if (weapon_id == 2 || weapon_id == 3)
+		return 1;
+	if (weapon_id == 4 || weapon_id == 5)
+		return 2;
+	if (weapon_id == 6)
+		return 3;
+	if (weapon_id == 7)
+		return 4;
+	if (weapon_id == 8)
+		return 5;
+	return 0;
+}
+
+int qnn_switch_impulse_from_slot(int switch_slot, int weapons_owned)
+{
+	switch (switch_slot)
+	{
+	case 1:
+		if (weapons_owned & IT_SUPER_SHOTGUN) return 3;
+		if (weapons_owned & IT_SHOTGUN) return 2;
+		return 0;
+	case 2:
+		if (weapons_owned & IT_SUPER_NAILGUN) return 5;
+		if (weapons_owned & IT_NAILGUN) return 4;
+		return 0;
+	case 3:
+		return (weapons_owned & IT_GRENADE_LAUNCHER) ? 6 : 0;
+	case 4:
+		return (weapons_owned & IT_ROCKET_LAUNCHER) ? 7 : 0;
+	case 5:
+		return (weapons_owned & IT_LIGHTNING) ? 8 : 0;
+	default:
+		return 0;
+	}
 }
 
 /* ── map preparation ─────────────────────────────────────────────── */
@@ -506,10 +671,31 @@ static float qnn_worker_current_armortype(void)
 
 /* ── observation capture ─────────────────────────────────────────── */
 
+/* Returns true if a server edict is an "actor" — anything that moves
+   autonomously and can take damage (players, bots, monsters).  Excludes
+   projectiles, doors, platforms, items, and corpses. */
+static qboolean qnn_is_actor_edict(const edict_t *ed)
+{
+	int mt;
+	if (ed->free)
+		return false;
+	if (ed->v.takedamage == DAMAGE_NO)
+		return false;
+	if (ed->v.health <= 0)
+		return false;
+	mt = (int)ed->v.movetype;
+	return mt == MOVETYPE_WALK || mt == MOVETYPE_STEP;
+}
+
 void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float fixed_dt)
 {
 	int entity_num;
+	/* Track which entity numbers were already captured from the client list
+	   so the server-side actor pass doesn't duplicate them. */
+	unsigned char captured[MAX_EDICTS / 8 + 1];
+	memset(captured, 0, sizeof(captured));
 
+	/* Pass 1: client-side entities (normal network-visible entities). */
 	for (entity_num = 1; entity_num < cl.num_entities && snapshot->visible_count < QNN_WORKER_MAX_VISIBLE; ++entity_num)
 	{
 		entity_t *entity;
@@ -546,6 +732,54 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 		out_entity->frags = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.frags : 0;
 		out_entity->region_id = qnn_worker_nearest_region_id(&qnn_worker_map_state, out_entity->origin);
 		snapshot->visible_count += 1;
+		captured[entity_num / 8] |= (1 << (entity_num % 8));
+	}
+
+	/* Pass 2: server-side actors not in the client entity list.
+	   FrikBots and other fake clients bypass the network protocol so they
+	   never appear in cl_entities.  We read their state directly from the
+	   server edict array. */
+	if (sv.active)
+	{
+		for (entity_num = 1; entity_num < sv.num_edicts && snapshot->visible_count < QNN_WORKER_MAX_VISIBLE; ++entity_num)
+		{
+			edict_t *ed;
+			qnn_worker_visible_entity_t *out_entity;
+			const char *model_name;
+			int model_idx;
+
+			if (captured[entity_num / 8] & (1 << (entity_num % 8)))
+				continue;
+			if (entity_num == cl.viewentity)
+				continue;
+
+			ed = EDICT_NUM(entity_num);
+			if (!qnn_is_actor_edict(ed))
+				continue;
+
+			model_idx = (int)ed->v.modelindex;
+			model_name = (model_idx > 0 && model_idx < MAX_MODELS && sv.model_precache[model_idx])
+				? sv.model_precache[model_idx] : "";
+
+			out_entity = &snapshot->visible[snapshot->visible_count];
+			memset(out_entity, 0, sizeof(*out_entity));
+			out_entity->entity_key = entity_num;
+			snprintf(out_entity->entity_id, sizeof(out_entity->entity_id), "entity_%04d", entity_num);
+			snprintf(out_entity->classname, sizeof(out_entity->classname), "%s", qnn_worker_server_classname(entity_num));
+			snprintf(out_entity->model_name, sizeof(out_entity->model_name), "%s", model_name);
+			out_entity->entity_num = entity_num;
+			VectorCopy(ed->v.origin, out_entity->origin);
+			VectorCopy(ed->v.velocity, out_entity->velocity);
+			VectorCopy(ed->v.angles, out_entity->angles);
+			out_entity->model_id = model_idx;
+			out_entity->frame = (int)ed->v.frame;
+			out_entity->effects = (int)ed->v.effects;
+			out_entity->skin = (int)ed->v.skin;
+			out_entity->health = (int)ed->v.health;
+			out_entity->frags = (int)ed->v.frags;
+			out_entity->region_id = qnn_worker_nearest_region_id(&qnn_worker_map_state, out_entity->origin);
+			snapshot->visible_count += 1;
+		}
 	}
 }
 
@@ -755,4 +989,63 @@ int qnn_worker_handle_nav_query(const char *line)
 
 	qnn_worker_write_error("unsupported nav_query kind");
 	return 0;
+}
+
+/* ── Tick resampling gate ─────────────────────────────────────────── */
+
+void qnn_resample_init(int target_hz)
+{
+	memset(&qnn_resample, 0, sizeof(qnn_resample));
+	if (target_hz > 0)
+	{
+		qnn_resample.target_hz = target_hz;
+		qnn_resample.target_dt = 1.0f / (float)target_hz;
+	}
+}
+
+void qnn_resample_accumulate(const qnn_worker_snapshot_t *snapshot, float frame_dt)
+{
+	qnn_resample.accumulated_dt += frame_dt;
+
+	/* Merge discrete actions across the window (OR — any press counts). */
+	if (snapshot->action_label.fire)
+		qnn_resample.fire_any = 1;
+	if (snapshot->action_label.jump)
+		qnn_resample.jump_any = 1;
+}
+
+void qnn_resample_accumulate_look(float yaw_degrees, float pitch_degrees)
+{
+	qnn_resample.look_yaw_degrees += yaw_degrees;
+	qnn_resample.look_pitch_degrees += pitch_degrees;
+}
+
+qboolean qnn_resample_should_emit(void)
+{
+	if (qnn_resample.target_hz <= 0)
+		return true; /* disabled — emit every frame */
+
+	if (qnn_resample.accumulated_dt >= qnn_resample.target_dt)
+		return true;
+
+	return false;
+}
+
+void qnn_resample_apply_action_merge(qnn_worker_snapshot_t *snapshot)
+{
+	/* Apply the OR-merged discrete actions to the snapshot being emitted. */
+	if (qnn_resample.fire_any)
+		snapshot->action_label.fire = 1;
+	if (qnn_resample.jump_any)
+		snapshot->action_label.jump = 1;
+
+	/* Look deltas are now computed at emission time by infer_action using
+	 * the full emission-to-emission window.  No accumulator override needed. */
+
+	/* Reset accumulators for next window. */
+	qnn_resample.accumulated_dt = 0.0f;
+	qnn_resample.fire_any = 0;
+	qnn_resample.jump_any = 0;
+	qnn_resample.look_yaw_degrees = 0.0f;
+	qnn_resample.look_pitch_degrees = 0.0f;
 }
