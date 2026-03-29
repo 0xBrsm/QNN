@@ -4,5 +4,8 @@
   "edp_delta_weight": 0.6,
   "frag_bonus": 3.0,
   "fire_penalty": 0.0,
-  "self_damage_penalty": 0.0
+  "self_damage_penalty": 0.0,
+  "tracking_weight": 0.0,
+  "tracking_fov": 360.0,
+  "tracking_penalty": true
 }

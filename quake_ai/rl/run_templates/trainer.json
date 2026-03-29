@@ -21,16 +21,5 @@
   "pbt_start_mutation": 20000000,
   "pbt_replace_fraction": 0.3,
   "pbt_mutation_rate": 0.15,
-  "pbt_optimize_gamma": false,
-  "eval_seed": 23,
-  "eval_policy_modes": [
-    "greedy",
-    "sampled"
-  ],
-  "eval_start_mode": "randomized",
-  "eval_holdout_seed_offset": 10000,
-  "eval_sample_seed_offset": 20000,
-  "eval_map_features_path": "",
-  "eval_record_demos": false,
-  "eval_parallel_policy_modes": true
+  "pbt_optimize_gamma": false
 }

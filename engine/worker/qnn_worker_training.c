@@ -5,7 +5,7 @@
 #include <string.h>
 
 #define QNN_TRAIN_BINARY_MAGIC "QTRN"
-#define QNN_TRAIN_BINARY_VERSION 1
+#define QNN_TRAIN_BINARY_VERSION 2
 
 #define QNN_TRAIN_FLAG_RESET 0x0001
 #define QNN_TRAIN_FLAG_DONE  0x0002
@@ -20,8 +20,9 @@
 #define QNN_TRAIN_PICKUP_ITEM   5
 #define QNN_TRAIN_PICKUP_PACK   6
 
-#define QNN_TRAIN_DAMAGE_FLAG_SELF  0x0001
-#define QNN_TRAIN_DAMAGE_FLAG_WORLD 0x0002
+#define QNN_TRAIN_DAMAGE_FLAG_SELF    0x0001
+#define QNN_TRAIN_DAMAGE_FLAG_WORLD  0x0002
+#define QNN_TRAIN_DAMAGE_FLAG_SPLASH 0x0004
 
 #define QNN_TRAIN_DEATH_FLAG_GIB 0x0001
 
@@ -99,9 +100,197 @@ typedef struct
 	float prev_armor;
 	float prev_armor_type;
 	int prev_frags;
+	/* Transient: computed during write, used for v2 extension fields */
+	float _computed_reward;
+	float _tracking_cos;
+	float _damage_dealt_self;
 } qnn_training_state_t;
 
 static qnn_training_state_t qnn_training_state;
+
+/* ── Reward computation (moved from Python for performance) ────── */
+
+typedef struct
+{
+	float	frag_bonus;
+	float	death_penalty;
+	float	ehp_delta_weight;
+	float	edp_delta_weight;
+	float	fire_penalty;
+	float	self_damage_penalty;
+	float	tracking_weight;
+	float	tracking_fov;		/* full FOV in degrees */
+	qboolean tracking_penalty;	/* if false, clamp tracking to non-negative */
+	qboolean valid;			/* true once weights have been received */
+} qnn_reward_weights_t;
+
+typedef struct
+{
+	float	prev_ehp;		/* persists across ticks, reset to 100 on death */
+} qnn_reward_state_t;
+
+static qnn_reward_weights_t qnn_reward_weights;
+static qnn_reward_state_t qnn_reward_state;
+
+/* Forward declaration — defined later in this file */
+static float qnn_train_effective_hp(float health, float armor, float armor_type);
+
+static void qnn_require_json_key(const char *line, const char *key)
+{
+	if (strstr(line, key) == NULL)
+		Sys_Error("reward_weights is missing required key %s", key);
+}
+
+void qnn_worker_training_parse_reward_weights(const char *line)
+{
+	/* Only parse if reward_weights block is present in reset options.
+	   When absent, valid stays false and reward computation is skipped. */
+	if (strstr(line, "\"reward_weights\"") == NULL)
+	{
+		qnn_reward_weights.valid = false;
+		return;
+	}
+	/* All keys are required when reward_weights is provided. */
+	qnn_require_json_key(line, "\"frag_bonus\"");
+	qnn_require_json_key(line, "\"death_penalty\"");
+	qnn_require_json_key(line, "\"ehp_delta_weight\"");
+	qnn_require_json_key(line, "\"edp_delta_weight\"");
+	qnn_require_json_key(line, "\"fire_penalty\"");
+	qnn_require_json_key(line, "\"self_damage_penalty\"");
+	qnn_require_json_key(line, "\"tracking_weight\"");
+	qnn_require_json_key(line, "\"tracking_fov\"");
+	qnn_require_json_key(line, "\"tracking_penalty\"");
+	qnn_reward_weights.frag_bonus = qnn_json_extract_float(line, "\"frag_bonus\"", 0.0f);
+	qnn_reward_weights.death_penalty = qnn_json_extract_float(line, "\"death_penalty\"", 0.0f);
+	qnn_reward_weights.ehp_delta_weight = qnn_json_extract_float(line, "\"ehp_delta_weight\"", 0.0f);
+	qnn_reward_weights.edp_delta_weight = qnn_json_extract_float(line, "\"edp_delta_weight\"", 0.0f);
+	qnn_reward_weights.fire_penalty = qnn_json_extract_float(line, "\"fire_penalty\"", 0.0f);
+	qnn_reward_weights.self_damage_penalty = qnn_json_extract_float(line, "\"self_damage_penalty\"", 0.0f);
+	qnn_reward_weights.tracking_weight = qnn_json_extract_float(line, "\"tracking_weight\"", 0.0f);
+	qnn_reward_weights.tracking_fov = qnn_json_extract_float(line, "\"tracking_fov\"", 360.0f);
+	qnn_reward_weights.tracking_penalty = qnn_json_extract_bool(line, "\"tracking_penalty\"", true);
+	qnn_reward_weights.valid = true;
+}
+
+static float qnn_train_remap_tracking(float cos_val, float fov_deg)
+{
+	float half_rad, boundary;
+
+	if (fov_deg >= 360.0f)
+		return cos_val;
+	half_rad = fov_deg * 0.5f * ((float)M_PI / 180.0f);
+	boundary = cosf(half_rad);
+	if (cos_val >= boundary)
+		return (cos_val - boundary) / fmaxf(1.0f - boundary, 1e-8f);
+	else
+		return -(boundary - cos_val) / fmaxf(boundary + 1.0f, 1e-8f);
+}
+
+static float qnn_train_tracking_cosine(const qnn_worker_snapshot_t *snapshot)
+{
+	float best_cos = 0.0f;
+	float best_dist_sq = 1e30f;
+	int i;
+	float yaw_rad, pitch_rad;
+	float cy, sy, cp, sp;
+	vec3_t forward;
+
+	/* Build forward vector from view angles */
+	yaw_rad = snapshot->player_view_angles[1] * ((float)M_PI / 180.0f);
+	pitch_rad = snapshot->player_view_angles[0] * ((float)M_PI / 180.0f);
+	cy = cosf(yaw_rad);
+	sy = sinf(yaw_rad);
+	cp = cosf(pitch_rad);
+	sp = sinf(pitch_rad);
+	forward[0] = cp * cy;
+	forward[1] = cp * sy;
+	forward[2] = -sp;
+
+	for (i = 0; i < snapshot->visible_count; ++i)
+	{
+		const qnn_worker_visible_entity_t *ent = &snapshot->visible[i];
+		float dx, dy, dz, dist_sq, inv_dist, cos_val;
+
+		if (ent->entity_num == cl.viewentity || ent->entity_num <= 0)
+			continue;
+		if (ent->health <= 0)
+			continue;
+
+		dx = ent->origin[0] - snapshot->player_origin[0];
+		dy = ent->origin[1] - snapshot->player_origin[1];
+		dz = ent->origin[2] - snapshot->player_origin[2];
+
+		dist_sq = dx * dx + dy * dy + dz * dz;
+		if (dist_sq < 1e-8f)
+			continue;
+
+		inv_dist = 1.0f / sqrtf(dist_sq);
+		cos_val = (forward[0] * dx + forward[1] * dy + forward[2] * dz) * inv_dist;
+
+		if (dist_sq < best_dist_sq)
+		{
+			best_dist_sq = dist_sq;
+			best_cos = cos_val;
+		}
+	}
+	return best_cos;
+}
+
+static float qnn_train_compute_reward(
+	const qnn_worker_snapshot_t *snapshot,
+	float damage_dealt_self,
+	float edp_raw,
+	int frag_gain,
+	int player_died,
+	int shots_fired,
+	float health_after,
+	float armor_after,
+	float armor_type_after,
+	float *out_tracking_cos,
+	float *out_damage_self)
+{
+	float reward = 0.0f;
+	float ehp_now, tracking_cos, remapped;
+
+	*out_tracking_cos = 0.0f;
+	*out_damage_self = damage_dealt_self;
+
+	if (!qnn_reward_weights.valid)
+		return 0.0f;
+
+	/* Frag bonus */
+	reward += qnn_reward_weights.frag_bonus * (float)(frag_gain > 0 ? frag_gain : 0);
+
+	/* Death penalty */
+	reward += qnn_reward_weights.death_penalty * (player_died ? 1.0f : 0.0f);
+
+	/* EHP delta (log-ratio) */
+	ehp_now = qnn_train_effective_hp(health_after, armor_after, armor_type_after);
+	if (!player_died && qnn_reward_state.prev_ehp > 0.0f)
+		reward += qnn_reward_weights.ehp_delta_weight * logf(ehp_now / fmaxf(qnn_reward_state.prev_ehp, 1.0f));
+
+	/* EDP delta */
+	reward += qnn_reward_weights.edp_delta_weight * edp_raw;
+
+	/* Fire penalty */
+	reward += qnn_reward_weights.fire_penalty * (shots_fired > 0 ? 1.0f : 0.0f);
+
+	/* Self-damage penalty */
+	reward += qnn_reward_weights.self_damage_penalty * damage_dealt_self;
+
+	/* Tracking */
+	tracking_cos = qnn_train_tracking_cosine(snapshot);
+	*out_tracking_cos = tracking_cos;
+	remapped = qnn_train_remap_tracking(tracking_cos, qnn_reward_weights.tracking_fov);
+	if (!qnn_reward_weights.tracking_penalty && remapped < 0.0f)
+		remapped = 0.0f;
+	reward += qnn_reward_weights.tracking_weight * remapped;
+
+	/* Update prev_ehp state for next tick */
+	qnn_reward_state.prev_ehp = player_died ? 100.0f : ehp_now;
+
+	return reward;
+}
 
 static void qnn_train_write_u16_le(FILE *out, uint16_t value)
 {
@@ -195,6 +384,7 @@ static void qnn_train_clear_tick(void)
 void qnn_worker_training_reset_episode(void)
 {
 	memset(&qnn_training_state, 0, sizeof(qnn_training_state));
+	qnn_reward_state.prev_ehp = 100.0f;
 }
 
 void qnn_worker_training_reset_tick(void)
@@ -275,6 +465,8 @@ void PF_qnn_training_note_damage(void)
 		record->flags |= QNN_TRAIN_DAMAGE_FLAG_SELF;
 	if (attacker == sv.edicts || record->attacker_entity_num == 0)
 		record->flags |= QNN_TRAIN_DAMAGE_FLAG_WORLD;
+	if (G_FLOAT(OFS_PARM6) != 0.0f)
+		record->flags |= QNN_TRAIN_DAMAGE_FLAG_SPLASH;
 	record->health_before = G_FLOAT(OFS_PARM3);
 	record->armor_before = G_FLOAT(OFS_PARM4);
 	record->armor_type_before = G_FLOAT(OFS_PARM5);
@@ -452,6 +644,32 @@ void qnn_worker_write_training_extras_binary(FILE *out, const qnn_worker_snapsho
 			player_died = 1;
 	}
 
+	/* Compute self-damage (attacker == target == self) for reward */
+	{
+		float damage_dealt_self = 0.0f;
+		float computed_reward;
+		float tracking_cos;
+		float out_damage_self;
+
+		for (idx = 0; idx < qnn_training_state.damage_count; ++idx)
+		{
+			qnn_training_damage_record_t *record = &qnn_training_state.damage[idx];
+			if (record->attacker_entity_num == self_entity_num
+				&& record->target_entity_num == self_entity_num)
+				damage_dealt_self += record->damage_health + record->damage_armor;
+		}
+
+		computed_reward = qnn_train_compute_reward(
+			snapshot, damage_dealt_self, edp_raw, frag_gain, player_died,
+			shots_fired, health_after, armor_after, armor_type_after,
+			&tracking_cos, &out_damage_self);
+
+		/* Store for writing after header (version 2 extension) */
+		qnn_training_state._computed_reward = computed_reward;
+		qnn_training_state._tracking_cos = tracking_cos;
+		qnn_training_state._damage_dealt_self = out_damage_self;
+	}
+
 	flags = 0;
 	if (reset_flag)
 		flags |= QNN_TRAIN_FLAG_RESET;
@@ -492,6 +710,11 @@ void qnn_worker_write_training_extras_binary(FILE *out, const qnn_worker_snapsho
 	qnn_train_write_f32_le(out, (float)((self_entity_num > 0 && self_entity_num < MAX_EDICTS) ? qnn_training_state.total_damage_dealt[self_entity_num] + damage_dealt : damage_dealt));
 	qnn_train_write_f32_le(out, (float)((self_entity_num > 0 && self_entity_num < MAX_EDICTS) ? qnn_training_state.total_hit_count[self_entity_num] + hit_count : hit_count));
 	qnn_train_write_f32_le(out, (float)((self_entity_num > 0 && self_entity_num < MAX_EDICTS) ? qnn_training_state.total_shots_fired[self_entity_num] + shots_fired : shots_fired));
+
+	/* Version 2 extension: computed reward, tracking cosine, self-damage */
+	qnn_train_write_f32_le(out, qnn_training_state._computed_reward);
+	qnn_train_write_f32_le(out, qnn_training_state._tracking_cos);
+	qnn_train_write_f32_le(out, qnn_training_state._damage_dealt_self);
 
 	for (idx = 0; idx < qnn_training_state.damage_count; ++idx)
 	{

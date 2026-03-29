@@ -77,8 +77,7 @@ MODALITY_IDS: Dict[str, int] = {
     "NONE": 0,
     "VISUAL": 1,
     "AUDITORY": 2,
-    "SPATIAL": 3,
-    "MENTAL": 4,
+    "MENTAL": 3,
 }
 
 MAX_PLAYER_SLOTS = 32

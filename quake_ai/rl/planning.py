@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
-from quake_ai.rl.profiles import (
+from quake_ai.rl.run_config import (
     _require_mapping,
     _require_string,
     build_run_plan_values,

@@ -70,6 +70,16 @@ static qnn_worker_reset_options_t qnn_worker_reset_options;
 
 /* Arena mode cvar: when 1, PutClientInServer gives all weapons/ammo on spawn. */
 static cvar_t qnn_arena_mode_cvar = {"qnn_arena_mode", "0", false, false};
+/* Inventory cvars: set by C worker from scenario.json, read by QuakeC PlayerPreThink. */
+static cvar_t qnn_inv_weapons_cvar    = {"qnn_inv_weapons",    "0", false, false};
+static cvar_t qnn_inv_shells_cvar     = {"qnn_inv_shells",     "0", false, false};
+static cvar_t qnn_inv_nails_cvar      = {"qnn_inv_nails",      "0", false, false};
+static cvar_t qnn_inv_rockets_cvar    = {"qnn_inv_rockets",    "0", false, false};
+static cvar_t qnn_inv_cells_cvar      = {"qnn_inv_cells",      "0", false, false};
+static cvar_t qnn_inv_armor_cvar      = {"qnn_inv_armor",      "0", false, false};
+static cvar_t qnn_inv_armor_type_cvar = {"qnn_inv_armor_type", "0", false, false};
+static cvar_t qnn_inv_health_cvar     = {"qnn_inv_health",     "0", false, false};
+static cvar_t qnn_inv_powerups_cvar   = {"qnn_inv_powerups",   "0", false, false};
 
 static qboolean qnn_worker_client_ready(void)
 {
@@ -100,6 +110,111 @@ static void qnn_worker_reset_options_defaults(qnn_worker_reset_options_t *option
 	options->arena_mode = 0;
 }
 
+/* Weapon name → IT_ bitmask. */
+static int qnn_weapon_bit(const char *name)
+{
+	if (!strcmp(name, "axe"))              return 4096;
+	if (!strcmp(name, "shotgun"))          return 1;
+	if (!strcmp(name, "super_shotgun"))    return 2;
+	if (!strcmp(name, "nailgun"))          return 4;
+	if (!strcmp(name, "super_nailgun"))    return 8;
+	if (!strcmp(name, "grenade_launcher")) return 16;
+	if (!strcmp(name, "rocket_launcher"))  return 32;
+	if (!strcmp(name, "lightning"))        return 64;
+	return 0;
+}
+
+/* Powerup name → IT_ bitmask. */
+static int qnn_powerup_bit(const char *name)
+{
+	if (!strcmp(name, "quad"))             return 4194304;
+	if (!strcmp(name, "pentagram"))        return 1048576;
+	if (!strcmp(name, "ring"))             return 524288;
+	if (!strcmp(name, "envirosuit"))       return 2097152;
+	return 0;
+}
+
+static void qnn_cvar_set_int(const char *name, int value)
+{
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%d", value);
+	Cvar_Set(name, buf);
+}
+
+static void qnn_cvar_set_float(const char *name, float value)
+{
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%g", value);
+	Cvar_Set(name, buf);
+}
+
+/* Parse "inventory" from reset JSON and set qnn_inv_* cvars.
+   Format: {"inventory": {"weapons": ["axe","lightning"], "ammo": {"shells":100,...},
+            "armor": {"value":200,"type":0.8}, "health":100, "powerups": ["quad"]}} */
+static void qnn_worker_parse_inventory(const char *line)
+{
+	int weapons = 0;
+	int powerups = 0;
+
+	/* Default: no custom inventory (cvars = 0 → QC fallback to arena_mode behavior) */
+	qnn_cvar_set_int("qnn_inv_weapons", 0);
+	qnn_cvar_set_int("qnn_inv_shells", 0);
+	qnn_cvar_set_int("qnn_inv_nails", 0);
+	qnn_cvar_set_int("qnn_inv_rockets", 0);
+	qnn_cvar_set_int("qnn_inv_cells", 0);
+	qnn_cvar_set_int("qnn_inv_armor", 0);
+	qnn_cvar_set_float("qnn_inv_armor_type", 0.0f);
+	qnn_cvar_set_int("qnn_inv_health", 0);
+	qnn_cvar_set_int("qnn_inv_powerups", 0);
+
+	if (strstr(line, "\"inventory\"") == NULL)
+		return;
+
+	/* Weapons: scan for known weapon names in the JSON string. */
+	{
+		static const char *weapon_names[] = {
+			"axe", "shotgun", "super_shotgun", "nailgun", "super_nailgun",
+			"grenade_launcher", "rocket_launcher", "lightning", NULL
+		};
+		int i;
+		for (i = 0; weapon_names[i]; ++i)
+		{
+			char needle[64];
+			snprintf(needle, sizeof(needle), "\"%s\"", weapon_names[i]);
+			if (strstr(line, needle))
+				weapons |= qnn_weapon_bit(weapon_names[i]);
+		}
+	}
+	qnn_cvar_set_int("qnn_inv_weapons", weapons);
+
+	/* Ammo */
+	qnn_cvar_set_int("qnn_inv_shells", qnn_json_extract_int(line, "\"shells\"", 0));
+	qnn_cvar_set_int("qnn_inv_nails", qnn_json_extract_int(line, "\"nails\"", 0));
+	qnn_cvar_set_int("qnn_inv_rockets", qnn_json_extract_int(line, "\"rockets\"", 0));
+	qnn_cvar_set_int("qnn_inv_cells", qnn_json_extract_int(line, "\"cells\"", 0));
+
+	/* Armor */
+	qnn_cvar_set_int("qnn_inv_armor", qnn_json_extract_int(line, "\"armor_value\"", 0));
+	qnn_cvar_set_float("qnn_inv_armor_type", qnn_json_extract_float(line, "\"armor_type\"", 0.0f));
+
+	/* Health */
+	qnn_cvar_set_int("qnn_inv_health", qnn_json_extract_int(line, "\"health\"", 0));
+
+	/* Powerups */
+	{
+		static const char *powerup_names[] = {"quad", "pentagram", "ring", "envirosuit", NULL};
+		int i;
+		for (i = 0; powerup_names[i]; ++i)
+		{
+			char needle[64];
+			snprintf(needle, sizeof(needle), "\"%s\"", powerup_names[i]);
+			if (strstr(line, needle))
+				powerups |= qnn_powerup_bit(powerup_names[i]);
+		}
+	}
+	qnn_cvar_set_int("qnn_inv_powerups", powerups);
+}
+
 static void qnn_worker_parse_reset_options(const char *line, qnn_worker_reset_options_t *options)
 {
 	qnn_worker_reset_options_defaults(options);
@@ -116,6 +231,9 @@ static void qnn_worker_parse_reset_options(const char *line, qnn_worker_reset_op
 	options->arena_mode = qnn_json_extract_int(line, "\"arena_mode\"", options->arena_mode);
 	qnn_json_extract_string(line, "\"pre_map_commands\"", options->pre_map_commands, sizeof(options->pre_map_commands));
 	qnn_json_extract_string(line, "\"post_map_commands\"", options->post_map_commands, sizeof(options->post_map_commands));
+
+	/* Parse inventory section and set qnn_inv_* cvars for QuakeC. */
+	qnn_worker_parse_inventory(line);
 }
 
 static void qnn_worker_append_command(char *buffer, size_t buffer_size, const char *command_text)
@@ -505,9 +623,8 @@ static qboolean qnn_worker_reset_world(int seed, char *error, size_t error_size)
 		qnn_worker_reset_options.fraglimit,
 		qnn_worker_reset_options.timelimit,
 		qnn_worker_reset_options.samelevel);
-	/* Set arena_mode cvar via engine API so QuakeC PutClientInServer can
-	   read it.  Cvar_Set creates and registers the cvar if needed, and it
-	   persists across map changes (unlike console commands in pre_map). */
+	/* Set arena_mode cvar so QuakeC PlayerPreThink can read it.
+	   Cvar persists across map changes (unlike console commands in pre_map). */
 	Cvar_Set("qnn_arena_mode", qnn_worker_reset_options.arena_mode ? "1" : "0");
 
 	qnn_worker_append_command(command, sizeof(command), qnn_worker_reset_options.pre_map_commands);
@@ -600,7 +717,7 @@ static qboolean qnn_worker_reset_world(int seed, char *error, size_t error_size)
 
 static void qnn_worker_write_hello_response(void)
 {
-	fprintf(stdout, "{\"capabilities\":[\"listen_local\",\"navmesh_query_v1\",\"obs_buffer_v1\",\"reset_options\",\"token_step_v2\",\"training_extras_v1\",\"udp_networking\"],\"map_id\":");
+	fprintf(stdout, "{\"capabilities\":[\"binary_step_v1\",\"listen_local\",\"navmesh_query_v1\",\"obs_buffer_v1\",\"reset_options\",\"token_step_v2\",\"training_extras_v1\",\"udp_networking\"],\"map_id\":");
 	qnn_worker_write_json_string(stdout, qnn_worker_map_state.requested_map_id);
 	fprintf(stdout, ",\"map_state\":");
 	qnn_worker_write_map_state_json(stdout, &qnn_worker_map_state);
@@ -707,6 +824,7 @@ static int qnn_worker_handle_reset(const char *line)
 	memset(error, 0, sizeof(error));
 	seed = qnn_json_extract_int(line, "\"seed\"", -1);
 	qnn_worker_parse_reset_options(line, &qnn_worker_reset_options);
+	qnn_worker_training_parse_reward_weights(line);
 	if (!qnn_worker_reset_world(seed, error, sizeof(error)))
 	{
 		qnn_worker_write_error(error);
@@ -794,10 +912,76 @@ int main(int argc, char **argv)
 	parms.basedir = basedir;
 	Host_Init(&parms);
 	Cvar_RegisterVariable(&qnn_arena_mode_cvar);
+	Cvar_RegisterVariable(&qnn_inv_weapons_cvar);
+	Cvar_RegisterVariable(&qnn_inv_shells_cvar);
+	Cvar_RegisterVariable(&qnn_inv_nails_cvar);
+	Cvar_RegisterVariable(&qnn_inv_rockets_cvar);
+	Cvar_RegisterVariable(&qnn_inv_cells_cvar);
+	Cvar_RegisterVariable(&qnn_inv_armor_cvar);
+	Cvar_RegisterVariable(&qnn_inv_armor_type_cvar);
+	Cvar_RegisterVariable(&qnn_inv_health_cvar);
+	Cvar_RegisterVariable(&qnn_inv_powerups_cvar);
 	cls.demonum = -1;
 
-	while (fgets(line, sizeof(line), stdin) != NULL)
+	for (;;)
 	{
+		int first_byte;
+
+		/* Peek at first byte to decide protocol: binary opcode or JSON line. */
+		first_byte = fgetc(stdin);
+		if (first_byte == EOF)
+			break;
+
+		if (first_byte == QNN_BINARY_OP_STEP)
+		{
+			/* Binary step: read action struct directly (no JSON parsing). */
+			qnn_worker_action_t action;
+			if (fread(&action, 1, QNN_BINARY_ACTION_SIZE, stdin) != (size_t)QNN_BINARY_ACTION_SIZE)
+				break;
+			qnn_worker_pending_action = action;
+			qnn_worker_training_reset_tick();
+			if (!qnn_worker_runtime.has_reset)
+			{
+				qnn_worker_write_error("Call reset before step");
+				continue;
+			}
+			if (!qnn_worker_runtime.done)
+			{
+				if (qnn_resample.target_hz > 0 && qnn_resample.target_hz < qnn_worker_runtime.fixed_tick_hz)
+				{
+					int sub_frames = qnn_worker_runtime.fixed_tick_hz / qnn_resample.target_hz;
+					int i;
+					for (i = 0; i < sub_frames && !qnn_worker_runtime.done; i++)
+					{
+						Host_Frame(qnn_worker_runtime.fixed_dt);
+						qnn_worker_runtime.tick += 1;
+						qnn_worker_runtime.steps += 1;
+					}
+				}
+				else
+				{
+					Host_Frame(qnn_worker_runtime.fixed_dt);
+					qnn_worker_runtime.tick += 1;
+					qnn_worker_runtime.steps += 1;
+				}
+			}
+			{
+				qnn_worker_snapshot_t snapshot;
+				qnn_worker_capture_snapshot(&snapshot, &action, false);
+				snapshot.action_label = action;
+				qnn_worker_semantic_update(&qnn_worker_map_state, &snapshot, qnn_worker_runtime.fixed_dt, false);
+				qnn_worker_commit_snapshot(&snapshot, &action, false);
+				qnn_worker_clear_action(&qnn_worker_pending_action);
+				qnn_worker_write_step_response(&snapshot);
+			}
+			continue;
+		}
+
+		/* JSON protocol: put first byte back and read the full line. */
+		ungetc(first_byte, stdin);
+		if (fgets(line, sizeof(line), stdin) == NULL)
+			break;
+
 		if (strstr(line, "\"op\"") != NULL && strstr(line, "hello") != NULL)
 		{
 			qnn_worker_handle_hello(line);

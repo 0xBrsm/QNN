@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Mapping, NoReturn, Sequence
@@ -178,6 +179,22 @@ class NativeProcessBase:
         return self._decode_json_response(line)
 
     # -- Action helpers ------------------------------------------------------
+
+    # Binary step protocol: 1-byte opcode + packed action struct (44 bytes).
+    # Matches qnn_worker_action_t layout: move[2] look[2] fire jump switch recall[4].
+    _BINARY_OP_STEP = b"\x01"
+    _ACTION_PACK_FORMAT = "<2f2f7i"  # 4 floats + 7 ints = 44 bytes
+
+    def _binary_step_request(self, action: Mapping[str, object]) -> bytes:
+        labels = ActionLabels.from_dict(action)
+        return self._BINARY_OP_STEP + struct.pack(
+            self._ACTION_PACK_FORMAT,
+            float(labels.move[0]), float(labels.move[1]),
+            float(labels.look[0]), float(labels.look[1]),
+            int(labels.fire), int(labels.jump), int(labels.switch),
+            int(labels.recall_0), int(labels.recall_1),
+            int(labels.recall_2), int(labels.recall_3),
+        )
 
     def _action_request(self, action: Mapping[str, object], op: str = "step") -> bytes:
         labels = ActionLabels.from_dict(action)
@@ -418,7 +435,7 @@ class NativeTokenProcess(NativeProcessBase):
 import numpy as np
 
 # Obs buffer layout constants (must match qnn_obs_buffer.h)
-OBS_BUFFER_SIZE = 14612
+OBS_BUFFER_SIZE = 15892
 
 _OBS_FIELDS = {
     "self_scalars":             (    0,   92, np.float32, (23,)),
@@ -426,21 +443,21 @@ _OBS_FIELDS = {
     "self_movement_id":         (   96,    4, np.int32,   (1,)),
     "self_cluster_id":          (  100,    4, np.int32,   (1,)),
     "object_ids":               (  104, 1280, np.int32,   (64, 5)),
-    "object_scalars":           ( 1384, 2048, np.float32, (64, 8)),
-    "object_mask":              ( 3432,   64, np.uint8,   (64,)),
-    "object_route_cluster_ids": ( 3496, 2048, np.int32,   (64, 8)),
-    "event_ids":                ( 5544, 4096, np.int32,   (256, 4)),
-    "event_scalars":            ( 9640, 3072, np.float32, (256, 3)),
-    "event_owner":              (12712, 1024, np.int32,   (256,)),
-    "event_mask":               (13736,  256, np.uint8,   (256,)),
-    "spatial_ids":              (13992,   36, np.int32,   (9,)),
-    "spatial_scalars":          (14028,  360, np.float32, (9, 10)),
-    "action_history":           (14388,  224, np.float32, (8, 7)),
+    "object_scalars":           ( 1384, 3328, np.float32, (64, 13)),
+    "object_mask":              ( 4712,   64, np.uint8,   (64,)),
+    "object_route_cluster_ids": ( 4776, 2048, np.int32,   (64, 8)),
+    "event_ids":                ( 6824, 4096, np.int32,   (256, 4)),
+    "event_scalars":            (10920, 3072, np.float32, (256, 3)),
+    "event_owner":              (13992, 1024, np.int32,   (256,)),
+    "event_mask":               (15016,  256, np.uint8,   (256,)),
+    "spatial_ids":              (15272,   36, np.int32,   (9,)),
+    "spatial_scalars":          (15308,  360, np.float32, (9, 10)),
+    "action_history":           (15668,  224, np.float32, (8, 7)),
 }
 
 
 def _unpack_obs_buffer(raw: bytes) -> Dict[str, np.ndarray]:
-    """Zero-copy unpack of the 14612-byte obs buffer into numpy arrays."""
+    """Zero-copy unpack of the 15892-byte obs buffer into numpy arrays."""
     obs: Dict[str, np.ndarray] = {}
     for name, (offset, size, dtype, shape) in _OBS_FIELDS.items():
         arr = np.frombuffer(raw, dtype=dtype, offset=offset, count=int(np.prod(shape)))
@@ -517,7 +534,7 @@ class NativeObsBufferProcess(NativeProcessBase):
     ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
         if self.proc is None:
             self.start()
-        obs = self._request_obs_packet(self._action_request(action))
+        obs = self._request_obs_packet(self._binary_step_request(action))
         return obs, self._maybe_read_training_binary()
 
 

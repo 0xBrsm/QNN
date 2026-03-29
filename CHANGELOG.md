@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.0
+
+### Changed
+- Object tokens widened from 8 to 13 scalars: bbox half-extents (3) and look-hint axes (2)
+- Reward computation moved to C worker (QTRN v2)
+- Binary action protocol for step hot path
+- BC data pipeline decoupled into standalone collect/precompute scripts
+- `.npz` eliminated; all checkpoints use `.pth`
+
+### Added
+- Optuna sweep mode with parallel containers, orphan recovery, live config reload
+- Configurable inventory system in `scenario.json`
+- `eval.json` with fixed seed pool and standard eval surface
+- BC fine-tuning from seed checkpoint with per-column learning rate tracking
+
+### Fixed
+- Modality priority overwrite (VISUAL > AUDITORY > MENTAL)
+- CheatCommand no-op in deathmatch; bots spawning unarmed
+- Bbox extent normalization scale mismatch with relative positions
+
 ## 0.7.0
 
 ### Changed

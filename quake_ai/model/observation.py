@@ -33,7 +33,7 @@ ACTION_HISTORY_DIM = 7
 SELF_SCALAR_DIM = 23
 SELF_ID_DIM = 3
 OBJECT_ID_DIM = 5
-OBJECT_SCALAR_DIM = 8
+OBJECT_SCALAR_DIM = 13
 EVENT_ID_DIM = 4
 EVENT_SCALAR_DIM = 3
 SPATIAL_SCALAR_DIM = 10
@@ -136,7 +136,7 @@ class TokenObservationEncoder:
 
         if n_obj > 0:
             ids_buf = np.empty((n_obj, OBJECT_ID_DIM), dtype=np.int32)
-            sc_buf = np.empty((n_obj, OBJECT_SCALAR_DIM), dtype=np.float32)
+            sc_buf = np.zeros((n_obj, OBJECT_SCALAR_DIM), dtype=np.float32)
             rc_buf = np.zeros((n_obj, MAX_ROUTE_CLUSTERS), dtype=np.int32)
             for i in range(n_obj):
                 obj = objects[i]

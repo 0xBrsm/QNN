@@ -1,6 +1,7 @@
 # Quake AI
 
-This repo is centered on one training path: competitive BC warm start plus Sample Factory APPO fine-tuning against FrikBotNex on Quake deathmatch maps.
+This repo has one promoted training workflow: create a frozen run directory,
+then execute it through the training router.
 
 ## Current Path
 
@@ -8,21 +9,23 @@ This repo is centered on one training path: competitive BC warm start plus Sampl
 |------|---------------|
 | Observation contract | token dict with `self`, `object`, `event`, and `spatial` tensors |
 | Policy | transformer trunk + GRU actor-critic |
-| PPO backend | Sample Factory 2.1.1 APPO |
+| PPO backend | Sample Factory APPO |
+| Public run modes | `bc`, `ppo`, `pbt`, `eval`, `optuna` |
 | Run entry point | `runs/<name>/run.json` |
-| Wire format | v6 (see `token-spec.md`) |
+| Templates | `src/quake_ai/rl/run_templates/` |
 | Resume control | explicit `run.json.resume` |
-| Warm start | explicit `run.json.checkpoint_path` when PPO has no retained checkpoint to resume |
-| Scenario source | `runs/<name>/config/scenario.json` |
-| PPO artifact root | `run.json.output.checkpoints` directly, with only SF `checkpoint_p*` subdirs underneath |
+| Warm start | explicit `run.json.checkpoint_path` |
+| PPO artifact root | `run.json.output.checkpoints` |
 
-The old campaign and E1M1 lanes are gone from the supported surface.
+Campaign-era and profile-era training surfaces are not the promoted path
+anymore. Use frozen run directories for everything.
 
 ## What Matters
 
-- `overview.md` is the source of truth for architecture and observation layout.
-- `quake_ai.rl.training` is the promoted orchestration entry point.
-- `Training containers use `docker compose -f src/docker/compose.yaml`.
+- [`docs/overview.md`](../docs/overview.md) is the source of truth for architecture and observation layout.
+- `python -m quake_ai.rl.training --run-dir runs/<name>` is the runtime router.
+- `scripts/init_run.py` is the only promoted way to create a run.
+- `scripts/train.sh runs/<name>` is the promoted launch wrapper inside the trainer container.
 - Every training and eval action is driven by a frozen run directory under `runs/`.
 
 ## Install
@@ -43,56 +46,73 @@ pip install gymnasium==0.29.1
 pip install psutil tensorboard tensorboardX signal-slot-mp wandb colorlog opencv-python-headless pyglet threadpoolctl huggingface-hub
 ```
 
-For AMD GPUs, use the training container instead of modifying the editor environment.
+For AMD GPUs, use the training container instead of modifying the editor
+environment.
 
 ## Promoted Commands
 
 From the repo root:
 
 ```bash
-docker compose -f src/docker/compose.yaml run --build trainer python -m quake_ai.utils.check_accelerator --device gpu
-docker compose -f src/docker/compose.yaml run --build trainer bash
-python scripts/init_run.py --name <run_name> --mode ppo --runtime-scale live --resume false --checkpoint-path <ckpt> --trainer src/quake_ai/rl/configs/trainer.json --scenario src/quake_ai/rl/configs/scenario.json --reward src/quake_ai/rl/configs/reward.json --machine src/quake_ai/rl/configs/machine.json --model src/quake_ai/rl/configs/model.json
-scripts/container.sh run scripts/train.sh runs/<run_name>
+docker compose -f src/docker/compose.yaml build trainer
+docker compose -f src/docker/compose.yaml run --rm trainer python -m quake_ai.utils.check_accelerator --device gpu
+docker compose -f src/docker/compose.yaml run --rm trainer bash
+python scripts/init_run.py --name <run_name> --checkpoint-path <ckpt> --trainer src/quake_ai/rl/run_templates/trainer.json --scenario src/quake_ai/rl/run_templates/scenario.json --reward src/quake_ai/rl/run_templates/reward.json --machine src/quake_ai/rl/run_templates/machine.json --model src/quake_ai/rl/run_templates/model.json
+docker compose -f src/docker/compose.yaml run --rm trainer scripts/train.sh runs/<run_name>
 ```
+
+Use the same path for every mode:
+
+- `ppo` is the default comparison lane
+- `pbt` is still a run dir launched through the same wrapper
+- `optuna` is still a run dir launched through the same wrapper
+- `eval` is a run dir with `mode: "eval"`
+
+## Run Layout
+
+```text
+runs/<name>/
+  run.json
+  run.md
+  config/
+    trainer.json
+    scenario.json
+    reward.json
+    machine.json
+    model.json
+  checkpoints/
+  metrics/
+  logs/
+```
+
+Generated Optuna trial wrappers live under `runs/<name>/trials/`. Each wrapper
+stores trial metadata plus a child PPO run under `ppo/`. Treat them as runtime
+output, not curated run manifests.
 
 ## Scenario Ladder
 
-The ladder is defined in `quake_ai/rl/configs/scenario.json`.
-
-| Scenario | Map | Purpose |
-|----------|-----|---------|
-| `duel-dm2` | `dm2` | close-range duel timing and quick re-engagements |
-| `open-dm4` | `dm4` | long sightlines and open pursuit |
-| `vertical-dm3` | `dm3` | vertical pickup timing and route choice |
-| `pressure-dm6` | `dm6` | spawn pressure and repeated explosive trades |
-
-The frozen `scenario.json` in each run defines the full multi-scenario ladder and emits per-scenario evaluation metrics.
+The default ladder template is
+`src/quake_ai/rl/run_templates/scenario.json`. Each run freezes its own copy in
+`runs/<name>/config/scenario.json`.
 
 ## Config Surface
 
-Training config is split by concern under `quake_ai/rl/configs/`:
+Training config is split by concern under `src/quake_ai/rl/run_templates/`:
 
-- `machine.json`: flat run-mode machine config
-- `scenario.json`: flat run-mode scenario surface
-- `model.json`: flat architecture config
-- `trainer.json`: flat run-mode trainer config
-- `reward.json`: reward weights
-- `run.json`: run manifest template copied into each run directory, including explicit `resume`
+- `machine.json`
+- `scenario.json`
+- `model.json`
+- `trainer.json`
+- `reward.json`
+- `run.json`
 
-See [`docs/training-config-matrix.md`](docs/training-config-matrix.md) for the required key matrix and the list of removed hidden defaults.
-
-## Outputs That Matter
-
-| Path | Purpose |
-|------|---------|
-| `runs/<name>/checkpoints/` | BC outputs, PPO checkpoints, retained best checkpoint |
-| `runs/<name>/metrics/` | eval summaries and metrics |
-| `runs/<name>/logs/` | watcher and runtime logs |
+See [`docs/training-config-matrix.md`](../docs/training-config-matrix.md) for
+the required key matrix.
 
 ## Related Docs
 
-- [`overview.md`](../overview.md)
-- [`token-spec.md`](../token-spec.md)
+- [`docs/overview.md`](../docs/overview.md)
+- [`docs/token-spec.md`](../docs/token-spec.md)
 - [`agents/training-quality-plan.md`](../agents/training-quality-plan.md)
+- [`agents/training-status.md`](../agents/training-status.md)
 - [`agents/environment.md`](../agents/environment.md)

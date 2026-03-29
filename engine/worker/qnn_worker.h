@@ -131,6 +131,7 @@ typedef struct
 	int	skin;
 	int	health;
 	int	frags;
+	float	half_extents[3];
 	qboolean static_proxy;
 } qnn_worker_visible_entity_t;
 
@@ -180,6 +181,11 @@ typedef struct
 
 extern qnn_worker_action_t qnn_worker_pending_action;
 
+/* Binary step protocol: 1 opcode byte + action struct.
+ * Replaces JSON for the hot step path.  Hello/reset/shutdown stay JSON. */
+#define QNN_BINARY_OP_STEP 0x01
+#define QNN_BINARY_ACTION_SIZE ((int)sizeof(qnn_worker_action_t))
+
 /* ── Tick resampling gate ─────────────────────────────────────────
  * Accumulates engine frames and emits at a fixed target Hz.
  * Call qnn_resample_init() once, then qnn_resample_should_emit()
@@ -219,6 +225,8 @@ extern char *cachedir;
 /* Common utilities (qnn_worker_common.c) */
 void qnn_worker_resolve_basedir(char *out, size_t out_size);
 int qnn_json_extract_int(const char *line, const char *key, int fallback);
+float qnn_json_extract_float(const char *line, const char *key, float fallback);
+qboolean qnn_json_extract_bool(const char *line, const char *key, qboolean fallback);
 qboolean qnn_json_extract_string(const char *line, const char *key, char *out, size_t out_size);
 qboolean qnn_json_extract_vec2(const char *line, const char *key, float out[2]);
 qboolean qnn_json_extract_vec3(const char *line, const char *key, vec3_t out);
@@ -247,6 +255,7 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 void qnn_worker_write_obs_buffer(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, int tick_hz, qboolean reset_flag);
 void qnn_worker_training_reset_episode(void);
 void qnn_worker_training_reset_tick(void);
+void qnn_worker_training_parse_reward_weights(const char *line);
 void qnn_worker_write_training_extras_binary(FILE *out, const qnn_worker_snapshot_t *snapshot, int tick, int steps, qboolean reset_flag);
 int qnn_worker_handle_nav_query(const char *line);
 

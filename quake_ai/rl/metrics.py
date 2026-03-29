@@ -26,6 +26,8 @@ EPISODE_MEAN_ALIASES = {
     "reward_deaths": "reward_deaths_mean",
     "reward_ehp": "reward_ehp_mean",
     "reward_edp": "reward_edp_mean",
+    "reward_tracking": "reward_tracking_mean",
+    "tracking_cos_mean": "tracking_cos_mean",
 }
 
 EVAL_REPORT_ALIASES = {
@@ -53,6 +55,8 @@ PPO_REPORT_METRICS = (
     "reward_deaths_mean",
     "reward_ehp_mean",
     "reward_edp_mean",
+    "reward_tracking_mean",
+    "tracking_cos_mean",
 )
 
 EVAL_REPORT_METRICS = (
@@ -71,6 +75,8 @@ EVAL_REPORT_METRICS = (
     "reward_deaths_mean",
     "reward_ehp_mean",
     "reward_edp_mean",
+    "reward_tracking_mean",
+    "tracking_cos_mean",
 )
 
 
@@ -111,6 +117,8 @@ def build_episode_extra_stats(
     reward_deaths: float,
     reward_ehp: float,
     reward_edp: float,
+    reward_tracking: float,
+    tracking_cos_sum: float,
 ) -> Dict[str, float]:
     """Build terminal episode stats in the shape Sample Factory expects."""
     max_deaths = max(deaths, 1)
@@ -137,6 +145,8 @@ def build_episode_extra_stats(
         "reward_deaths": float(reward_deaths),
         "reward_ehp": float(reward_ehp),
         "reward_edp": float(reward_edp),
+        "reward_tracking": float(reward_tracking),
+        "tracking_cos_mean": float(tracking_cos_sum / max_steps),
     }
 
 
@@ -161,6 +171,8 @@ class EpisodeStatAccumulator:
     reward_deaths: float = 0.0
     reward_ehp: float = 0.0
     reward_edp: float = 0.0
+    reward_tracking: float = 0.0
+    tracking_cos_sum: float = 0.0
 
     def add_step(self, *, reward: float, info: Mapping[str, object], terminal: bool) -> None:
         done_reason = str(info.get("done_reason", ""))
@@ -188,6 +200,8 @@ class EpisodeStatAccumulator:
         self.reward_deaths += float(info.get("reward_death_penalty", 0.0))
         self.reward_ehp += float(info.get("reward_ehp_delta", 0.0))
         self.reward_edp += float(info.get("reward_edp_delta", 0.0))
+        self.reward_tracking += float(info.get("reward_tracking", 0.0))
+        self.tracking_cos_sum += float(info.get("tracking_cos", 0.0))
 
     def as_dict(self) -> Dict[str, float]:
         return build_episode_extra_stats(
@@ -208,6 +222,8 @@ class EpisodeStatAccumulator:
             reward_deaths=self.reward_deaths,
             reward_ehp=self.reward_ehp,
             reward_edp=self.reward_edp,
+            reward_tracking=self.reward_tracking,
+            tracking_cos_sum=self.tracking_cos_sum,
         )
 
 

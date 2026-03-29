@@ -57,6 +57,14 @@ def _require_bool(mapping: Mapping[str, Any], key: str, context: str) -> bool:
     return value
 
 
+def _key_with_prefix_fallback(mapping: Mapping[str, Any], key: str, prefix: str, context: str) -> Any:
+    """Try ``{prefix}{key}`` first, then fall back to ``{key}``."""
+    prefixed = f"{prefix}{key}"
+    if prefixed in mapping:
+        return mapping[prefixed]
+    return _require_key(mapping, key, context)
+
+
 def _optional_mapping(mapping: Mapping[str, Any], key: str, context: str) -> dict[str, Any] | None:
     if key not in mapping:
         return None
@@ -134,14 +142,13 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
         result["config_paths"][required_name] = abs_path
 
     # checkpoint_path: the starting checkpoint for this run (BC seed for PPO, model for eval).
-    # Accept legacy "seed_checkpoint" key as fallback.
-    ckpt = manifest.get("checkpoint_path", "") or manifest.get("seed_checkpoint", "")
+    ckpt = manifest.get("checkpoint_path", "")
     if not isinstance(ckpt, str):
         raise RuntimeError("run.json.checkpoint_path must be a string")
     result["checkpoint_path"] = _resolve_optional_path(ckpt)
 
-    if mode == "eval" and not result["checkpoint_path"]:
-        raise RuntimeError("run.json must define a non-empty checkpoint_path when mode is 'eval'")
+    if mode in {"eval", "ppo", "pbt", "optuna"} and not result["checkpoint_path"]:
+        raise RuntimeError(f"run.json must define a non-empty checkpoint_path when mode is '{mode}'")
 
     result["output"] = _require_mapping(manifest, "output", "run.json")
     return result
@@ -180,7 +187,6 @@ def run_plan_path(run_cfg: dict[str, Any]) -> Path:
 def build_run_bc_config(
     run_cfg: dict[str, Any],
     requested_device: str,
-    variant_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build BC config from a flat run-dir config dict."""
     trainer = _require_mapping(run_cfg, "trainer", "run config")
@@ -192,18 +198,17 @@ def build_run_bc_config(
     bc_cfg.update(model)
 
     checkpoints_dir = run_output_dirs(run_cfg)["checkpoints"]
-    collect_dir = checkpoints_dir / "collect"
+    asset_root = Path(_require_string(machine, "asset_root", "machine.json"))
+    bc_data_dir = asset_root / "bc"
     bc_cfg["output_dir"] = str(checkpoints_dir)
-    bc_cfg["token_ticks_path"] = str(collect_dir / "token_ticks.bin")
-    bc_cfg["map_state_path"] = str(collect_dir / "world_map.json")
-    bc_cfg["map_states_path"] = str(collect_dir / "map_states.json")
-    bc_cfg["metadata_path"] = str(collect_dir / "demo_metadata.ndjson")
+    bc_cfg["token_ticks_path"] = str(bc_data_dir / "token_ticks.bin")
+    bc_cfg["map_state_path"] = str(bc_data_dir / "world_map.json")
+    bc_cfg["map_states_path"] = str(bc_data_dir / "map_states.json")
+    bc_cfg["metadata_path"] = str(bc_data_dir / "demo_metadata.ndjson")
     bc_cfg["device"] = requested_device
     bc_cfg["batch_size"] = int(_require_key(machine, "batch_size", "machine.json"))
     bc_cfg["map_id"] = _require_string(scenario, "map_id", "scenario.json")
 
-    if variant_overrides:
-        bc_cfg.update(variant_overrides)
     return bc_cfg
 
 
@@ -225,12 +230,34 @@ def build_run_ppo_eval_config(
     ppo_cfg["output_dir"] = str(outputs["checkpoints"])
     ppo_cfg["reward_json_path"] = str(run_cfg["config_paths"]["reward"])
     ppo_cfg["device"] = requested_device
-    ppo_cfg["num_workers"] = int(_require_key(machine, "num_workers", "machine.json"))
+    total_workers = int(_require_key(machine, "num_workers", "machine.json"))
+    containers = int(machine.get("containers", 1))
+    ppo_cfg["num_workers"] = total_workers // max(containers, 1)
     ppo_cfg["num_envs_per_worker"] = int(_require_key(machine, "num_envs_per_worker", "machine.json"))
     ppo_cfg["worker_num_splits"] = int(_require_key(machine, "worker_num_splits", "machine.json"))
     ppo_cfg["minibatch_size"] = int(_require_key(machine, "minibatch_size", "machine.json"))
-    ppo_cfg["policy_workers_per_policy"] = int(machine.get("policy_workers_per_policy", 1))
+    ppo_cfg["policy_workers_per_policy"] = int(_require_key(machine, "policy_workers_per_policy", "machine.json"))
+    ppo_cfg["batched_sampling"] = bool(_require_key(machine, "batched_sampling", "machine.json"))
+    ppo_cfg["worker_inference"] = bool(machine.get("worker_inference", False))
     ppo_cfg["num_envs"] = int(ppo_cfg["num_workers"]) * int(ppo_cfg["num_envs_per_worker"])
+
+    # Validate minibatch alignment
+    rollout_batch = int(ppo_cfg["num_envs"]) * int(ppo_cfg.get("rollout_steps", 0))
+    mb = int(ppo_cfg["minibatch_size"])
+    if rollout_batch > 0 and mb > 0 and rollout_batch % mb != 0:
+        import warnings
+        warnings.warn(
+            f"Minibatch fragmentation: rollout_batch={rollout_batch} "
+            f"(num_envs={ppo_cfg['num_envs']} x rollout_steps={ppo_cfg.get('rollout_steps')}) "
+            f"is not evenly divisible by minibatch_size={mb}. "
+            f"Last minibatch will be undersized ({rollout_batch % mb} vs {mb}). "
+            f"Clean sizes for this config: "
+            + ", ".join(str(d) for d in sorted(set(
+                d for d in range(1, rollout_batch + 1)
+                if rollout_batch % d == 0 and 1024 <= d <= rollout_batch
+            ))[:8]),
+            stacklevel=2,
+        )
 
     eval_cfg = {
         "checkpoint_path": str(outputs["checkpoints"] / "best" / "best_model.pth"),
@@ -266,11 +293,23 @@ def build_run_eval_config(
     run_cfg: dict[str, Any],
     requested_device: str,
 ) -> dict[str, Any]:
-    """Build standalone eval config from a flat run-dir config dict."""
+    """Build standalone eval config from a flat run-dir config dict.
+
+    Reads ``eval_``-prefixed trainer/machine keys (shared with the PPO
+    post-train eval path) and falls back to unprefixed keys when the
+    prefixed variant is absent.  This lets PPO run dirs work without
+    duplicating every key.
+    """
     trainer = _require_mapping(run_cfg, "trainer", "run config")
     machine = _require_mapping(run_cfg, "machine", "run config")
     surface = _scenario_surface(run_cfg)
     outputs = run_output_dirs(run_cfg)
+
+    def _t(key: str) -> Any:
+        return _key_with_prefix_fallback(trainer, key, "eval_", "trainer.json")
+
+    def _m(key: str) -> Any:
+        return _key_with_prefix_fallback(machine, key, "eval_", "machine.json")
 
     return {
         "checkpoint_path": str(run_cfg["checkpoint_path"]),
@@ -283,33 +322,21 @@ def build_run_eval_config(
         "native_args": list(surface["native_args"]),
         "options": dict(surface["options"]),
         "mode": _require_string(trainer, "mode", "trainer.json"),
-        "seed": int(_require_key(trainer, "seed", "trainer.json")),
-        "num_episodes": int(_require_key(machine, "num_episodes", "machine.json")),
-        "num_envs": int(_require_key(machine, "num_envs", "machine.json")),
+        "seed": int(_t("seed")),
+        "num_episodes": int(_m("num_episodes")),
+        "num_envs": int(_m("num_envs")),
         "max_steps_per_episode": int(_require_key(trainer, "max_steps_per_episode", "trainer.json")),
-        "policy_modes": [str(value) for value in _require_list(trainer, "policy_modes", "trainer.json")],
-        "start_mode": _require_string(trainer, "start_mode", "trainer.json"),
-        "holdout_seed_offset": int(_require_key(trainer, "holdout_seed_offset", "trainer.json")),
-        "sample_seed_offset": int(_require_key(trainer, "sample_seed_offset", "trainer.json")),
-        "map_features_path": _require_string_value(trainer, "map_features_path", "trainer.json"),
+        "policy_modes": [str(v) for v in _t("policy_modes")],
+        "start_mode": str(_t("start_mode")),
+        "holdout_seed_offset": int(_t("holdout_seed_offset")),
+        "sample_seed_offset": int(_t("sample_seed_offset")),
+        "map_features_path": str(_t("map_features_path")),
         "procgen": surface["procgen"],
         "scenario_config_path": str(surface["scenario_config_path"]),
         "reward_json_path": str(run_cfg["config_paths"]["reward"]),
-        "record_demos": bool(_require_key(trainer, "record_demos", "trainer.json")),
-        "parallel_policy_modes": bool(_require_key(trainer, "parallel_policy_modes", "trainer.json")),
+        "record_demos": bool(_t("record_demos")),
+        "parallel_policy_modes": bool(_t("parallel_policy_modes")),
         "device": requested_device,
-    }
-
-
-def build_run_check_surface(run_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Build the lightweight env surface needed by check runs."""
-    trainer = _require_mapping(run_cfg, "trainer", "run config")
-    surface = _scenario_surface(run_cfg)
-    return {
-        "map_id": str(surface["map_id"]),
-        "tick_hz": int(_require_key(trainer, "fixed_tick_hz", "trainer.json")),
-        "native_args": list(surface["native_args"]),
-        "options": dict(surface["options"]),
     }
 
 
@@ -329,8 +356,10 @@ def build_run_plan_values(run_cfg: dict[str, Any]) -> dict[str, int]:
             "eval_episodes": 0,
         }
 
-    if mode == "ppo":
-        num_workers = int(_require_key(machine, "num_workers", "machine.json"))
+    if mode in {"ppo", "pbt", "optuna"}:
+        total_workers = int(_require_key(machine, "num_workers", "machine.json"))
+        containers = int(machine.get("containers", 1))
+        num_workers = total_workers // max(containers, 1)
         num_envs_per_worker = int(_require_key(machine, "num_envs_per_worker", "machine.json"))
         return {
             "bc_batch_size": 0,
@@ -344,21 +373,11 @@ def build_run_plan_values(run_cfg: dict[str, Any]) -> dict[str, int]:
     if mode == "eval":
         return {
             "bc_batch_size": 0,
-            "num_envs": int(_require_key(machine, "num_envs", "machine.json")),
+            "num_envs": int(_key_with_prefix_fallback(machine, "num_envs", "eval_", "machine.json")),
             "rollout_steps": 0,
             "total_steps": 0,
             "minibatch_size": 0,
-            "eval_episodes": int(_require_key(machine, "num_episodes", "machine.json")),
-        }
-
-    if mode == "check":
-        return {
-            "bc_batch_size": 0,
-            "num_envs": 0,
-            "rollout_steps": 0,
-            "total_steps": 0,
-            "minibatch_size": 0,
-            "eval_episodes": 0,
+            "eval_episodes": int(_key_with_prefix_fallback(machine, "num_episodes", "eval_", "machine.json")),
         }
 
     raise RuntimeError(f"Unsupported run mode in run.json: {mode}")

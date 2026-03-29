@@ -15,11 +15,13 @@
 #define QNN_TOKEN_FLAG_DONE       0x0002
 #define QNN_TOKEN_FLAG_HAS_ACTION 0x0004
 
+/* Modality priority: lower number = higher priority.
+   VISUAL beats AUDITORY beats MENTAL.  qnn_ensure_dynamic_object
+   only upgrades modality, never downgrades. */
 #define QNN_MODALITY_NONE 0
 #define QNN_MODALITY_VISUAL 1
 #define QNN_MODALITY_AUDITORY 2
-#define QNN_MODALITY_SPATIAL 3
-#define QNN_MODALITY_MENTAL 4
+#define QNN_MODALITY_MENTAL 3
 
 /* player_id: 0 = non-player, 1..32 = player slot */
 
@@ -178,6 +180,7 @@ typedef struct
 	int route_cluster_count;
 	qboolean pvs_seen;
 	qboolean surfaced_this_tick;
+	float half_extents[3];
 } qnn_semantic_object_t;
 
 typedef struct
@@ -1098,7 +1101,10 @@ static qnn_semantic_object_t *qnn_ensure_dynamic_object(int entity_num, int subj
 
 	obj->subject_id = subject_id;
 	obj->qualifier_id = qualifier_id;
-	obj->modality_id = modality_id;
+	/* Priority overwrite: only upgrade modality (lower number = higher priority).
+	   Recency always refreshes regardless of modality change. */
+	if (modality_id < obj->modality_id || obj->modality_id == QNN_MODALITY_NONE)
+		obj->modality_id = modality_id;
 	obj->player_id = (subject_id == QNN_SUBJECT_PLAYER && entity_num > 0) ? entity_num : 0;
 	obj->region_id = region_id;
 	VectorCopy(origin, obj->origin);
@@ -1343,7 +1349,8 @@ static void qnn_update_items_from_visibility(const qnn_worker_snapshot_t *snapsh
 		obj = qnn_nearest_static_subject(subject_id, snapshot->visible[i].origin, QNN_ITEM_PVS_MATCH_SQ, false, 0);
 		if (obj == NULL)
 			continue;
-		obj->modality_id = QNN_MODALITY_VISUAL;
+		if (QNN_MODALITY_VISUAL < obj->modality_id || obj->modality_id == QNN_MODALITY_NONE)
+			obj->modality_id = QNN_MODALITY_VISUAL;
 		obj->recency = 1.0f;
 		obj->confidence = 1.0f;
 		obj->magnitude = magnitude;
@@ -1374,7 +1381,8 @@ static void qnn_advance_item_timers(float dt)
 
 static void qnn_refresh_static_object(qnn_semantic_object_t *obj, int modality_id, float confidence)
 {
-	obj->modality_id = modality_id;
+	if (modality_id < obj->modality_id || obj->modality_id == QNN_MODALITY_NONE)
+		obj->modality_id = modality_id;
 	obj->recency = 1.0f;
 	obj->confidence = confidence;
 	obj->surfaced_this_tick = true;
@@ -1406,7 +1414,8 @@ static void qnn_handle_item_sound(const qnn_worker_sound_event_t *snd, const cha
 		obj = qnn_nearest_dynamic_subject(QNN_SUBJECT_BACKPACK, snd->origin, QNN_ITEM_PICKUP_MATCH_SQ);
 		if (obj != NULL)
 		{
-			obj->modality_id = QNN_MODALITY_AUDITORY;
+			if (QNN_MODALITY_AUDITORY < obj->modality_id || obj->modality_id == QNN_MODALITY_NONE)
+				obj->modality_id = QNN_MODALITY_AUDITORY;
 			obj->recency = 1.0f;
 			obj->confidence = 1.0f;
 			obj->surfaced_this_tick = true;
@@ -1474,7 +1483,8 @@ static void qnn_handle_sound_projectile(const qnn_worker_sound_event_t *snd, con
 		return;
 	if (snd->entity_num <= 0)
 	{
-		obj->modality_id = QNN_MODALITY_AUDITORY;
+		if (QNN_MODALITY_AUDITORY < obj->modality_id || obj->modality_id == QNN_MODALITY_NONE)
+			obj->modality_id = QNN_MODALITY_AUDITORY;
 		obj->recency = 1.0f;
 		obj->confidence = 1.0f;
 		obj->surfaced_this_tick = true;
@@ -1657,6 +1667,8 @@ static void qnn_update_from_visible_entities(const qnn_worker_snapshot_t *snapsh
 				1.0f,
 				magnitude
 			);
+			if (obj != NULL)
+				VectorCopy(snapshot->visible[i].half_extents, obj->half_extents);
 			if (obj != NULL && subject_id == QNN_SUBJECT_PROJECTILE_NAIL)
 				VectorCopy(snapshot->visible[i].velocity, obj->velocity);
 			if (obj != NULL && subject_id == QNN_SUBJECT_PLAYER)
@@ -2403,7 +2415,7 @@ void qnn_worker_write_token_step_binary(FILE *out, const qnn_worker_snapshot_t *
 /* ====================================================================
  * Direct-pack observation buffer writer.
  *
- * Produces the fixed-size obs buffer (14612 bytes).  Layout defined in
+ * Produces the fixed-size obs buffer (15380 bytes).  Layout defined in
  * qnn_obs_buffer.h.  Training extras continue to use the existing QTRN
  * binary writer (not in the hot path).
  *
@@ -2697,6 +2709,34 @@ void qnn_worker_write_obs_buffer(FILE *out, const qnn_worker_snapshot_t *snapsho
 		qnn_buf_write_f32(obs, sc_off + 20, object_rows[i]->confidence);
 		qnn_buf_write_f32(obs, sc_off + 24, object_rows[i]->magnitude);
 		qnn_buf_write_f32(obs, sc_off + 28, object_rows[i]->state);
+		qnn_buf_write_f32(obs, sc_off + 32, object_rows[i]->half_extents[0] / QNN_OBJECT_REL_SCALE);
+		qnn_buf_write_f32(obs, sc_off + 36, object_rows[i]->half_extents[1] / QNN_OBJECT_REL_SCALE);
+		qnn_buf_write_f32(obs, sc_off + 40, object_rows[i]->half_extents[2] / QNN_OBJECT_REL_SCALE);
+
+		/* Target look axis: the look[0]/look[1] values that would center
+		   the crosshair on this object in one tick.  Computed from the
+		   raw view-frame relative position (object_rel) so the model
+		   can learn tracking as: look[0] ≈ target_yaw_axis. */
+		{
+			float rx = object_rel[i][0];  /* forward */
+			float ry = object_rel[i][1];  /* right */
+			float rz = object_rel[i][2];  /* up */
+			float horiz_dist = sqrtf(rx * rx + ry * ry);
+			float yaw_deg = 0.0f, pitch_deg = 0.0f;
+			int yaw_counts, pitch_counts;
+
+			if (horiz_dist > 1.0f)
+			{
+				yaw_deg = atan2f(ry, rx) * (180.0f / M_PI);
+				pitch_deg = atan2f(-rz, horiz_dist) * (180.0f / M_PI);
+			}
+			/* Negate yaw: positive ry = target to the right, but Quake
+			   positive yaw mouse count = turn left. */
+			yaw_counts = (int)roundf(-yaw_deg / QNN_DEMO_MOUSE_DEGREES_PER_COUNT);
+			pitch_counts = (int)roundf(pitch_deg / QNN_DEMO_MOUSE_DEGREES_PER_COUNT);
+			qnn_buf_write_f32(obs, sc_off + 44, qnn_look_axis_from_mouse_count(yaw_counts));
+			qnn_buf_write_f32(obs, sc_off + 48, qnn_look_axis_from_mouse_count(pitch_counts));
+		}
 
 		obs[QNN_OBS_OFF_OBJECT_MASK + i] = 1;
 

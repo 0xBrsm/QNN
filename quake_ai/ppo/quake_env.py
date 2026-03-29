@@ -35,14 +35,34 @@ _DISCRETE_HEAD_ORDER = [
 ]
 
 
-def tuple_action_to_heads(action: np.ndarray | Sequence) -> Dict[str, object]:
+def tuple_action_to_heads(action) -> Dict[str, object]:
     """Convert an SF Tuple action to the canonical action dict.
 
-    SF 2.1.1 passes a tuple/list of sub-arrays: (Box(2), Box(2), Discrete, ...).
-    Flatten into a single array for consistent indexing.
+    Handles two formats:
+    - Non-batched: tuple/list of sub-arrays (Box(2), Box(2), Discrete, ...)
+    - Batched (transposed): tuple of per-head values for one env,
+      e.g. (tensor(2), tensor(2), tensor(1), ...) or a single tensor/array.
     """
-    parts = [np.asarray(a, dtype=np.float32).reshape(-1) for a in action]
-    flat = np.concatenate(parts)
+    import torch as _torch
+
+    # Unwrap single-element list/slice from SequentialVectorizeWrapper
+    if isinstance(action, (list, tuple)) and len(action) == 1:
+        action = action[0]
+
+    # If it's a single tensor/ndarray, it may be the full flat action
+    if isinstance(action, (_torch.Tensor, np.ndarray)):
+        a = action.cpu().numpy() if isinstance(action, _torch.Tensor) else np.asarray(action)
+        flat = a.reshape(-1).astype(np.float32)
+    elif isinstance(action, (list, tuple)):
+        parts = []
+        for a in action:
+            if isinstance(a, _torch.Tensor):
+                a = a.cpu().numpy()
+            parts.append(np.asarray(a, dtype=np.float32).reshape(-1))
+        flat = np.concatenate(parts)
+    else:
+        flat = np.asarray(action, dtype=np.float32).reshape(-1)
+
     expected = _MOVE_DIM + _LOOK_DIM + len(_DISCRETE_HEAD_ORDER)
     if flat.size != expected:
         raise ValueError(f"Expected {expected} action values, got {flat.size}")
@@ -275,7 +295,7 @@ class QuakeEnv(gymnasium.Env):
         obs = self.inner_env.reset(seed=seed)
         return obs, {"scenario_id": self.scenario_id}
 
-    def step(self, action: np.ndarray):
+    def step(self, action):
         action_dict = tuple_action_to_heads(action)
         obs, reward, done, info = self.inner_env.step(action_dict)
         info = dict(info)

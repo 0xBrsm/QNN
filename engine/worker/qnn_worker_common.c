@@ -276,6 +276,42 @@ int qnn_json_extract_int(const char *line, const char *key, int fallback)
 	return atoi(colon + 1);
 }
 
+float qnn_json_extract_float(const char *line, const char *key, float fallback)
+{
+	const char *match;
+	const char *colon;
+
+	match = strstr(line, key);
+	if (match == NULL)
+		return fallback;
+	colon = strchr(match, ':');
+	if (colon == NULL)
+		return fallback;
+	return (float)atof(colon + 1);
+}
+
+qboolean qnn_json_extract_bool(const char *line, const char *key, qboolean fallback)
+{
+	const char *match;
+	const char *colon;
+	const char *val;
+
+	match = strstr(line, key);
+	if (match == NULL)
+		return fallback;
+	colon = strchr(match, ':');
+	if (colon == NULL)
+		return fallback;
+	val = colon + 1;
+	while (*val == ' ' || *val == '\t')
+		val++;
+	if (*val == 't' || *val == 'T' || *val == '1')
+		return true;
+	if (*val == 'f' || *val == 'F' || *val == '0')
+		return false;
+	return fallback;
+}
+
 qboolean qnn_json_extract_string(const char *line, const char *key, char *out, size_t out_size)
 {
 	const char *match;
@@ -730,6 +766,25 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 		out_entity->skin = entity->skinnum;
 		out_entity->health = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.health : 0;
 		out_entity->frags = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.frags : 0;
+		/* Shift origin to bounding box center and store half-extents. */
+		{
+			vec3_t bmins = {0,0,0}, bmaxs = {0,0,0};
+			qboolean have_bounds = false;
+			if (server_edict != NULL && !server_edict->free) {
+				VectorCopy(server_edict->v.mins, bmins);
+				VectorCopy(server_edict->v.maxs, bmaxs);
+				have_bounds = (bmins[0] != 0 || bmins[1] != 0 || bmins[2] != 0 ||
+				               bmaxs[0] != 0 || bmaxs[1] != 0 || bmaxs[2] != 0);
+			}
+			if (have_bounds) {
+				out_entity->origin[0] += (bmins[0] + bmaxs[0]) * 0.5f;
+				out_entity->origin[1] += (bmins[1] + bmaxs[1]) * 0.5f;
+				out_entity->origin[2] += (bmins[2] + bmaxs[2]) * 0.5f;
+				out_entity->half_extents[0] = (bmaxs[0] - bmins[0]) * 0.5f;
+				out_entity->half_extents[1] = (bmaxs[1] - bmins[1]) * 0.5f;
+				out_entity->half_extents[2] = (bmaxs[2] - bmins[2]) * 0.5f;
+			}
+		}
 		out_entity->region_id = qnn_worker_nearest_region_id(&qnn_worker_map_state, out_entity->origin);
 		snapshot->visible_count += 1;
 		captured[entity_num / 8] |= (1 << (entity_num % 8));
@@ -777,6 +832,23 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 			out_entity->skin = (int)ed->v.skin;
 			out_entity->health = (int)ed->v.health;
 			out_entity->frags = (int)ed->v.frags;
+			/* Shift origin to bounding box center and store half-extents. */
+			{
+				vec3_t bmins = {0,0,0}, bmaxs = {0,0,0};
+				qboolean have_bounds = false;
+				VectorCopy(ed->v.mins, bmins);
+				VectorCopy(ed->v.maxs, bmaxs);
+				have_bounds = (bmins[0] != 0 || bmins[1] != 0 || bmins[2] != 0 ||
+				               bmaxs[0] != 0 || bmaxs[1] != 0 || bmaxs[2] != 0);
+				if (have_bounds) {
+					out_entity->origin[0] += (bmins[0] + bmaxs[0]) * 0.5f;
+					out_entity->origin[1] += (bmins[1] + bmaxs[1]) * 0.5f;
+					out_entity->origin[2] += (bmins[2] + bmaxs[2]) * 0.5f;
+					out_entity->half_extents[0] = (bmaxs[0] - bmins[0]) * 0.5f;
+					out_entity->half_extents[1] = (bmaxs[1] - bmins[1]) * 0.5f;
+					out_entity->half_extents[2] = (bmaxs[2] - bmins[2]) * 0.5f;
+				}
+			}
 			out_entity->region_id = qnn_worker_nearest_region_id(&qnn_worker_map_state, out_entity->origin);
 			snapshot->visible_count += 1;
 		}

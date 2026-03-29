@@ -1,4 +1,4 @@
-"""AlgoObserver that archives every best checkpoint to a profile-level directory.
+"""AlgoObserver that archives every best checkpoint to the run checkpoint directory.
 
 SF's ``Learner.save_best`` keeps only the single most recent best checkpoint
 (``keep=1``).  This observer connects to each learner's ``saved_model`` signal

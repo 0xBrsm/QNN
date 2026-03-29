@@ -7,13 +7,18 @@ from dataclasses import dataclass
 from typing import Callable
 
 TRAINING_BINARY_MAGIC = b"QTRN"
-TRAINING_BINARY_VERSION = 1
+TRAINING_BINARY_VERSION_MIN = 1
+TRAINING_BINARY_VERSION_MAX = 2
 
 TRAINING_FLAG_RESET = 0x0001
 TRAINING_FLAG_DONE = 0x0002
 
 _HEADER_FORMAT = "<4sHHIIhhHHHHhhHHHH17f"
 TRAINING_BINARY_HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)
+
+# Version 2 appends 3 floats after the v1 header: computed_reward, tracking_cos, damage_dealt_self
+_V2_EXTENSION_FORMAT = "<3f"
+_V2_EXTENSION_SIZE = struct.calcsize(_V2_EXTENSION_FORMAT)
 
 _DAMAGE_FORMAT = "<hhHH8f"
 _DAMAGE_SIZE = struct.calcsize(_DAMAGE_FORMAT)
@@ -106,6 +111,10 @@ class TrustedTrainingExtrasV1:
     item_records: tuple[TrainingItemRecordV1, ...]
     death_records: tuple[TrainingDeathRecordV1, ...]
     spawn_records: tuple[TrainingSpawnRecordV1, ...]
+    # Version 2 extension fields (0.0 for v1 frames)
+    computed_reward: float = 0.0
+    tracking_cos: float = 0.0
+    damage_dealt_self: float = 0.0
 
 
 def decode_binary_training_extras(
@@ -152,8 +161,16 @@ def decode_binary_training_extras(
     ) = struct.unpack(_HEADER_FORMAT, header)
     if magic != TRAINING_BINARY_MAGIC:
         raise ValueError(f"Unexpected training magic {magic!r}")
-    if int(version) != TRAINING_BINARY_VERSION:
-        raise ValueError(f"Unexpected training version {version}")
+    if int(version) < TRAINING_BINARY_VERSION_MIN or int(version) > TRAINING_BINARY_VERSION_MAX:
+        raise ValueError(f"Unexpected training version {version} (expected {TRAINING_BINARY_VERSION_MIN}-{TRAINING_BINARY_VERSION_MAX})")
+
+    # Version 2 extension: 3 floats appended after v1 header
+    computed_reward = 0.0
+    tracking_cos = 0.0
+    damage_dealt_self = 0.0
+    if int(version) >= 2:
+        ext_data = read_exact(_V2_EXTENSION_SIZE)
+        computed_reward, tracking_cos, damage_dealt_self = struct.unpack(_V2_EXTENSION_FORMAT, ext_data)
 
     damage_records = tuple(
         TrainingDamageRecordV1(*struct.unpack(_DAMAGE_FORMAT, read_exact(_DAMAGE_SIZE)))
@@ -218,4 +235,7 @@ def decode_binary_training_extras(
         item_records=item_records,
         death_records=death_records,
         spawn_records=spawn_records,
+        computed_reward=float(computed_reward),
+        tracking_cos=float(tracking_cos),
+        damage_dealt_self=float(damage_dealt_self),
     )

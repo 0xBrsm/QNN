@@ -19,9 +19,55 @@ from quake_ai.rl.combat_metrics import WEAPON_TOTAL_DEBUG_KEYS, weapon_metric_ke
 from quake_ai.model.observation import TokenObservationEncoder, visible_threat_count
 from quake_ai.rl.reward import WEAPON_TIER_VALUES, RewardWeights, effective_hp, reward_components
 from quake_ai.rl.schemas import MapState
+from quake_ai.vocab import MODALITY_IDS, SUBJECT_IDS
 
 if TYPE_CHECKING:
     from mapgen.pool import MapPool
+
+
+_PLAYER_SUBJECT_ID = SUBJECT_IDS["PLAYER"]
+_VISUAL_MODALITY_ID = MODALITY_IDS["VISUAL"]
+
+
+def _tracking_cosine(obs: Dict[str, np.ndarray]) -> float:
+    """Cosine of angle between player aim and nearest enemy.
+
+    Returns a value in [-1, +1]: +1 means enemy is dead-center on crosshair,
+    -1 means enemy is directly behind. Returns 0.0 if no enemy is visible.
+
+    Object token rel_x/y/z are already in the player's view frame
+    (forward/right/up), computed by qnn_relative_frame() in the C worker.
+    So rel_x/dist gives the cosine directly — no yaw/pitch needed.
+    """
+    obj_ids = obs["object_ids"]       # (N, 5) — subject_id at [:, 0]
+    obj_sc = obs["object_scalars"]    # (N, 8) — rel_x/y/z at [:, 0:3]
+    obj_mask = obs["object_mask"]     # (N,)
+
+    best_cos = 0.0
+    best_dist_sq = float("inf")
+
+    for i in range(obj_ids.shape[0]):
+        if not obj_mask[i]:
+            break
+        if int(obj_ids[i, 0]) != _PLAYER_SUBJECT_ID:
+            continue
+
+        rx = float(obj_sc[i, 0])  # forward component (view frame)
+        ry = float(obj_sc[i, 1])  # right component
+        # Offset up component to hitbox center (+28 Quake units / 1024 norm)
+        rz = float(obj_sc[i, 2]) + 28.0 / 1024.0
+        dist_sq = rx * rx + ry * ry + rz * rz
+        if dist_sq < 1e-8:
+            continue
+
+        # In view frame, crosshair = forward axis, so cos = rx / dist
+        cos = rx / (dist_sq ** 0.5)
+
+        if dist_sq < best_dist_sq:
+            best_dist_sq = dist_sq
+            best_cos = cos
+
+    return best_cos
 
 
 _HEALTH_CAP = 250.0
@@ -191,6 +237,18 @@ class NativeWorldEnv:
         self.rng = np.random.default_rng(seed)
         self.encoder = encoder if encoder is not None else TokenObservationEncoder()  # kept for visible_threat_count shape inference
         self.options = dict(options)
+        self.options["reward_weights"] = {
+            "frag_bonus": reward_weights.frag_bonus,
+            "death_penalty": reward_weights.death_penalty,
+            "ehp_delta_weight": reward_weights.ehp_delta_weight,
+            "edp_delta_weight": reward_weights.edp_delta_weight,
+            "fire_penalty": reward_weights.fire_penalty,
+            "self_damage_penalty": reward_weights.self_damage_penalty,
+            "tracking_weight": reward_weights.tracking_weight,
+            "tracking_fov": reward_weights.tracking_fov,
+            "tracking_penalty": reward_weights.tracking_penalty,
+        }
+        self._reward_weights = reward_weights
         self.map_pool = map_pool
         self._procgen = procgen
 
@@ -300,114 +358,73 @@ class NativeWorldEnv:
 
         obs, training_extras = self.adapter.step_obs_with_training(action)
 
-        si = _self_info_from_obs(obs)
+        te = training_extras
         steps = self.state.steps + 1
-        worker_done = training_extras is not None and training_extras.done
+        worker_done = te is not None and te.done
         timed_out = bool(steps >= self.max_steps and not worker_done)
         done = bool(worker_done or timed_out)
-        speed = _velocity_magnitude(si.velocity)
-        stuck = speed < 10.0
 
-        raw_health = si.health * _HEALTH_CAP
-        raw_armor = si.armor * _ARMOR_CAP
-        raw_armor_type = si.armor_type * _ARMOR_TYPE_CAP
+        # Reward: use C-computed value from QTRN v2, require it.
+        reward = te.computed_reward if te is not None else 0.0
 
-        current_frags = self.state.frags + (int(training_extras.frag_gain) if training_extras is not None else 0) - (int(training_extras.frag_loss) if training_extras is not None else 0)
-        visible_threats = visible_threat_count(obs)
-        combat_signals = _combat_signals(
-            state=self.state,
-            health=int(raw_health),
-            armor=int(raw_armor),
-            armor_type=float(raw_armor_type),
-            weapon_id=si.weapon_id,
-            visible_threats=visible_threats,
-            fire_pressed=int(action.get("fire", 0)),
-        )
-        combat_signals = _apply_training_extras(combat_signals, training_extras=training_extras)
-        reward_breakdown = reward_components(
-            weights=self.reward_weights,
-            combat_signals=combat_signals,
-        )
-        reward = reward_breakdown["reward_total"]
-
-        current_ehp = effective_hp(
-            float(raw_health),
-            float(raw_armor),
-            float(raw_armor_type),
-        )
-        # On death ticks, pretend prev_ehp is spawn health (100, no armor)
-        # so the respawn tick doesn't get a free +2.3 ehp_delta reward.
-        player_died = training_extras is not None and training_extras.player_died
-        stored_ehp = 100.0 if player_died else current_ehp
+        # Minimal state tracking for frags
+        frag_gain = int(te.frag_gain) if te is not None else 0
+        frag_loss = int(te.frag_loss) if te is not None else 0
+        current_frags = self.state.frags + frag_gain - frag_loss
         self.state = NativeEnvState(
             steps=steps,
             current_region_id=0,
             frags=current_frags,
-            weapon_id=si.weapon_id,
-            prev_ehp=stored_ehp,
+            weapon_id=0,
+            prev_ehp=100.0,
         )
 
+        # Done reason
         done_reason = ""
         if timed_out:
             done_reason = "timeout"
-        elif training_extras is not None and training_extras.player_died:
+        elif te is not None and te.player_died:
             done_reason = "player_died"
         elif worker_done:
             done_reason = "done"
-        info: Dict[str, object] = {}
-        info.update(
-            {
-                "steps": steps,
-                "current_region_id": 0,
-                "stuck": stuck,
-                "speed": speed,
-                "done_reason": done_reason,
-                "worker_done": bool(worker_done),
-                "worker_reward": 0.0,
-                "health": int(raw_health),
-                "armor": int(raw_armor),
-                "ammo": float(sum(si.ammo)),
-                "weapon_id": si.weapon_id,
-                "scenario_id": str(self.map_state.map_id),
-                "frags": current_frags,
-                "monster_kills": 0,
-                "monster_total": 0,
-                "frag_delta": float(combat_signals["frag_gain"]),
-                "frag_loss": float(combat_signals["frag_loss"]),
-                "monster_kill_delta": float(combat_signals["monster_kills"]),
-                "damage_taken": float(combat_signals["damage_taken"]),
-                "damage_dealt": float(combat_signals["damage_dealt"]),
-                "damage_dealt_self": float(combat_signals.get("damage_dealt_self", 0)),
-                "damage_dealt_other": float(combat_signals.get("damage_dealt_other", 0)),
-                "hit_count": float(combat_signals["hit_count"]),
-                "shots_fired": float(combat_signals["shots_fired"]),
-                "health_gain": float(combat_signals["health_gain"]),
-                "armor_gain": float(combat_signals["armor_gain"]),
-                "ammo_gain": float(combat_signals["ammo_gain"]),
-                "weapon_pickups": float(combat_signals["weapon_pickups"]),
-                "weapon_switches": float(combat_signals["weapon_switches"]),
-                "visible_threats": int(visible_threats),
-                "fire_pressed": int(combat_signals["fire_pressed"]),
-                "effective_fire": int(combat_signals["effective_fire"]),
-                "blind_fire": int(combat_signals["blind_fire"]),
-                "health_fraction": float(combat_signals["health_fraction"]),
-                "armor_fraction": float(combat_signals["armor_fraction"]),
-                "player_died": bool(combat_signals["player_died"]),
-                "episode_damage_dealt": float(combat_signals["episode_damage_dealt"]),
-                "episode_hit_count": float(combat_signals["episode_hit_count"]),
-                "episode_shots_fired": float(combat_signals["episode_shots_fired"]),
-                "training_extras_tick": int(training_extras.tick) if training_extras is not None else -1,
-            }
-        )
-        for prefix, _debug_key in WEAPON_TOTAL_DEBUG_KEYS.items():
-            for weapon_id in range(1, 9):
-                metric_key = f"episode_{weapon_metric_key(prefix, weapon_id)}"
-                if metric_key in combat_signals:
-                    info[metric_key] = float(combat_signals[metric_key])
-        for key, value in combat_signals.items():
-            if key.startswith("weapon_") and key not in info:
-                info[key] = float(value)
-        info.update(reward_breakdown)
+
+        # Split damage by type from per-record flags.
+        _FLAG_SPLASH = 0x0004
+        damage_direct = 0.0
+        damage_splash = 0.0
+        if te is not None:
+            self_ent = te.self_entity_num
+            for rec in te.damage_records:
+                if rec.attacker_entity_num != self_ent or rec.target_entity_num == self_ent:
+                    continue
+                delta = rec.damage_health + rec.damage_armor
+                if rec.flags & _FLAG_SPLASH:
+                    damage_splash += delta
+                else:
+                    damage_direct += delta
+
+        # Lean info dict: only what EpisodeStatAccumulator and SF need.
+        info: Dict[str, object] = {
+            "done_reason": done_reason,
+            "scenario_id": str(self.map_state.map_id),
+            "frag_delta": float(frag_gain),
+            "frag_loss": float(frag_loss),
+            "player_died": bool(te.player_died) if te is not None else False,
+            "damage_dealt": float(te.damage_dealt) if te is not None else 0.0,
+            "damage_dealt_self": float(te.damage_dealt_self) if te is not None else 0.0,
+            "damage_dealt_other": float(te.damage_dealt - te.damage_dealt_self) if te is not None else 0.0,
+            "damage_direct": float(damage_direct),
+            "damage_splash": float(damage_splash),
+            "damage_taken": float(te.damage_taken) if te is not None else 0.0,
+            "hit_count": float(te.hit_count) if te is not None else 0.0,
+            "shots_fired": float(te.shots_fired) if te is not None else 0.0,
+            "health_gain": float(te.pickup_health) if te is not None else 0.0,
+            "armor_gain": float(te.pickup_armor) if te is not None else 0.0,
+            "weapon_pickups": float(te.weapon_pickups) if te is not None else 0.0,
+            "tracking_cos": float(te.tracking_cos) if te is not None else 0.0,
+            "blind_fire": 0,
+            "stuck": False,
+        }
         return obs, reward, done, info
 
     def close(self) -> None:

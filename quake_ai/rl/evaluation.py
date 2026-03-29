@@ -281,11 +281,13 @@ _AUX_INFO_KEYS = (
     "weapon_pickups",
     "weapon_switches",
     "visible_threats",
+    "tracking_cos",
     "fire_pressed",
     "effective_fire",
     "blind_fire",
     "health_fraction",
     "armor_fraction",
+    "reward_tracking",
 )
 _EPISODE_AUX_KEYS = (
     "episode_damage_dealt",
@@ -524,18 +526,44 @@ def _is_sf_checkpoint(path: str | Path) -> bool:
         return False
 
 
-def _load_sf_checkpoint_as_qnn(path: str | Path, device: str = "cpu") -> QNNPolicy:
-    """Convert an SF checkpoint to a QNNPolicy in-memory (no temp files)."""
+def _load_sf_checkpoint_as_qnn(
+    path: str | Path,
+    device: str = "cpu",
+    model_config: Dict[str, Any] | None = None,
+) -> QNNPolicy:
+    """Convert an SF checkpoint to a QNNPolicy in-memory (no temp files).
+
+    Architecture metadata is read from a sidecar JSON if available, otherwise
+    from the caller-supplied ``model_config`` (typically model.json from the
+    run dir).
+    """
     from quake_ai.ppo.checkpoint_converter import sf_to_qnn
+    from quake_ai.model.observation import (
+        SELF_SCALAR_DIM, SELF_ID_DIM, MAX_OBJECT_TOKENS, OBJECT_ID_DIM,
+        OBJECT_SCALAR_DIM, MAX_EVENT_ATOMS, EVENT_ID_DIM, EVENT_SCALAR_DIM,
+        SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM, ACTION_HISTORY_LEN, ACTION_HISTORY_DIM,
+    )
 
     p = Path(path)
-    # Check for a sidecar JSON with architecture metadata.
     sidecar = p.with_suffix(".json")
-    if not sidecar.exists():
-        raise RuntimeError(f"SF checkpoint evaluation requires architecture sidecar metadata: {sidecar}")
-    meta = json.loads(sidecar.read_text(encoding="utf-8"))
-    if not isinstance(meta, dict):
-        raise RuntimeError(f"SF checkpoint sidecar must be a JSON object: {sidecar}")
+    if sidecar.exists():
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            raise RuntimeError(f"SF checkpoint sidecar must be a JSON object: {sidecar}")
+    elif model_config is not None:
+        meta = dict(model_config)
+        meta.setdefault("obs_dim", int(
+            SELF_SCALAR_DIM + SELF_ID_DIM
+            + (MAX_OBJECT_TOKENS * (OBJECT_ID_DIM + OBJECT_SCALAR_DIM + 1))
+            + (MAX_EVENT_ATOMS * (EVENT_ID_DIM + EVENT_SCALAR_DIM + 2))
+            + SPATIAL_TOKEN_COUNT
+            + (SPATIAL_TOKEN_COUNT * SPATIAL_SCALAR_DIM)
+            + (ACTION_HISTORY_LEN * ACTION_HISTORY_DIM)
+        ))
+    else:
+        raise RuntimeError(
+            f"SF checkpoint requires either a sidecar JSON ({sidecar}) or model_config"
+        )
 
     required_keys = (
         "obs_dim",
@@ -573,23 +601,31 @@ def _load_sf_checkpoint_as_qnn(path: str | Path, device: str = "cpu") -> QNNPoli
     )
 
 
-def _load_checkpoint(path: str | Path, device: str = "cpu") -> QNNPolicy:
-    """Load a checkpoint in either QNN (.npz/.pth) or SF (.pth) format."""
+def _load_checkpoint(
+    path: str | Path,
+    device: str = "cpu",
+    model_config: Dict[str, Any] | None = None,
+) -> QNNPolicy:
+    """Load a checkpoint in either QNN (.pth) or SF (.pth) format."""
     if _is_sf_checkpoint(path):
-        return _load_sf_checkpoint_as_qnn(path, device=device)
+        return _load_sf_checkpoint_as_qnn(path, device=device, model_config=model_config)
     return QNNPolicy.load(str(path), device=device)
 
 
 def _evaluate_policy_mode(
     config: EvalConfig,
     mode: str,
+    model_config: Dict[str, Any] | None = None,
 ) -> tuple[str, Dict[str, float], QNNPolicy]:
-    model = _load_checkpoint(config.checkpoint_path, device=config.device)
+    model = _load_checkpoint(config.checkpoint_path, device=config.device, model_config=model_config)
     summary = _evaluate_mode(config, model, mode, _episode_specs(config))
     return mode, summary, model
 
 
-def run_evaluation(config: EvalConfig) -> Dict[str, float]:
+def run_evaluation(
+    config: EvalConfig,
+    model_config: Dict[str, Any] | None = None,
+) -> Dict[str, float]:
     set_global_seed(config.seed)
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -599,7 +635,7 @@ def run_evaluation(config: EvalConfig) -> Dict[str, float]:
     if len(config.policy_modes) > 1 and config.parallel_policy_modes:
         with ThreadPoolExecutor(max_workers=len(config.policy_modes), thread_name_prefix="nq-eval-mode") as executor:
             futures = {
-                mode: executor.submit(_evaluate_policy_mode, config, mode)
+                mode: executor.submit(_evaluate_policy_mode, config, mode, model_config)
                 for mode in config.policy_modes
             }
             for mode in config.policy_modes:
@@ -609,7 +645,7 @@ def run_evaluation(config: EvalConfig) -> Dict[str, float]:
                     model_card_model = mode_model
     else:
         for mode in config.policy_modes:
-            _, summary, mode_model = _evaluate_policy_mode(config, mode)
+            _, summary, mode_model = _evaluate_policy_mode(config, mode, model_config)
             mode_summaries[mode] = summary
             if model_card_model is None:
                 model_card_model = mode_model

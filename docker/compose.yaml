@@ -15,16 +15,9 @@ services:
       - HIP_VISIBLE_DEVICES
       - ROCR_VISIBLE_DEVICES
       - PUSHGATEWAY_URL=${PUSHGATEWAY_URL:-}
-      # Limit thread pools in rollout workers — without these, each worker
-      # spawns ~32 threads from ROCm/OpenMP/MKL even though workers only
-      # step the Quake engine and never run inference. With 24 workers this
-      # means ~768 idle threads competing for 32 cores.
-      - OMP_NUM_THREADS=1
-      - MKL_NUM_THREADS=1
-      - OPENBLAS_NUM_THREADS=1
-      - GOTO_NUM_THREADS=1
-      - VECLIB_MAXIMUM_THREADS=1
-      - NUMEXPR_NUM_THREADS=1
+      # Thread pool tuning is handled per-process: rollout workers get
+      # OMP_NUM_THREADS=1 via monkey-patch in train.py, while learner and
+      # inference workers keep their default thread counts for peak throughput.
     volumes:
       - type: bind
         source: ${HOST_WORKSPACE:?Set HOST_WORKSPACE to the host repo path}
@@ -55,7 +48,7 @@ services:
         hard: -1
       stack: 67108864
     ipc: host
-    shm_size: ${TRAINING_SHM_SIZE:-16gb}
+    shm_size: ${TRAINING_SHM_SIZE:-2gb}
     stdin_open: true
     tty: true
 

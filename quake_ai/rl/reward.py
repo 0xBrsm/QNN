@@ -29,6 +29,9 @@ class RewardWeights:
     frag_bonus: float
     fire_penalty: float
     self_damage_penalty: float
+    tracking_weight: float
+    tracking_fov: float      # full FOV in degrees; cosine boundary = cos(fov/2)
+    tracking_penalty: bool    # if False, clamp tracking to non-negative (reward only)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "RewardWeights":
@@ -42,8 +45,11 @@ class RewardWeights:
             ehp_delta_weight=float(cfg["ehp_delta_weight"]),
             edp_delta_weight=float(cfg["edp_delta_weight"]),
             frag_bonus=float(cfg["frag_bonus"]),
-            fire_penalty=float(cfg.get("fire_penalty", 0.0)),
-            self_damage_penalty=float(cfg.get("self_damage_penalty", 0.0)),
+            fire_penalty=float(cfg["fire_penalty"]),
+            self_damage_penalty=float(cfg["self_damage_penalty"]),
+            tracking_weight=float(cfg["tracking_weight"]),
+            tracking_fov=float(cfg["tracking_fov"]),
+            tracking_penalty=bool(cfg["tracking_penalty"]),
         )
 
 
@@ -58,6 +64,25 @@ def effective_hp(health: float, armor: float, armor_type: float) -> float:
 
 def _combat_signal(combat_signals: Mapping[str, float], key: str) -> float:
     return float(combat_signals.get(key, 0.0))
+
+
+def _remap_tracking(cos: float, fov_deg: float) -> float:
+    """Remap raw tracking cosine through an FOV-aware linear curve.
+
+    Returns +1 at dead center, 0 at the FOV boundary, -1 at 180° behind.
+    ``fov_deg`` is the full field-of-view in degrees (e.g. 90 means ±45°).
+    A value of 360 (default) reproduces the old behaviour (no remapping).
+    """
+    if fov_deg >= 360.0:
+        return cos
+    half_rad = math.radians(min(fov_deg, 360.0) * 0.5)
+    boundary = math.cos(half_rad)  # cosine at the FOV edge
+    if cos >= boundary:
+        # Inside FOV: remap [boundary, 1] → [0, +1]
+        return (cos - boundary) / max(1.0 - boundary, 1e-8)
+    else:
+        # Outside FOV: remap [-1, boundary] → [-1, 0]
+        return -(boundary - cos) / max(boundary + 1.0, 1e-8)
 
 
 def reward_components(
@@ -85,6 +110,14 @@ def reward_components(
     self_damage = _combat_signal(signals, "damage_dealt_self")
     self_damage_pen = weights.self_damage_penalty * self_damage
 
+    # Tracking: cosine of angle between player aim and nearest enemy.
+    # Remapped so the FOV boundary maps to 0: positive inside, negative outside.
+    tracking_cos = _combat_signal(signals, "tracking_cos")
+    remapped = _remap_tracking(tracking_cos, weights.tracking_fov)
+    if not weights.tracking_penalty:
+        remapped = max(remapped, 0.0)
+    tracking = weights.tracking_weight * remapped
+
     components = {
         "reward_frag_bonus": float(weights.frag_bonus * frag_gain),
         "reward_death_penalty": float(weights.death_penalty * player_died),
@@ -92,6 +125,7 @@ def reward_components(
         "reward_edp_delta": float(edp_delta),
         "reward_fire_penalty": float(fire_pen),
         "reward_self_damage_penalty": float(self_damage_pen),
+        "reward_tracking": float(tracking),
     }
     components["reward_total"] = float(sum(components.values()))
     return components

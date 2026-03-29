@@ -976,6 +976,9 @@ class QNNPolicy:
             readout=str(meta.get("readout", "cls")),
             action_history_tokens=int(meta.get("action_history_tokens", 0)),
         )
+        from quake_ai.ppo.checkpoint_converter import migrate_modality_embed, migrate_object_proj
+        migrate_modality_embed(payload["state_dict"])
+        migrate_object_proj(payload["state_dict"])
         try:
             model.model.load_state_dict(payload["state_dict"])
         except RuntimeError as exc:

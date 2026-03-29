@@ -216,6 +216,20 @@ def _pack_samples(
             dtype=np.float32,
         )
 
+    # Apply the same smoothing to the look-hint observation scalars (object_scalars
+    # slots 11-12) so the hints match the smoothed look labels exactly.
+    if look_smoothing and "object_scalars" in obs:
+        obj_sc = obs["object_scalars"]  # (n, 64, 13)
+        if obj_sc.shape[-1] >= 13 and n >= w and w > 1:
+            half = w // 2
+            kernel = np.ones(w, dtype=np.float32) / float(w)
+            for slot in (11, 12):
+                for obj_idx in range(obj_sc.shape[1]):
+                    raw = obj_sc[:, obj_idx, slot].astype(np.float32)
+                    if np.any(raw != 0):
+                        smoothed = np.convolve(raw, kernel, mode="same")
+                        obj_sc[half:n - half, obj_idx, slot] = smoothed[half:n - half]
+
     if action_tick_offset != 0:
         for head in _ACTION_HEAD_NAMES:
             actions[head] = np.roll(actions[head], -action_tick_offset, axis=0)
@@ -795,7 +809,7 @@ def _push_metrics_to_prometheus(
 # Main entry point.
 # ---------------------------------------------------------------------------
 
-def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
+def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[str, float]:
     set_global_seed(config.seed)
     rng = np.random.default_rng(config.seed)
 
@@ -894,21 +908,25 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
         raise RuntimeError("No training samples available after split")
 
     obs_dim = TokenObservationEncoder().obs_dim
-    model = QNNPolicy(
-        obs_dim=obs_dim,
-        trunk_hidden=config.trunk_hidden,
-        gru_hidden=config.gru_hidden,
-        use_gru=config.use_gru,
-        seed=config.seed,
-        device=config.device,
-        d_model=config.d_model,
-        n_heads=config.n_heads,
-        n_layers=config.n_layers,
-        ffn_dim=config.ffn_dim,
-        attn_dropout=config.attn_dropout,
-        action_history_tokens=config.action_history_tokens,
-        readout=config.readout,
-    )
+    if seed_checkpoint and Path(seed_checkpoint).exists():
+        print(f"  [bc] Fine-tuning from seed: {seed_checkpoint}")
+        model = QNNPolicy.load(seed_checkpoint, device=config.device)
+    else:
+        model = QNNPolicy(
+            obs_dim=obs_dim,
+            trunk_hidden=config.trunk_hidden,
+            gru_hidden=config.gru_hidden,
+            use_gru=config.use_gru,
+            seed=config.seed,
+            device=config.device,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.n_layers,
+            ffn_dim=config.ffn_dim,
+            attn_dropout=config.attn_dropout,
+            action_history_tokens=config.action_history_tokens,
+            readout=config.readout,
+        )
 
     weights = {
         head: torch.as_tensor(values, dtype=torch.float32, device=model.device)
@@ -938,6 +956,8 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
     _best_max_reg = float("inf")  # for checkpoint selection: min of max(move_reg, look_reg)
     _best_reg_epoch = -1
     _reg_violations = 0
+    _prev_ext_norm = 0.0
+    _prev_hint_norm = 0.0
 
     # NAS archive: save every epoch checkpoint to SMB share for offsite backup.
     _NAS_CHECKPOINTS = r"\\pi.local\nqcorpus\bc_checkpoints"
@@ -993,11 +1013,7 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
         # Flush step log to disk every report interval for live monitoring.
         write_json(output / "bc_step_log.json", {"steps": _step_log})
 
-    # Hot-reload config: drop a JSON file to modify params between epochs.
-    _hot_reload_path = output / "bc_override.json"
     _active_lr = config.lr
-    _active_regression_threshold = config.regression_threshold
-    _active_regression_patience = config.regression_patience
 
     import math as _math
 
@@ -1006,21 +1022,6 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
         if config.lr_min > 0:
             progress = epoch / max(config.epochs - 1, 1)
             _active_lr = config.lr_min + 0.5 * (config.lr - config.lr_min) * (1 + _math.cos(_math.pi * progress))
-
-        # Hot-reload: check for override file at each epoch boundary.
-        if _hot_reload_path.exists():
-            try:
-                import json as _hr_json
-                overrides = _hr_json.loads(_hot_reload_path.read_text())
-                if "lr" in overrides:
-                    _active_lr = float(overrides["lr"])
-                if "regression_threshold" in overrides:
-                    _active_regression_threshold = float(overrides["regression_threshold"])
-                if "regression_patience" in overrides:
-                    _active_regression_patience = int(overrides["regression_patience"])
-                print(f"  [bc] Hot-reload applied: {overrides}")
-            except Exception as exc:
-                print(f"  [bc] Hot-reload failed: {exc}")
 
         if epoch == start_epoch or (config.lr_min > 0 and epoch > start_epoch):
             print(f"  [bc] LR={_active_lr:.6f}")
@@ -1084,8 +1085,33 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
               f"{'*' if improved else ''}  "
               f"{mae_str}")
 
+        # Track per-column learning on new object_proj slots (8-12).
+        # Slots 8-10: bbox extents, slots 11-12: look hints.
+        _col_norms = {}
+        for name, param in model.model.named_parameters():
+            if "object_proj.weight" in name and param.shape[1] >= 13:
+                w = param.detach()
+                for slot, label in ((8, "ext_x"), (9, "ext_y"), (10, "ext_z"),
+                                     (11, "hint_yaw"), (12, "hint_pitch")):
+                    _col_norms[label] = float(w[:, slot].norm().item())
+                break
+        _ext_norm = sum(_col_norms.get(k, 0) ** 2 for k in ("ext_x", "ext_y", "ext_z")) ** 0.5
+        _hint_norm = sum(_col_norms.get(k, 0) ** 2 for k in ("hint_yaw", "hint_pitch")) ** 0.5
+        _ext_delta = _ext_norm - _prev_ext_norm if epoch > 0 else _ext_norm
+        _hint_delta = _hint_norm - _prev_hint_norm if epoch > 0 else _hint_norm
+        _prev_ext_norm = _ext_norm
+        _prev_hint_norm = _hint_norm
+        print(f"  [bc] obj_proj extents norm={_ext_norm:.4f} delta={_ext_delta:+.4f}  "
+              f"hints norm={_hint_norm:.4f} delta={_hint_delta:+.4f}")
+
         # Assemble and record per-epoch metrics.
         epoch_metrics: Dict[str, float] = {"epoch": float(epoch)}
+        for label, norm in _col_norms.items():
+            epoch_metrics[f"obj_proj_{label}_norm"] = norm
+        epoch_metrics["obj_proj_extents_norm"] = _ext_norm
+        epoch_metrics["obj_proj_extents_delta"] = _ext_delta
+        epoch_metrics["obj_proj_hints_norm"] = _hint_norm
+        epoch_metrics["obj_proj_hints_delta"] = _hint_delta
         for key, value in train_metrics.items():
             if key == "_next_hidden":
                 continue
@@ -1129,21 +1155,21 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
             if selection_metric < best_val_loss:
                 best_val_loss = selection_metric
                 best_epoch = epoch
-                model.save(output / "bc_best_model.npz")
+                model.save(output / "bc_best_model.pth")
 
-            if move_reg > _active_regression_threshold or look_reg > _active_regression_threshold:
+            if move_reg > config.regression_threshold or look_reg > config.regression_threshold:
                 _reg_violations += 1
             else:
                 _reg_violations = 0
 
             print(f"  [bc]   regression: move={move_reg:+.4f} look={look_reg:+.4f} "
-                  f"violations={_reg_violations}/{_active_regression_patience}")
+                  f"violations={_reg_violations}/{config.regression_patience}")
         else:
             if improved:
                 best_val_loss = selection_metric
                 best_epoch = epoch
                 epochs_without_improvement = 0
-                model.save(output / "bc_best_model.npz")
+                model.save(output / "bc_best_model.pth")
             else:
                 epochs_without_improvement += 1
 
@@ -1174,7 +1200,7 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
             try:
                 import smbclient as _smb
                 import shutil as _shutil
-                for src in [checkpoint_path, output / "bc_best_model.npz"]:
+                for src in [checkpoint_path, output / "bc_best_model.pth"]:
                     if src.exists():
                         nas_dest = _variant_dir + "\\" + src.name
                         with open(src, "rb") as local_f:
@@ -1184,17 +1210,17 @@ def run_behavior_cloning(config: BCConfig) -> Dict[str, float]:
                 print(f"  [bc] NAS archive failed: {exc}")
 
         if config.regression_stop:
-            if _reg_violations >= _active_regression_patience:
-                print(f"  [bc] Regression stop: {_active_regression_patience} consecutive epochs "
-                      f"above threshold {_active_regression_threshold}. Best epoch: {best_epoch + 1}")
+            if _reg_violations >= config.regression_patience:
+                print(f"  [bc] Regression stop: {config.regression_patience} consecutive epochs "
+                      f"above threshold {config.regression_threshold}. Best epoch: {best_epoch + 1}")
                 break
         elif epochs_without_improvement >= config.patience:
             break
 
     if best_epoch < 0:
-        model.save(output / "bc_best_model.npz")
+        model.save(output / "bc_best_model.pth")
 
-    final_model = QNNPolicy.load(output / "bc_best_model.npz", device=config.device)
+    final_model = QNNPolicy.load(output / "bc_best_model.pth", device=config.device)
 
     test_metrics = _run_precomputed_supervised(
         final_model,

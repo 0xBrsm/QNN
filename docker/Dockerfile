@@ -35,6 +35,8 @@ RUN apt-get update \
         "numpy==1.26.4" \
         "pytest>=8.0.0" \
         "sample-factory==2.1.1" --no-deps \
+    && find /opt/venv -path '*/sample_factory/algo/sampling/batched_sampling.py' \
+        -exec sed -i 's/# out_actions = list(zip(\*out_actions)) # transpose/out_actions = list(zip(*out_actions))  # transpose (patched)/' {} \; \
     && python3 -m pip install --no-cache-dir \
         "gymnasium==0.29.1" \
         "colorlog" \
@@ -47,7 +49,8 @@ RUN apt-get update \
         "tensorboardX" \
         "threadpoolctl" \
         "smbprotocol" \
-        "wandb"
+        "wandb" \
+        "optuna"
 
 WORKDIR /workspace
 

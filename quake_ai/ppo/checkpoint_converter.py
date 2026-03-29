@@ -263,6 +263,52 @@ _OBS_SHAPES: Dict[str, tuple[int, ...]] = {
 }
 
 
+def migrate_modality_embed(state: Dict[str, torch.Tensor], expected_rows: int = 4,
+                           optimizer: Dict[str, Any] | None = None) -> bool:
+    """Shrink modality_embed from old 5-row layout to current 4-row layout.
+
+    Old vocab had a SPATIAL gap at index 3, putting MENTAL at 4 → [5, d_model].
+    Current vocab packs MENTAL at 3 → [4, d_model].  Rows 3+ were never trained
+    (random noise), so we simply truncate to keep only rows 0-2 (NONE, VISUAL,
+    AUDITORY) and let the new MENTAL row reinitialise from the model's init.
+
+    Works on both SF state dicts (key contains ``encoder.trunk.tokenizer.modality_embed.weight``)
+    and BC state dicts (``trunk.tokenizer.modality_embed.weight``).
+
+    If ``optimizer`` is provided, also truncates matching Adam momentum buffers
+    (exp_avg, exp_avg_sq) so the optimizer state stays consistent with the model.
+
+    Returns True if any tensor was migrated.
+    """
+    migrated = False
+    # Build ordered list of parameter keys (excluding normalizer buffers) to
+    # map integer param indices in optimizer state to model keys.
+    param_keys = [k for k in state
+                  if not k.startswith("obs_normalizer.") and not k.startswith("returns_normalizer.")]
+
+    for idx, key in enumerate(param_keys):
+        if not key.endswith("modality_embed.weight"):
+            continue
+        tensor = state[key]
+        if tensor.shape[0] > expected_rows:
+            # Keep only the first `expected_rows` rows; discard untrained tail.
+            state[key] = tensor[:expected_rows].clone()
+            migrated = True
+
+        # Truncate matching optimizer momentum buffers regardless of whether
+        # the model tensor itself needed migration (it may have been migrated
+        # in a prior pass while the optimizer was missed).
+        if optimizer is not None and idx in optimizer.get("state", {}):
+            opt_entry = optimizer["state"][idx]
+            for buf_key in ("exp_avg", "exp_avg_sq"):
+                if buf_key in opt_entry and hasattr(opt_entry[buf_key], "shape"):
+                    if opt_entry[buf_key].shape[0] > expected_rows:
+                        opt_entry[buf_key] = opt_entry[buf_key][:expected_rows].clone()
+                        migrated = True
+
+    return migrated
+
+
 def _add_sf_normalizer_buffers(sf_state: Dict[str, torch.Tensor]) -> None:
     """Add zero-initialized SF normalizer entries so load_state_dict(strict=True) works."""
     # obs_normalizer.running_mean_std is a RunningMeanStdDictInPlace containing
@@ -277,6 +323,70 @@ def _add_sf_normalizer_buffers(sf_state: Dict[str, torch.Tensor]) -> None:
     sf_state["returns_normalizer.running_mean"] = torch.zeros([1], dtype=torch.float64)
     sf_state["returns_normalizer.running_var"] = torch.ones([1], dtype=torch.float64)
     sf_state["returns_normalizer.count"] = torch.ones([1], dtype=torch.float64)
+
+
+# ------------------------------------------------------------------
+# Checkpoint migration: object_proj (OBJECT_SCALAR_DIM widening)
+# ------------------------------------------------------------------
+
+
+def migrate_object_proj(
+    model_state: Dict[str, torch.Tensor],
+    optimizer_state: Dict[str, Any] | None = None,
+) -> bool:
+    """Zero-pad object_proj weights and SF normalizer buffers for wider OBJECT_SCALAR_DIM.
+
+    Returns True if any tensors were migrated.
+    """
+    expected_dim = OBJECT_SCALAR_DIM  # current (new) dimension
+    migrated = False
+
+    # --- model weights: object_proj.weight has shape [d_model, in_features] ---
+    for key in list(model_state.keys()):
+        if not key.endswith("object_proj.weight"):
+            continue
+        tensor = model_state[key]
+        old_in = tensor.shape[1]
+        if old_in >= expected_dim:
+            continue
+        pad_cols = expected_dim - old_in
+        model_state[key] = torch.cat(
+            [tensor, torch.zeros(tensor.shape[0], pad_cols, dtype=tensor.dtype, device=tensor.device)],
+            dim=1,
+        )
+        migrated = True
+        # Also pad the bias if present (bias shape is [d_model], no padding needed)
+
+    # --- SF normalizer buffers for object_scalars ---
+    for key in list(model_state.keys()):
+        if "object_scalars" not in key:
+            continue
+        if not (key.endswith(".running_mean") or key.endswith(".running_var")):
+            continue
+        tensor = model_state[key]
+        if tensor.ndim < 1:
+            continue
+        old_last = tensor.shape[-1]
+        if old_last >= expected_dim:
+            continue
+        pad_size = expected_dim - old_last
+        if key.endswith(".running_var"):
+            pad_val = torch.ones(*tensor.shape[:-1], pad_size, dtype=tensor.dtype, device=tensor.device)
+        else:
+            pad_val = torch.zeros(*tensor.shape[:-1], pad_size, dtype=tensor.dtype, device=tensor.device)
+        model_state[key] = torch.cat([tensor, pad_val], dim=-1)
+        migrated = True
+
+    # --- optimizer state ---
+    # When the observation dimension changes, optimizer momentum buffers
+    # (exp_avg, exp_avg_sq) no longer match the parameter shapes.  Rather
+    # than trying to pad individual buffers (which breaks when SF's
+    # _foreach_lerp_ batches parameters with mismatched shapes), clear
+    # the entire optimizer state so Adam restarts cleanly.
+    if migrated and optimizer_state is not None and "state" in optimizer_state:
+        optimizer_state["state"].clear()
+
+    return migrated
 
 
 # ------------------------------------------------------------------

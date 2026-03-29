@@ -37,6 +37,8 @@ try:
 except ImportError as exc:
     raise ImportError("sample-factory is required: pip install sample-factory>=2.0.0") from exc
 
+import torch
+
 from quake_ai.ppo.quake_core import make_quake_core
 from quake_ai.ppo.quake_encoder import QuakeTransformerEncoder, make_quake_encoder
 from quake_ai.ppo.quake_env import make_quake_env
@@ -109,6 +111,8 @@ _PPO_SCALAR_TAGS = {
     "reward_deaths_mean": "policy_stats/avg_reward_deaths",
     "reward_ehp_mean": "policy_stats/avg_reward_ehp",
     "reward_edp_mean": "policy_stats/avg_reward_edp",
+    "reward_tracking_mean": "policy_stats/avg_reward_tracking",
+    "tracking_cos_mean": "policy_stats/avg_tracking_cos_mean",
     "policy_loss": "train/policy_loss",
     "value_loss": "train/value_loss",
     "entropy": "train/entropy",
@@ -285,6 +289,28 @@ def write_ppo_stage_artifacts(cfg: Any, status: Any, runner: Any | None = None) 
     }
 
 
+def _scrub_numpy(obj: Any) -> Any:
+    """Recursively convert numpy scalars to Python types so torch.save
+    produces a checkpoint loadable with weights_only=True."""
+    import numpy as np
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            obj[k] = _scrub_numpy(v)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            obj[i] = _scrub_numpy(v)
+    elif isinstance(obj, tuple):
+        obj = tuple(_scrub_numpy(v) for v in obj)
+    elif isinstance(obj, np.integer):
+        obj = int(obj)
+    elif isinstance(obj, np.floating):
+        obj = float(obj)
+    elif isinstance(obj, np.ndarray):
+        obj = obj.tolist()
+    return obj
+
+
 def _warm_start_policy(
     pid: int,
     ckpt: str,
@@ -301,9 +327,26 @@ def _warm_start_policy(
         # best_*.pth for its own save_best tracking — if the seed
         # occupies that name, SF's new-best writes silently collide
         # with the seed file and the checkpoint is lost.
+        from quake_ai.ppo.checkpoint_converter import migrate_modality_embed, migrate_object_proj
+        from quake_ai.utils.io import trusted_torch_load
+
         name = Path(ckpt).name.replace("best_", "checkpoint_")
         dest = policy_dir / name
-        shutil.copy2(ckpt, dest)
+        payload = trusted_torch_load(ckpt, map_location="cpu")
+        migrated = False
+        if "model" in payload:
+            if migrate_modality_embed(payload["model"], optimizer=payload.get("optimizer")):
+                print(f"[quake_ppo] Migrated modality_embed in {ckpt}")
+                migrated = True
+            if migrate_object_proj(payload["model"], optimizer_state=payload.get("optimizer")):
+                print(f"[quake_ppo] Migrated object_proj in {ckpt}")
+                migrated = True
+        if migrated:
+            # Scrub numpy scalars so SF's weights_only=True torch.load works.
+            _scrub_numpy(payload)
+            torch.save(payload, dest)
+        else:
+            shutil.copy2(ckpt, dest)
         print(f"[quake_ppo] Policy {pid} warm-start copied: {ckpt} → {dest}")
         return dest
     else:
@@ -320,7 +363,7 @@ def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
     Supports both single-seed (all policies from one checkpoint) and
     multi-seed PBT (round-robin assignment from a list of checkpoints).
 
-    Accepts either BC ``.npz`` (converted to SF format) or existing
+    Accepts either BC ``.pth`` (converted to SF format) or existing
     SF ``.pth`` (copied directly). The caller decides whether this launch
     is resuming an existing PPO experiment or seeding a fresh one.
     """
@@ -359,8 +402,27 @@ def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
         return first_path
 
 
+def _patch_save_best_keep() -> None:
+    """Fix SF's hardcoded keep=1 in save_best to use cfg.keep_checkpoints."""
+    from sample_factory.algo.learning.learner import Learner
+
+    _original_save_best = Learner.save_best
+
+    def _save_best_keep_all(self, policy_id, metric, metric_value):
+        if policy_id != self.policy_id:
+            return False
+        if metric_value - self.best_performance > 0.001:
+            self.best_performance = metric_value
+            name_suffix = f"_{metric}_{metric_value:.3f}"
+            return self._save_impl("best", name_suffix, self.cfg.keep_checkpoints, verbose=False)
+        return False
+
+    Learner.save_best = _save_best_keep_all
+
+
 def register_quake_components() -> None:
     """Register Quake env and encoder with Sample Factory (idempotent)."""
+    _patch_save_best_keep()
     _patch_sample_factory_checkpoint_loading()
     register_env("quake_combat", make_quake_env)
     if _HAS_REGISTER_CUSTOM_ENCODER:
@@ -508,7 +570,9 @@ def build_ppo_cfg(
     max_grad_norm: float,
     value_coef: float,
     minibatch_size: int,
-    policy_workers_per_policy: int = 1,
+    policy_workers_per_policy: int,
+    batched_sampling: bool,
+    worker_inference: bool = False,
     max_policy_lag: int = 30,
     with_wandb: bool = False,
     # Population-Based Training
@@ -562,6 +626,7 @@ def build_ppo_cfg(
         "--continuous_tanh_scale=1.0",
         "--initial_stddev=0.2",
         f"--policy_workers_per_policy={policy_workers_per_policy}",
+        f"--batched_sampling={'True' if batched_sampling else 'False'}",
         f"--max_policy_lag={max_policy_lag}",
         "--keep_checkpoints=10",
         "--save_milestones_sec=600",
@@ -620,6 +685,7 @@ def build_ppo_cfg(
     add_quake_cli_args(parser)
     cfg = parse_full_cfg(parser, argv=argv)
     cfg.quake_resume = bool(resume)
+    cfg.worker_inference = bool(worker_inference)
     _validate_quake_cfg(cfg)
     return cfg
 
@@ -669,6 +735,17 @@ def run_ppo(cfg: Any) -> Dict[str, Any]:
     cfg.lr_schedule = "linear_decay"
 
     cfg, runner = make_runner(cfg)
+
+    # Worker inference: bypass centralized inference workers entirely.
+    if getattr(cfg, "worker_inference", False):
+        from quake_ai.ppo.worker_inference import WorkerInferenceSampler
+        _orig_make_sampler = runner._make_sampler
+        def _patched_make_sampler(sampler_cls, event_loop):
+            print("[quake_ppo] Using WorkerInferenceSampler (bypassing inference workers)")
+            return _orig_make_sampler(WorkerInferenceSampler, event_loop)
+        runner._make_sampler = _patched_make_sampler
+        print("[quake_ppo] Worker inference mode enabled")
+
     runner.register_observer(BestCheckpointArchiver(runner))
 
     status = runner.init()

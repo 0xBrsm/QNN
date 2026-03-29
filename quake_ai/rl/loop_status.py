@@ -109,13 +109,15 @@ def build_loop_status(
     ppo_dir = run_root / "checkpoints"
     config_path = ppo_dir / "config.json"
     log_path = ppo_dir / "sf_log.txt"
-    best_path = run_root / "checkpoints" / "best" / "best_model.pth"
+    from quake_ai.rl.training import best_checkpoint
+    best_path = best_checkpoint(run_root / "checkpoints") or (run_root / "checkpoints" / "nonexistent")
     eval_summary_path = run_root / "metrics" / "eval" / "eval_summary.json"
 
     config = _safe_read_json(config_path) or {}
     log_text = _read_text(log_path)
     loaded_train_step, loaded_env_steps = _loaded_state_steps(log_text)
-    seed_checkpoint = manifest.get("checkpoint_path") or manifest.get("seed_checkpoint") or config.get("quake_bc_checkpoint")
+    seed_checkpoint_raw = manifest.get("checkpoint_path")
+    seed_checkpoint = seed_checkpoint_raw if isinstance(seed_checkpoint_raw, str) else None
     checkpoint_seed_steps = _seed_steps_from_checkpoint_name(seed_checkpoint)
     seed_env_steps = loaded_env_steps if loaded_env_steps is not None else checkpoint_seed_steps
     current_env_steps, throughput = _latest_total_frames(log_text)
@@ -123,6 +125,8 @@ def build_loop_status(
     eval_summary = _safe_read_json(eval_summary_path)
     fixed_tick_hz = config.get("quake_fixed_tick_hz")
     effective_minutes = effective_game_minutes_per_wall_minute(throughput, fixed_tick_hz)
+    with_pbt_raw = config.get("with_pbt")
+    num_policies_raw = config.get("num_policies")
 
     status: dict[str, Any] = {
         "root": str(run_root),
@@ -134,8 +138,8 @@ def build_loop_status(
         "fixed_tick_hz": int(fixed_tick_hz) if isinstance(fixed_tick_hz, (int, float)) else None,
         "throughput_fps": throughput,
         "effective_game_minutes_per_wall_minute": effective_minutes,
-        "with_pbt": bool(config.get("with_pbt", False)),
-        "num_policies": int(config.get("num_policies", 1) or 1),
+        "with_pbt": bool(with_pbt_raw) if isinstance(with_pbt_raw, bool) else None,
+        "num_policies": int(num_policies_raw) if isinstance(num_policies_raw, (int, float)) else None,
         "eval_summary_path": str(eval_summary_path),
         "eval_present": eval_summary is not None,
     }
@@ -192,7 +196,7 @@ def build_loop_status(
             status["reason"] = "The run has crossed the hard gate; use retained eval to either promote it or change one thing."
 
     if eval_run_dir:
-        status["recommended_eval_command"] = f"docker compose -f src/docker/compose.yaml run --build trainer scripts/train.sh {Path(eval_run_dir)}"
+        status["recommended_eval_command"] = f"docker compose -f src/docker/compose.yaml run --rm trainer scripts/train.sh {Path(eval_run_dir)}"
     else:
         status["recommended_eval_command"] = None
     status["recommended_summary_command"] = (
