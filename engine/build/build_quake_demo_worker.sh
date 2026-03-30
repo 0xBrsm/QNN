@@ -14,12 +14,13 @@ PATCHES=(
 )
 
 CUSTOM_SOURCES=(
-  "${ENGINE_DIR}/worker/qnn_worker_common.c"
-  "${ENGINE_DIR}/worker/qnn_demo_worker_main.c"
-  "${ENGINE_DIR}/worker/qnn_worker_input.c"
-  "${ENGINE_DIR}/worker/qnn_worker_sound.c"
-  "${ENGINE_DIR}/worker/qnn_worker_token.c"
-  "${ENGINE_DIR}/worker/qnn_world_model.c"
+  "${ENGINE_DIR}/worker/qnn_sys.c"
+  "${ENGINE_DIR}/worker/qnn_demo_main.c"
+  "${ENGINE_DIR}/worker/qnn_input.c"
+  "${ENGINE_DIR}/worker/qnn_sound.c"
+  "${ENGINE_DIR}/worker/qnn_obs.c"
+  "${ENGINE_DIR}/worker/qnn_metrics.c"
+  "${ENGINE_DIR}/worker/qnn_world.c"
 )
 
 check_build_deps "the Quake demo worker"

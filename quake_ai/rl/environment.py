@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from math import hypot
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Mapping, Sequence, Tuple
 
@@ -12,12 +11,12 @@ import numpy as np
 
 import logging
 
-from engine.bridge import NativeEngineError, NativeObsBufferAdapter, NativeTokenAdapter
+from engine.bridge import NativeEngineError, NativeObsBufferAdapter
 from engine.training_protocol import TrustedTrainingExtrasV1
 from quake_ai.actions import ActionLabels, CONTINUOUS_ACTION_HEADS
 from quake_ai.rl.combat_metrics import WEAPON_TOTAL_DEBUG_KEYS, weapon_metric_key
-from quake_ai.model.observation import TokenObservationEncoder, visible_threat_count
-from quake_ai.rl.reward import WEAPON_TIER_VALUES, RewardWeights, effective_hp, reward_components
+from quake_ai.model.observation import visible_threat_count
+from quake_ai.rl.reward import RewardWeights, effective_hp
 from quake_ai.rl.schemas import MapState
 from quake_ai.vocab import MODALITY_IDS, SUBJECT_IDS
 
@@ -27,189 +26,6 @@ if TYPE_CHECKING:
 
 _PLAYER_SUBJECT_ID = SUBJECT_IDS["PLAYER"]
 _VISUAL_MODALITY_ID = MODALITY_IDS["VISUAL"]
-
-
-def _tracking_cosine(obs: Dict[str, np.ndarray]) -> float:
-    """Cosine of angle between player aim and nearest enemy.
-
-    Returns a value in [-1, +1]: +1 means enemy is dead-center on crosshair,
-    -1 means enemy is directly behind. Returns 0.0 if no enemy is visible.
-
-    Object token rel_x/y/z are already in the player's view frame
-    (forward/right/up), computed by qnn_relative_frame() in the C worker.
-    So rel_x/dist gives the cosine directly — no yaw/pitch needed.
-    """
-    obj_ids = obs["object_ids"]       # (N, 5) — subject_id at [:, 0]
-    obj_sc = obs["object_scalars"]    # (N, 8) — rel_x/y/z at [:, 0:3]
-    obj_mask = obs["object_mask"]     # (N,)
-
-    best_cos = 0.0
-    best_dist_sq = float("inf")
-
-    for i in range(obj_ids.shape[0]):
-        if not obj_mask[i]:
-            break
-        if int(obj_ids[i, 0]) != _PLAYER_SUBJECT_ID:
-            continue
-
-        rx = float(obj_sc[i, 0])  # forward component (view frame)
-        ry = float(obj_sc[i, 1])  # right component
-        # Offset up component to hitbox center (+28 Quake units / 1024 norm)
-        rz = float(obj_sc[i, 2]) + 28.0 / 1024.0
-        dist_sq = rx * rx + ry * ry + rz * rz
-        if dist_sq < 1e-8:
-            continue
-
-        # In view frame, crosshair = forward axis, so cos = rx / dist
-        cos = rx / (dist_sq ** 0.5)
-
-        if dist_sq < best_dist_sq:
-            best_dist_sq = dist_sq
-            best_cos = cos
-
-    return best_cos
-
-
-_HEALTH_CAP = 250.0
-_ARMOR_CAP = 200.0
-_ARMOR_TYPE_CAP = 0.8
-_VEL_CAP = 2000.0
-
-
-@dataclass(frozen=True, slots=True)
-class _SelfInfo:
-    """Self-token fields extracted from the obs buffer for reward computation."""
-    health: float       # normalized [0,1]
-    armor: float        # normalized [0,1]
-    armor_type: float   # normalized [0,1]
-    velocity: list      # [vx, vy, vz] normalized
-    weapon_id: int      # weapon embedding ID
-    ammo: list          # [shells, nails, rockets, cells] normalized
-
-
-def _self_info_from_obs(obs: Dict[str, np.ndarray]) -> _SelfInfo:
-    """Extract self-token fields from the obs buffer numpy dict."""
-    s = obs["self_scalars"]
-    return _SelfInfo(
-        health=float(s[0]),
-        armor=float(s[1]),
-        armor_type=float(s[2]),
-        velocity=[float(s[15]), float(s[16]), float(s[17])],
-        weapon_id=int(obs["self_weapon_id"][0]),
-        ammo=[float(s[11]), float(s[12]), float(s[13]), float(s[14])],
-    )
-
-
-@dataclass(slots=True)
-class NativeEnvState:
-    steps: int
-    current_region_id: int | None
-    frags: int
-    weapon_id: int
-    prev_ehp: float = 100.0
-
-
-def _velocity_magnitude(vel_norm: List[float]) -> float:
-    """Planar speed from normalized velocity (`self_token.velocity / 2000`)."""
-    return float(hypot(vel_norm[0] * _VEL_CAP, vel_norm[1] * _VEL_CAP))
-
-
-def _combat_signals(
-    *,
-    state: NativeEnvState,
-    health: int,
-    armor: int,
-    armor_type: float,
-    weapon_id: int,
-    visible_threats: int,
-    fire_pressed: int,
-) -> Dict[str, float]:
-    shots_fired = float(fire_pressed)
-    effective_fire = 1 if (shots_fired > 0 and visible_threats > 0) else 0
-    blind_fire = 1 if (shots_fired > 0 and visible_threats == 0) else 0
-    signals = {
-        "frag_gain": 0.0,
-        "frag_loss": 0.0,
-        "monster_kills": 0.0,
-        "damage_taken": 0.0,
-        "damage_dealt": 0.0,
-        "hit_count": 0.0,
-        "shots_fired": shots_fired,
-        "health_gain": 0.0,
-        "armor_gain": 0.0,
-        "ammo_gain": 0.0,
-        "weapon_pickups": 0.0,
-        "weapon_switches": float(1 if (weapon_id > 0 and weapon_id != state.weapon_id) else 0),
-        "visible_threats": float(visible_threats),
-        "fire_pressed": float(fire_pressed),
-        "effective_fire": float(effective_fire),
-        "blind_fire": float(blind_fire),
-        "health": float(health),
-        "armor": float(armor),
-        "armor_type": float(armor_type),
-        "prev_ehp": float(state.prev_ehp),
-        "health_fraction": float(max(0.0, min(health / 100.0, 1.0))),
-        "armor_fraction": float(max(0.0, min(armor / 100.0, 1.0))),
-        "player_died": 0.0,
-        "episode_damage_dealt": 0.0,
-        "episode_hit_count": 0.0,
-        "episode_shots_fired": 0.0,
-    }
-    return signals
-
-
-def _apply_training_extras(
-    combat_signals: Dict[str, float],
-    *,
-    training_extras: TrustedTrainingExtrasV1 | None,
-) -> Dict[str, float]:
-    if training_extras is None:
-        return combat_signals
-
-    weapon_pickup_value = 0.0
-    for record in training_extras.item_records:
-        if record.actor_entity_num != training_extras.self_entity_num:
-            continue
-        if record.event_kind != 1 or record.category != 4:
-            continue
-        weapon_pickup_value += WEAPON_TIER_VALUES.get(int(record.weapon_id), 1.0)
-
-    # Split damage into self (rocket splash etc.) vs other (enemy hits).
-    self_ent = training_extras.self_entity_num
-    damage_self = 0.0
-    damage_other = 0.0
-    for record in training_extras.damage_records:
-        if record.attacker_entity_num != self_ent:
-            continue
-        delta = record.damage_health + record.damage_armor
-        if record.target_entity_num == self_ent:
-            damage_self += delta
-        else:
-            damage_other += delta
-
-    combat_signals = dict(combat_signals)
-    combat_signals.update(
-        {
-            "frag_gain": float(training_extras.frag_gain),
-            "frag_loss": float(training_extras.frag_loss),
-            "damage_taken": float(training_extras.damage_taken),
-            "damage_dealt": float(training_extras.damage_dealt),
-            "damage_dealt_self": float(damage_self),
-            "damage_dealt_other": float(damage_other),
-            "hit_count": float(training_extras.hit_count),
-            "shots_fired": float(training_extras.shots_fired),
-            "health_gain": float(training_extras.pickup_health),
-            "armor_gain": float(training_extras.pickup_armor),
-            "ammo_gain": float(training_extras.pickup_ammo),
-            "weapon_pickups": float(weapon_pickup_value),
-            "player_died": float(1.0 if training_extras.player_died else 0.0),
-            "episode_damage_dealt": float(training_extras.episode_damage_dealt),
-            "episode_hit_count": float(training_extras.episode_hit_count),
-            "episode_shots_fired": float(training_extras.episode_shots_fired),
-            "edp_raw": float(training_extras.edp_raw),
-        }
-    )
-    return combat_signals
 
 
 class NativeWorldEnv:

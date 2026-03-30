@@ -1,5 +1,5 @@
 /*
- * qnn_worker_sound.c — Replaces snd_null.c for the Quake worker.
+ * qnn_sound.c — Replaces snd_null.c for the Quake worker.
  *
  * All playback is still null (no audio output), but S_PrecacheSound stores
  * sound names and S_StartSound captures spatial sound events into a ring
@@ -10,7 +10,7 @@
  * requiring a real audio subsystem.
  */
 
-#include "qnn_worker.h"
+#include "qnn.h"
 
 /* ---- Precache name table ------------------------------------------------ */
 
@@ -30,12 +30,12 @@ cvar_t volume = {"volume", "0.7"};
 
 /* ---- Sound event ring buffer -------------------------------------------- */
 
-qnn_worker_sound_event_t qnn_worker_sound_buffer[QNN_WORKER_MAX_SOUNDS];
-int qnn_worker_sound_count = 0;
+qnn_sound_event_t qnn_sound_buffer[QNN_MAX_SOUNDS];
+int qnn_sound_count = 0;
 
 /* ---- Sound category classification -------------------------------------- */
 
-static int qnn_snd_classify(const char *name)
+static int QNN_SndClassify(const char *name)
 {
 	if (!name || !name[0])
 		return QNN_SND_CAT_AMBIENT;
@@ -114,12 +114,12 @@ void S_StaticSound(sfx_t *sfx, vec3_t origin, float vol, float attenuation)
 
 void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin, float fvol, float attenuation)
 {
-	qnn_worker_sound_event_t *snd;
+	qnn_sound_event_t *snd;
 	const char *name;
 
 	(void)entchannel;
 
-	if (qnn_worker_sound_count >= QNN_WORKER_MAX_SOUNDS)
+	if (qnn_sound_count >= QNN_MAX_SOUNDS)
 		return;
 
 	/* Determine sound name from sfx pointer offset into our precache pool */
@@ -133,15 +133,15 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin, float f
 			name = sfx->name;
 	}
 
-	snd = &qnn_worker_sound_buffer[qnn_worker_sound_count];
+	snd = &qnn_sound_buffer[qnn_sound_count];
 	VectorCopy(origin, snd->origin);
 	snd->volume = fvol;
 	snd->attenuation = attenuation;
 	snd->entity_num = entnum;
-	snd->category = qnn_snd_classify(name);
+	snd->category = QNN_SndClassify(name);
 	strncpy(snd->name, name, sizeof(snd->name) - 1);
 	snd->name[sizeof(snd->name) - 1] = '\0';
-	qnn_worker_sound_count += 1;
+	qnn_sound_count += 1;
 }
 
 void S_StopSound(int entnum, int entchannel)
@@ -182,7 +182,7 @@ void S_Update(vec3_t origin, vec3_t v_forward, vec3_t v_right, vec3_t v_up)
 void S_StopAllSounds(qboolean clear)
 {
 	(void)clear;
-	qnn_worker_sound_count = 0;
+	qnn_sound_count = 0;
 }
 
 void S_BeginPrecaching(void)

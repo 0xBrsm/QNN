@@ -1,4 +1,4 @@
-#include "qnn_worker.h"
+#include "qnn.h"
 #include "qnn_nav_oracle.h"
 
 #include <ctype.h>
@@ -15,13 +15,13 @@
 
 /* ── shared globals ──────────────────────────────────────────────── */
 
-qnn_worker_map_state_t qnn_worker_map_state;
+qnn_map_state_t qnn_map_state;
 qnn_resample_state_t qnn_resample;
-char qnn_worker_basedir_storage[MAX_OSPATH] = ".";
+char qnn_basedir_storage[MAX_OSPATH] = ".";
 
 qboolean isDedicated;
 int nostdout = 1;
-char *basedir = qnn_worker_basedir_storage;
+char *basedir = qnn_basedir_storage;
 char *cachedir = "/tmp";
 cvar_t sys_linerefresh = {"sys_linerefresh", "0"};
 
@@ -192,7 +192,7 @@ void Sys_MakeCodeWriteable(unsigned long startaddr, unsigned long length)
 
 /* ── basedir resolution ──────────────────────────────────────────── */
 
-static qboolean qnn_worker_dir_exists(const char *path)
+static qboolean QNN_DirExists(const char *path)
 {
 	struct stat st;
 
@@ -201,24 +201,24 @@ static qboolean qnn_worker_dir_exists(const char *path)
 	return S_ISDIR(st.st_mode) ? true : false;
 }
 
-static qboolean qnn_worker_has_id1(const char *root)
+static qboolean QNN_HasId1(const char *root)
 {
 	char path[MAX_OSPATH];
 
 	snprintf(path, sizeof(path), "%s/id1", root);
-	return qnn_worker_dir_exists(path);
+	return QNN_DirExists(path);
 }
 
-static void qnn_worker_try_basedir(char *out, size_t out_size, const char *candidate)
+static void QNN_TryBasedir(char *out, size_t out_size, const char *candidate)
 {
 	if (!candidate || !candidate[0])
 		return;
-	if (!qnn_worker_has_id1(candidate))
+	if (!QNN_HasId1(candidate))
 		return;
 	snprintf(out, out_size, "%s", candidate);
 }
 
-void qnn_worker_resolve_basedir(char *out, size_t out_size)
+void QNN_ResolveBasedir(char *out, size_t out_size)
 {
 	const char *env;
 	char cwd[MAX_OSPATH];
@@ -228,11 +228,11 @@ void qnn_worker_resolve_basedir(char *out, size_t out_size)
 	out[0] = 0;
 
 	if (env && env[0])
-		qnn_worker_try_basedir(out, out_size, env);
+		QNN_TryBasedir(out, out_size, env);
 	if (out[0])
 		return;
 
-	qnn_worker_try_basedir(out, out_size, "/assets");
+	QNN_TryBasedir(out, out_size, "/assets");
 	if (out[0])
 		return;
 
@@ -243,17 +243,17 @@ void qnn_worker_resolve_basedir(char *out, size_t out_size)
 	}
 
 	snprintf(candidate, sizeof(candidate), "%s/assets", cwd);
-	qnn_worker_try_basedir(out, out_size, candidate);
+	QNN_TryBasedir(out, out_size, candidate);
 	if (out[0])
 		return;
 
 	snprintf(candidate, sizeof(candidate), "%s/../assets", cwd);
-	qnn_worker_try_basedir(out, out_size, candidate);
+	QNN_TryBasedir(out, out_size, candidate);
 	if (out[0])
 		return;
 
 	snprintf(candidate, sizeof(candidate), "%s/../../assets", cwd);
-	qnn_worker_try_basedir(out, out_size, candidate);
+	QNN_TryBasedir(out, out_size, candidate);
 	if (out[0])
 		return;
 
@@ -262,7 +262,7 @@ void qnn_worker_resolve_basedir(char *out, size_t out_size)
 
 /* ── JSON extraction utilities ───────────────────────────────────── */
 
-int qnn_json_extract_int(const char *line, const char *key, int fallback)
+int QNN_JsonExtractInt(const char *line, const char *key, int fallback)
 {
 	const char *match;
 	const char *colon;
@@ -276,7 +276,7 @@ int qnn_json_extract_int(const char *line, const char *key, int fallback)
 	return atoi(colon + 1);
 }
 
-float qnn_json_extract_float(const char *line, const char *key, float fallback)
+float QNN_JsonExtractFloat(const char *line, const char *key, float fallback)
 {
 	const char *match;
 	const char *colon;
@@ -290,7 +290,7 @@ float qnn_json_extract_float(const char *line, const char *key, float fallback)
 	return (float)atof(colon + 1);
 }
 
-qboolean qnn_json_extract_bool(const char *line, const char *key, qboolean fallback)
+qboolean QNN_JsonExtractBool(const char *line, const char *key, qboolean fallback)
 {
 	const char *match;
 	const char *colon;
@@ -312,7 +312,7 @@ qboolean qnn_json_extract_bool(const char *line, const char *key, qboolean fallb
 	return fallback;
 }
 
-qboolean qnn_json_extract_string(const char *line, const char *key, char *out, size_t out_size)
+qboolean QNN_JsonExtractString(const char *line, const char *key, char *out, size_t out_size)
 {
 	const char *match;
 	const char *colon;
@@ -356,7 +356,7 @@ qboolean qnn_json_extract_string(const char *line, const char *key, char *out, s
 	return true;
 }
 
-qboolean qnn_json_extract_vec2(const char *line, const char *key, float out[2])
+qboolean QNN_JsonExtractVec2(const char *line, const char *key, float out[2])
 {
 	const char *match;
 	const char *colon;
@@ -398,7 +398,7 @@ qboolean qnn_json_extract_vec2(const char *line, const char *key, float out[2])
 	return *cursor == ']' ? true : false;
 }
 
-qboolean qnn_json_extract_vec3(const char *line, const char *key, vec3_t out)
+qboolean QNN_JsonExtractVec3(const char *line, const char *key, vec3_t out)
 {
 	const char *match;
 	const char *colon;
@@ -440,7 +440,7 @@ qboolean qnn_json_extract_vec3(const char *line, const char *key, vec3_t out)
 	return *cursor == ']' ? true : false;
 }
 
-static float qnn_clamp_unit(float value)
+static float QNN_ClampUnit(float value)
 {
 	if (value < -1.0f)
 		return -1.0f;
@@ -453,7 +453,7 @@ static float qnn_clamp_unit(float value)
 #define QNN_LOOK_BASE_COUNT 256.0f
 #define QNN_LOOK_HIGH_GAIN 2.0f
 
-static float qnn_look_count_curve(float magnitude)
+static float QNN_LookCountCurve(float magnitude)
 {
 	float clamped;
 
@@ -465,7 +465,7 @@ static float qnn_look_count_curve(float magnitude)
 	return QNN_LOOK_BASE_COUNT * clamped * (1.0f + ((QNN_LOOK_HIGH_GAIN - 1.0f) * clamped * clamped));
 }
 
-static float qnn_look_magnitude_from_count(float count_magnitude)
+static float QNN_LookMagnitudeFromCount(float count_magnitude)
 {
 	float target;
 	float lo;
@@ -491,23 +491,23 @@ static float qnn_look_magnitude_from_count(float count_magnitude)
 	return 0.5f * (lo + hi);
 }
 
-int qnn_mouse_count_from_look_axis(float axis)
+int QNN_MouseCountFromLookAxis(float axis)
 {
 	float clamped;
 	float magnitude;
 	float normalized;
 	float sign;
 
-	clamped = qnn_clamp_unit(axis);
+	clamped = QNN_ClampUnit(axis);
 	sign = clamped < 0.0f ? -1.0f : 1.0f;
 	magnitude = fabsf(clamped);
 	if (magnitude <= QNN_LOOK_DEADZONE)
 		return 0;
 	normalized = (magnitude - QNN_LOOK_DEADZONE) / (1.0f - QNN_LOOK_DEADZONE);
-	return (int)roundf(sign * qnn_look_count_curve(normalized));
+	return (int)roundf(sign * QNN_LookCountCurve(normalized));
 }
 
-float qnn_look_axis_from_mouse_count(int mouse_count)
+float QNN_LookAxisFromMouseCount(int mouse_count)
 {
 	float normalized;
 	float axis;
@@ -516,12 +516,12 @@ float qnn_look_axis_from_mouse_count(int mouse_count)
 	if (mouse_count == 0)
 		return 0.0f;
 	sign = mouse_count < 0 ? -1.0f : 1.0f;
-	normalized = qnn_look_magnitude_from_count((float)abs(mouse_count));
+	normalized = QNN_LookMagnitudeFromCount((float)abs(mouse_count));
 	axis = QNN_LOOK_DEADZONE + ((1.0f - QNN_LOOK_DEADZONE) * normalized);
-	return sign * qnn_clamp_unit(axis);
+	return sign * QNN_ClampUnit(axis);
 }
 
-int qnn_switch_slot_from_weapon_id(int weapon_id)
+int QNN_SwitchSlotFromWeaponId(int weapon_id)
 {
 	if (weapon_id <= 0)
 		return 0;
@@ -538,7 +538,7 @@ int qnn_switch_slot_from_weapon_id(int weapon_id)
 	return 0;
 }
 
-int qnn_switch_impulse_from_slot(int switch_slot, int weapons_owned)
+int QNN_SwitchImpulseFromSlot(int switch_slot, int weapons_owned)
 {
 	switch (switch_slot)
 	{
@@ -563,7 +563,7 @@ int qnn_switch_impulse_from_slot(int switch_slot, int weapons_owned)
 
 /* ── map preparation ─────────────────────────────────────────────── */
 
-static void qnn_worker_canonicalize_map(char *out, size_t out_size, const char *requested)
+static void QNN_CanonicalizeMap(char *out, size_t out_size, const char *requested)
 {
 	size_t i;
 
@@ -572,9 +572,9 @@ static void qnn_worker_canonicalize_map(char *out, size_t out_size, const char *
 		out[i] = (char)tolower((unsigned char)out[i]);
 }
 
-qboolean qnn_worker_prepare_map(const char *requested_map_id, char *error, size_t error_size)
+qboolean QNN_PrepareMap(const char *requested_map_id, char *error, size_t error_size)
 {
-	char map_name[QNN_WORKER_MAX_MAP_ID];
+	char map_name[QNN_MAX_MAP_ID];
 
 	if (!requested_map_id || !requested_map_id[0])
 	{
@@ -582,21 +582,21 @@ qboolean qnn_worker_prepare_map(const char *requested_map_id, char *error, size_
 		return false;
 	}
 
-	qnn_worker_canonicalize_map(map_name, sizeof(map_name), requested_map_id);
-	if (!strcmp(qnn_worker_map_state.requested_map_id, requested_map_id)
-		&& !strcmp(qnn_worker_map_state.map_name, map_name)
-		&& qnn_worker_map_state.region_count > 0)
+	QNN_CanonicalizeMap(map_name, sizeof(map_name), requested_map_id);
+	if (!strcmp(qnn_map_state.requested_map_id, requested_map_id)
+		&& !strcmp(qnn_map_state.map_name, map_name)
+		&& qnn_map_state.region_count > 0)
 		return true;
 
-	qnn_worker_free_map_state(&qnn_worker_map_state);
-	if (!qnn_worker_build_map_state(&qnn_worker_map_state, requested_map_id, map_name, error, error_size))
+	QNN_FreeMapState(&qnn_map_state);
+	if (!QNN_BuildMapState(&qnn_map_state, requested_map_id, map_name, error, error_size))
 		return false;
 	return true;
 }
 
 /* ── JSON output helpers ─────────────────────────────────────────── */
 
-void qnn_worker_write_json_string(FILE *out, const char *text)
+void QNN_WriteJsonString(FILE *out, const char *text)
 {
 	const unsigned char *cursor;
 
@@ -622,24 +622,24 @@ void qnn_worker_write_json_string(FILE *out, const char *text)
 	fputc('"', out);
 }
 
-void qnn_worker_write_error(const char *message)
+void QNN_WriteError(const char *message)
 {
 	fprintf(stdout, "{\"error\":");
-	qnn_worker_write_json_string(stdout, message);
+	QNN_WriteJsonString(stdout, message);
 	fprintf(stdout, ",\"ok\":false}\n");
 	fflush(stdout);
 }
 
 /* ── engine state helpers ────────────────────────────────────────── */
 
-const char *qnn_worker_prog_string(string_t value)
+const char *QNN_ProgString(string_t value)
 {
 	if (!value)
 		return "";
 	return pr_strings + value;
 }
 
-static const char *qnn_worker_server_classname(int entity_num)
+static const char *QNN_ServerClassname(int entity_num)
 {
 	edict_t *edict;
 
@@ -650,10 +650,10 @@ static const char *qnn_worker_server_classname(int entity_num)
 	edict = EDICT_NUM(entity_num);
 	if (edict->free || !edict->v.classname)
 		return "";
-	return qnn_worker_prog_string(edict->v.classname);
+	return QNN_ProgString(edict->v.classname);
 }
 
-int qnn_worker_weapon_id(void)
+int QNN_WeaponId(void)
 {
 	int active;
 	int weapon_id;
@@ -687,14 +687,14 @@ int qnn_worker_weapon_id(void)
 	return 0;
 }
 
-int qnn_worker_current_frags(void)
+int QNN_CurrentFrags(void)
 {
 	if (cl.viewentity > 0 && cl.scores != NULL && cl.viewentity - 1 < cl.maxclients)
 		return cl.scores[cl.viewentity - 1].frags;
 	return cl.stats[STAT_FRAGS];
 }
 
-static float qnn_worker_current_armortype(void)
+static float QNN_CurrentArmortype(void)
 {
 	int items;
 
@@ -710,7 +710,7 @@ static float qnn_worker_current_armortype(void)
 /* Returns true if a server edict is an "actor" — anything that moves
    autonomously and can take damage (players, bots, monsters).  Excludes
    projectiles, doors, platforms, items, and corpses. */
-static qboolean qnn_is_actor_edict(const edict_t *ed)
+static qboolean QNN_IsActorEdict(const edict_t *ed)
 {
 	int mt;
 	if (ed->free)
@@ -723,7 +723,7 @@ static qboolean qnn_is_actor_edict(const edict_t *ed)
 	return mt == MOVETYPE_WALK || mt == MOVETYPE_STEP;
 }
 
-void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float fixed_dt)
+void QNN_CaptureVisibleEntities(qnn_snapshot_t *snapshot, float fixed_dt)
 {
 	int entity_num;
 	/* Track which entity numbers were already captured from the client list
@@ -732,11 +732,11 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 	memset(captured, 0, sizeof(captured));
 
 	/* Pass 1: client-side entities (normal network-visible entities). */
-	for (entity_num = 1; entity_num < cl.num_entities && snapshot->visible_count < QNN_WORKER_MAX_VISIBLE; ++entity_num)
+	for (entity_num = 1; entity_num < cl.num_entities && snapshot->visible_count < QNN_MAX_VISIBLE; ++entity_num)
 	{
 		entity_t *entity;
 		edict_t *server_edict;
-		qnn_worker_visible_entity_t *out_entity;
+		qnn_visible_entity_t *out_entity;
 		vec3_t delta;
 
 		entity = &cl_entities[entity_num];
@@ -750,7 +750,7 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 		memset(out_entity, 0, sizeof(*out_entity));
 		out_entity->entity_key = entity_num;
 		snprintf(out_entity->entity_id, sizeof(out_entity->entity_id), "entity_%04d", entity_num);
-		snprintf(out_entity->classname, sizeof(out_entity->classname), "%s", qnn_worker_server_classname(entity_num));
+		snprintf(out_entity->classname, sizeof(out_entity->classname), "%s", QNN_ServerClassname(entity_num));
 		snprintf(out_entity->model_name, sizeof(out_entity->model_name), "%s", entity->model != NULL ? entity->model->name : "");
 		out_entity->entity_num = entity_num;
 		VectorCopy(entity->origin, out_entity->origin);
@@ -766,13 +766,21 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 		out_entity->skin = entity->skinnum;
 		out_entity->health = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.health : 0;
 		out_entity->frags = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.frags : 0;
-		/* Shift origin to bounding box center and store half-extents. */
+		/* Shift origin to bounding box center and store half-extents.
+		   Prefer server edict bounds (exact per-entity), fall back to
+		   model bounds (works during demo playback without a server). */
 		{
 			vec3_t bmins = {0,0,0}, bmaxs = {0,0,0};
 			qboolean have_bounds = false;
 			if (server_edict != NULL && !server_edict->free) {
 				VectorCopy(server_edict->v.mins, bmins);
 				VectorCopy(server_edict->v.maxs, bmaxs);
+				have_bounds = (bmins[0] != 0 || bmins[1] != 0 || bmins[2] != 0 ||
+				               bmaxs[0] != 0 || bmaxs[1] != 0 || bmaxs[2] != 0);
+			}
+			if (!have_bounds && entity->model != NULL) {
+				VectorCopy(entity->model->mins, bmins);
+				VectorCopy(entity->model->maxs, bmaxs);
 				have_bounds = (bmins[0] != 0 || bmins[1] != 0 || bmins[2] != 0 ||
 				               bmaxs[0] != 0 || bmaxs[1] != 0 || bmaxs[2] != 0);
 			}
@@ -785,7 +793,7 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 				out_entity->half_extents[2] = (bmaxs[2] - bmins[2]) * 0.5f;
 			}
 		}
-		out_entity->region_id = qnn_worker_nearest_region_id(&qnn_worker_map_state, out_entity->origin);
+		out_entity->region_id = QNN_NearestRegionId(&qnn_map_state, out_entity->origin);
 		snapshot->visible_count += 1;
 		captured[entity_num / 8] |= (1 << (entity_num % 8));
 	}
@@ -796,10 +804,10 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 	   server edict array. */
 	if (sv.active)
 	{
-		for (entity_num = 1; entity_num < sv.num_edicts && snapshot->visible_count < QNN_WORKER_MAX_VISIBLE; ++entity_num)
+		for (entity_num = 1; entity_num < sv.num_edicts && snapshot->visible_count < QNN_MAX_VISIBLE; ++entity_num)
 		{
 			edict_t *ed;
-			qnn_worker_visible_entity_t *out_entity;
+			qnn_visible_entity_t *out_entity;
 			const char *model_name;
 			int model_idx;
 
@@ -809,7 +817,7 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 				continue;
 
 			ed = EDICT_NUM(entity_num);
-			if (!qnn_is_actor_edict(ed))
+			if (!QNN_IsActorEdict(ed))
 				continue;
 
 			model_idx = (int)ed->v.modelindex;
@@ -820,7 +828,7 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 			memset(out_entity, 0, sizeof(*out_entity));
 			out_entity->entity_key = entity_num;
 			snprintf(out_entity->entity_id, sizeof(out_entity->entity_id), "entity_%04d", entity_num);
-			snprintf(out_entity->classname, sizeof(out_entity->classname), "%s", qnn_worker_server_classname(entity_num));
+			snprintf(out_entity->classname, sizeof(out_entity->classname), "%s", QNN_ServerClassname(entity_num));
 			snprintf(out_entity->model_name, sizeof(out_entity->model_name), "%s", model_name);
 			out_entity->entity_num = entity_num;
 			VectorCopy(ed->v.origin, out_entity->origin);
@@ -849,13 +857,13 @@ void qnn_worker_capture_visible_entities(qnn_worker_snapshot_t *snapshot, float 
 					out_entity->half_extents[2] = (bmaxs[2] - bmins[2]) * 0.5f;
 				}
 			}
-			out_entity->region_id = qnn_worker_nearest_region_id(&qnn_worker_map_state, out_entity->origin);
+			out_entity->region_id = QNN_NearestRegionId(&qnn_map_state, out_entity->origin);
 			snapshot->visible_count += 1;
 		}
 	}
 }
 
-void qnn_worker_capture_base_snapshot(qnn_worker_snapshot_t *snapshot)
+void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot)
 {
 	entity_t *player_entity;
 	edict_t *server_edict;
@@ -876,47 +884,47 @@ void qnn_worker_capture_base_snapshot(qnn_worker_snapshot_t *snapshot)
 
 	snapshot->health = cl.stats[STAT_HEALTH];
 	snapshot->armor = cl.stats[STAT_ARMOR];
-	snapshot->armor_type = qnn_worker_current_armortype();
+	snapshot->armor_type = QNN_CurrentArmortype();
 	snapshot->ammo = cl.stats[STAT_AMMO];
 	snapshot->ammo_shells = cl.stats[STAT_SHELLS];
 	snapshot->ammo_nails = cl.stats[STAT_NAILS];
 	snapshot->ammo_rockets = cl.stats[STAT_ROCKETS];
 	snapshot->ammo_cells = cl.stats[STAT_CELLS];
 	snapshot->weapons_owned = cl.items & (IT_SHOTGUN | IT_SUPER_SHOTGUN | IT_NAILGUN | IT_SUPER_NAILGUN | IT_GRENADE_LAUNCHER | IT_ROCKET_LAUNCHER | IT_LIGHTNING);
-	snapshot->weapon_id = qnn_worker_weapon_id();
+	snapshot->weapon_id = QNN_WeaponId();
 	snapshot->waterlevel = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.waterlevel : (cl.inwater ? 2 : 0);
 	snapshot->grounded = (server_edict != NULL && !server_edict->free)
 		? ((((int)server_edict->v.flags) & FL_ONGROUND) ? true : false)
 		: (cl.onground ? true : false);
-	snapshot->current_region_id = qnn_worker_nearest_region_id(&qnn_worker_map_state, snapshot->player_origin);
+	snapshot->current_region_id = QNN_NearestRegionId(&qnn_map_state, snapshot->player_origin);
 }
 
-void qnn_worker_drain_sounds(qnn_worker_snapshot_t *snapshot)
+void QNN_DrainSounds(qnn_snapshot_t *snapshot)
 {
-	snapshot->sound_count = qnn_worker_sound_count < QNN_WORKER_MAX_SOUNDS
-		? qnn_worker_sound_count : QNN_WORKER_MAX_SOUNDS;
+	snapshot->sound_count = qnn_sound_count < QNN_MAX_SOUNDS
+		? qnn_sound_count : QNN_MAX_SOUNDS;
 	if (snapshot->sound_count > 0)
-		memcpy(snapshot->sounds, qnn_worker_sound_buffer, snapshot->sound_count * sizeof(qnn_worker_sound_event_t));
-	qnn_worker_sound_count = 0;
+		memcpy(snapshot->sounds, qnn_sound_buffer, snapshot->sound_count * sizeof(qnn_sound_event_t));
+	qnn_sound_count = 0;
 }
 
 /* ── shared nav query handler ───────────────────────────────────── */
 
-int qnn_worker_handle_nav_query(const char *line)
+int QNN_HandleNavQuery(const char *line)
 {
 	char kind[32];
 	char error[256];
 
 	memset(kind, 0, sizeof(kind));
 	memset(error, 0, sizeof(error));
-	if (qnn_worker_map_state.navmesh == NULL)
+	if (qnn_map_state.navmesh == NULL)
 	{
-		qnn_worker_write_error("Navmesh is unavailable for this map");
+		QNN_WriteError("Navmesh is unavailable for this map");
 		return 0;
 	}
-	if (!qnn_json_extract_string(line, "\"kind\"", kind, sizeof(kind)))
+	if (!QNN_JsonExtractString(line, "\"kind\"", kind, sizeof(kind)))
 	{
-		qnn_worker_write_error("nav_query requires kind");
+		QNN_WriteError("nav_query requires kind");
 		return 0;
 	}
 
@@ -926,15 +934,15 @@ int qnn_worker_handle_nav_query(const char *line)
 		qnn_navmesh_nearest_result_t result;
 		int found;
 
-		if (!qnn_json_extract_vec3(line, "\"point\"", point))
+		if (!QNN_JsonExtractVec3(line, "\"point\"", point))
 		{
-			qnn_worker_write_error("nav_query nearest requires point=[x,y,z]");
+			QNN_WriteError("nav_query nearest requires point=[x,y,z]");
 			return 0;
 		}
-		found = qnn_navmesh_find_nearest(qnn_worker_map_state.navmesh, point, &result, error, sizeof(error));
+		found = qnn_navmesh_find_nearest(qnn_map_state.navmesh, point, &result, error, sizeof(error));
 		if (!found && error[0] != 0)
 		{
-			qnn_worker_write_error(error);
+			QNN_WriteError(error);
 			return 0;
 		}
 		fprintf(stdout, "{\"ok\":true,\"query\":\"nearest\",\"result\":");
@@ -951,16 +959,16 @@ int qnn_worker_handle_nav_query(const char *line)
 		qnn_navmesh_path_result_t result;
 		int found;
 
-		if (!qnn_json_extract_vec3(line, "\"start\"", start)
-			|| !qnn_json_extract_vec3(line, "\"end\"", end))
+		if (!QNN_JsonExtractVec3(line, "\"start\"", start)
+			|| !QNN_JsonExtractVec3(line, "\"end\"", end))
 		{
-			qnn_worker_write_error("nav_query path requires start=[x,y,z] and end=[x,y,z]");
+			QNN_WriteError("nav_query path requires start=[x,y,z] and end=[x,y,z]");
 			return 0;
 		}
-		found = qnn_navmesh_find_path(qnn_worker_map_state.navmesh, start, end, &result, error, sizeof(error));
+		found = qnn_navmesh_find_path(qnn_map_state.navmesh, start, end, &result, error, sizeof(error));
 		if (!found && error[0] != 0)
 		{
-			qnn_worker_write_error(error);
+			QNN_WriteError(error);
 			return 0;
 		}
 		fprintf(stdout, "{\"ok\":true,\"query\":\"path\",\"result\":");
@@ -976,20 +984,20 @@ int qnn_worker_handle_nav_query(const char *line)
 		qnn_nav_area_result_t result;
 		int found;
 
-		if (qnn_worker_map_state.nav_oracle == NULL)
+		if (qnn_map_state.nav_oracle == NULL)
 		{
-			qnn_worker_write_error("Navigation oracle is unavailable for this map");
+			QNN_WriteError("Navigation oracle is unavailable for this map");
 			return 0;
 		}
-		if (!qnn_json_extract_vec3(line, "\"point\"", point))
+		if (!QNN_JsonExtractVec3(line, "\"point\"", point))
 		{
-			qnn_worker_write_error("nav_query area requires point=[x,y,z]");
+			QNN_WriteError("nav_query area requires point=[x,y,z]");
 			return 0;
 		}
-		found = qnn_nav_oracle_find_area(qnn_worker_map_state.nav_oracle, point, &result, error, sizeof(error));
+		found = qnn_nav_oracle_find_area(qnn_map_state.nav_oracle, point, &result, error, sizeof(error));
 		if (!found && error[0] != 0)
 		{
-			qnn_worker_write_error(error);
+			QNN_WriteError(error);
 			return 0;
 		}
 		fprintf(stdout, "{\"ok\":true,\"query\":\"area\",\"result\":");
@@ -1005,20 +1013,20 @@ int qnn_worker_handle_nav_query(const char *line)
 		qnn_nav_cluster_result_t result;
 		int found;
 
-		if (qnn_worker_map_state.nav_oracle == NULL)
+		if (qnn_map_state.nav_oracle == NULL)
 		{
-			qnn_worker_write_error("Navigation oracle is unavailable for this map");
+			QNN_WriteError("Navigation oracle is unavailable for this map");
 			return 0;
 		}
-		if (!qnn_json_extract_vec3(line, "\"point\"", point))
+		if (!QNN_JsonExtractVec3(line, "\"point\"", point))
 		{
-			qnn_worker_write_error("nav_query cluster requires point=[x,y,z]");
+			QNN_WriteError("nav_query cluster requires point=[x,y,z]");
 			return 0;
 		}
-		found = qnn_nav_oracle_find_cluster(qnn_worker_map_state.nav_oracle, point, &result, error, sizeof(error));
+		found = qnn_nav_oracle_find_cluster(qnn_map_state.nav_oracle, point, &result, error, sizeof(error));
 		if (!found && error[0] != 0)
 		{
-			qnn_worker_write_error(error);
+			QNN_WriteError(error);
 			return 0;
 		}
 		fprintf(stdout, "{\"ok\":true,\"query\":\"cluster\",\"result\":");
@@ -1035,21 +1043,21 @@ int qnn_worker_handle_nav_query(const char *line)
 		qnn_nav_route_result_t result;
 		int found;
 
-		if (qnn_worker_map_state.nav_oracle == NULL)
+		if (qnn_map_state.nav_oracle == NULL)
 		{
-			qnn_worker_write_error("Navigation oracle is unavailable for this map");
+			QNN_WriteError("Navigation oracle is unavailable for this map");
 			return 0;
 		}
-		if (!qnn_json_extract_vec3(line, "\"start\"", start)
-			|| !qnn_json_extract_vec3(line, "\"end\"", end))
+		if (!QNN_JsonExtractVec3(line, "\"start\"", start)
+			|| !QNN_JsonExtractVec3(line, "\"end\"", end))
 		{
-			qnn_worker_write_error("nav_query route requires start=[x,y,z] and end=[x,y,z]");
+			QNN_WriteError("nav_query route requires start=[x,y,z] and end=[x,y,z]");
 			return 0;
 		}
-		found = qnn_nav_oracle_find_route(qnn_worker_map_state.nav_oracle, start, end, &result, error, sizeof(error));
+		found = qnn_nav_oracle_find_route(qnn_map_state.nav_oracle, start, end, &result, error, sizeof(error));
 		if (!found && error[0] != 0)
 		{
-			qnn_worker_write_error(error);
+			QNN_WriteError(error);
 			return 0;
 		}
 		fprintf(stdout, "{\"ok\":true,\"query\":\"route\",\"result\":");
@@ -1059,13 +1067,13 @@ int qnn_worker_handle_nav_query(const char *line)
 		return 0;
 	}
 
-	qnn_worker_write_error("unsupported nav_query kind");
+	QNN_WriteError("unsupported nav_query kind");
 	return 0;
 }
 
 /* ── Tick resampling gate ─────────────────────────────────────────── */
 
-void qnn_resample_init(int target_hz)
+void QNN_ResampleInit(int target_hz)
 {
 	memset(&qnn_resample, 0, sizeof(qnn_resample));
 	if (target_hz > 0)
@@ -1075,7 +1083,7 @@ void qnn_resample_init(int target_hz)
 	}
 }
 
-void qnn_resample_accumulate(const qnn_worker_snapshot_t *snapshot, float frame_dt)
+void QNN_ResampleAccumulate(const qnn_snapshot_t *snapshot, float frame_dt)
 {
 	qnn_resample.accumulated_dt += frame_dt;
 
@@ -1086,13 +1094,13 @@ void qnn_resample_accumulate(const qnn_worker_snapshot_t *snapshot, float frame_
 		qnn_resample.jump_any = 1;
 }
 
-void qnn_resample_accumulate_look(float yaw_degrees, float pitch_degrees)
+void QNN_ResampleAccumulateLook(float yaw_degrees, float pitch_degrees)
 {
 	qnn_resample.look_yaw_degrees += yaw_degrees;
 	qnn_resample.look_pitch_degrees += pitch_degrees;
 }
 
-qboolean qnn_resample_should_emit(void)
+qboolean QNN_ResampleShouldEmit(void)
 {
 	if (qnn_resample.target_hz <= 0)
 		return true; /* disabled — emit every frame */
@@ -1103,7 +1111,7 @@ qboolean qnn_resample_should_emit(void)
 	return false;
 }
 
-void qnn_resample_apply_action_merge(qnn_worker_snapshot_t *snapshot)
+void QNN_ResampleApplyActionMerge(qnn_snapshot_t *snapshot)
 {
 	/* Apply the OR-merged discrete actions to the snapshot being emitted. */
 	if (qnn_resample.fire_any)
@@ -1120,4 +1128,41 @@ void qnn_resample_apply_action_merge(qnn_worker_snapshot_t *snapshot)
 	qnn_resample.jump_any = 0;
 	qnn_resample.look_yaw_degrees = 0.0f;
 	qnn_resample.look_pitch_degrees = 0.0f;
+}
+
+/* ── Binary write helpers (little-endian) ────────────────────────── */
+
+void QNN_WriteU16LE(FILE *out, uint16_t value)
+{
+	uint8_t b[2];
+	b[0] = (uint8_t)(value & 0xff);
+	b[1] = (uint8_t)((value >> 8) & 0xff);
+	fwrite(b, 1, 2, out);
+}
+
+void QNN_WriteI16LE(FILE *out, int value)
+{
+	QNN_WriteU16LE(out, (uint16_t)(int16_t)value);
+}
+
+void QNN_WriteU32LE(FILE *out, uint32_t value)
+{
+	uint8_t b[4];
+	b[0] = (uint8_t)(value & 0xff);
+	b[1] = (uint8_t)((value >> 8) & 0xff);
+	b[2] = (uint8_t)((value >> 16) & 0xff);
+	b[3] = (uint8_t)((value >> 24) & 0xff);
+	fwrite(b, 1, 4, out);
+}
+
+void QNN_WriteI32LE(FILE *out, int32_t value)
+{
+	QNN_WriteU32LE(out, (uint32_t)value);
+}
+
+void QNN_WriteF32LE(FILE *out, float value)
+{
+	union { float f; uint32_t u; } bits;
+	bits.f = value;
+	QNN_WriteU32LE(out, bits.u);
 }

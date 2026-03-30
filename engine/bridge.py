@@ -434,38 +434,18 @@ class NativeTokenProcess(NativeProcessBase):
 
 import numpy as np
 
-# Obs buffer layout constants (must match qnn_obs_buffer.h)
-OBS_BUFFER_SIZE = 15892
-
-_OBS_FIELDS = {
-    "self_scalars":             (    0,   92, np.float32, (23,)),
-    "self_weapon_id":           (   92,    4, np.int32,   (1,)),
-    "self_movement_id":         (   96,    4, np.int32,   (1,)),
-    "self_cluster_id":          (  100,    4, np.int32,   (1,)),
-    "object_ids":               (  104, 1280, np.int32,   (64, 5)),
-    "object_scalars":           ( 1384, 3328, np.float32, (64, 13)),
-    "object_mask":              ( 4712,   64, np.uint8,   (64,)),
-    "object_route_cluster_ids": ( 4776, 2048, np.int32,   (64, 8)),
-    "event_ids":                ( 6824, 4096, np.int32,   (256, 4)),
-    "event_scalars":            (10920, 3072, np.float32, (256, 3)),
-    "event_owner":              (13992, 1024, np.int32,   (256,)),
-    "event_mask":               (15016,  256, np.uint8,   (256,)),
-    "spatial_ids":              (15272,   36, np.int32,   (9,)),
-    "spatial_scalars":          (15308,  360, np.float32, (9, 10)),
-    "action_history":           (15668,  224, np.float32, (8, 7)),
-}
+from quake_ai.obs_format import OBS_BUFFER_SIZE, OBS_FIELDS
 
 
 def _unpack_obs_buffer(raw: bytes) -> Dict[str, np.ndarray]:
-    """Zero-copy unpack of the 15892-byte obs buffer into numpy arrays."""
+    """Unpack the obs buffer into numpy arrays. Copies data (raw may be reused)."""
     obs: Dict[str, np.ndarray] = {}
-    for name, (offset, size, dtype, shape) in _OBS_FIELDS.items():
+    for name, (offset, dtype, shape) in OBS_FIELDS.items():
         arr = np.frombuffer(raw, dtype=dtype, offset=offset, count=int(np.prod(shape)))
-        # Convert uint8 mask fields to bool to match TokenObservationEncoder output
-        if name in ("object_mask", "event_mask"):
+        if dtype == np.uint8 and "mask" in name:
             obs[name] = arr.astype(np.bool_).reshape(shape)
         else:
-            obs[name] = arr.reshape(shape).copy()  # copy — raw bytes invalidated next call
+            obs[name] = arr.reshape(shape).copy()
     return obs
 
 

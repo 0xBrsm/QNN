@@ -201,13 +201,9 @@ def build_run_bc_config(
     asset_root = Path(_require_string(machine, "asset_root", "machine.json"))
     bc_data_dir = asset_root / "bc"
     bc_cfg["output_dir"] = str(checkpoints_dir)
-    bc_cfg["token_ticks_path"] = str(bc_data_dir / "token_ticks.bin")
-    bc_cfg["map_state_path"] = str(bc_data_dir / "world_map.json")
-    bc_cfg["map_states_path"] = str(bc_data_dir / "map_states.json")
-    bc_cfg["metadata_path"] = str(bc_data_dir / "demo_metadata.ndjson")
+    bc_cfg["bc_data_dir"] = str(bc_data_dir)
     bc_cfg["device"] = requested_device
     bc_cfg["batch_size"] = int(_require_key(machine, "batch_size", "machine.json"))
-    bc_cfg["map_id"] = _require_string(scenario, "map_id", "scenario.json")
 
     return bc_cfg
 

@@ -10,13 +10,14 @@ OUTPUT_PATH=${1:-"${REPO_ROOT}/assets/bin/quake_worker"}
 PATCHES=("${COMMON_PATCHES[@]}" "${ENGINE_DIR}/patches/host.c.patch")
 
 CUSTOM_SOURCES=(
-  "${ENGINE_DIR}/worker/qnn_worker_common.c"
-  "${ENGINE_DIR}/worker/qnn_worker_main.c"
-  "${ENGINE_DIR}/worker/qnn_worker_input.c"
-  "${ENGINE_DIR}/worker/qnn_worker_sound.c"
-  "${ENGINE_DIR}/worker/qnn_worker_token.c"
-  "${ENGINE_DIR}/worker/qnn_worker_training.c"
-  "${ENGINE_DIR}/worker/qnn_world_model.c"
+  "${ENGINE_DIR}/worker/qnn_sys.c"
+  "${ENGINE_DIR}/worker/qnn_trainer_main.c"
+  "${ENGINE_DIR}/worker/qnn_input.c"
+  "${ENGINE_DIR}/worker/qnn_sound.c"
+  "${ENGINE_DIR}/worker/qnn_obs.c"
+  "${ENGINE_DIR}/worker/qnn_metrics.c"
+  "${ENGINE_DIR}/worker/qnn_reward.c"
+  "${ENGINE_DIR}/worker/qnn_world.c"
 )
 
 check_build_deps "the Quake worker"

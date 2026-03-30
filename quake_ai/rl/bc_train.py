@@ -3,33 +3,22 @@
 from __future__ import annotations
 
 import os
-from collections import defaultdict
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, List, Sequence
+from typing import Any, Dict
 
 import numpy as np
 import torch
 
-from engine.token_protocol import TOKEN_BINARY_HEADER_SIZE, TrustedTokenTick, decode_binary_token_tick
 from quake_ai.actions import (
     ACTION_HEADS,
-    ActionLabels,
     CONTINUOUS_ACTION_HEADS,
     DISCRETE_ACTION_HEADS,
-    look_axis_from_mouse_count,
-    mouse_count_from_look_axis,
 )
 from quake_ai.model.observation import TokenObservationEncoder
-from quake_ai.rl.dataset_bc import (
-    Sample,
-    build_token_samples,
-    randomize_player_slots,
-)
 from quake_ai.model.policy import QNNPolicy
-from quake_ai.rl.schemas import MapState
-from quake_ai.utils.io import read_json, read_ndjson, write_json
+from quake_ai.utils.io import write_json
 from quake_ai.utils.repro import set_global_seed, write_experiment_manifest
 
 _ACTION_HEAD_NAMES = list(ACTION_HEADS.keys())
@@ -60,15 +49,9 @@ class BCConfig:
     the frozen run's ``config/model.json`` — ``build_run_bc_config()`` injects
     those values from the run directory before training starts.
     """
-    map_id: str
     output_dir: str
-    token_ticks_path: str
-    map_state_path: str
-    map_states_path: str
-    metadata_path: str
+    bc_data_dir: str
     seed: int
-    train_ratio: float
-    val_ratio: float
     batch_size: int
     sequence_length: int  # 0 = full episode (no chunking)
     epochs: int
@@ -81,9 +64,7 @@ class BCConfig:
     class_weight_power: float
     class_weight_min: float
     class_weight_max: float
-    action_tick_offset: int  # shift action labels by N ticks (±1 to diagnose timing)
-    look_smoothing: bool  # temporal smoothing on look targets
-    look_smooth_window: int  # smoothing window size (3 = ±1 tick, 5 = ±2 ticks, etc.)
+    # look smoothing is now applied during bc_collect.py, not at training time
     max_grad_norm: float  # gradient clipping for BPTT stability
     tbptt_limit: int  # max ticks before detaching gradient graph (0 = no limit)
     n_heads: int
@@ -108,29 +89,6 @@ class BCConfig:
 
 
 @dataclass(slots=True)
-class _EpisodeRecord:
-    index: int
-    start_offset: int
-    end_offset: int
-    episode_id: str
-    map_id: str
-    source_path: str
-    map_state: MapState
-
-
-@dataclass(slots=True)
-class _EpisodeSplit:
-    train: list[_EpisodeRecord]
-    val: list[_EpisodeRecord]
-    test: list[_EpisodeRecord]
-
-
-# ---------------------------------------------------------------------------
-# Precomputed episode data — observations and actions stored as contiguous
-# numpy arrays, encoded once and reused across all epochs.
-# ---------------------------------------------------------------------------
-
-@dataclass(slots=True)
 class _PrecomputedEpisode:
     """One episode's observations and actions as contiguous arrays."""
     obs: dict[str, np.ndarray]      # key → (n_samples, ...) arrays
@@ -138,268 +96,8 @@ class _PrecomputedEpisode:
     n_samples: int
 
 
-def _pack_samples(
-    samples: List[Sample],
-    action_tick_offset: int = 0,
-    look_smoothing: bool = True,
-    look_smooth_window: int = 3,
-) -> _PrecomputedEpisode | None:
-    """Pack a list of Sample objects into contiguous arrays.
 
-    If *action_tick_offset* is non-zero, actions are shifted by that many
-    ticks relative to observations (positive = action comes from a later tick).
-    This is a diagnostic tool for detecting timing misalignment in demo data.
-    """
-    if not samples:
-        return None
-    n = len(samples)
-    first_obs = samples[0].obs
-    if not isinstance(first_obs, dict):
-        return None
-    obs: dict[str, np.ndarray] = {}
-    for key, value in first_obs.items():
-        arr = np.empty((n, *value.shape), dtype=value.dtype)
-        arr[0] = value
-        obs[key] = arr
-    actions: dict[str, np.ndarray] = {}
-    for head in _ACTION_HEAD_NAMES:
-        if head in _CONTINUOUS_HEAD_NAMES:
-            actions[head] = np.empty((n, ACTION_HEADS[head]), dtype=np.float32)
-        else:
-            actions[head] = np.empty(n, dtype=np.int64)
-    first_action = ActionLabels.from_dict(samples[0].action)
-    actions["move"][0] = np.asarray(first_action.move, dtype=np.float32)
-    actions["look"][0] = np.asarray(first_action.look, dtype=np.float32)
-    actions["jump"][0] = int(first_action.jump)
-    actions["fire"][0] = int(first_action.fire)
-    actions["switch"][0] = int(first_action.switch)
-    actions["recall_0"][0] = int(first_action.recall_0)
-    actions["recall_1"][0] = int(first_action.recall_1)
-    actions["recall_2"][0] = int(first_action.recall_2)
-    actions["recall_3"][0] = int(first_action.recall_3)
-    for i in range(1, n):
-        s = samples[i]
-        for key, value in s.obs.items():
-            obs[key][i] = value
-        action = ActionLabels.from_dict(s.action)
-        actions["move"][i] = np.asarray(action.move, dtype=np.float32)
-        actions["look"][i] = np.asarray(action.look, dtype=np.float32)
-        actions["jump"][i] = int(action.jump)
-        actions["fire"][i] = int(action.fire)
-        actions["switch"][i] = int(action.switch)
-        actions["recall_0"][i] = int(action.recall_0)
-        actions["recall_1"][i] = int(action.recall_1)
-        actions["recall_2"][i] = int(action.recall_2)
-        actions["recall_3"][i] = int(action.recall_3)
-    # Temporal smoothing for look deltas: smooth canonical mouse-count deltas
-    # over a ±1 tick window, then convert back into the bounded look vector.
-    # WARNING: this quantizes through int(round(mouse_count)), destroying precision.
-    if look_smoothing and "look" in actions:
-        yaw_counts = np.array([mouse_count_from_look_axis(float(value[0])) for value in actions["look"]], dtype=np.float32)
-        pitch_counts = np.array([mouse_count_from_look_axis(float(value[1])) for value in actions["look"]], dtype=np.float32)
-        w = max(1, look_smooth_window)
-        if n >= w and w > 1:
-            half = w // 2
-            kernel = np.ones(w, dtype=np.float32) / float(w)
-            # Apply uniform moving average, preserving edges.
-            yaw_smooth = np.convolve(yaw_counts, kernel, mode="same")
-            pitch_smooth = np.convolve(pitch_counts, kernel, mode="same")
-            # Only overwrite interior where the full kernel fits.
-            yaw_counts[half:n - half] = yaw_smooth[half:n - half]
-            pitch_counts[half:n - half] = pitch_smooth[half:n - half]
-        actions["look"][:, 0] = np.asarray(
-            [look_axis_from_mouse_count(int(round(value))) for value in yaw_counts],
-            dtype=np.float32,
-        )
-        actions["look"][:, 1] = np.asarray(
-            [look_axis_from_mouse_count(int(round(value))) for value in pitch_counts],
-            dtype=np.float32,
-        )
-
-    # Apply the same smoothing to the look-hint observation scalars (object_scalars
-    # slots 11-12) so the hints match the smoothed look labels exactly.
-    if look_smoothing and "object_scalars" in obs:
-        obj_sc = obs["object_scalars"]  # (n, 64, 13)
-        if obj_sc.shape[-1] >= 13 and n >= w and w > 1:
-            half = w // 2
-            kernel = np.ones(w, dtype=np.float32) / float(w)
-            for slot in (11, 12):
-                for obj_idx in range(obj_sc.shape[1]):
-                    raw = obj_sc[:, obj_idx, slot].astype(np.float32)
-                    if np.any(raw != 0):
-                        smoothed = np.convolve(raw, kernel, mode="same")
-                        obj_sc[half:n - half, obj_idx, slot] = smoothed[half:n - half]
-
-    if action_tick_offset != 0:
-        for head in _ACTION_HEAD_NAMES:
-            actions[head] = np.roll(actions[head], -action_tick_offset, axis=0)
-        # Trim edges where the shift wraps around.
-        trim = abs(action_tick_offset)
-        if n > 2 * trim:
-            start = trim if action_tick_offset > 0 else 0
-            end = n - trim if action_tick_offset < 0 else n
-            for key in obs:
-                obs[key] = obs[key][start:end]
-            for head in _ACTION_HEAD_NAMES:
-                actions[head] = actions[head][start:end]
-            n = end - start
-    return _PrecomputedEpisode(obs=obs, actions=actions, n_samples=n)
-
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# File and metadata helpers.
-# ---------------------------------------------------------------------------
-
-def _load_episode_rows(metadata_path: str, episode_count: int) -> list[Dict[str, Any]]:
-    if not metadata_path:
-        return [{} for _ in range(episode_count)]
-    rows = [dict(row) for row in read_ndjson(metadata_path)]
-    if len(rows) != episode_count:
-        raise RuntimeError(
-            f"metadata_path row count {len(rows)} does not match collected episodes {episode_count}: {metadata_path}"
-        )
-    return rows
-
-
-def _load_map_states(
-    map_state_path: str,
-    map_states_path: str,
-) -> tuple[Dict[str, MapState], MapState | None]:
-    default_map_state: MapState | None = None
-    map_states: Dict[str, MapState] = {}
-
-    if map_state_path:
-        payload = read_json(map_state_path)
-        if isinstance(payload.get("map_states"), Mapping):
-            map_states.update({str(key): MapState.from_dict(value) for key, value in payload["map_states"].items()})
-        else:
-            default_map_state = MapState.from_dict(payload)
-
-    if map_states_path:
-        payload = read_json(map_states_path)
-        if not isinstance(payload.get("map_states"), Mapping):
-            raise RuntimeError(f"map_states_path must define a map_states mapping: {map_states_path}")
-        map_states.update({str(key): MapState.from_dict(value) for key, value in payload["map_states"].items()})
-
-    return map_states, default_map_state
-
-
-def _resolve_episode_map_state(
-    episode_row: Mapping[str, Any],
-    config: BCConfig,
-    map_states: Mapping[str, MapState],
-    default_map_state: MapState | None,
-) -> tuple[str, MapState]:
-    map_id = str(episode_row.get("map_id", "")).strip() or str(config.map_id)
-    if map_id in map_states:
-        return map_id, map_states[map_id]
-    if default_map_state is not None:
-        return map_id, default_map_state
-    raise RuntimeError(f"No map state available for demo map_id={map_id}")
-
-
-def _read_token_tick_from_file(handle: BinaryIO) -> TrustedTokenTick | None:
-    header = handle.read(TOKEN_BINARY_HEADER_SIZE)
-    if not header:
-        return None
-    if len(header) < TOKEN_BINARY_HEADER_SIZE:
-        raise ValueError(f"Truncated header: {len(header)} bytes")
-
-    def read_exact(size: int) -> bytes:
-        data = handle.read(size)
-        if len(data) != size:
-            raise EOFError(f"Expected {size} bytes, got {len(data)}")
-        return data
-
-    return decode_binary_token_tick(header, read_exact)
-
-
-def _scan_token_episode_ranges(path: str) -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    current_start: int | None = None
-    current_end = 0
-    with open(path, "rb") as handle:
-        while True:
-            start_offset = handle.tell()
-            tick = _read_token_tick_from_file(handle)
-            if tick is None:
-                break
-            end_offset = handle.tell()
-            if current_start is None:
-                current_start = start_offset
-            elif tick.reset:
-                ranges.append((current_start, current_end))
-                current_start = start_offset
-            current_end = end_offset
-    if current_start is not None:
-        ranges.append((current_start, current_end))
-    return ranges
-
-
-def _scan_episode_records(
-    config: BCConfig,
-    map_states: Mapping[str, MapState],
-    default_map_state: MapState | None,
-) -> list[_EpisodeRecord]:
-    token_ticks_file = Path(config.token_ticks_path)
-    episode_ranges = _scan_token_episode_ranges(str(token_ticks_file))
-    episode_rows = _load_episode_rows(config.metadata_path, len(episode_ranges))
-    records: list[_EpisodeRecord] = []
-    for index, (start_offset, end_offset) in enumerate(episode_ranges):
-        episode_row = episode_rows[index] if index < len(episode_rows) else {}
-        map_id, map_state = _resolve_episode_map_state(episode_row, config, map_states, default_map_state)
-        episode_id = str(episode_row.get("episode_id", "")).strip() or f"{token_ticks_file.stem}_{index:04d}"
-        records.append(
-            _EpisodeRecord(
-                index=index,
-                start_offset=start_offset,
-                end_offset=end_offset,
-                episode_id=episode_id,
-                map_id=map_id,
-                source_path=str(episode_row.get("source_path", "")),
-                map_state=map_state,
-            )
-        )
-    return records
-
-
-def _split_episode_records(records: Sequence[_EpisodeRecord], train_ratio: float, val_ratio: float, seed: int) -> _EpisodeSplit:
-    grouped: dict[str, list[_EpisodeRecord]] = defaultdict(list)
-    for record in records:
-        grouped[record.episode_id].append(record)
-
-    episode_ids = sorted(grouped.keys())
-    rng = np.random.default_rng(seed)
-    rng.shuffle(episode_ids)
-
-    total = len(episode_ids)
-    train_cut = int(total * train_ratio)
-    val_cut = int(total * (train_ratio + val_ratio))
-
-    train_ids = set(episode_ids[:train_cut])
-    val_ids = set(episode_ids[train_cut:val_cut])
-    test_ids = set(episode_ids[val_cut:])
-
-    return _EpisodeSplit(
-        train=[record for episode_id in episode_ids if episode_id in train_ids for record in grouped[episode_id]],
-        val=[record for episode_id in episode_ids if episode_id in val_ids for record in grouped[episode_id]],
-        test=[record for episode_id in episode_ids if episode_id in test_ids for record in grouped[episode_id]],
-    )
-
-
-def _read_episode_ticks_for_record(handle: BinaryIO, record: _EpisodeRecord) -> list[TrustedTokenTick]:
-    handle.seek(record.start_offset)
-    ticks: list[TrustedTokenTick] = []
-    while handle.tell() < record.end_offset:
-        tick = _read_token_tick_from_file(handle)
-        if tick is None:
-            raise EOFError(f"Unexpected EOF while reading episode {record.episode_id}")
-        ticks.append(tick)
-    if handle.tell() != record.end_offset:
-        raise ValueError(f"Episode {record.episode_id} overran offset boundary")
-    return ticks
-
+# --- Action class counting ---
 
 def _init_action_counts() -> dict[str, np.ndarray]:
     return {head: np.ones(ACTION_HEADS[head], dtype=np.float32) for head in _DISCRETE_HEAD_NAMES}
@@ -429,56 +127,8 @@ def _class_weights_from_counts(
     return weights
 
 
-def _episode_slot_rng(base_seed: int, episode_index: int) -> np.random.Generator:
-    seed_value = (int(base_seed) * 1_000_003 + int(episode_index) + 1) % (2**63 - 1)
-    return np.random.default_rng(seed_value)
 
-
-def _write_episode_split_manifest(
-    path: Path,
-    sample_counts: Mapping[str, int],
-    sample_episode_ids: Mapping[str, Sequence[str]],
-) -> None:
-    write_json(
-        path,
-        {
-            "train": int(sample_counts.get("train", 0)),
-            "val": int(sample_counts.get("val", 0)),
-            "test": int(sample_counts.get("test", 0)),
-            "train_episodes": sorted({str(value) for value in sample_episode_ids.get("train", ())}),
-            "val_episodes": sorted({str(value) for value in sample_episode_ids.get("val", ())}),
-            "test_episodes": sorted({str(value) for value in sample_episode_ids.get("test", ())}),
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
-# Precompute phase — read all episodes once, encode observations, store as
-# contiguous numpy arrays. Amortizes I/O and encoding across all epochs.
-# ---------------------------------------------------------------------------
-
-def _precompute_cache_path(output_dir: str, split_name: str) -> Path:
-    return Path(output_dir) / f"precomputed_{split_name}"
-
-
-def _save_precomputed(episodes: list[_PrecomputedEpisode], cache_dir: Path) -> None:
-    """Save precomputed episodes as individual .npy files for real mmap support."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    manifest: list[dict[str, Any]] = []
-    for i, ep in enumerate(episodes):
-        entry: dict[str, Any] = {"n_samples": ep.n_samples, "obs": {}, "actions": {}}
-        for key, arr in ep.obs.items():
-            fname = f"ep{i:04d}_obs_{key}.npy"
-            np.save(cache_dir / fname, arr)
-            entry["obs"][key] = fname
-        for head, arr in ep.actions.items():
-            fname = f"ep{i:04d}_act_{head}.npy"
-            np.save(cache_dir / fname, arr)
-            entry["actions"][head] = fname
-        manifest.append(entry)
-    import json
-    (cache_dir / "manifest.json").write_text(json.dumps(manifest))
-
+# --- Data loading ---
 
 def _load_precomputed(cache_dir: Path) -> list[_PrecomputedEpisode]:
     """Load precomputed episodes with real memory-mapped .npy arrays."""
@@ -494,79 +144,8 @@ def _load_precomputed(cache_dir: Path) -> list[_PrecomputedEpisode]:
     return episodes
 
 
-def _precomputed_cache_is_fresh(cache_dir: Path, token_ticks_path: str) -> bool:
-    manifest_path = cache_dir / "manifest.json"
-    if not cache_dir.exists() or not manifest_path.exists():
-        return False
-    token_path = Path(token_ticks_path)
-    if not token_path.exists():
-        return False
-    return manifest_path.stat().st_mtime_ns >= token_path.stat().st_mtime_ns
 
-
-def _precompute_one_episode(args: tuple) -> _PrecomputedEpisode | None:
-    """Precompute a single episode — pickleable for multiprocessing."""
-    token_ticks_path, record_index, record_start, record_end, record_episode_id, \
-        record_map_id, record_source_path, record_map_state_dict, slot_seed, action_tick_offset, look_smoothing, look_smooth_window = args
-    from quake_ai.rl.schemas import MapState
-    record = _EpisodeRecord(
-        index=record_index, start_offset=record_start, end_offset=record_end,
-        episode_id=record_episode_id, map_id=record_map_id,
-        source_path=record_source_path, map_state=MapState(**record_map_state_dict),
-    )
-    with open(token_ticks_path, "rb") as handle:
-        ticks = _read_episode_ticks_for_record(handle, record)
-    slot_rng = _episode_slot_rng(slot_seed, record.index)
-    randomize_player_slots(ticks, slot_rng)
-    samples = build_token_samples(
-        ticks, record.episode_id, map_id=record.map_id, source_path=record.source_path,
-    )
-    return _pack_samples(samples, action_tick_offset=action_tick_offset, look_smoothing=look_smoothing, look_smooth_window=look_smooth_window)
-
-
-def _precompute_split(
-    token_ticks_path: str,
-    records: Sequence[_EpisodeRecord],
-    slot_seed: int,
-    action_tick_offset: int = 0,
-    cache_path: Path | None = None,
-    look_smoothing: bool = True,
-    look_smooth_window: int = 3,
-) -> list[_PrecomputedEpisode]:
-    """Precompute all episodes, parallelized across CPU cores, with optional disk cache."""
-    if cache_path is not None and _precomputed_cache_is_fresh(cache_path, token_ticks_path):
-        print(f"  [bc] Loading precomputed cache: {cache_path}")
-        return _load_precomputed(cache_path)
-
-    import multiprocessing as mp
-    n_workers = max(1, (os.cpu_count() or 1) - 2)
-
-    # Serialize records into plain tuples for pickling.
-    args_list = [
-        (token_ticks_path, r.index, r.start_offset, r.end_offset,
-         r.episode_id, r.map_id, r.source_path,
-         r.map_state.to_dict() if hasattr(r.map_state, 'to_dict') else {},
-         slot_seed, action_tick_offset, look_smoothing, look_smooth_window)
-        for r in records
-    ]
-
-    print(f"  [bc] Precomputing {len(records)} episodes across {n_workers} workers...")
-    with mp.Pool(n_workers) as pool:
-        results = pool.map(_precompute_one_episode, args_list)
-
-    episodes = [ep for ep in results if ep is not None]
-
-    if cache_path is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"  [bc] Saving precomputed cache: {cache_path}")
-        _save_precomputed(episodes, cache_path)
-
-    return episodes
-
-
-# ---------------------------------------------------------------------------
-# Training loop — operates on precomputed arrays, with background prefetch.
-# ---------------------------------------------------------------------------
+# --- Training loop ---
 
 def _generate_chunk_indices(
     episodes: Sequence[_PrecomputedEpisode],
@@ -826,71 +405,25 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    if not config.token_ticks_path or (not config.map_state_path and not config.map_states_path):
-        raise RuntimeError("Behavior cloning requires token_ticks_path and at least one map state input")
-    token_ticks_file = Path(config.token_ticks_path)
-    if not token_ticks_file.exists():
-        raise RuntimeError(f"token_ticks_path does not exist: {token_ticks_file}")
-    if config.map_state_path and not Path(config.map_state_path).exists():
-        raise RuntimeError(f"map_state_path does not exist: {config.map_state_path}")
-    if config.map_states_path and not Path(config.map_states_path).exists():
-        raise RuntimeError(f"map_states_path does not exist: {config.map_states_path}")
-    map_states, default_map_state = _load_map_states(config.map_state_path, config.map_states_path)
-    records = _scan_episode_records(config, map_states, default_map_state)
-    split = _split_episode_records(records, config.train_ratio, config.val_ratio, config.seed)
+    # Load precomputed .npy caches (produced by scripts/bc_collect.py)
+    bc_data_dir = Path(config.bc_data_dir) if hasattr(config, "bc_data_dir") else Path(config.output_dir).parent
+    train_cache = bc_data_dir / "precomputed_train"
+    val_cache = bc_data_dir / "precomputed_val"
+    if not train_cache.exists():
+        raise RuntimeError(f"BC training data not found at {train_cache}. Run scripts/bc_collect.py first.")
 
-    # Precompute all episodes once — observations encoded and stored as contiguous arrays.
-    # Cache to disk so subsequent runs (e.g. ablation variants) skip this step.
-    tick_offset = config.action_tick_offset
-    if tick_offset:
-        print(f"  [bc] Action tick offset: {tick_offset} (diagnostic mode)")
-    cache_dir = Path(config.token_ticks_path).parent
-    if not config.look_smoothing:
-        cache_suffix = "_nosmooth"
-    elif config.look_smooth_window != 3:
-        cache_suffix = f"_smooth{config.look_smooth_window}"
-    else:
-        cache_suffix = ""
-    train_episodes = _precompute_split(
-        config.token_ticks_path, split.train, config.seed, tick_offset,
-        cache_path=_precompute_cache_path(str(cache_dir), f"train{cache_suffix}"),
-        look_smoothing=config.look_smoothing,
-        look_smooth_window=config.look_smooth_window,
-    )
-    val_episodes = _precompute_split(
-        config.token_ticks_path, split.val, config.seed, tick_offset,
-        cache_path=_precompute_cache_path(str(cache_dir), f"val{cache_suffix}"),
-        look_smoothing=config.look_smoothing,
-        look_smooth_window=config.look_smooth_window,
-    )
-    test_episodes = _precompute_split(
-        config.token_ticks_path, split.test, config.seed, tick_offset,
-        cache_path=_precompute_cache_path(str(cache_dir), f"test{cache_suffix}"),
-        look_smoothing=config.look_smoothing,
-        look_smooth_window=config.look_smooth_window,
-    )
+    print(f"  [bc] Loading training data: {train_cache}")
+    train_episodes = _load_precomputed(train_cache)
+    val_episodes = _load_precomputed(val_cache) if val_cache.exists() else []
 
     sample_counts = {
         "train": sum(ep.n_samples for ep in train_episodes),
         "val": sum(ep.n_samples for ep in val_episodes),
-        "test": sum(ep.n_samples for ep in test_episodes),
     }
-    sample_episode_ids: dict[str, set[str]] = {"train": set(), "val": set(), "test": set()}
-    for split_name, split_records, split_episodes in (
-        ("train", split.train, train_episodes),
-        ("val", split.val, val_episodes),
-        ("test", split.test, test_episodes),
-    ):
-        ep_idx = 0
-        for record in split_records:
-            if ep_idx < len(split_episodes) and split_episodes[ep_idx].n_samples > 0:
-                sample_episode_ids[split_name].add(record.episode_id)
-                ep_idx += 1
 
-    # Accumulate action class counts from precomputed arrays (vectorized).
-    # Cache to disk so ablation variants sharing the same corpus skip this scan.
+    # Accumulate action class counts
     import json as _json_counts
-    counts_cache = _precompute_cache_path(str(cache_dir), "train") / "class_counts.json"
+    counts_cache = train_cache / "class_counts.json"
     if counts_cache.exists():
         print(f"  [bc] Loading cached class counts: {counts_cache}")
         _raw = _json_counts.loads(counts_cache.read_text())
@@ -902,10 +435,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         counts_cache.write_text(_json_counts.dumps({h: v.tolist() for h, v in class_counts.items()}))
         print(f"  [bc] Cached class counts: {counts_cache}")
 
-    _write_episode_split_manifest(output / "split_manifest.json", sample_counts, sample_episode_ids)
-
     if sample_counts["train"] <= 0:
-        raise RuntimeError("No training samples available after split")
+        raise RuntimeError("No training samples available")
 
     obs_dim = TokenObservationEncoder().obs_dim
     if seed_checkpoint and Path(seed_checkpoint).exists():
@@ -1222,28 +753,27 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
 
     final_model = QNNPolicy.load(output / "bc_best_model.pth", device=config.device)
 
-    test_metrics = _run_precomputed_supervised(
+    final_val_metrics = _run_precomputed_supervised(
         final_model,
-        test_episodes,
+        val_episodes,
         batch_size=config.batch_size,
         sequence_length=config.sequence_length,
         tbptt_limit=config.tbptt_limit,
         focal_gamma=config.focal_gamma,
-    )
+    ) if val_episodes else {"loss": 0.0}
 
     summary: Dict[str, Any] = {
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
-        "test_loss": float(test_metrics["loss"]),
+        "final_val_loss": float(final_val_metrics["loss"]),
         "num_train_samples": int(sample_counts["train"]),
         "num_val_samples": int(sample_counts["val"]),
-        "num_test_samples": int(sample_counts["test"]),
         "epochs_ran": len(history),
     }
-    for key, value in test_metrics.items():
+    for key, value in final_val_metrics.items():
         if key == "_next_hidden":
             continue
-        summary[f"test_{key}"] = float(value)
+        summary[f"final_val_{key}"] = float(value)
 
     write_json(output / "bc_history.json", {"history": history})
     write_json(output / "bc_summary.json", summary)

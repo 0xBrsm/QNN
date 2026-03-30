@@ -174,6 +174,62 @@ prepare_upstream() {
   for patch_path in "${patches[@]}"; do
     patch -d "${WORKTREE_DIR}" -p0 < "${patch_path}"
   done
+
+  # Shared inline patches applied to all worker builds:
+
+  # 1. Increase MAX_OSPATH from 128 to 512 (long demo filenames)
+  python3 - "${WORKTREE_DIR}/quakedef.h" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text()
+p.write_text(t.replace("#define\tMAX_OSPATH\t\t128", "#define\tMAX_OSPATH\t\t512"))
+PY
+
+  # 2. snprintf in COM_FindFile (bounded path concatenation)
+  python3 - "${WORKTREE_DIR}/common.c" <<'PY'
+from pathlib import Path; import sys
+path = Path(sys.argv[1]); text = path.read_text()
+text = text.replace(
+    'sprintf (netpath, "%s/%s",search->filename, filename);',
+    'snprintf (netpath, MAX_OSPATH, "%s/%s",search->filename, filename);')
+text = text.replace(
+    'sprintf (cachepath,"%s%s", com_cachedir, netpath);',
+    'snprintf (cachepath, MAX_OSPATH, "%s%s", com_cachedir, netpath);')
+text = text.replace(
+    'sprintf (cachepath,"%s%s", com_cachedir, netpath+2);',
+    'snprintf (cachepath, MAX_OSPATH, "%s%s", com_cachedir, netpath+2);')
+path.write_text(text)
+PY
+
+  # 3. Guard R_AddEfrags against NULL worldmodel (headless demo playback)
+  python3 - "${WORKTREE_DIR}/r_efrag.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text()
+t = t.replace(
+    'if (!ent->model)\n\t\treturn;',
+    'if (!ent->model)\n\t\treturn;\n\n\tif (!cl.worldmodel || !cl.worldmodel->nodes)\n\t\treturn;')
+p.write_text(t)
+PY
+
+  # 4. Non-fatal model precache failures (headless doesn't need all models)
+  #    Without this, demos on maps like e4m3 fail because progs/star.mdl
+  #    isn't in our PAK files — the engine returns early and worldmodel is NULL.
+  python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text()
+old = '''		cl.model_precache[i] = Mod_ForName (model_precache[i], false);
+		if (cl.model_precache[i] == NULL)
+		{
+			Con_Printf("Model %s not found\\n", model_precache[i]);
+			return;
+		}'''
+new = '''		cl.model_precache[i] = Mod_ForName (model_precache[i], false);
+		if (cl.model_precache[i] == NULL)
+		{
+			Con_Printf("Model %s not found (non-fatal)\\n", model_precache[i]);
+		}'''
+t = t.replace(old, new)
+p.write_text(t)
+PY
 }
 
 # ── Compile helpers ────────────────────────────────────────────────

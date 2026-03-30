@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.0
+
+### Changed
+- C worker split by concern: monolithic `qnn_worker_main.c` replaced by `qnn_trainer_main.c`, `qnn_demo_main.c`, `qnn_obs.c`, `qnn_reward.c`, `qnn_metrics.c`, `qnn_world.c`, `qnn_sys.c`
+- Unified header `qnn.h`, PascalCase all worker functions, Quake-style naming
+- BC collect pipeline rewritten: parallel `ProcessPoolExecutor`, resume support, look smoothing (window=3)
+- Renamed`training_bc.py` to `bc_train.py` with dead token/precompute code stripped
+
+### Added
+- Demo worker emits binary obs buffers for BC collection (`PackObsBuffer`)
+- Separated metrics API from reward computation (`qnn_metrics.c` / `qnn_metrics.h`)
+- O(1) event lookup via per-owner linked list with inline `WeaponIndex`
+- `obs_format.py` canonical obs format shared between C worker and Python
+- `bc_status.py` for checking BC training progress from `bc_history.json`
+
+### Fixed
+- Critical `memset` bug zeroing wrong size in worker state init
+- `R_AddEfrags` NULL guard and `MAX_OSPATH` increased to 512 for long demo paths
+- Non-fatal model precache for headless demo playback
+- Entity `half_extents` derived from model bounds during demo playback
+
 ## 0.8.0
 
 ### Changed
