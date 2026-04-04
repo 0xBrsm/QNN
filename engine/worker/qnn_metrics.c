@@ -21,9 +21,9 @@ void QNN_ComputeTracking(qnn_metrics_t *out, const qnn_snapshot_t *snapshot)
 
 	QNN_ForwardFromAngles(snapshot->player_view_angles, forward);
 
-	for (i = 0; i < snapshot->visible_count; ++i)
+	for (i = 0; i < snapshot->known_count; ++i)
 	{
-		const qnn_visible_entity_t *ent = &snapshot->visible[i];
+		const qnn_known_entity_t *ent = &snapshot->known[i];
 		float dx, dy, dz, dist_sq, inv_dist, cos_val;
 		int slot, j;
 

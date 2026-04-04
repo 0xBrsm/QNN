@@ -21,5 +21,20 @@
   "pbt_start_mutation": 20000000,
   "pbt_replace_fraction": 0.3,
   "pbt_mutation_rate": 0.15,
-  "pbt_optimize_gamma": false
+  "pbt_optimize_gamma": false,
+  "lr": 0.003,
+  "lr_min": 0.001,
+  "epochs": 200,
+  "patience": 30,
+  "sequence_length": 0,
+  "head_loss_weights": "",
+  "focal_gamma": 0.0,
+  "class_weight_power": 0.6,
+  "class_weight_min": 0.5,
+  "class_weight_max": 2.5,
+  "tbptt_limit": 256,
+  "regression_stop": false,
+  "regression_threshold": 0.01,
+  "regression_patience": 5,
+  "prometheus_pushgateway_url": ""
 }

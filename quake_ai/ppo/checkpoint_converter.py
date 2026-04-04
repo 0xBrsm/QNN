@@ -27,14 +27,14 @@ from typing import Any, Dict
 
 import torch
 
-from quake_ai.actions import ACTION_HEADS, CONTINUOUS_ACTION_HEADS
+from quake_ai.actions import ACTION_HEADS, CONTINUOUS_ACTION_HEADS, HEAD_ORDER
 from quake_ai.model.observation import (
     ACTION_HISTORY_DIM,
     ACTION_HISTORY_LEN,
-    EVENT_ID_DIM,
-    EVENT_SCALAR_DIM,
-    MAX_EVENT_ATOMS,
+    ENTITY_EVENT_ID_DIM,
+    MAX_ENTITY_EVENTS,
     MAX_OBJECT_TOKENS,
+    MAX_ROUTE_CLUSTERS,
     OBJECT_ID_DIM,
     OBJECT_SCALAR_DIM,
     SELF_SCALAR_DIM,
@@ -44,7 +44,7 @@ from quake_ai.model.observation import (
 from quake_ai.model.policy import QNNPolicy
 from quake_ai.utils.io import trusted_torch_load
 
-_HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
+_HEAD_ORDER = HEAD_ORDER
 _HEAD_SIZES: list[int] = list(ACTION_HEADS.values())
 
 # SF 2.1.1 key prefixes
@@ -248,15 +248,18 @@ def save_sf_format(
 _OBS_SHAPES: Dict[str, tuple[int, ...]] = {
     "self_scalars": (SELF_SCALAR_DIM,),
     "self_weapon_id": (1,),
+    "self_armor_type_id": (1,),
+    "self_powerup_ids": (5,),
+    "self_powerup_count": (1,),
     "self_movement_id": (1,),
     "self_cluster_id": (1,),
     "object_ids": (MAX_OBJECT_TOKENS, OBJECT_ID_DIM),
     "object_scalars": (MAX_OBJECT_TOKENS, OBJECT_SCALAR_DIM),
     "object_mask": (MAX_OBJECT_TOKENS,),
-    "event_ids": (MAX_EVENT_ATOMS, EVENT_ID_DIM),
-    "event_scalars": (MAX_EVENT_ATOMS, EVENT_SCALAR_DIM),
-    "event_owner": (MAX_EVENT_ATOMS,),
-    "event_mask": (MAX_EVENT_ATOMS,),
+    "object_route_cluster_ids": (MAX_OBJECT_TOKENS, MAX_ROUTE_CLUSTERS),
+    "object_event_ids": (MAX_OBJECT_TOKENS, MAX_ENTITY_EVENTS, ENTITY_EVENT_ID_DIM),
+    "object_event_scalars": (MAX_OBJECT_TOKENS, MAX_ENTITY_EVENTS),
+    "object_event_counts": (MAX_OBJECT_TOKENS,),
     "spatial_ids": (SPATIAL_TOKEN_COUNT,),
     "spatial_scalars": (SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM),
     "action_history": (ACTION_HISTORY_LEN, ACTION_HISTORY_DIM),

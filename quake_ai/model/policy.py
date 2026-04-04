@@ -31,6 +31,10 @@ HEAD_LOSS_WEIGHTS: Dict[str, float] = {
 }
 _CONTINUOUS_HEAD_STD_INIT = -1.0
 
+# Sparse binary heads: skip true-negative ticks in BC loss.
+# Only train on ticks where the demonstrator acted or the model predicted action.
+_SPARSE_BINARY_HEADS = frozenset({"fire", "jump"})
+
 
 def _focal_cross_entropy(
     logits: torch.Tensor,
@@ -473,7 +477,7 @@ class QNNPolicy:
         obs_tensors: Dict[str, torch.Tensor] = {}
         for key, value in obs.items():
             dtype = torch.float32
-            if key.endswith("_id") or key.endswith("_ids") or key == "event_owner":
+            if key.endswith("_id") or key.endswith("_ids"):
                 dtype = torch.long
             elif key.endswith("_mask"):
                 dtype = torch.bool
@@ -694,12 +698,29 @@ class QNNPolicy:
                 metrics.update(_continuous_head_metrics(head, pred, target))
             else:
                 target = self._action_targets_for_head(actions, head, head_logits)
-                if class_weights is not None:
+                pred = torch.argmax(head_logits, dim=1)
+
+                # Sparse binary heads (fire, jump): skip true negatives.
+                # Only compute loss on ticks where demonstrator acted OR model
+                # predicted action — avoids rewarding trivial "always predict 0".
+                if head in _SPARSE_BINARY_HEADS:
+                    sparse_mask = (target != 0) | (pred != 0)
+                    if sparse_mask.any():
+                        masked_logits = head_logits[sparse_mask]
+                        masked_target = target[sparse_mask]
+                        if class_weights is not None:
+                            w = self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
+                            head_loss = _focal_cross_entropy(masked_logits, masked_target, focal_gamma, weight=w)
+                        else:
+                            head_loss = _focal_cross_entropy(masked_logits, masked_target, focal_gamma)
+                    else:
+                        head_loss = torch.tensor(0.0, device=head_logits.device)
+                elif class_weights is not None:
                     w = self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
                     head_loss = _focal_cross_entropy(head_logits, target, focal_gamma, weight=w)
                 else:
                     head_loss = _focal_cross_entropy(head_logits, target, focal_gamma)
-                pred = torch.argmax(head_logits, dim=1)
+
                 match = pred == target
                 # Stack 7 scalars into one tensor: n, correct, tp, fp, fn, target_pos, pred_pos
                 n_t = torch.tensor(float(pred.shape[0]), device=pred.device)

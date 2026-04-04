@@ -12,8 +12,6 @@ import torch.nn as nn
 from quake_ai.model.observation import (
     ACTION_HISTORY_DIM,
     ACTION_HISTORY_LEN,
-    EVENT_ID_DIM,
-    EVENT_SCALAR_DIM,
     MAX_OBJECT_TOKENS,
     OBJECT_ID_DIM,
     OBJECT_SCALAR_DIM,
@@ -39,45 +37,50 @@ class TokenObservationTokenizer(nn.Module):
 
         self.self_proj = nn.Linear(SELF_SCALAR_DIM, d_model)
         self.object_proj = nn.Linear(OBJECT_SCALAR_DIM, d_model)
-        self.event_proj = nn.Linear(EVENT_SCALAR_DIM, d_model)
         self.spatial_proj = nn.Linear(SPATIAL_SCALAR_DIM, d_model)
         if self.action_history_tokens > 0:
             self.action_proj = nn.Linear(ACTION_HISTORY_DIM, d_model)
             self.action_pos_embed = nn.Embedding(ACTION_HISTORY_LEN, d_model)
 
         self.kind_embed = nn.Embedding(4, d_model)  # self, object, spatial, action
-        self.weapon_embed = nn.Embedding(6, d_model)  # 0=axe,1=SG/SSG,2=nails,3=GL,4=RL,5=LG
         self.movement_embed = nn.Embedding(5, d_model)
         self.cluster_embed = nn.Embedding(256, d_model)
-        self.subject_embed = nn.Embedding(max(SUBJECT_IDS.values()) + 1, d_model)
+        self.subject_embed = nn.Embedding(32, d_model)  # v8: IDs 0-31
         self.action_embed = nn.Embedding(max(ACTION_IDS.values()) + 1, d_model)
         self.qualifier_embed = nn.Embedding(max(QUALIFIER_IDS.values()) + 1, d_model)
         self.modality_embed = nn.Embedding(max(MODALITY_IDS.values()) + 1, d_model)
         self.player_embed = nn.Embedding(MAX_PLAYER_SLOTS + 1, d_model)
         self.spatial_sector_embed = nn.Embedding(max(SPATIAL_SECTOR_IDS.values()) + 1, d_model)
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        # Constant tensors registered as buffers so they move with .to(device)
+        # and are not recreated every forward pass.
+        self.register_buffer('_kind_self', torch.tensor([_TOKEN_KIND_SELF], dtype=torch.long))
+        self.register_buffer('_kind_object', torch.full((MAX_OBJECT_TOKENS,), _TOKEN_KIND_OBJECT, dtype=torch.long))
+        self.register_buffer('_kind_spatial', torch.full((SPATIAL_TOKEN_COUNT,), _TOKEN_KIND_SPATIAL, dtype=torch.long))
+        self.register_buffer('_pu_range', torch.arange(5, dtype=torch.long))
 
-        self.n_tokens = 1 + 1 + MAX_OBJECT_TOKENS + SPATIAL_TOKEN_COUNT + self.action_history_tokens
+        # v8: no CLS token — self token is position 0
+        # 1 (self) + SPATIAL + action_history + MAX_OBJECT_TOKENS
+        self.n_tokens = 1 + MAX_OBJECT_TOKENS + SPATIAL_TOKEN_COUNT + self.action_history_tokens
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         self_scalars = obs_dict["self_scalars"]
         self_weapon_id = obs_dict["self_weapon_id"].long().squeeze(-1)
         self_movement_id = obs_dict.get("self_movement_id")
         self_cluster_id = obs_dict.get("self_cluster_id")
+        self_armor_type_id = obs_dict.get("self_armor_type_id")
+        self_powerup_ids = obs_dict.get("self_powerup_ids")
+        self_powerup_count = obs_dict.get("self_powerup_count")
         object_ids = obs_dict["object_ids"].long()
         object_scalars = obs_dict["object_scalars"]
         object_mask = obs_dict["object_mask"].bool()
-        event_ids = obs_dict["event_ids"].long()
-        event_scalars = obs_dict["event_scalars"]
-        event_owner = obs_dict["event_owner"].long()
-        event_mask = obs_dict["event_mask"].bool()
         spatial_ids = obs_dict["spatial_ids"].long()
         spatial_scalars = obs_dict["spatial_scalars"]
 
         batch = int(self_scalars.shape[0])
         device = self_scalars.device
+        _se_max = self.subject_embed.num_embeddings - 1
+
         if self_movement_id is None:
             self_movement_id = torch.zeros((batch,), dtype=torch.long, device=device)
         else:
@@ -86,65 +89,105 @@ class TokenObservationTokenizer(nn.Module):
             self_cluster_id = torch.zeros((batch,), dtype=torch.long, device=device)
         else:
             self_cluster_id = self_cluster_id.long().squeeze(-1)
+        if self_armor_type_id is None:
+            self_armor_type_id = torch.zeros((batch,), dtype=torch.long, device=device)
+        else:
+            self_armor_type_id = self_armor_type_id.long().squeeze(-1)
 
+        # v8: self token — subject_embed for weapon, armor_type, and powerups
         self_token = (
             self.self_proj(self_scalars).unsqueeze(1)
-            + self.kind_embed(torch.full((batch, 1), _TOKEN_KIND_SELF, dtype=torch.long, device=device))
-            + self.weapon_embed(self_weapon_id.clamp(min=0, max=self.weapon_embed.num_embeddings - 1)).unsqueeze(1)
+            + self.kind_embed(self._kind_self.expand(batch, -1))
+            + self.subject_embed(self_weapon_id.clamp(min=0, max=_se_max)).unsqueeze(1)
+            + self.subject_embed(self_armor_type_id.clamp(min=0, max=_se_max)).unsqueeze(1)
             + self.movement_embed(self_movement_id.clamp(min=0, max=self.movement_embed.num_embeddings - 1)).unsqueeze(1)
             + self.cluster_embed(self_cluster_id.clamp(min=0, max=self.cluster_embed.num_embeddings - 1)).unsqueeze(1)
         )
 
+        # v8: variable powerup stacking — sum subject_embed(p) for active powerups
+        if self_powerup_ids is not None and self_powerup_count is not None:
+            pu_ids = self_powerup_ids.long().clamp(min=0, max=_se_max)  # (batch, 5)
+            pu_count = self_powerup_count.long().squeeze(-1)  # (batch,)
+            pu_embeds = self.subject_embed(pu_ids)  # (batch, 5, d_model)
+            # Mask: only sum entries up to powerup_count
+            pu_range = self._pu_range.unsqueeze(0)  # (1, 5)
+            pu_mask = pu_range < pu_count.unsqueeze(1)  # (batch, 5)
+            pu_sum = (pu_embeds * pu_mask.unsqueeze(-1).to(dtype=pu_embeds.dtype)).sum(dim=1, keepdim=True)  # (batch, 1, d_model)
+            self_token = self_token + pu_sum
+
+        # --- object tokens ---
         object_token = self.object_proj(object_scalars)
         object_token = object_token + self.kind_embed(
-            torch.full((batch, MAX_OBJECT_TOKENS), _TOKEN_KIND_OBJECT, dtype=torch.long, device=device)
+            self._kind_object.expand(batch, -1)
         )
-        object_token = object_token + self.subject_embed(object_ids[:, :, 0].clamp(min=0, max=self.subject_embed.num_embeddings - 1))
+        object_token = object_token + self.subject_embed(object_ids[:, :, 0].clamp(min=0, max=_se_max))
         object_token = object_token + self.qualifier_embed(object_ids[:, :, 1].clamp(min=0, max=self.qualifier_embed.num_embeddings - 1))
         object_token = object_token + self.modality_embed(object_ids[:, :, 2].clamp(min=0, max=self.modality_embed.num_embeddings - 1))
         object_token = object_token + self.player_embed(object_ids[:, :, 3].clamp(min=0, max=self.player_embed.num_embeddings - 1))
-        if int(object_ids.shape[-1]) > 4:
-            object_cluster_ids = object_ids[:, :, 4]
-        else:
-            object_cluster_ids = torch.zeros((batch, MAX_OBJECT_TOKENS), dtype=torch.long, device=device)
+        # Column 4: cluster_id
+        object_cluster_ids = object_ids[:, :, 4]
         object_token = object_token + self.cluster_embed(
             object_cluster_ids.clamp(min=0, max=self.cluster_embed.num_embeddings - 1)
         )
+        # v8 columns 5-6: powerup_id and weapon_id (subject_embed additions)
+        if int(object_ids.shape[-1]) > 5:
+            obj_powerup_ids = object_ids[:, :, 5].clamp(min=0, max=_se_max)
+            # Only add powerup embed where ID > 0 (NONE=0 would add noise)
+            obj_pu_mask = (object_ids[:, :, 5] > 0).unsqueeze(-1).to(dtype=object_token.dtype)
+            object_token = object_token + self.subject_embed(obj_powerup_ids) * obj_pu_mask
+        if int(object_ids.shape[-1]) > 6:
+            obj_weapon_ids = object_ids[:, :, 6].clamp(min=0, max=_se_max)
+            obj_wep_mask = (object_ids[:, :, 6] > 0).unsqueeze(-1).to(dtype=object_token.dtype)
+            object_token = object_token + self.subject_embed(obj_weapon_ids) * obj_wep_mask
+
+        # Route embedding
         route_cluster_ids = obs_dict.get("object_route_cluster_ids")
         if route_cluster_ids is not None:
-            route_cluster_ids = route_cluster_ids.long().clamp(min=0, max=self.cluster_embed.num_embeddings - 1)
+            route_raw = route_cluster_ids.long()
+            route_mask = route_raw >= 0
+            route_cluster_ids = route_raw.clamp(min=0, max=self.cluster_embed.num_embeddings - 1)
             route_embeds = self.cluster_embed(route_cluster_ids)
-            route_mask = route_cluster_ids > 0
             route_embed = (route_embeds * route_mask.unsqueeze(-1).to(dtype=route_embeds.dtype)).sum(dim=2)
         else:
             route_embed = torch.zeros((batch, MAX_OBJECT_TOKENS, self.d_model), dtype=object_token.dtype, device=device)
         object_token = object_token + route_embed
 
-        event_token = self.event_proj(event_scalars)
-        event_token = event_token + self.subject_embed(event_ids[:, :, 0].clamp(min=0, max=self.subject_embed.num_embeddings - 1))
-        event_token = event_token + self.action_embed(event_ids[:, :, 1].clamp(min=0, max=self.action_embed.num_embeddings - 1))
-        event_token = event_token + self.qualifier_embed(event_ids[:, :, 2].clamp(min=0, max=self.qualifier_embed.num_embeddings - 1))
-        event_token = event_token + self.modality_embed(event_ids[:, :, 3].clamp(min=0, max=self.modality_embed.num_embeddings - 1))
-        event_token = event_token * event_mask.unsqueeze(-1).to(dtype=event_token.dtype)
+        # --- per-entity events: embed and sum onto owner object token ---
+        obj_event_ids = obs_dict.get("object_event_ids")
+        obj_event_scalars = obs_dict.get("object_event_scalars")
+        obj_event_counts = obs_dict.get("object_event_counts")
+        if obj_event_ids is not None and obj_event_scalars is not None and obj_event_counts is not None:
+            # obj_event_ids: (batch, 16, 4, 3) — subject, action, qualifier
+            # obj_event_scalars: (batch, 16, 4) — recency per slot
+            # obj_event_counts: (batch, 16) — valid slot count
+            oe_ids = obj_event_ids.long()  # (batch, 16, 4, 3)
+            oe_rec = obj_event_scalars.unsqueeze(-1)  # (batch, 16, 4, 1) — recency as weight
+            oe_counts = obj_event_counts.long()  # (batch, 16)
+            # Build mask: slot < count
+            oe_range = torch.arange(4, device=device).view(1, 1, 4)  # (1, 1, 4)
+            oe_mask = (oe_range < oe_counts.unsqueeze(-1)).unsqueeze(-1).to(dtype=object_token.dtype)  # (batch, 16, 4, 1)
+            # Embed each event slot: subject + action + qualifier, scaled by recency
+            oe_embed = (
+                self.subject_embed(oe_ids[:, :, :, 0].clamp(min=0, max=_se_max))
+                + self.action_embed(oe_ids[:, :, :, 1].clamp(min=0, max=self.action_embed.num_embeddings - 1))
+                + self.qualifier_embed(oe_ids[:, :, :, 2].clamp(min=0, max=self.qualifier_embed.num_embeddings - 1))
+            )  # (batch, 16, 4, d_model)
+            oe_embed = oe_embed * oe_mask * oe_rec.to(dtype=oe_embed.dtype)
+            object_token = object_token + oe_embed.sum(dim=2)  # sum over 4 event slots → (batch, 16, d_model)
 
-        object_event_trace = torch.zeros((batch, MAX_OBJECT_TOKENS, self.d_model), dtype=event_token.dtype, device=device)
-        owner_index = event_owner.clamp(min=0, max=MAX_OBJECT_TOKENS - 1).unsqueeze(-1).expand(-1, -1, self.d_model)
-        object_event_trace.scatter_add_(1, owner_index, event_token)
-        object_token = object_token + object_event_trace
-
+        # --- spatial tokens ---
         spatial_token = self.spatial_proj(spatial_scalars)
         spatial_token = spatial_token + self.kind_embed(
-            torch.full((batch, SPATIAL_TOKEN_COUNT), _TOKEN_KIND_SPATIAL, dtype=torch.long, device=device)
+            self._kind_spatial.expand(batch, -1)
         )
         spatial_token = spatial_token + self.spatial_sector_embed(
             spatial_ids.clamp(min=0, max=self.spatial_sector_embed.num_embeddings - 1)
         )
 
-        cls = self.cls_token.expand(batch, -1, -1)
-
+        # v8: no CLS token — self is position 0
+        # Sequence: self(1) + spatial(9) + action_history(N) + objects(16)
         if self.action_history_tokens > 0:
             action_history = obs_dict["action_history"]  # (batch, ACTION_HISTORY_LEN, ACTION_HISTORY_DIM)
-            # Take the most recent N ticks.
             n = self.action_history_tokens
             action_slice = action_history[:, -n:, :]  # (batch, n, ACTION_HISTORY_DIM)
             action_token = self.action_proj(action_slice)  # (batch, n, d_model)
@@ -153,17 +196,17 @@ class TokenObservationTokenizer(nn.Module):
             )
             pos_ids = torch.arange(ACTION_HISTORY_LEN - n, ACTION_HISTORY_LEN, dtype=torch.long, device=device)
             action_token = action_token + self.action_pos_embed(pos_ids).unsqueeze(0)
-            # Mask: action history entry is valid if any feature is nonzero.
             action_valid = action_slice.abs().sum(dim=-1) > 0  # (batch, n)
-            tokens = torch.cat([cls, self_token, object_token, spatial_token, action_token], dim=1)
-            prefix = torch.zeros((batch, 2), dtype=torch.bool, device=device)
-            spatial_valid = torch.ones((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
-            key_padding_mask = torch.cat([prefix, ~object_mask, ~spatial_valid, ~action_valid], dim=1)
+            tokens = torch.cat([self_token, spatial_token, action_token, object_token], dim=1)
+            # self(1) always valid, spatial(9) always valid
+            self_valid = torch.zeros((batch, 1), dtype=torch.bool, device=device)  # False = not masked
+            spatial_valid = torch.zeros((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
+            key_padding_mask = torch.cat([self_valid, spatial_valid, ~action_valid, ~object_mask], dim=1)
         else:
-            tokens = torch.cat([cls, self_token, object_token, spatial_token], dim=1)
-            prefix = torch.zeros((batch, 2), dtype=torch.bool, device=device)
-            spatial_valid = torch.ones((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
-            key_padding_mask = torch.cat([prefix, ~object_mask, ~spatial_valid], dim=1)
+            tokens = torch.cat([self_token, spatial_token, object_token], dim=1)
+            self_valid = torch.zeros((batch, 1), dtype=torch.bool, device=device)
+            spatial_valid = torch.zeros((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
+            key_padding_mask = torch.cat([self_valid, spatial_valid, ~object_mask], dim=1)
 
         return tokens, key_padding_mask
 
@@ -206,13 +249,12 @@ class TransformerTrunk(nn.Module):
         n_layers: int = 2,
         ffn_dim: int = 256,
         dropout: float = 0.0,
-        readout: str = "self",  # "cls" or "self"
+        readout: str = "self",  # accepted for compatibility, ignored (always "self")
         action_history_tokens: int = 0,
     ) -> None:
         super().__init__()
-        del obs_dim
+        del obs_dim, readout
         self.output_dim = int(d_model)
-        self._readout = readout
         self.tokenizer = TokenObservationTokenizer(d_model=d_model, action_history_tokens=action_history_tokens)
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model=d_model, n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout) for _ in range(n_layers)]
@@ -232,6 +274,5 @@ class TransformerTrunk(nn.Module):
         transformed = tokens
         for block in self.blocks:
             transformed = block(transformed, key_padding_mask=key_padding_mask)
-        # CLS is position 0, self token is position 1.
-        readout_idx = 0 if self._readout == "cls" else 1
-        return self.final_ln(transformed[:, readout_idx, :])
+        # v8: self token is position 0 (no CLS token).
+        return self.final_ln(transformed[:, 0, :])

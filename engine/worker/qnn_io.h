@@ -1,0 +1,183 @@
+/*
+ * qnn_io.h — Unified tick IO: action in, tokens out.
+ *
+ * All token types, buffer layout constants, and the public tick API.
+ * This is the single header that consumers (collect, trainer, client)
+ * include.  Also the wire format contract — buffer offsets must match
+ * Python obs_format.py.
+ */
+
+#ifndef QNN_IO_H
+#define QNN_IO_H
+
+#include "qnn.h"
+#include "qnn_vocab.h"
+#include "qnn_object.h"
+
+#include <stdint.h>
+
+/* ── Observation dimensions (must match obs_format.py) ─────────── */
+/* Entity-level capacities come from qnn_oracle_store.h:
+   QNN_MAX_TOKEN_OBJECTS, QNN_MAX_ROUTE_CLUSTERS,
+   QNN_MAX_ENTITY_EVENTS, QNN_ENTITY_EVENT_ID_DIM */
+
+#define QNN_OBS_SELF_SCALAR_DIM      14
+#define QNN_OBS_OBJECT_ID_DIM         7
+#define QNN_OBS_OBJECT_SCALAR_DIM    17
+#define QNN_OBS_SPATIAL_COUNT         9
+#define QNN_OBS_SPATIAL_SCALAR_DIM   10
+#define QNN_OBS_ACTION_HISTORY_LEN    8
+#define QNN_OBS_ACTION_HISTORY_DIM    7
+#define QNN_OBS_SELF_POWERUP_SLOTS    5
+
+/* ── Normalization constants ───────────────────────────────────── */
+
+#define QNN_DIST_SCALE      1000.0f
+#define QNN_VELOCITY_SCALE  2000.0f
+#define QNN_TIME_SCALE        60.0f
+#define QNN_SV_MAXSPEED      320.0f
+
+/* ── Action history ────────────────────────────────────────────── */
+
+#define QNN_ACTION_SWITCH_SLOTS 5
+
+/* ── Obs buffer wire format (3820 bytes, little-endian) ────────── */
+
+/*  Offset  Field                        Type       Shape             Bytes */
+/*       0  self_scalars                 float32    [14]                 56 */
+/*      56  self_weapon_id               int32      [1]                   4 */
+/*      60  self_armor_type_id           int32      [1]                   4 */
+/*      64  self_powerup_ids             int32      [5]                  20 */
+/*      84  self_powerup_count           int32      [1]                   4 */
+/*      88  self_movement_id             int32      [1]                   4 */
+/*      92  self_cluster_id              int32      [1]                   4 */
+/*      96  object_ids                   int32      [16,7]              448 */
+/*     544  object_scalars               float32    [16,17]            1088 */
+/*    1632  object_mask                  uint8      [16]                 16 */
+/*    1648  object_route_cluster_ids     int32      [16,8]              512 */
+/*    2160  object_event_ids             int32      [16,4,3]            768 */
+/*    2928  object_event_scalars         float32    [16,4]              256 */
+/*    3184  object_event_counts          uint8      [16]                 16 */
+/*    3200  spatial_ids                  int32      [9]                  36 */
+/*    3236  spatial_scalars              float32    [9,10]              360 */
+/*    3596  action_history               float32    [8,7]               224 */
+/*   Total:                                                           3820 */
+
+#define QNN_OBS_BUFFER_SIZE 3820
+
+#define QNN_OBS_OFF_SELF_SCALARS            0
+#define QNN_OBS_OFF_SELF_WEAPON_ID         56
+#define QNN_OBS_OFF_SELF_ARMOR_TYPE_ID     60
+#define QNN_OBS_OFF_SELF_POWERUP_IDS       64
+#define QNN_OBS_OFF_SELF_POWERUP_COUNT     84
+#define QNN_OBS_OFF_SELF_MOVEMENT_ID       88
+#define QNN_OBS_OFF_SELF_CLUSTER_ID        92
+#define QNN_OBS_OFF_OBJECT_IDS             96
+#define QNN_OBS_OFF_OBJECT_SCALARS        544
+#define QNN_OBS_OFF_OBJECT_MASK          1632
+#define QNN_OBS_OFF_OBJECT_ROUTE_IDS     1648
+#define QNN_OBS_OFF_OBJECT_EVENT_IDS     2160
+#define QNN_OBS_OFF_OBJECT_EVENT_SCALARS 2928
+#define QNN_OBS_OFF_OBJECT_EVENT_COUNTS  3184
+#define QNN_OBS_OFF_SPATIAL_IDS          3200
+#define QNN_OBS_OFF_SPATIAL_SCALARS      3236
+#define QNN_OBS_OFF_ACTION_HISTORY       3596
+
+/* ── Buffer write helpers (little-endian) ──────────────────────── */
+
+static inline void QNN_BufWriteF32(uint8_t *buf, int offset, float value)
+{
+	union { float f; uint32_t u; } bits;
+	bits.f = value;
+	buf[offset + 0] = (uint8_t)(bits.u & 0xffu);
+	buf[offset + 1] = (uint8_t)((bits.u >> 8) & 0xffu);
+	buf[offset + 2] = (uint8_t)((bits.u >> 16) & 0xffu);
+	buf[offset + 3] = (uint8_t)((bits.u >> 24) & 0xffu);
+}
+
+static inline void QNN_BufWriteI32(uint8_t *buf, int offset, int32_t value)
+{
+	uint32_t u = (uint32_t)value;
+	buf[offset + 0] = (uint8_t)(u & 0xffu);
+	buf[offset + 1] = (uint8_t)((u >> 8) & 0xffu);
+	buf[offset + 2] = (uint8_t)((u >> 16) & 0xffu);
+	buf[offset + 3] = (uint8_t)((u >> 24) & 0xffu);
+}
+
+/* ── Token types ───────────────────────────────────────────────── */
+
+typedef struct
+{
+	float health;
+	float armor;
+	float weapon_sg;
+	float weapon_ng;
+	float weapon_gl;
+	float weapon_rl;
+	float weapon_lg;
+	float ammo_shells;
+	float ammo_nails;
+	float ammo_rockets;
+	float ammo_cells;
+	float vel[3];
+	int weapon_id;
+	int armor_type_id;
+	int movement_id;
+	int cluster_id;
+	int powerup_ids[QNN_OBS_SELF_POWERUP_SLOTS];
+	int powerup_count;
+} qnn_self_token_t;
+
+typedef struct
+{
+	int	sector_id;
+	float	nearest_dist;
+	float	mean_dist;
+	float	openness;
+	float	solid_frac;
+	float	water_frac;
+	float	slime_frac;
+	float	lava_frac;
+	float	traversable;
+	float	dropoff;
+	float	clearance;
+} qnn_spatial_token_t;
+
+typedef struct
+{
+	float move[2];
+	float look[2];
+	float fire;
+	float jump;
+	float switch_norm;
+} qnn_action_token_t;
+
+/* qnn_entity_token_t defined in qnn_oracle_store.h */
+
+/* ── Tick result ───────────────────────────────────────────────── */
+
+typedef struct
+{
+	qnn_self_token_t	self;
+	qnn_entity_token_t	entities[QNN_MAX_TOKEN_OBJECTS];
+	int			entity_count;
+	qnn_spatial_token_t	spatial[QNN_SPATIAL_TOKEN_COUNT];
+	qnn_action_token_t	action_history[QNN_OBS_ACTION_HISTORY_LEN];
+	int			action_history_count;
+	int			player_cluster_id;
+} qnn_tick_result_t;
+
+/* ── Public API ────────────────────────────────────────────────── */
+
+void QNN_IOInit(const qnn_map_state_t *map_state);
+void QNN_IOUpdate(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag);
+void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out);
+void QNN_IOPushAction(const qnn_snapshot_t *snapshot);
+void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *result);
+
+/* ── Internal module functions (called by qnn_io.c) ──────────── */
+
+void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot, int player_cluster_id);
+void QNN_SpatialEmitTokens(const qnn_snapshot_t *snapshot, qnn_spatial_token_t tokens[QNN_SPATIAL_TOKEN_COUNT]);
+
+#endif /* QNN_IO_H */

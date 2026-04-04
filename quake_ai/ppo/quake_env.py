@@ -16,12 +16,14 @@ except ImportError as exc:
 
 from quake_ai.actions import ACTION_HEADS, ActionLabels
 from quake_ai.rl.environment import NativeWorldEnv
-from quake_ai.rl.metrics import EpisodeStatAccumulator, build_episode_extra_stats as _episode_extra_stats
-from quake_ai.model.observation import ACTION_HISTORY_DIM, ACTION_HISTORY_LEN, SELF_SCALAR_DIM
+from quake_ai.rl.metrics import EpisodeStatAccumulator
+from quake_ai.model.observation import (
+    ACTION_HISTORY_DIM, ACTION_HISTORY_LEN, ENTITY_EVENT_ID_DIM,
+    MAX_ENTITY_EVENTS, MAX_OBJECT_TOKENS, MAX_ROUTE_CLUSTERS, OBJECT_ID_DIM,
+    OBJECT_SCALAR_DIM, SELF_SCALAR_DIM, SPATIAL_SCALAR_DIM, SPATIAL_TOKEN_COUNT,
+)
 from mapgen.pool import PROCGEN_SENTINEL
 
-# Deterministic head ordering (Python 3.7+ dict preserves insertion order)
-_HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
 _MOVE_DIM = ACTION_HEADS["move"]
 _LOOK_DIM = ACTION_HEADS["look"]
 _DISCRETE_HEAD_ORDER = [
@@ -199,7 +201,16 @@ class QuakeEnv(gymnasium.Env):
                 low=-np.inf, high=np.inf, shape=(SELF_SCALAR_DIM,), dtype=np.float32,
             ),
             "self_weapon_id": gymnasium.spaces.Box(
-                low=0, high=4, shape=(1,), dtype=np.int32,
+                low=0, high=31, shape=(1,), dtype=np.int32,
+            ),
+            "self_armor_type_id": gymnasium.spaces.Box(
+                low=0, high=31, shape=(1,), dtype=np.int32,
+            ),
+            "self_powerup_ids": gymnasium.spaces.Box(
+                low=0, high=31, shape=(5,), dtype=np.int32,
+            ),
+            "self_powerup_count": gymnasium.spaces.Box(
+                low=0, high=5, shape=(1,), dtype=np.int32,
             ),
             "self_movement_id": gymnasium.spaces.Box(
                 low=0, high=4, shape=(1,), dtype=np.int32,
@@ -210,55 +221,55 @@ class QuakeEnv(gymnasium.Env):
             "object_ids": gymnasium.spaces.Box(
                 low=0,
                 high=255,
-                shape=self.inner_env.encoder.object_ids_shape,
+                shape=(MAX_OBJECT_TOKENS, OBJECT_ID_DIM),
                 dtype=np.int32,
             ),
             "object_scalars": gymnasium.spaces.Box(
                 low=-np.inf,
                 high=np.inf,
-                shape=self.inner_env.encoder.object_scalars_shape,
+                shape=(MAX_OBJECT_TOKENS, OBJECT_SCALAR_DIM),
                 dtype=np.float32,
             ),
             "object_mask": gymnasium.spaces.Box(
                 low=0,
                 high=1,
-                shape=(self.inner_env.encoder.object_ids_shape[0],),
+                shape=(MAX_OBJECT_TOKENS,),
                 dtype=np.uint8,
             ),
-            "event_ids": gymnasium.spaces.Box(
+            "object_route_cluster_ids": gymnasium.spaces.Box(
                 low=0,
                 high=255,
-                shape=self.inner_env.encoder.event_ids_shape,
+                shape=(MAX_OBJECT_TOKENS, MAX_ROUTE_CLUSTERS),
                 dtype=np.int32,
             ),
-            "event_scalars": gymnasium.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=self.inner_env.encoder.event_scalars_shape,
+            "object_event_ids": gymnasium.spaces.Box(
+                low=0,
+                high=255,
+                shape=(MAX_OBJECT_TOKENS, MAX_ENTITY_EVENTS, ENTITY_EVENT_ID_DIM),
+                dtype=np.int32,
+            ),
+            "object_event_scalars": gymnasium.spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(MAX_OBJECT_TOKENS, MAX_ENTITY_EVENTS),
                 dtype=np.float32,
             ),
-            "event_owner": gymnasium.spaces.Box(
+            "object_event_counts": gymnasium.spaces.Box(
                 low=0,
-                high=self.inner_env.encoder.object_ids_shape[0] - 1,
-                shape=(self.inner_env.encoder.event_ids_shape[0],),
-                dtype=np.int32,
-            ),
-            "event_mask": gymnasium.spaces.Box(
-                low=0,
-                high=1,
-                shape=(self.inner_env.encoder.event_ids_shape[0],),
+                high=MAX_ENTITY_EVENTS,
+                shape=(MAX_OBJECT_TOKENS,),
                 dtype=np.uint8,
             ),
             "spatial_ids": gymnasium.spaces.Box(
                 low=0,
                 high=8,
-                shape=(self.inner_env.encoder.spatial_scalars_shape[0],),
+                shape=(SPATIAL_TOKEN_COUNT,),
                 dtype=np.int32,
             ),
             "spatial_scalars": gymnasium.spaces.Box(
                 low=-np.inf,
                 high=np.inf,
-                shape=self.inner_env.encoder.spatial_scalars_shape,
+                shape=(SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM),
                 dtype=np.float32,
             ),
             "action_history": gymnasium.spaces.Box(

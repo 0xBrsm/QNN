@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Mapping, Sequence, Tuple
 
@@ -12,20 +11,11 @@ import numpy as np
 import logging
 
 from engine.bridge import NativeEngineError, NativeObsBufferAdapter
-from engine.training_protocol import TrustedTrainingExtrasV1
 from quake_ai.actions import ActionLabels, CONTINUOUS_ACTION_HEADS
-from quake_ai.rl.combat_metrics import WEAPON_TOTAL_DEBUG_KEYS, weapon_metric_key
-from quake_ai.model.observation import visible_threat_count
-from quake_ai.rl.reward import RewardWeights, effective_hp
-from quake_ai.rl.schemas import MapState
-from quake_ai.vocab import MODALITY_IDS, SUBJECT_IDS
+from quake_ai.rl.reward import RewardWeights
 
 if TYPE_CHECKING:
     from mapgen.pool import MapPool
-
-
-_PLAYER_SUBJECT_ID = SUBJECT_IDS["PLAYER"]
-_VISUAL_MODALITY_ID = MODALITY_IDS["VISUAL"]
 
 
 class NativeWorldEnv:
@@ -44,14 +34,12 @@ class NativeWorldEnv:
         native_args: Sequence[str],
         options: Mapping[str, object],
         workdir: str | Path | None = None,
-        encoder: TokenObservationEncoder | None = None,
         map_pool: MapPool | None = None,
         procgen: dict | None = None,
     ) -> None:
         self.max_steps = max_steps
         self.reward_weights = reward_weights
         self.rng = np.random.default_rng(seed)
-        self.encoder = encoder if encoder is not None else TokenObservationEncoder()  # kept for visible_threat_count shape inference
         self.options = dict(options)
         self.options["reward_weights"] = {
             "frag_bonus": reward_weights.frag_bonus,
@@ -97,12 +85,13 @@ class NativeWorldEnv:
             reset_options=self.options,
             training_format="binary_v1",
         )
-        map_state = self.adapter.map_state_snapshot()
-        if map_state is None:
+        map_id = self.adapter.map_id_snapshot()
+        if map_id is None:
             self.adapter.close()
-            raise RuntimeError("Native worker did not return MapState in hello payload")
-        self.map_state = map_state
-        self.state: NativeEnvState | None = None
+            raise RuntimeError("Native worker did not return map_id in hello payload")
+        self.map_id = map_id
+        self._steps: int = -1
+        self._frags: int = 0
 
     _MAX_PROCGEN_RETRIES = 3
 
@@ -127,9 +116,9 @@ class NativeWorldEnv:
                 else:
                     new_map_id = self.map_pool.get(timeout=120.0)
                 try:
-                    new_map_state = self.adapter.change_map(new_map_id)
-                    if new_map_state is not None:
-                        self.map_state = new_map_state
+                    new_map_id_result = self.adapter.change_map(new_map_id)
+                    if new_map_id_result is not None:
+                        self.map_id = new_map_id_result
                     obs, training_extras = self.adapter.reset_obs_with_training(seed=reset_seed)
                     self._current_map_id = new_map_id
                     last_err = None
@@ -154,30 +143,20 @@ class NativeWorldEnv:
         else:
             obs, training_extras = self.adapter.reset_obs_with_training(seed=reset_seed)
         frag_delta = int(training_extras.frag_gain) if training_extras is not None else 0
-        si = _self_info_from_obs(obs)
-        self.state = NativeEnvState(
-            steps=0,
-            current_region_id=0,
-            frags=frag_delta,
-            weapon_id=si.weapon_id,
-            prev_ehp=effective_hp(
-                float(si.health * _HEALTH_CAP),
-                float(si.armor * _ARMOR_CAP),
-                float(si.armor_type * _ARMOR_TYPE_CAP),
-            ),
-        )
+        self._steps = 0
+        self._frags = frag_delta
         return obs
 
     def step(self, action: Mapping[str, int]) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, object]]:
-        if self.state is None:
+        if self._steps < 0:
             raise RuntimeError("Call reset() before step()")
 
         obs, training_extras = self.adapter.step_obs_with_training(action)
 
         te = training_extras
-        steps = self.state.steps + 1
+        self._steps += 1
         worker_done = te is not None and te.done
-        timed_out = bool(steps >= self.max_steps and not worker_done)
+        timed_out = bool(self._steps >= self.max_steps and not worker_done)
         done = bool(worker_done or timed_out)
 
         # Reward: use C-computed value from QTRN v2, require it.
@@ -186,14 +165,7 @@ class NativeWorldEnv:
         # Minimal state tracking for frags
         frag_gain = int(te.frag_gain) if te is not None else 0
         frag_loss = int(te.frag_loss) if te is not None else 0
-        current_frags = self.state.frags + frag_gain - frag_loss
-        self.state = NativeEnvState(
-            steps=steps,
-            current_region_id=0,
-            frags=current_frags,
-            weapon_id=0,
-            prev_ehp=100.0,
-        )
+        self._frags += frag_gain - frag_loss
 
         # Done reason
         done_reason = ""
@@ -222,7 +194,7 @@ class NativeWorldEnv:
         # Lean info dict: only what EpisodeStatAccumulator and SF need.
         info: Dict[str, object] = {
             "done_reason": done_reason,
-            "scenario_id": str(self.map_state.map_id),
+            "scenario_id": self.map_id,
             "frag_delta": float(frag_gain),
             "frag_loss": float(frag_loss),
             "player_died": bool(te.player_died) if te is not None else False,

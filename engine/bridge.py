@@ -1,11 +1,11 @@
-"""Unified native token bridge for Quake worker subprocesses.
+"""Unified native bridge for Quake worker subprocesses.
 
-The supported worker surface is the token protocol:
+The supported worker surface is the obs-buffer protocol:
 
-- ``NativeTokenProcess`` reads QTOK token packets
+- ``NativeObsBufferProcess`` reads direct-pack obs_buffer_v1 binary
 - optional QTRN sidecars carry training extras
 
-``NativeTokenAdapter`` adds reset-option defaults and a narrower public API.
+``NativeObsBufferAdapter`` adds reset-option defaults and a narrower public API.
 """
 
 from __future__ import annotations
@@ -15,12 +15,11 @@ import os
 import struct
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Mapping, NoReturn, Sequence
+from typing import Any, Dict, Mapping, Sequence
 
 from quake_ai.actions import (
     ActionLabels,
 )
-from quake_ai.rl.schemas import MapState
 
 from engine.training_protocol import (
     TRAINING_BINARY_HEADER_SIZE,
@@ -28,33 +27,12 @@ from engine.training_protocol import (
     TrustedTrainingExtrasV1,
     decode_binary_training_extras,
 )
-from engine.token_protocol import (
-    TOKEN_BINARY_HEADER_SIZE,
-    TOKEN_BINARY_MAGIC,
-    TrustedSelfToken,
-    TrustedTokenTick,
-    decode_binary_token_tick,
-)
 
 
 class NativeEngineError(RuntimeError):
     pass
 
 
-# Keep as alias for the token path; same error hierarchy.
-NativeTokenError = NativeEngineError
-
-_ACTION_KEYS = (
-    "move",
-    "look",
-    "fire",
-    "jump",
-    "switch",
-    "recall_0",
-    "recall_1",
-    "recall_2",
-    "recall_3",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +72,10 @@ class NativeProcessBase:
         self.proc: subprocess.Popen[bytes] | None = None
         self.hello: Dict[str, object] | None = None
         self.capabilities: tuple[str, ...] = ()
-        self.map_state: MapState | None = None
+        self.map_id: str | None = None
         self._training_requested = self.training_format == "binary_v1"
         self._training_enabled = False
         self._last_training_extras: TrustedTrainingExtrasV1 | None = None
-        self._last_token_tick: TrustedTokenTick | None = None
         self._current_episode_id = ""
         hello_payload: Dict[str, Any] = {
             "op": "hello",
@@ -160,8 +137,8 @@ class NativeProcessBase:
     def _update_response_state(self, response_dict: Mapping[str, object]) -> None:
         if isinstance(response_dict.get("capabilities"), list):
             self.capabilities = tuple(str(v) for v in response_dict.get("capabilities", []))
-        if isinstance(response_dict.get("map_state"), Mapping):
-            self.map_state = MapState.from_dict(response_dict["map_state"])
+        if isinstance(response_dict.get("map_id"), str):
+            self.map_id = response_dict["map_id"]
         tick_hz = response_dict.get("tick_hz")
         if isinstance(tick_hz, (int, float)) and int(tick_hz) > 0:
             self.fixed_tick_hz = int(tick_hz)
@@ -271,7 +248,6 @@ class NativeProcessBase:
         self.map_state = None
         self._training_enabled = False
         self._last_training_extras = None
-        self._last_token_tick = None
         self._current_episode_id = ""
 
     def __enter__(self) -> "NativeProcessBase":
@@ -283,108 +259,68 @@ class NativeProcessBase:
 
 
 # ---------------------------------------------------------------------------
-# NativeTokenProcess — QTOK (token-step) binary packets
+# NativeObsBufferProcess — direct-pack obs_buffer_v1 binary
 # ---------------------------------------------------------------------------
 
+import numpy as np
 
-class NativeTokenProcess(NativeProcessBase):
-    """Subprocess bridge that reads QTOK token-step binary packets."""
+from quake_ai.obs_format import OBS_BUFFER_SIZE, unpack_obs_buffer as _unpack_obs_buffer
 
-    _step_format = "token_binary_v2"
-    _required_capability = "token_step_v2"
 
-    def _read_token_packet(self) -> TrustedTokenTick:
-        proc = self._ensure_running()
-        prefix = self._read_exact(1)
-        if prefix == b"{":
-            self._decode_json_response(prefix + proc.stdout.readline())
-            raise NativeEngineError("Worker returned JSON when token packet was expected")
+class NativeObsBufferProcess(NativeProcessBase):
+    """Subprocess bridge that reads direct-pack obs_buffer_v1 binary."""
 
-        magic = prefix + self._read_exact(3)
-        if magic != TOKEN_BINARY_MAGIC:
-            raise NativeEngineError(f"Unexpected token packet prefix {magic!r}")
-        header = magic + self._read_exact(TOKEN_BINARY_HEADER_SIZE - 4)
-        tick = decode_binary_token_tick(header, self._read_exact)
-        if int(tick.tick_hz) > 0:
-            self.fixed_tick_hz = int(tick.tick_hz)
-        self._last_token_tick = tick
-        return tick
+    _step_format = "obs_buffer_v1"
+    _required_capability = "obs_buffer_v1"
+    _last_obs: Dict[str, np.ndarray] | None = None
 
-    def _request_token_packet(self, payload: bytes) -> TrustedTokenTick:
+    def _read_obs_packet(self) -> Dict[str, np.ndarray]:
+        raw = self._read_exact(OBS_BUFFER_SIZE)
+        obs = _unpack_obs_buffer(raw)
+        self._last_obs = obs
+        return obs
+
+    def _request_obs_packet(self, payload: bytes) -> Dict[str, np.ndarray]:
         proc = self._ensure_running()
         proc.stdin.write(payload)
         proc.stdin.flush()
-        return self._read_token_packet()
+        return self._read_obs_packet()
 
     # -- Public API ----------------------------------------------------------
 
     def reset(
         self, seed: int | None = None, options: Mapping[str, object] | None = None
-    ) -> TrustedTokenTick:
-        tick, _ = self.reset_with_training(seed=seed, options=options)
-        return tick
+    ) -> Dict[str, np.ndarray]:
+        obs, _ = self.reset_with_training(seed=seed, options=options)
+        return obs
 
     def reset_with_training(
         self,
         seed: int | None = None,
         options: Mapping[str, object] | None = None,
-    ) -> tuple[TrustedTokenTick, TrustedTrainingExtrasV1 | None]:
+    ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
         if self.proc is None:
             self.start()
         payload: Dict[str, Any] = {"op": "reset", "seed": seed if seed is not None else -1}
         if options:
             payload["options"] = dict(options)
-        tick = self._request_token_packet(self._serialize_request(payload))
-        self._current_episode_id = f"{self.map_id}:{int(tick.tick)}"
-        return tick, self._maybe_read_training_binary()
+        obs = self._request_obs_packet(self._serialize_request(payload))
+        self._current_episode_id = f"{self.map_id}:{0}"
+        return obs, self._maybe_read_training_binary()
 
-    def step(self, action: Mapping[str, int]) -> TrustedTokenTick:
-        tick, _ = self.step_with_training(action)
-        return tick
+    def step(self, action: Mapping[str, int]) -> Dict[str, np.ndarray]:
+        obs, _ = self.step_with_training(action)
+        return obs
 
     def step_with_training(
         self, action: Mapping[str, int]
-    ) -> tuple[TrustedTokenTick, TrustedTrainingExtrasV1 | None]:
+    ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
         if self.proc is None:
             self.start()
-        tick = self._request_token_packet(self._action_request(action))
-        return tick, self._maybe_read_training_binary()
+        obs = self._request_obs_packet(self._binary_step_request(action))
+        return obs, self._maybe_read_training_binary()
 
-    def collect_episode(
-        self,
-        *,
-        seed: int | None = None,
-        options: Mapping[str, object] | None = None,
-        idle_action: Mapping[str, int] | None = None,
-    ) -> list[TrustedTokenTick]:
-        if self.proc is None:
-            self.start()
-
-        if "token_collect_v1" not in self.capabilities:
-            if idle_action is None:
-                raise NativeEngineError("token_collect_v1 is unavailable and no idle_action fallback was provided")
-            ticks = [self.reset(seed=seed, options=options)]
-            while not ticks[-1].done:
-                ticks.append(self.step(idle_action))
-            return ticks
-
-        payload: Dict[str, Any] = {"op": "collect", "seed": seed if seed is not None else -1}
-        if options:
-            payload["options"] = dict(options)
-
-        proc = self._ensure_running()
-        proc.stdin.write(self._serialize_request(payload))
-        proc.stdin.flush()
-
-        ticks: list[TrustedTokenTick] = []
-        while True:
-            tick = self._read_token_packet()
-            ticks.append(tick)
-            if tick.done:
-                break
-        if ticks:
-            self._current_episode_id = f"{self.map_id}:{int(ticks[0].tick)}"
-        return ticks
+    # -- Navmesh queries (JSON protocol) ------------------------------------
 
     @staticmethod
     def _vec3_payload(point: Sequence[float]) -> list[float]:
@@ -429,195 +365,8 @@ class NativeTokenProcess(NativeProcessBase):
 
 
 # ---------------------------------------------------------------------------
-# NativeObsBufferProcess — direct-pack obs_buffer_v1 binary
-# ---------------------------------------------------------------------------
-
-import numpy as np
-
-from quake_ai.obs_format import OBS_BUFFER_SIZE, OBS_FIELDS
-
-
-def _unpack_obs_buffer(raw: bytes) -> Dict[str, np.ndarray]:
-    """Unpack the obs buffer into numpy arrays. Copies data (raw may be reused)."""
-    obs: Dict[str, np.ndarray] = {}
-    for name, (offset, dtype, shape) in OBS_FIELDS.items():
-        arr = np.frombuffer(raw, dtype=dtype, offset=offset, count=int(np.prod(shape)))
-        if dtype == np.uint8 and "mask" in name:
-            obs[name] = arr.astype(np.bool_).reshape(shape)
-        else:
-            obs[name] = arr.reshape(shape).copy()
-    return obs
-
-
-class NativeObsBufferProcess(NativeProcessBase):
-    """Subprocess bridge that reads direct-pack obs_buffer_v1 binary."""
-
-    _step_format = "obs_buffer_v1"
-    _required_capability = "obs_buffer_v1"
-    _last_obs: Dict[str, np.ndarray] | None = None
-
-    def _read_obs_packet(self) -> Dict[str, np.ndarray]:
-        raw = self._read_exact(OBS_BUFFER_SIZE)
-        obs = _unpack_obs_buffer(raw)
-        self._last_obs = obs
-        # Synthesize a minimal _last_token_tick so _action_request can read weapon_bits
-        # for weapons_owned. Only self_token.weapon_bits is used.
-        scalars = obs["self_scalars"]
-        weapon_bits = [float(scalars[i]) for i in range(3, 10)]
-        self._last_token_tick = TrustedTokenTick(
-            tick=0, steps=0, current_region_id=0,
-            self_token=TrustedSelfToken(
-                health=0, armor=0, armor_type=0,
-                weapon_bits=weapon_bits,
-                weapon_super=0, ammo=[0]*4, velocity=[0]*3,
-                yaw_sin=0, yaw_cos=0, pitch_sin=0, pitch_cos=0,
-                dt=0, weapon_id=0, movement_id=0, cluster_id=0,
-            ),
-            object_tokens=[], spatial_tokens=[],
-        )
-        return obs
-
-    def _request_obs_packet(self, payload: bytes) -> Dict[str, np.ndarray]:
-        proc = self._ensure_running()
-        proc.stdin.write(payload)
-        proc.stdin.flush()
-        return self._read_obs_packet()
-
-    # -- Public API ----------------------------------------------------------
-
-    def reset(
-        self, seed: int | None = None, options: Mapping[str, object] | None = None
-    ) -> Dict[str, np.ndarray]:
-        obs, _ = self.reset_with_training(seed=seed, options=options)
-        return obs
-
-    def reset_with_training(
-        self,
-        seed: int | None = None,
-        options: Mapping[str, object] | None = None,
-    ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
-        if self.proc is None:
-            self.start()
-        payload: Dict[str, Any] = {"op": "reset", "seed": seed if seed is not None else -1}
-        if options:
-            payload["options"] = dict(options)
-        obs = self._request_obs_packet(self._serialize_request(payload))
-        self._current_episode_id = f"{self.map_id}:{0}"
-        return obs, self._maybe_read_training_binary()
-
-    def step(self, action: Mapping[str, int]) -> Dict[str, np.ndarray]:
-        obs, _ = self.step_with_training(action)
-        return obs
-
-    def step_with_training(
-        self, action: Mapping[str, int]
-    ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
-        if self.proc is None:
-            self.start()
-        obs = self._request_obs_packet(self._binary_step_request(action))
-        return obs, self._maybe_read_training_binary()
-
-
-# ---------------------------------------------------------------------------
 # Adapter wrappers — thin public API with reset-option defaults
 # ---------------------------------------------------------------------------
-
-
-class NativeTokenAdapter:
-    """Control-plane wrapper around a NativeTokenProcess."""
-
-    def __init__(
-        self,
-        executable: str | Path,
-        map_id: str,
-        fixed_tick_hz: int = 20,
-        workdir: str | Path | None = None,
-        env: Mapping[str, str] | None = None,
-        extra_args: Sequence[str] | None = None,
-        reset_options: Mapping[str, object] | None = None,
-        training_format: str = "",
-    ) -> None:
-        self.reset_options = dict(reset_options or {})
-        self.process = NativeTokenProcess(
-            executable=executable,
-            map_id=map_id,
-            fixed_tick_hz=fixed_tick_hz,
-            workdir=workdir,
-            env=env,
-            extra_args=extra_args,
-            training_format=training_format,
-        )
-        self.process.start()
-
-    def ticks_per_second(self) -> int:
-        return self.process.fixed_tick_hz
-
-    def map_state_snapshot(self) -> MapState | None:
-        return self.process.map_state
-
-    def reset_tokens(self, seed: int | None = None) -> TrustedTokenTick:
-        return self.process.reset(seed=seed, options=self.reset_options)
-
-    def reset_tokens_with_training(
-        self, seed: int | None = None
-    ) -> tuple[TrustedTokenTick, TrustedTrainingExtrasV1 | None]:
-        return self.process.reset_with_training(seed=seed, options=self.reset_options)
-
-    def step_tokens(self, action: Mapping[str, int]) -> TrustedTokenTick:
-        return self.process.step(action)
-
-    def step_tokens_with_training(
-        self, action: Mapping[str, int]
-    ) -> tuple[TrustedTokenTick, TrustedTrainingExtrasV1 | None]:
-        return self.process.step_with_training(action)
-
-    def navmesh_nearest(self, point: Sequence[float]) -> Dict[str, object]:
-        return self.process.navmesh_nearest(point)
-
-    def navmesh_path(self, start: Sequence[float], end: Sequence[float]) -> Dict[str, object]:
-        return self.process.navmesh_path(start, end)
-
-    def navmesh_area(self, point: Sequence[float]) -> Dict[str, object]:
-        return self.process.navmesh_area(point)
-
-    def navmesh_cluster(self, point: Sequence[float]) -> Dict[str, object]:
-        return self.process.navmesh_cluster(point)
-
-    def navmesh_route(self, start: Sequence[float], end: Sequence[float]) -> Dict[str, object]:
-        return self.process.navmesh_route(start, end)
-
-    def change_map(self, new_map_id: str) -> MapState | None:
-        """Restart the worker subprocess with a different map.
-
-        Returns the new ``MapState`` from the fresh hello handshake.
-        """
-        self.process.shutdown()
-        self.process = NativeTokenProcess(
-            executable=self.process.executable,
-            map_id=new_map_id,
-            fixed_tick_hz=self.process.fixed_tick_hz,
-            workdir=self.process.workdir,
-            env=self.process.env,
-            extra_args=self.process.extra_args,
-            training_format=self.process.training_format,
-        )
-        self.process.start()
-        return self.process.map_state
-
-    def reset(self, seed: int | None = None) -> NoReturn:
-        del seed
-        raise NativeEngineError(
-            "Legacy flat observation API has been removed; use reset_tokens() or NativeWorldEnv"
-        )
-
-    def step(self, action: Mapping[str, int]) -> NoReturn:
-        del action
-        raise NativeEngineError(
-            "Legacy flat observation API has been removed; use step_tokens() or NativeWorldEnv"
-        )
-
-    def close(self) -> None:
-        self.process.shutdown()
 
 
 class NativeObsBufferAdapter:
@@ -653,8 +402,8 @@ class NativeObsBufferAdapter:
     def ticks_per_second(self) -> int:
         return self.process.fixed_tick_hz
 
-    def map_state_snapshot(self) -> MapState | None:
-        return self.process.map_state
+    def map_id_snapshot(self) -> str | None:
+        return self.process.map_id
 
     def reset_obs_with_training(
         self, seed: int | None = None
@@ -666,7 +415,7 @@ class NativeObsBufferAdapter:
     ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
         return self.process.step_with_training(action)
 
-    def change_map(self, new_map_id: str) -> MapState | None:
+    def change_map(self, new_map_id: str) -> str | None:
         self.process.shutdown()
         self.process = NativeObsBufferProcess(
             executable=self.process.executable,
@@ -678,7 +427,7 @@ class NativeObsBufferAdapter:
             training_format=self.process.training_format,
         )
         self.process.start()
-        return self.process.map_state
+        return self.process.map_id
 
     def close(self) -> None:
         self.process.shutdown()

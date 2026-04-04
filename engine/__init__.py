@@ -1,11 +1,11 @@
-"""Engine adapters for deterministic collection and simulation."""
+"""Engine adapters for native worker subprocesses."""
 
 from engine.bridge import (
-    NativeTokenAdapter,
-    NativeTokenProcess,
+    NativeObsBufferAdapter,
+    NativeObsBufferProcess,
 )
 
 __all__ = [
-    "NativeTokenAdapter",
-    "NativeTokenProcess",
+    "NativeObsBufferAdapter",
+    "NativeObsBufferProcess",
 ]

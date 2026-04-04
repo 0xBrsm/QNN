@@ -1,5 +1,6 @@
 #include "qnn.h"
-#include "qnn_obs.h"
+#include "qnn_io.h"
+#include "qnn_store.h"
 #include "qnn_metrics.h"
 
 #include <stdlib.h>
@@ -34,6 +35,7 @@ typedef struct
 	int	prev_weapon_id;
 	int	prev_ammo;
 	qboolean has_prev;
+	FILE	*store_dump;	/* NULL = no dump, set from QNN_STORE_DUMP env var */
 } qnn_runtime_t;
 
 static qnn_runtime_t qnn_runtime;
@@ -90,9 +92,6 @@ static void QNN_InferAction(qnn_action_t *action, const qnn_snapshot_t *snapshot
 	yaw_delta = QNN_NormalizeYaw(snapshot->player_view_angles[1] - qnn_runtime.prev_view_angles[1]);
 	pitch_delta = snapshot->player_view_angles[0] - qnn_runtime.prev_view_angles[0];
 
-	/* Accumulate look deltas for resampling (degrees, converted at emission). */
-	QNN_ResampleAccumulateLook(yaw_delta, pitch_delta);
-
 	mouse_yaw = (int)roundf(-yaw_delta / QNN_DEMO_MOUSE_DEGREES_PER_COUNT);
 	mouse_pitch = (int)roundf(pitch_delta / QNN_DEMO_MOUSE_DEGREES_PER_COUNT);
 	action->look[0] = QNN_LookAxisFromMouseCount(mouse_yaw);
@@ -135,10 +134,15 @@ static void QNN_WriteObsTick(FILE *out, const qnn_snapshot_t *snapshot,
 	int tick, int steps, int tick_hz, qboolean reset_flag)
 {
 	static uint8_t obs[QNN_OBS_BUFFER_SIZE];
+	qnn_tick_result_t result;
 	uint8_t header[16];
 	uint16_t flags = 0;
 
-	QNN_PackObsBuffer(obs, snapshot, tick_hz, reset_flag);
+	(void)tick_hz;
+	(void)reset_flag;
+	QNN_IOEmit(snapshot, &result);
+	QNN_IOPackObsBuffer(obs, &result);
+	QNN_IOPushAction(snapshot);
 
 	if (reset_flag) flags |= 0x01;
 	if (snapshot->done) flags |= 0x02;
@@ -176,6 +180,18 @@ static void QNN_RuntimeReset(void)
 	qnn_runtime.fixed_dt = 1.0f / 20.0f;
 	qnn_runtime.auto_detect_tick_hz = false;
 	qnn_runtime.movement_threshold = QNN_DEMO_MOVEMENT_THRESHOLD_DEFAULT;
+	qnn_runtime.store_dump = NULL;
+	{
+		const char *dump_path = getenv("QNN_STORE_DUMP");
+		if (dump_path != NULL && dump_path[0] != '\0')
+		{
+			qnn_runtime.store_dump = fopen(dump_path, "w");
+			if (qnn_runtime.store_dump != NULL)
+				fprintf(stderr, "[demo] store dump: %s\n", dump_path);
+			else
+				fprintf(stderr, "[demo] store dump: failed to open %s\n", dump_path);
+		}
+	}
 }
 
 #define QNN_DEMO_DETECT_PROBE_DT 0.001f
@@ -236,7 +252,6 @@ static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, qboolean reset_fl
 {
 	QNN_CaptureBaseSnapshot(snapshot);
 	snapshot->done = reset_flag ? false : qnn_runtime.done;
-	QNN_CaptureVisibleEntities(snapshot, qnn_runtime.fixed_dt);
 	QNN_DrainSounds(snapshot);
 }
 
@@ -292,11 +307,42 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, int seed, char *error
 	if (qnn_runtime.auto_detect_tick_hz)
 		QNN_DetectNativeTickHz();
 
+	/* The demo may play on a different map than what hello specified.
+	   Detect the actual map from the loaded worldmodel and rebuild the
+	   map state so static objects (items, doors, etc.) match reality. */
+	if (cl.worldmodel != NULL && cl.worldmodel->name[0] != '\0')
+	{
+		char demo_map[QNN_MAX_MAP_ID];
+		const char *bsp_name = cl.worldmodel->name;
+		const char *slash;
+		const char *dot;
+		size_t len;
+
+		/* Extract bare map name from "maps/dm3.bsp" */
+		slash = strrchr(bsp_name, '/');
+		if (slash != NULL)
+			bsp_name = slash + 1;
+		dot = strrchr(bsp_name, '.');
+		len = dot ? (size_t)(dot - bsp_name) : strlen(bsp_name);
+		if (len >= sizeof(demo_map))
+			len = sizeof(demo_map) - 1;
+		memcpy(demo_map, bsp_name, len);
+		demo_map[len] = '\0';
+
+		if (strcasecmp(demo_map, qnn_map_state.map_name) != 0)
+		{
+			char map_error[256];
+			if (!QNN_PrepareMap(demo_map, map_error, sizeof(map_error)))
+				fprintf(stderr, "[demo] map rebuild for %s failed: %s\n", demo_map, map_error);
+		}
+	}
+
 	qnn_runtime.tick = 0;
 	qnn_runtime.steps = 0;
 	qnn_runtime.has_reset = true;
 	qnn_runtime.done = false;
-	QNN_SemanticReset(&qnn_map_state);
+	QNN_IOInit(&qnn_map_state);
+	/* Store init is now called inside QNN_ObjectInit */
 	return true;
 }
 
@@ -304,8 +350,6 @@ static void QNN_WriteHelloResponse(void)
 {
 	fprintf(stdout, "{\"capabilities\":[\"demo_playback\",\"navmesh_query_v1\",\"obs_buffer_collect_v1\"],\"map_id\":");
 	QNN_WriteJsonString(stdout, qnn_map_state.requested_map_id);
-	fprintf(stdout, ",\"map_state\":");
-	QNN_WriteMapStateJson(stdout, &qnn_map_state);
 	fprintf(stdout, ",\"ok\":true,\"protocol_version\":");
 	QNN_WriteJsonString(stdout, QNN_WORKER_PROTOCOL);
 	fprintf(stdout, ",\"server\":");
@@ -409,7 +453,7 @@ static int QNN_HandleCollect(const char *line)
 
 		QNN_CaptureSnapshotLocal(&snapshot, true);
 		QNN_SavePrev(&snapshot);
-		QNN_SemanticUpdate(&qnn_map_state, &snapshot, qnn_runtime.fixed_dt, true);
+		QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
 		QNN_WriteObsTick(stdout, &snapshot, qnn_runtime.tick,
 			qnn_runtime.steps, emit_hz, true);
 
@@ -421,7 +465,13 @@ static int QNN_HandleCollect(const char *line)
 			if (!cls.demoplayback || cls.state == ca_disconnected)
 				qnn_runtime.done = true;
 			QNN_CaptureSnapshotLocal(&snapshot, false);
-			QNN_SemanticUpdate(&qnn_map_state, &snapshot, qnn_runtime.fixed_dt, false);
+			QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
+			/* Store update now runs inside QNN_IOUpdate → QNN_ObjectUpdate */
+			if (qnn_runtime.store_dump != NULL)
+			{
+				QNN_StoreDumpSounds(qnn_runtime.store_dump, qnn_runtime.tick, &snapshot);
+				QNN_StoreDumpTick(qnn_runtime.store_dump, qnn_runtime.tick, (float)cl.mtime[0]);
+			}
 
 			QNN_ResampleAccumulate(&snapshot, qnn_runtime.fixed_dt);
 			if (QNN_ResampleShouldEmit() || qnn_runtime.done)
@@ -440,6 +490,12 @@ static int QNN_HandleCollect(const char *line)
 		}
 	}
 	fflush(stdout);
+	if (qnn_runtime.store_dump != NULL)
+	{
+		fflush(qnn_runtime.store_dump);
+		fclose(qnn_runtime.store_dump);
+		qnn_runtime.store_dump = NULL;
+	}
 	return 0;
 }
 

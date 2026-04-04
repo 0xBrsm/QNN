@@ -16,7 +16,7 @@ from quake_ai.actions import (
     CONTINUOUS_ACTION_HEADS,
     DISCRETE_ACTION_HEADS,
 )
-from quake_ai.model.observation import TokenObservationEncoder
+from quake_ai.model.observation import OBS_DIM
 from quake_ai.model.policy import QNNPolicy
 from quake_ai.utils.io import write_json
 from quake_ai.utils.repro import set_global_seed, write_experiment_manifest
@@ -438,7 +438,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     if sample_counts["train"] <= 0:
         raise RuntimeError("No training samples available")
 
-    obs_dim = TokenObservationEncoder().obs_dim
+    obs_dim = OBS_DIM
     if seed_checkpoint and Path(seed_checkpoint).exists():
         print(f"  [bc] Fine-tuning from seed: {seed_checkpoint}")
         model = QNNPolicy.load(seed_checkpoint, device=config.device)
@@ -545,16 +545,31 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         write_json(output / "bc_step_log.json", {"steps": _step_log})
 
     _active_lr = config.lr
+    _lr_override_path = output / "lr_override.json"
 
     import math as _math
 
     for epoch in range(start_epoch, config.epochs):
-        # Cosine LR decay: lr anneals from config.lr to config.lr_min over all epochs.
-        if config.lr_min > 0:
-            progress = epoch / max(config.epochs - 1, 1)
-            _active_lr = config.lr_min + 0.5 * (config.lr - config.lr_min) * (1 + _math.cos(_math.pi * progress))
+        # Hot-reload LR: drop {"lr": 0.001, "lr_min": 0.0003} into lr_override.json.
+        _lr = config.lr
+        _lr_min = config.lr_min
+        if _lr_override_path.exists():
+            try:
+                _ovr = json.loads(_lr_override_path.read_text())
+                _lr = float(_ovr.get("lr", _lr))
+                _lr_min = float(_ovr.get("lr_min", _lr_min))
+                print(f"  [bc] lr_override.json: lr={_lr}, lr_min={_lr_min}")
+            except Exception as exc:
+                print(f"  [bc] lr_override.json parse error: {exc}")
 
-        if epoch == start_epoch or (config.lr_min > 0 and epoch > start_epoch):
+        # Cosine LR decay: lr anneals from lr to lr_min over all epochs.
+        if _lr_min > 0:
+            progress = epoch / max(config.epochs - 1, 1)
+            _active_lr = _lr_min + 0.5 * (_lr - _lr_min) * (1 + _math.cos(_math.pi * progress))
+        else:
+            _active_lr = _lr
+
+        if epoch == start_epoch or epoch > start_epoch:
             print(f"  [bc] LR={_active_lr:.6f}")
 
         train_metrics = _run_precomputed_supervised(

@@ -1,3 +1,7 @@
+extern "C" {
+#include "quakedef.h"
+}
+
 #include "qnn_navmesh.h"
 
 #include <cmath>
@@ -15,7 +19,7 @@
 #include "Recast.h"
 
 /* Shared error-formatting helper (declared in qnn_navmesh.h, used by both
-   qnn_navmesh.cpp and qnn_nav_oracle.cpp). */
+   qnn_navmesh.cpp and qnn_route.cpp). */
 extern "C" void qnn_nav_set_error(char *error, size_t error_size, const char *format, ...)
 {
 	va_list args;
@@ -30,7 +34,15 @@ extern "C" void qnn_nav_set_error(char *error, size_t error_size, const char *fo
 namespace {
 
 constexpr unsigned char kAreaWalkable = 1;
+constexpr unsigned char kAreaNearWall = 2;
 constexpr unsigned short kPolyFlagWalk = 1;
+constexpr float kNearWallCost = 3.0f;
+
+static void qnn_navmesh_setup_filter(dtQueryFilter *filter)
+{
+	filter->setAreaCost(kAreaWalkable, 1.0f);
+	filter->setAreaCost(kAreaNearWall, kNearWallCost);
+}
 
 struct QnnRcContext : public rcContext
 {
@@ -104,14 +116,18 @@ struct qnn_navmesh_runtime_s
 {
 	dtNavMesh *navmesh;
 	dtNavMeshQuery *query;
-	float query_half_extents[3];
+	float query_half_extents[3];       /* wide: for items/goals */
+	float query_half_extents_tight[3]; /* tight: for agent position */
 
 	qnn_navmesh_runtime_s()
 		: navmesh(nullptr), query(nullptr)
 	{
-		query_half_extents[0] = 64.0f;
-		query_half_extents[1] = 96.0f;
-		query_half_extents[2] = 64.0f;
+		query_half_extents[0] = 48.0f;
+		query_half_extents[1] = 128.0f;
+		query_half_extents[2] = 48.0f;
+		query_half_extents_tight[0] = 24.0f;
+		query_half_extents_tight[1] = 56.0f;
+		query_half_extents_tight[2] = 24.0f;
 	}
 };
 
@@ -209,17 +225,39 @@ static int qnn_navmesh_collect_neighbors(const qnn_navmesh_runtime_t *navmesh, d
 	return count;
 }
 
+static float qnn_navmesh_horizontal_dist_sq(const float *a, const float *b)
+{
+	float dx = a[0] - b[0];
+	float dz = a[2] - b[2];
+	return dx * dx + dz * dz;
+}
+
+static float qnn_navmesh_snap_limit(const qnn_navmesh_runtime_t *navmesh, const float *extents)
+{
+	float limit;
+
+	limit = fmaxf(extents[0], extents[2]) * 0.75f;
+	if (navmesh != nullptr && extents == navmesh->query_half_extents_tight)
+		limit = fminf(limit, 24.0f);
+	else
+		limit = fminf(limit, 48.0f);
+	return fmaxf(limit, 16.0f);
+}
+
+/* extents_override: if non-NULL, use these instead of the runtime wide defaults. */
 static int qnn_navmesh_find_nearest_internal(
 	const qnn_navmesh_runtime_t *navmesh,
 	const float *point,
 	dtPolyRef *nearest_ref,
 	float *nearest_pt,
 	bool *is_over_poly,
+	const float *extents_override,
 	char *error,
 	size_t error_size)
 {
-	dtQueryFilter filter;
+	dtQueryFilter filter; qnn_navmesh_setup_filter(&filter);
 	float recast_point[3];
+	const float *extents;
 	dtStatus status;
 
 	if (navmesh == nullptr || navmesh->query == nullptr || navmesh->navmesh == nullptr)
@@ -228,10 +266,12 @@ static int qnn_navmesh_find_nearest_internal(
 		return 0;
 	}
 
+	extents = extents_override ? extents_override : navmesh->query_half_extents;
+
 	qnn_quake_to_recast(point, recast_point);
 	status = navmesh->query->findNearestPoly(
 		recast_point,
-		navmesh->query_half_extents,
+		extents,
 		&filter,
 		nearest_ref,
 		nearest_pt,
@@ -240,6 +280,21 @@ static int qnn_navmesh_find_nearest_internal(
 	{
 		qnn_nav_set_error(error, error_size, "Detour findNearestPoly failed");
 		return 0;
+	}
+	/* Reject results that snapped too far horizontally — prevents
+	   snapping through thin walls into adjacent rooms. */
+	if (*nearest_ref != 0)
+	{
+		float dist_sq = qnn_navmesh_horizontal_dist_sq(recast_point, nearest_pt);
+		float limit = qnn_navmesh_snap_limit(navmesh, extents);
+		if (dist_sq > limit * limit)
+		{
+			*nearest_ref = 0;
+			memset(nearest_pt, 0, sizeof(float) * 3);
+			if (is_over_poly != nullptr)
+				*is_over_poly = false;
+			return 0;
+		}
 	}
 	return *nearest_ref != 0 ? 1 : 0;
 }
@@ -304,7 +359,7 @@ extern "C" qnn_navmesh_runtime_t *qnn_navmesh_build(
 	rcCalcGridSize(rc_config.bmin, rc_config.bmax, rc_config.cs, &rc_config.width, &rc_config.height);
 	rc_config.walkableSlopeAngle = config->walkable_slope_angle;
 	rc_config.walkableHeight = (int)ceilf(config->walkable_height / rc_config.ch);
-	rc_config.walkableClimb = (int)floorf(config->walkable_climb / rc_config.ch);
+	rc_config.walkableClimb = (int)ceilf(config->walkable_climb / rc_config.ch);
 	rc_config.walkableRadius = (int)ceilf(config->walkable_radius / rc_config.cs);
 	rc_config.maxEdgeLen = (int)(config->max_edge_len / rc_config.cs);
 	rc_config.maxSimplificationError = config->max_simplification_error;
@@ -408,12 +463,94 @@ extern "C" qnn_navmesh_runtime_t *qnn_navmesh_build(
 		return nullptr;
 	}
 
-	for (i = 0; i < guard.poly_mesh->npolys; ++i)
+	/* Mark poly areas using distance-field wall proximity.
+	   Two-pass approach:
+	   1. Sample each poly's wall distance from the compact heightfield.
+	   2. Mark a poly as kAreaNearWall only if it is near a wall AND
+	      has a neighbor that is NOT near a wall (i.e., a center-of-corridor
+	      alternative exists).  Narrow corridors where ALL polys are near
+	      walls stay as normal WALK cost — no penalty when there's no choice. */
 	{
-		if (guard.poly_mesh->areas[i] == RC_WALKABLE_AREA)
-			guard.poly_mesh->areas[i] = kAreaWalkable;
-		if (guard.poly_mesh->areas[i] == kAreaWalkable)
+		const unsigned short *pverts = guard.poly_mesh->verts;
+		const unsigned short *ppolys = guard.poly_mesh->polys;
+		const int nvp = guard.poly_mesh->nvp;
+		const int npoly = guard.poly_mesh->npolys;
+		const unsigned short dist_threshold =
+			(unsigned short)(config->walkable_radius / config->cell_size * 2.0f);
+
+		/* Pass 1: compute per-poly "near wall" flag via distance field */
+		std::vector<bool> poly_near_wall(static_cast<size_t>(npoly), false);
+
+		for (i = 0; i < npoly; ++i)
+		{
+			if (guard.poly_mesh->areas[i] != RC_WALKABLE_AREA)
+				continue;
+
+			float cx = 0, cz = 0;
+			int vc = 0;
+			const unsigned short *p = &ppolys[i * nvp * 2];
+			for (int vi = 0; vi < nvp && p[vi] != RC_MESH_NULL_IDX; ++vi)
+			{
+				cx += pverts[p[vi] * 3 + 0];
+				cz += pverts[p[vi] * 3 + 2];
+				vc++;
+			}
+			if (vc > 0) { cx /= vc; cz /= vc; }
+
+			int gx = (int)cx;
+			int gz = (int)cz;
+			if (gx < 0) gx = 0;
+			if (gz < 0) gz = 0;
+			if (gx >= guard.compact->width) gx = guard.compact->width - 1;
+			if (gz >= guard.compact->height) gz = guard.compact->height - 1;
+
+			const rcCompactCell *cell = &guard.compact->cells[gx + gz * guard.compact->width];
+			for (int si = (int)cell->index, sn = (int)(cell->index + cell->count); si < sn; ++si)
+			{
+				if (guard.compact->dist[si] < dist_threshold)
+				{
+					poly_near_wall[static_cast<size_t>(i)] = true;
+					break;
+				}
+			}
+		}
+
+		/* Pass 2: only penalize near-wall polys that have a non-near-wall
+		   neighbor (meaning a center path exists).  Narrow corridors where
+		   ALL polys are near walls stay at normal WALK cost. */
+		for (i = 0; i < npoly; ++i)
+		{
 			guard.poly_mesh->flags[i] = kPolyFlagWalk;
+
+			if (guard.poly_mesh->areas[i] != RC_WALKABLE_AREA)
+				continue;
+
+			if (!poly_near_wall[static_cast<size_t>(i)])
+			{
+				guard.poly_mesh->areas[i] = kAreaWalkable;
+				continue;
+			}
+
+			/* Check neighbors: does any adjacent poly have open space? */
+			int has_open_neighbor = 0;
+			const unsigned short *adj = &ppolys[i * nvp * 2 + nvp];
+			for (int ei = 0; ei < nvp; ++ei)
+			{
+				unsigned short ni = adj[ei];
+				if (ni == RC_MESH_NULL_IDX)
+					continue;
+				if (!poly_near_wall[static_cast<size_t>(ni)])
+				{
+					has_open_neighbor = 1;
+					break;
+				}
+			}
+
+			if (has_open_neighbor)
+				guard.poly_mesh->areas[i] = kAreaNearWall;
+			else
+				guard.poly_mesh->areas[i] = kAreaWalkable;
+		}
 	}
 
 	memset(&params, 0, sizeof(params));
@@ -431,7 +568,12 @@ extern "C" qnn_navmesh_runtime_t *qnn_navmesh_build(
 	params.detailTriCount = guard.detail_mesh->ntris;
 	params.walkableHeight = config->walkable_height;
 	params.walkableRadius = config->walkable_radius;
-	params.walkableClimb = config->walkable_climb;
+	/* Use walkable_height (not walkable_climb) for the Detour tile param.
+	   This controls the Y search extent when linking off-mesh connections
+	   to ground polys.  The navmesh surface sits ~44u below floor level
+	   (player hull offset + voxel quantization), so 18u walkable_climb
+	   is too small to find ground polys under off-mesh endpoints. */
+	params.walkableClimb = config->walkable_height;
 	rcVcopy(params.bmin, guard.poly_mesh->bmin);
 	rcVcopy(params.bmax, guard.poly_mesh->bmax);
 	params.cs = rc_config.cs;
@@ -475,9 +617,20 @@ extern "C" qnn_navmesh_runtime_t *qnn_navmesh_build(
 		return nullptr;
 	}
 
-	guard.runtime->query_half_extents[0] = fmaxf(config->walkable_radius * 4.0f, 64.0f);
-	guard.runtime->query_half_extents[1] = fmaxf(config->walkable_height * 2.0f, 96.0f);
-	guard.runtime->query_half_extents[2] = fmaxf(config->walkable_radius * 4.0f, 64.0f);
+	/* Wide extents for goal/item snapping.
+	   Keep XZ tighter than the old 64u box to avoid snapping
+	   through thin walls into adjacent rooms. */
+	guard.runtime->query_half_extents[0] = fmaxf(config->walkable_radius * 3.0f, 48.0f);
+	guard.runtime->query_half_extents[1] = fmaxf(config->walkable_height * 2.0f, 128.0f);
+	guard.runtime->query_half_extents[2] = fmaxf(config->walkable_radius * 3.0f, 48.0f);
+
+	/* Tight extents for agent position.
+	   Y must cover the offset between player origin (center of 56u hull)
+	   and navmesh surface (~44u below), while staying under the minimum
+	   floor gap (~64u on dm4). */
+	guard.runtime->query_half_extents_tight[0] = fmaxf(config->walkable_radius * 1.5f, 24.0f);
+	guard.runtime->query_half_extents_tight[1] = config->walkable_height;
+	guard.runtime->query_half_extents_tight[2] = fmaxf(config->walkable_radius * 1.5f, 24.0f);
 
 	if (summary != nullptr)
 	{
@@ -512,7 +665,7 @@ extern "C" int qnn_navmesh_find_nearest(
 	bool is_over_poly;
 	const dtMeshTile *tile;
 	const dtPoly *poly;
-	dtQueryFilter filter;
+	dtQueryFilter filter; qnn_navmesh_setup_filter(&filter);
 	dtStatus status;
 
 	if (result == nullptr || point == nullptr)
@@ -526,7 +679,7 @@ extern "C" int qnn_navmesh_find_nearest(
 	nearest_ref = 0;
 	memset(nearest_pt, 0, sizeof(nearest_pt));
 	is_over_poly = false;
-	if (!qnn_navmesh_find_nearest_internal(navmesh, point, &nearest_ref, nearest_pt, &is_over_poly, error, error_size))
+	if (!qnn_navmesh_find_nearest_internal(navmesh, point, &nearest_ref, nearest_pt, &is_over_poly, NULL, error, error_size))
 		return 0;
 
 	if (dtStatusFailed(navmesh->navmesh->getTileAndPolyByRef(nearest_ref, &tile, &poly)))
@@ -662,7 +815,7 @@ extern "C" int qnn_navmesh_find_path(
 	float end_nearest[3];
 	bool start_over_poly;
 	bool end_over_poly;
-	dtQueryFilter filter;
+	dtQueryFilter filter; qnn_navmesh_setup_filter(&filter);
 	dtPolyRef path_refs[QNN_NAVMESH_MAX_PATH_REFS];
 	int path_count;
 	float straight_path[QNN_NAVMESH_MAX_STRAIGHT_POINTS * 3];
@@ -685,8 +838,8 @@ extern "C" int qnn_navmesh_find_path(
 	memset(end_nearest, 0, sizeof(end_nearest));
 	start_over_poly = false;
 	end_over_poly = false;
-	if (!qnn_navmesh_find_nearest_internal(navmesh, start, &start_ref, start_nearest, &start_over_poly, error, error_size)
-		|| !qnn_navmesh_find_nearest_internal(navmesh, end, &end_ref, end_nearest, &end_over_poly, error, error_size))
+	if (!qnn_navmesh_find_nearest_internal(navmesh, start, &start_ref, start_nearest, &start_over_poly, navmesh->query_half_extents_tight, error, error_size)
+		|| !qnn_navmesh_find_nearest_internal(navmesh, end, &end_ref, end_nearest, &end_over_poly, NULL, error, error_size))
 		return 0;
 
 	path_count = 0;
@@ -841,3 +994,7 @@ extern "C" void qnn_navmesh_write_path_json(FILE *out, const qnn_navmesh_path_re
 		result->straight_point_count,
 		result->travel_distance);
 }
+
+/* Geometry extraction, default config, and build_from_worldmodel
+   moved to qnn_map.c — map.c is the engine interface. */
+

@@ -26,6 +26,10 @@ ACTION_HEADS = {
     "recall_3": RECALL_REGISTER_SIZE + 1,
 }
 CONTINUOUS_ACTION_HEADS = frozenset({"move", "look"})
+
+# Deterministic head ordering (Python 3.7+ dict preserves insertion order).
+# Shared by checkpoint_converter and other modules that need a canonical order.
+HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
 DISCRETE_ACTION_HEADS = frozenset({"jump", "fire", "switch", "recall_0", "recall_1", "recall_2", "recall_3"})
 
 _SWITCH_SLOT_TO_IMPULSES = {

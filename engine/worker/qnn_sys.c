@@ -1,5 +1,5 @@
 #include "qnn.h"
-#include "qnn_nav_oracle.h"
+#include "qnn_route.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -192,72 +192,20 @@ void Sys_MakeCodeWriteable(unsigned long startaddr, unsigned long length)
 
 /* ── basedir resolution ──────────────────────────────────────────── */
 
-static qboolean QNN_DirExists(const char *path)
-{
-	struct stat st;
-
-	if (stat(path, &st) != 0)
-		return false;
-	return S_ISDIR(st.st_mode) ? true : false;
-}
-
-static qboolean QNN_HasId1(const char *root)
-{
-	char path[MAX_OSPATH];
-
-	snprintf(path, sizeof(path), "%s/id1", root);
-	return QNN_DirExists(path);
-}
-
-static void QNN_TryBasedir(char *out, size_t out_size, const char *candidate)
-{
-	if (!candidate || !candidate[0])
-		return;
-	if (!QNN_HasId1(candidate))
-		return;
-	snprintf(out, out_size, "%s", candidate);
-}
-
 void QNN_ResolveBasedir(char *out, size_t out_size)
 {
-	const char *env;
-	char cwd[MAX_OSPATH];
-	char candidate[MAX_OSPATH];
-
-	env = getenv("QUAKE_BASEDIR");
-	out[0] = 0;
-
+	const char *env = getenv("QUAKE_BASEDIR");
 	if (env && env[0])
-		QNN_TryBasedir(out, out_size, env);
-	if (out[0])
-		return;
-
-	QNN_TryBasedir(out, out_size, "/assets");
-	if (out[0])
-		return;
-
-	if (getcwd(cwd, sizeof(cwd)) == NULL)
-	{
+		snprintf(out, out_size, "%s", env);
+	else
 		snprintf(out, out_size, ".");
-		return;
-	}
+}
 
-	snprintf(candidate, sizeof(candidate), "%s/assets", cwd);
-	QNN_TryBasedir(out, out_size, candidate);
-	if (out[0])
-		return;
-
-	snprintf(candidate, sizeof(candidate), "%s/../assets", cwd);
-	QNN_TryBasedir(out, out_size, candidate);
-	if (out[0])
-		return;
-
-	snprintf(candidate, sizeof(candidate), "%s/../../assets", cwd);
-	QNN_TryBasedir(out, out_size, candidate);
-	if (out[0])
-		return;
-
-	snprintf(out, out_size, "%s", cwd);
+const char *QNN_ProgString(string_t value)
+{
+	if (!value)
+		return "";
+	return pr_strings + value;
 }
 
 /* ── JSON extraction utilities ───────────────────────────────────── */
@@ -561,38 +509,7 @@ int QNN_SwitchImpulseFromSlot(int switch_slot, int weapons_owned)
 	}
 }
 
-/* ── map preparation ─────────────────────────────────────────────── */
-
-static void QNN_CanonicalizeMap(char *out, size_t out_size, const char *requested)
-{
-	size_t i;
-
-	snprintf(out, out_size, "%s", requested);
-	for (i = 0; i < strlen(out); ++i)
-		out[i] = (char)tolower((unsigned char)out[i]);
-}
-
-qboolean QNN_PrepareMap(const char *requested_map_id, char *error, size_t error_size)
-{
-	char map_name[QNN_MAX_MAP_ID];
-
-	if (!requested_map_id || !requested_map_id[0])
-	{
-		snprintf(error, error_size, "map_id is required");
-		return false;
-	}
-
-	QNN_CanonicalizeMap(map_name, sizeof(map_name), requested_map_id);
-	if (!strcmp(qnn_map_state.requested_map_id, requested_map_id)
-		&& !strcmp(qnn_map_state.map_name, map_name)
-		&& qnn_map_state.region_count > 0)
-		return true;
-
-	QNN_FreeMapState(&qnn_map_state);
-	if (!QNN_BuildMapState(&qnn_map_state, requested_map_id, map_name, error, error_size))
-		return false;
-	return true;
-}
+/* map preparation moved to qnn_io.c */
 
 /* ── JSON output helpers ─────────────────────────────────────────── */
 
@@ -630,283 +547,9 @@ void QNN_WriteError(const char *message)
 	fflush(stdout);
 }
 
-/* ── engine state helpers ────────────────────────────────────────── */
-
-const char *QNN_ProgString(string_t value)
-{
-	if (!value)
-		return "";
-	return pr_strings + value;
-}
-
-static const char *QNN_ServerClassname(int entity_num)
-{
-	edict_t *edict;
-
-	if (!sv.active)
-		return "";
-	if (entity_num < 0 || entity_num >= sv.num_edicts)
-		return "";
-	edict = EDICT_NUM(entity_num);
-	if (edict->free || !edict->v.classname)
-		return "";
-	return QNN_ProgString(edict->v.classname);
-}
-
-int QNN_WeaponId(void)
-{
-	int active;
-	int weapon_id;
-
-	active = cl.stats[STAT_ACTIVEWEAPON];
-	/* In listen server mode cl.stats[STAT_ACTIVEWEAPON] can stay zero even
-	   though the server-side edict has the correct weapon field.  Fall back
-	   to the authoritative server edict when the client stat is missing. */
-	if (sv.active && cl.viewentity > 0 && cl.viewentity < sv.num_edicts)
-	{
-		edict_t *ent = EDICT_NUM(cl.viewentity);
-		if (ent && !ent->free)
-		{
-			if (active <= 0)
-				active = (int)ent->v.weapon;
-			(void)0; /* weapon fallback checked */
-		}
-	}
-	if (active > 0)
-	{
-		weapon_id = 1;
-		while (active > 1)
-		{
-			active >>= 1;
-			weapon_id += 1;
-		}
-		return weapon_id;
-	}
-	if (cl.stats[STAT_WEAPON] > 0)
-		return cl.stats[STAT_WEAPON];
-	return 0;
-}
-
-int QNN_CurrentFrags(void)
-{
-	if (cl.viewentity > 0 && cl.scores != NULL && cl.viewentity - 1 < cl.maxclients)
-		return cl.scores[cl.viewentity - 1].frags;
-	return cl.stats[STAT_FRAGS];
-}
-
-static float QNN_CurrentArmortype(void)
-{
-	int items;
-
-	items = cl.items;
-	if (items & IT_ARMOR3) return 0.8f;
-	if (items & IT_ARMOR2) return 0.6f;
-	if (items & IT_ARMOR1) return 0.3f;
-	return 0.0f;
-}
-
-/* ── observation capture ─────────────────────────────────────────── */
-
-/* Returns true if a server edict is an "actor" — anything that moves
-   autonomously and can take damage (players, bots, monsters).  Excludes
-   projectiles, doors, platforms, items, and corpses. */
-static qboolean QNN_IsActorEdict(const edict_t *ed)
-{
-	int mt;
-	if (ed->free)
-		return false;
-	if (ed->v.takedamage == DAMAGE_NO)
-		return false;
-	if (ed->v.health <= 0)
-		return false;
-	mt = (int)ed->v.movetype;
-	return mt == MOVETYPE_WALK || mt == MOVETYPE_STEP;
-}
-
-void QNN_CaptureVisibleEntities(qnn_snapshot_t *snapshot, float fixed_dt)
-{
-	int entity_num;
-	/* Track which entity numbers were already captured from the client list
-	   so the server-side actor pass doesn't duplicate them. */
-	unsigned char captured[MAX_EDICTS / 8 + 1];
-	memset(captured, 0, sizeof(captured));
-
-	/* Pass 1: client-side entities (normal network-visible entities). */
-	for (entity_num = 1; entity_num < cl.num_entities && snapshot->visible_count < QNN_MAX_VISIBLE; ++entity_num)
-	{
-		entity_t *entity;
-		edict_t *server_edict;
-		qnn_visible_entity_t *out_entity;
-		vec3_t delta;
-
-		entity = &cl_entities[entity_num];
-		server_edict = (sv.active && entity_num >= 0 && entity_num < sv.num_edicts) ? EDICT_NUM(entity_num) : NULL;
-		if (entity_num == cl.viewentity)
-			continue;
-		if (entity->model == NULL)
-			continue;
-
-		out_entity = &snapshot->visible[snapshot->visible_count];
-		memset(out_entity, 0, sizeof(*out_entity));
-		out_entity->entity_key = entity_num;
-		snprintf(out_entity->entity_id, sizeof(out_entity->entity_id), "entity_%04d", entity_num);
-		snprintf(out_entity->classname, sizeof(out_entity->classname), "%s", QNN_ServerClassname(entity_num));
-		snprintf(out_entity->model_name, sizeof(out_entity->model_name), "%s", entity->model != NULL ? entity->model->name : "");
-		out_entity->entity_num = entity_num;
-		VectorCopy(entity->origin, out_entity->origin);
-		VectorSubtract(entity->msg_origins[0], entity->msg_origins[1], delta);
-		if (fixed_dt > 0.0f)
-			VectorScale(delta, 1.0f / fixed_dt, out_entity->velocity);
-		else
-			VectorCopy(vec3_origin, out_entity->velocity);
-		VectorCopy(entity->angles, out_entity->angles);
-		out_entity->model_id = entity->baseline.modelindex > 0 ? entity->baseline.modelindex : 0;
-		out_entity->frame = entity->frame;
-		out_entity->effects = entity->effects;
-		out_entity->skin = entity->skinnum;
-		out_entity->health = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.health : 0;
-		out_entity->frags = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.frags : 0;
-		/* Shift origin to bounding box center and store half-extents.
-		   Prefer server edict bounds (exact per-entity), fall back to
-		   model bounds (works during demo playback without a server). */
-		{
-			vec3_t bmins = {0,0,0}, bmaxs = {0,0,0};
-			qboolean have_bounds = false;
-			if (server_edict != NULL && !server_edict->free) {
-				VectorCopy(server_edict->v.mins, bmins);
-				VectorCopy(server_edict->v.maxs, bmaxs);
-				have_bounds = (bmins[0] != 0 || bmins[1] != 0 || bmins[2] != 0 ||
-				               bmaxs[0] != 0 || bmaxs[1] != 0 || bmaxs[2] != 0);
-			}
-			if (!have_bounds && entity->model != NULL) {
-				VectorCopy(entity->model->mins, bmins);
-				VectorCopy(entity->model->maxs, bmaxs);
-				have_bounds = (bmins[0] != 0 || bmins[1] != 0 || bmins[2] != 0 ||
-				               bmaxs[0] != 0 || bmaxs[1] != 0 || bmaxs[2] != 0);
-			}
-			if (have_bounds) {
-				out_entity->origin[0] += (bmins[0] + bmaxs[0]) * 0.5f;
-				out_entity->origin[1] += (bmins[1] + bmaxs[1]) * 0.5f;
-				out_entity->origin[2] += (bmins[2] + bmaxs[2]) * 0.5f;
-				out_entity->half_extents[0] = (bmaxs[0] - bmins[0]) * 0.5f;
-				out_entity->half_extents[1] = (bmaxs[1] - bmins[1]) * 0.5f;
-				out_entity->half_extents[2] = (bmaxs[2] - bmins[2]) * 0.5f;
-			}
-		}
-		out_entity->region_id = QNN_NearestRegionId(&qnn_map_state, out_entity->origin);
-		snapshot->visible_count += 1;
-		captured[entity_num / 8] |= (1 << (entity_num % 8));
-	}
-
-	/* Pass 2: server-side actors not in the client entity list.
-	   FrikBots and other fake clients bypass the network protocol so they
-	   never appear in cl_entities.  We read their state directly from the
-	   server edict array. */
-	if (sv.active)
-	{
-		for (entity_num = 1; entity_num < sv.num_edicts && snapshot->visible_count < QNN_MAX_VISIBLE; ++entity_num)
-		{
-			edict_t *ed;
-			qnn_visible_entity_t *out_entity;
-			const char *model_name;
-			int model_idx;
-
-			if (captured[entity_num / 8] & (1 << (entity_num % 8)))
-				continue;
-			if (entity_num == cl.viewentity)
-				continue;
-
-			ed = EDICT_NUM(entity_num);
-			if (!QNN_IsActorEdict(ed))
-				continue;
-
-			model_idx = (int)ed->v.modelindex;
-			model_name = (model_idx > 0 && model_idx < MAX_MODELS && sv.model_precache[model_idx])
-				? sv.model_precache[model_idx] : "";
-
-			out_entity = &snapshot->visible[snapshot->visible_count];
-			memset(out_entity, 0, sizeof(*out_entity));
-			out_entity->entity_key = entity_num;
-			snprintf(out_entity->entity_id, sizeof(out_entity->entity_id), "entity_%04d", entity_num);
-			snprintf(out_entity->classname, sizeof(out_entity->classname), "%s", QNN_ServerClassname(entity_num));
-			snprintf(out_entity->model_name, sizeof(out_entity->model_name), "%s", model_name);
-			out_entity->entity_num = entity_num;
-			VectorCopy(ed->v.origin, out_entity->origin);
-			VectorCopy(ed->v.velocity, out_entity->velocity);
-			VectorCopy(ed->v.angles, out_entity->angles);
-			out_entity->model_id = model_idx;
-			out_entity->frame = (int)ed->v.frame;
-			out_entity->effects = (int)ed->v.effects;
-			out_entity->skin = (int)ed->v.skin;
-			out_entity->health = (int)ed->v.health;
-			out_entity->frags = (int)ed->v.frags;
-			/* Shift origin to bounding box center and store half-extents. */
-			{
-				vec3_t bmins = {0,0,0}, bmaxs = {0,0,0};
-				qboolean have_bounds = false;
-				VectorCopy(ed->v.mins, bmins);
-				VectorCopy(ed->v.maxs, bmaxs);
-				have_bounds = (bmins[0] != 0 || bmins[1] != 0 || bmins[2] != 0 ||
-				               bmaxs[0] != 0 || bmaxs[1] != 0 || bmaxs[2] != 0);
-				if (have_bounds) {
-					out_entity->origin[0] += (bmins[0] + bmaxs[0]) * 0.5f;
-					out_entity->origin[1] += (bmins[1] + bmaxs[1]) * 0.5f;
-					out_entity->origin[2] += (bmins[2] + bmaxs[2]) * 0.5f;
-					out_entity->half_extents[0] = (bmaxs[0] - bmins[0]) * 0.5f;
-					out_entity->half_extents[1] = (bmaxs[1] - bmins[1]) * 0.5f;
-					out_entity->half_extents[2] = (bmaxs[2] - bmins[2]) * 0.5f;
-				}
-			}
-			out_entity->region_id = QNN_NearestRegionId(&qnn_map_state, out_entity->origin);
-			snapshot->visible_count += 1;
-		}
-	}
-}
-
-void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot)
-{
-	entity_t *player_entity;
-	edict_t *server_edict;
-
-	memset(snapshot, 0, sizeof(*snapshot));
-	player_entity = (cl.viewentity > 0 && cl.viewentity < MAX_EDICTS) ? &cl_entities[cl.viewentity] : NULL;
-	server_edict = (sv.active && cl.viewentity > 0 && cl.viewentity < sv.num_edicts) ? EDICT_NUM(cl.viewentity) : NULL;
-	if (player_entity != NULL)
-	{
-		VectorCopy(player_entity->origin, snapshot->player_origin);
-	}
-	else
-	{
-		VectorCopy(vec3_origin, snapshot->player_origin);
-	}
-	VectorCopy(cl.velocity, snapshot->player_velocity);
-	VectorCopy(cl.viewangles, snapshot->player_view_angles);
-
-	snapshot->health = cl.stats[STAT_HEALTH];
-	snapshot->armor = cl.stats[STAT_ARMOR];
-	snapshot->armor_type = QNN_CurrentArmortype();
-	snapshot->ammo = cl.stats[STAT_AMMO];
-	snapshot->ammo_shells = cl.stats[STAT_SHELLS];
-	snapshot->ammo_nails = cl.stats[STAT_NAILS];
-	snapshot->ammo_rockets = cl.stats[STAT_ROCKETS];
-	snapshot->ammo_cells = cl.stats[STAT_CELLS];
-	snapshot->weapons_owned = cl.items & (IT_SHOTGUN | IT_SUPER_SHOTGUN | IT_NAILGUN | IT_SUPER_NAILGUN | IT_GRENADE_LAUNCHER | IT_ROCKET_LAUNCHER | IT_LIGHTNING);
-	snapshot->weapon_id = QNN_WeaponId();
-	snapshot->waterlevel = (server_edict != NULL && !server_edict->free) ? (int)server_edict->v.waterlevel : (cl.inwater ? 2 : 0);
-	snapshot->grounded = (server_edict != NULL && !server_edict->free)
-		? ((((int)server_edict->v.flags) & FL_ONGROUND) ? true : false)
-		: (cl.onground ? true : false);
-	snapshot->current_region_id = QNN_NearestRegionId(&qnn_map_state, snapshot->player_origin);
-}
-
-void QNN_DrainSounds(qnn_snapshot_t *snapshot)
-{
-	snapshot->sound_count = qnn_sound_count < QNN_MAX_SOUNDS
-		? qnn_sound_count : QNN_MAX_SOUNDS;
-	if (snapshot->sound_count > 0)
-		memcpy(snapshot->sounds, qnn_sound_buffer, snapshot->sound_count * sizeof(qnn_sound_event_t));
-	qnn_sound_count = 0;
-}
+/* Engine state helpers (QNN_ProgString, QNN_WeaponId, QNN_CurrentFrags,
+   QNN_CaptureBaseSnapshot, QNN_CaptureKnownEntities, QNN_DrainSounds)
+   moved to qnn_object.c */
 
 /* ── shared nav query handler ───────────────────────────────────── */
 
@@ -981,10 +624,10 @@ int QNN_HandleNavQuery(const char *line)
 	if (!strcmp(kind, "area"))
 	{
 		vec3_t point;
-		qnn_nav_area_result_t result;
+		qnn_route_area_result_t result;
 		int found;
 
-		if (qnn_map_state.nav_oracle == NULL)
+		if (qnn_map_state.route == NULL)
 		{
 			QNN_WriteError("Navigation oracle is unavailable for this map");
 			return 0;
@@ -994,14 +637,14 @@ int QNN_HandleNavQuery(const char *line)
 			QNN_WriteError("nav_query area requires point=[x,y,z]");
 			return 0;
 		}
-		found = qnn_nav_oracle_find_area(qnn_map_state.nav_oracle, point, &result, error, sizeof(error));
+		found = QNN_RouteFindArea(qnn_map_state.route, point, &result, error, sizeof(error));
 		if (!found && error[0] != 0)
 		{
 			QNN_WriteError(error);
 			return 0;
 		}
 		fprintf(stdout, "{\"ok\":true,\"query\":\"area\",\"result\":");
-		qnn_nav_oracle_write_area_json(stdout, &result);
+		QNN_RouteWriteAreaJson(stdout, &result);
 		fprintf(stdout, "}\n");
 		fflush(stdout);
 		return 0;
@@ -1010,10 +653,10 @@ int QNN_HandleNavQuery(const char *line)
 	if (!strcmp(kind, "cluster"))
 	{
 		vec3_t point;
-		qnn_nav_cluster_result_t result;
+		qnn_route_cluster_result_t result;
 		int found;
 
-		if (qnn_map_state.nav_oracle == NULL)
+		if (qnn_map_state.route == NULL)
 		{
 			QNN_WriteError("Navigation oracle is unavailable for this map");
 			return 0;
@@ -1023,14 +666,14 @@ int QNN_HandleNavQuery(const char *line)
 			QNN_WriteError("nav_query cluster requires point=[x,y,z]");
 			return 0;
 		}
-		found = qnn_nav_oracle_find_cluster(qnn_map_state.nav_oracle, point, &result, error, sizeof(error));
+		found = QNN_RouteFindCluster(qnn_map_state.route, point, &result, error, sizeof(error));
 		if (!found && error[0] != 0)
 		{
 			QNN_WriteError(error);
 			return 0;
 		}
 		fprintf(stdout, "{\"ok\":true,\"query\":\"cluster\",\"result\":");
-		qnn_nav_oracle_write_cluster_json(stdout, &result);
+		QNN_RouteWriteClusterJson(stdout, &result);
 		fprintf(stdout, "}\n");
 		fflush(stdout);
 		return 0;
@@ -1040,10 +683,10 @@ int QNN_HandleNavQuery(const char *line)
 	{
 		vec3_t start;
 		vec3_t end;
-		qnn_nav_route_result_t result;
+		qnn_route_route_result_t result;
 		int found;
 
-		if (qnn_map_state.nav_oracle == NULL)
+		if (qnn_map_state.route == NULL)
 		{
 			QNN_WriteError("Navigation oracle is unavailable for this map");
 			return 0;
@@ -1054,14 +697,14 @@ int QNN_HandleNavQuery(const char *line)
 			QNN_WriteError("nav_query route requires start=[x,y,z] and end=[x,y,z]");
 			return 0;
 		}
-		found = qnn_nav_oracle_find_route(qnn_map_state.nav_oracle, start, end, &result, error, sizeof(error));
+		found = QNN_RouteFind(qnn_map_state.route, start, end, &result, error, sizeof(error));
 		if (!found && error[0] != 0)
 		{
 			QNN_WriteError(error);
 			return 0;
 		}
 		fprintf(stdout, "{\"ok\":true,\"query\":\"route\",\"result\":");
-		qnn_nav_oracle_write_route_json(stdout, &result);
+		QNN_RouteWriteRouteJson(stdout, &result);
 		fprintf(stdout, "}\n");
 		fflush(stdout);
 		return 0;
@@ -1094,12 +737,6 @@ void QNN_ResampleAccumulate(const qnn_snapshot_t *snapshot, float frame_dt)
 		qnn_resample.jump_any = 1;
 }
 
-void QNN_ResampleAccumulateLook(float yaw_degrees, float pitch_degrees)
-{
-	qnn_resample.look_yaw_degrees += yaw_degrees;
-	qnn_resample.look_pitch_degrees += pitch_degrees;
-}
-
 qboolean QNN_ResampleShouldEmit(void)
 {
 	if (qnn_resample.target_hz <= 0)
@@ -1119,15 +756,10 @@ void QNN_ResampleApplyActionMerge(qnn_snapshot_t *snapshot)
 	if (qnn_resample.jump_any)
 		snapshot->action_label.jump = 1;
 
-	/* Look deltas are now computed at emission time by infer_action using
-	 * the full emission-to-emission window.  No accumulator override needed. */
-
 	/* Reset accumulators for next window. */
 	qnn_resample.accumulated_dt = 0.0f;
 	qnn_resample.fire_any = 0;
 	qnn_resample.jump_any = 0;
-	qnn_resample.look_yaw_degrees = 0.0f;
-	qnn_resample.look_pitch_degrees = 0.0f;
 }
 
 /* ── Binary write helpers (little-endian) ────────────────────────── */

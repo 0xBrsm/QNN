@@ -87,7 +87,9 @@ UPSTREAM_SOURCES=(
 
 CUSTOM_CXX_SOURCES=(
   "${ENGINE_DIR}/worker/qnn_navmesh.cpp"
-  "${ENGINE_DIR}/worker/qnn_nav_oracle.cpp"
+  "${ENGINE_DIR}/worker/qnn_link.cpp"
+  "${ENGINE_DIR}/worker/qnn_cluster.cpp"
+  "${ENGINE_DIR}/worker/qnn_route.cpp"
 )
 
 NAV_CXX_SOURCES=(
@@ -177,14 +179,36 @@ prepare_upstream() {
 
   # Shared inline patches applied to all worker builds:
 
-  # 1. Increase MAX_OSPATH from 128 to 512 (long demo filenames)
+  # 1. Make upstream qboolean C++-safe for the nav/oracle worker sources.
+  python3 - "${WORKTREE_DIR}/common.h" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+pattern = r'typedef enum \{false, true\}\s+qboolean;'
+replacement = (
+    '#ifdef __cplusplus\n'
+    'typedef int qboolean;\n'
+    '#else\n'
+    'typedef enum {false, true}\t\tqboolean;\n'
+    '#endif'
+)
+text, count = re.subn(pattern, replacement, text, count=1)
+if count != 1:
+    raise SystemExit("failed to patch qboolean definition in common.h")
+path.write_text(text)
+PY
+
+  # 2. Increase MAX_OSPATH from 128 to 512 (long demo filenames)
   python3 - "${WORKTREE_DIR}/quakedef.h" <<'PY'
 from pathlib import Path; import sys
 p = Path(sys.argv[1]); t = p.read_text()
 p.write_text(t.replace("#define\tMAX_OSPATH\t\t128", "#define\tMAX_OSPATH\t\t512"))
 PY
 
-  # 2. snprintf in COM_FindFile (bounded path concatenation)
+  # 3. snprintf in COM_FindFile (bounded path concatenation)
   python3 - "${WORKTREE_DIR}/common.c" <<'PY'
 from pathlib import Path; import sys
 path = Path(sys.argv[1]); text = path.read_text()
@@ -200,7 +224,7 @@ text = text.replace(
 path.write_text(text)
 PY
 
-  # 3. Guard R_AddEfrags against NULL worldmodel (headless demo playback)
+  # 4. Guard R_AddEfrags against NULL worldmodel (headless demo playback)
   python3 - "${WORKTREE_DIR}/r_efrag.c" <<'PY'
 from pathlib import Path; import sys
 p = Path(sys.argv[1]); t = p.read_text()
@@ -210,7 +234,7 @@ t = t.replace(
 p.write_text(t)
 PY
 
-  # 4. Non-fatal model precache failures (headless doesn't need all models)
+  # 5. Non-fatal model precache failures (headless doesn't need all models)
   #    Without this, demos on maps like e4m3 fail because progs/star.mdl
   #    isn't in our PAK files — the engine returns early and worldmodel is NULL.
   python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'

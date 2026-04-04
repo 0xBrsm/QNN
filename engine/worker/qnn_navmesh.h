@@ -121,6 +121,9 @@ void qnn_navmesh_write_summary_json(FILE *out, const qnn_navmesh_summary_t *summ
 void qnn_navmesh_write_nearest_json(FILE *out, const qnn_navmesh_nearest_result_t *result);
 void qnn_navmesh_write_path_json(FILE *out, const qnn_navmesh_path_result_t *result);
 
+/* Geometry extraction and navmesh build from cl.worldmodel are in
+   qnn_map.c (QNN_MapBuildNavmesh) — map.c is the engine interface. */
+
 #ifdef __cplusplus
 }
 #endif

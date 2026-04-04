@@ -22,7 +22,7 @@ from quake_ai.rl.metrics import (
     mean_metric_values,
 )
 from quake_ai.model.policy import QNNPolicy
-from quake_ai.model.observation import TokenObservationEncoder, observation_signature_dim
+from quake_ai.model.observation import observation_signature_dim
 from quake_ai.rl.environment import NativeWorldEnv
 from quake_ai.utils.io import trusted_torch_load, write_json
 from quake_ai.utils.repro import set_global_seed, write_experiment_manifest
@@ -539,9 +539,10 @@ def _load_sf_checkpoint_as_qnn(
     """
     from quake_ai.ppo.checkpoint_converter import sf_to_qnn
     from quake_ai.model.observation import (
-        SELF_SCALAR_DIM, SELF_ID_DIM, MAX_OBJECT_TOKENS, OBJECT_ID_DIM,
-        OBJECT_SCALAR_DIM, MAX_EVENT_ATOMS, EVENT_ID_DIM, EVENT_SCALAR_DIM,
-        SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM, ACTION_HISTORY_LEN, ACTION_HISTORY_DIM,
+        SELF_SCALAR_DIM, SELF_ID_DIM, MAX_OBJECT_TOKENS, MAX_ROUTE_CLUSTERS,
+        OBJECT_ID_DIM, OBJECT_SCALAR_DIM, MAX_EVENT_ATOMS, EVENT_ID_DIM,
+        EVENT_SCALAR_DIM, SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM,
+        ACTION_HISTORY_LEN, ACTION_HISTORY_DIM,
     )
 
     p = Path(path)
@@ -554,7 +555,7 @@ def _load_sf_checkpoint_as_qnn(
         meta = dict(model_config)
         meta.setdefault("obs_dim", int(
             SELF_SCALAR_DIM + SELF_ID_DIM
-            + (MAX_OBJECT_TOKENS * (OBJECT_ID_DIM + OBJECT_SCALAR_DIM + 1))
+            + (MAX_OBJECT_TOKENS * (OBJECT_ID_DIM + OBJECT_SCALAR_DIM + 1 + MAX_ROUTE_CLUSTERS))
             + (MAX_EVENT_ATOMS * (EVENT_ID_DIM + EVENT_SCALAR_DIM + 2))
             + SPATIAL_TOKEN_COUNT
             + (SPATIAL_TOKEN_COUNT * SPATIAL_SCALAR_DIM)

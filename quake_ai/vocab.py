@@ -18,24 +18,25 @@ SUBJECT_IDS: Dict[str, int] = {
     "NAILS": 10,
     "ROCKETS": 11,
     "CELLS": 12,
-    "HEALTH": 13,
-    "MEGAHEALTH": 14,
-    "ARMOR_GREEN": 15,
-    "ARMOR_YELLOW": 16,
-    "ARMOR_RED": 17,
+    "ARMOR_GREEN": 13,
+    "ARMOR_YELLOW": 14,
+    "ARMOR_RED": 15,
+    "HEALTH": 16,
+    "MEGAHEALTH": 17,
     "QUAD": 18,
     "PENT": 19,
     "RING": 20,
     "SUIT": 21,
-    "PROJECTILE_NAIL": 22,
-    "PROJECTILE_GRENADE": 23,
-    "PROJECTILE_ROCKET": 24,
-    "LIGHTNING_BEAM": 25,
-    "TELEPORTER": 26,
-    "DOOR": 27,
-    "PLATFORM": 28,
-    "TRAIN": 29,
-    "BUTTON": 30,
+    "POWERUP": 22,
+    "PROJECTILE_NAIL": 23,
+    "PROJECTILE_GRENADE": 24,
+    "PROJECTILE_ROCKET": 25,
+    "LIGHTNING_BEAM": 26,
+    "TELEPORTER": 27,
+    "DOOR": 28,
+    "PLATFORM": 29,
+    "TRAIN": 30,
+    "BUTTON": 31,
 }
 
 ACTION_IDS: Dict[str, int] = {
@@ -75,9 +76,10 @@ QUALIFIER_IDS: Dict[str, int] = {
 
 MODALITY_IDS: Dict[str, int] = {
     "NONE": 0,
-    "VISUAL": 1,
-    "AUDITORY": 2,
-    "MENTAL": 3,
+    "SIGHT": 1,
+    "PROXIMITY": 2,
+    "SOUND": 3,
+    "MEMORY": 4,
 }
 
 MAX_PLAYER_SLOTS = 32

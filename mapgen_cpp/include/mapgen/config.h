@@ -57,15 +57,15 @@ struct EntityConfig {
 };
 
 struct NavmeshConfig {
-    float cell_size = 16.0f;
-    float cell_height = 8.0f;
+    float cell_size = 4.0f;
+    float cell_height = 2.0f;
     float walkable_slope_angle = 45.0f;
     float walkable_height = 56.0f;
     float walkable_climb = 18.0f;
     float walkable_radius = 16.0f;
     float max_edge_len = 192.0f;
     float max_simplification_error = 1.3f;
-    int min_region_size = 8;
+    int min_region_size = 2;
     int merge_region_size = 20;
     int max_verts_per_poly = 6;
     float detail_sample_distance = 6.0f;

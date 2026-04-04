@@ -1,4 +1,5 @@
 #include "qnn.h"
+#include "qnn_io.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +14,6 @@
 #define QNN_TRAIN_OUTPUT_NONE 0
 #define QNN_TRAIN_OUTPUT_BINARY_V1 1
 
-#define QNN_STEP_OUTPUT_TOKEN_BINARY_V2 0
 #define QNN_STEP_OUTPUT_OBS_BUFFER_V1   1
 
 typedef struct
@@ -381,28 +381,6 @@ static void QNN_AddCombatEvent(
 	QNN_AddEvent(snapshot, event_type, region_id, 1, delta, 1, weapon_id, source_entity_num, target_entity_num);
 }
 
-static void QNN_AddStaticProxy(qnn_snapshot_t *snapshot, const qnn_static_object_t *object)
-{
-	qnn_visible_entity_t *entity;
-
-	if (snapshot->visible_count >= QNN_MAX_VISIBLE)
-		return;
-	entity = &snapshot->visible[snapshot->visible_count];
-	memset(entity, 0, sizeof(*entity));
-	entity->entity_key = -((int)(object - qnn_map_state.static_objects) + 1);
-	snprintf(entity->entity_id, sizeof(entity->entity_id), "%s", object->object_id);
-	snprintf(entity->classname, sizeof(entity->classname), "%s", object->classname);
-	entity->entity_num = 0;
-	entity->region_id = object->region_id;
-	VectorCopy(object->origin, entity->origin);
-	VectorCopy(vec3_origin, entity->velocity);
-	VectorCopy(object->angles, entity->angles);
-	entity->model_id = 0;
-	entity->frame = 0;
-	entity->static_proxy = true;
-	snapshot->visible_count += 1;
-}
-
 static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, const qnn_action_t *current_action, qboolean reset_flag)
 {
 	int entity_num;
@@ -528,29 +506,6 @@ static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, const qnn_action_
 		/* In deathmatch, death is part of the reward signal, not a terminal
 		   state.  The player respawns and the episode continues until
 		   max_steps (Python-side timeout).  Only end on intermission. */
-	}
-
-	QNN_CaptureVisibleEntities(snapshot, qnn_runtime.fixed_dt);
-
-	/* Static proxy fallback: synthesise entities from map objects when
-	   the engine reports no visible entities in this frame. */
-	if (snapshot->visible_count == 0)
-	{
-		int i;
-
-		for (i = 0; i < qnn_map_state.static_object_count && snapshot->visible_count < 4; ++i)
-		{
-			const qnn_static_object_t *object;
-
-			object = &qnn_map_state.static_objects[i];
-			if (object->region_id != snapshot->current_region_id)
-				continue;
-			if (strcmp(object->category, "item")
-				&& strcmp(object->category, "goal")
-				&& strcmp(object->category, "trigger"))
-				continue;
-			QNN_AddStaticProxy(snapshot, object);
-		}
 	}
 
 	/* Drain the global sound ring buffer into this snapshot. */
@@ -703,17 +658,15 @@ static qboolean QNN_ResetWorldLocal(int seed, char *error, size_t error_size)
 	qnn_runtime.prev_frags = QNN_CurrentFrags();
 	qnn_runtime.prev_monster_kills = QNN_CurrentMonsterKills();
 	QNN_CacheEntityState();
-	QNN_SemanticReset(&qnn_map_state);
+	QNN_IOInit(&qnn_map_state);
 	QNN_TrainingResetEpisode();
 	return true;
 }
 
 static void QNN_WriteHelloResponse(void)
 {
-	fprintf(stdout, "{\"capabilities\":[\"binary_step_v1\",\"listen_local\",\"navmesh_query_v1\",\"obs_buffer_v1\",\"reset_options\",\"token_step_v2\",\"training_extras_v1\",\"udp_networking\"],\"map_id\":");
+	fprintf(stdout, "{\"capabilities\":[\"binary_step_v1\",\"listen_local\",\"navmesh_query_v1\",\"obs_buffer_v1\",\"reset_options\",\"training_extras_v1\",\"udp_networking\"],\"map_id\":");
 	QNN_WriteJsonString(stdout, qnn_map_state.requested_map_id);
-	fprintf(stdout, ",\"map_state\":");
-	QNN_WriteMapStateJson(stdout, &qnn_map_state);
 	fprintf(stdout, ",\"ok\":true,\"protocol_version\":");
 	QNN_WriteJsonString(stdout, QNN_WORKER_PROTOCOL);
 	fprintf(stdout, ",\"server\":");
@@ -726,22 +679,27 @@ static void QNN_WriteHelloResponse(void)
 	fflush(stdout);
 }
 
+static void QNN_WriteObsToStdout(const qnn_snapshot_t *snapshot)
+{
+	static uint8_t obs[QNN_OBS_BUFFER_SIZE];
+	qnn_tick_result_t result;
+	QNN_IOEmit(snapshot, &result);
+	QNN_IOPackObsBuffer(obs, &result);
+	QNN_IOPushAction(snapshot);
+	fwrite(obs, 1, QNN_OBS_BUFFER_SIZE, stdout);
+	fflush(stdout);
+}
+
 static void QNN_WriteResetResponse(const qnn_snapshot_t *snapshot)
 {
-	if (qnn_runtime.step_output_mode == QNN_STEP_OUTPUT_OBS_BUFFER_V1)
-		QNN_WriteObsBuffer(stdout, snapshot, qnn_runtime.tick, qnn_runtime.steps, qnn_runtime.fixed_tick_hz, true);
-	else
-		QNN_WriteTokenStepBinary(stdout, snapshot, qnn_runtime.tick, qnn_runtime.steps, qnn_runtime.fixed_tick_hz, true);
+	QNN_WriteObsToStdout(snapshot);
 	if (qnn_runtime.training_output_mode == QNN_TRAIN_OUTPUT_BINARY_V1)
 		QNN_WriteTrainingExtrasBinary(stdout, snapshot, qnn_runtime.tick, qnn_runtime.steps, true);
 }
 
 static void QNN_WriteStepResponse(const qnn_snapshot_t *snapshot)
 {
-	if (qnn_runtime.step_output_mode == QNN_STEP_OUTPUT_OBS_BUFFER_V1)
-		QNN_WriteObsBuffer(stdout, snapshot, qnn_runtime.tick, qnn_runtime.steps, qnn_runtime.fixed_tick_hz, false);
-	else
-		QNN_WriteTokenStepBinary(stdout, snapshot, qnn_runtime.tick, qnn_runtime.steps, qnn_runtime.fixed_tick_hz, false);
+	QNN_WriteObsToStdout(snapshot);
 	if (qnn_runtime.training_output_mode == QNN_TRAIN_OUTPUT_BINARY_V1)
 		QNN_WriteTrainingExtrasBinary(stdout, snapshot, qnn_runtime.tick, qnn_runtime.steps, false);
 }
@@ -768,20 +726,16 @@ static int QNN_HandleHello(const char *line)
 	if (QNN_JsonExtractString(line, "\"protocol_version\"", protocol_version, sizeof(protocol_version)))
 		requested_protocol_version = QNN_ParseProtocolVersion(protocol_version, 5);
 	qnn_runtime.training_output_mode = QNN_TRAIN_OUTPUT_NONE;
-	qnn_runtime.step_output_mode = QNN_STEP_OUTPUT_TOKEN_BINARY_V2;
+	qnn_runtime.step_output_mode = QNN_STEP_OUTPUT_OBS_BUFFER_V1;
 	if (!QNN_JsonExtractString(line, "\"step_format\"", step_format, sizeof(step_format))
 		|| requested_protocol_version < 4)
 	{
-		QNN_WriteError("Worker requires step_format with protocol_version>=4");
+		QNN_WriteError("Worker requires step_format=obs_buffer_v1 with protocol_version>=4");
 		return 0;
 	}
-	if (strcmp(step_format, "obs_buffer_v1") == 0)
+	if (strcmp(step_format, "obs_buffer_v1") != 0)
 	{
-		qnn_runtime.step_output_mode = QNN_STEP_OUTPUT_OBS_BUFFER_V1;
-	}
-	else if (strcmp(step_format, "token_binary_v2") != 0)
-	{
-		QNN_WriteError("Worker requires step_format=token_binary_v2 or obs_buffer_v1");
+		QNN_WriteError("Worker requires step_format=obs_buffer_v1");
 		return 0;
 	}
 	if (QNN_JsonExtractString(line, "\"training_format\"", training_format, sizeof(training_format)))
@@ -824,9 +778,17 @@ static int QNN_HandleReset(const char *line)
 		return 0;
 	}
 
+	/* Rebuild navmesh/route if worldmodel changed (first reset after hello,
+	   or map change).  QNN_PrepareMap detects the change via cached_worldmodel. */
+	if (!QNN_PrepareMap(qnn_map_state.requested_map_id, error, sizeof(error)))
+	{
+		QNN_WriteError(error);
+		return 0;
+	}
+
 	QNN_CaptureSnapshotLocal(&snapshot, &action, true);
 	snapshot.action_label = action;
-	QNN_SemanticUpdate(&qnn_map_state, &snapshot, qnn_runtime.fixed_dt, true);
+	QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
 	QNN_CommitSnapshot(&snapshot, &action, true);
 	QNN_WriteResetResponse(&snapshot);
 	return 0;
@@ -881,7 +843,7 @@ static int QNN_HandleStep(const char *line)
 
 	QNN_CaptureSnapshotLocal(&snapshot, &action, false);
 	snapshot.action_label = action;
-	QNN_SemanticUpdate(&qnn_map_state, &snapshot, qnn_runtime.fixed_dt, false);
+	QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
 	QNN_CommitSnapshot(&snapshot, &action, false);
 	QNN_ClearAction(&qnn_pending_action);
 	QNN_WriteStepResponse(&snapshot);
@@ -962,7 +924,7 @@ int main(int argc, char **argv)
 				qnn_snapshot_t snapshot;
 				QNN_CaptureSnapshotLocal(&snapshot, &action, false);
 				snapshot.action_label = action;
-				QNN_SemanticUpdate(&qnn_map_state, &snapshot, qnn_runtime.fixed_dt, false);
+				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
 				QNN_CommitSnapshot(&snapshot, &action, false);
 				QNN_ClearAction(&qnn_pending_action);
 				QNN_WriteStepResponse(&snapshot);
