@@ -29,37 +29,37 @@ typedef struct {
 } qnn_model_classify_t;
 
 static const qnn_model_classify_t qnn_model_table[] = {
-	{"progs/player.mdl",    QNN_SUBJECT_PLAYER,             QNN_QUAL_NONE,      0, 0},
-	{"progs/eyes.mdl",      QNN_SUBJECT_PLAYER,             QNN_QUAL_INVISIBLE, 0, 0},
-	{"progs/backpack.mdl",  QNN_SUBJECT_BACKPACK,           QNN_QUAL_NONE,      0, 0},
-	{"progs/spike.mdl",     QNN_SUBJECT_PROJECTILE_NAIL,    QNN_QUAL_NONE,      0, 0},
-	{"progs/s_spike.mdl",   QNN_SUBJECT_PROJECTILE_NAIL,    QNN_QUAL_NONE,      0, 0},
-	{"progs/grenade.mdl",   QNN_SUBJECT_PROJECTILE_GRENADE, QNN_QUAL_NONE,      0, 0},
-	{"progs/missile.mdl",   QNN_SUBJECT_PROJECTILE_ROCKET,  QNN_QUAL_NONE,      0, 0},
-	{"progs/bolt2.mdl",     QNN_SUBJECT_LIGHTNING_BEAM,     QNN_QUAL_NONE,      0, 0},
-	{"progs/bolt3.mdl",     QNN_SUBJECT_LIGHTNING_BEAM,     QNN_QUAL_NONE,      0, 0},
-	{"progs/teleport.mdl",  QNN_SUBJECT_TELEPORTER,         QNN_QUAL_NONE,      0, 0},
-	{"maps/b_bh10.bsp",     QNN_SUBJECT_HEALTH,             QNN_QUAL_NONE,      15,  QNN_SELF_HEALTH_CAP},
-	{"maps/b_bh25.bsp",     QNN_SUBJECT_HEALTH,             QNN_QUAL_NONE,      25,  QNN_SELF_HEALTH_CAP},
-	{"maps/b_bh100.bsp",    QNN_SUBJECT_MEGAHEALTH,         QNN_QUAL_NONE,      100, QNN_SELF_HEALTH_CAP},
-	{"maps/b_shell0.bsp",   QNN_SUBJECT_SHELLS,             QNN_QUAL_NONE,      20,  QNN_SELF_SHELLS_CAP},
-	{"maps/b_shell1.bsp",   QNN_SUBJECT_SHELLS,             QNN_QUAL_NONE,      40,  QNN_SELF_SHELLS_CAP},
-	{"maps/b_nail0.bsp",    QNN_SUBJECT_NAILS,              QNN_QUAL_NONE,      25,  QNN_SELF_NAILS_CAP},
-	{"maps/b_nail1.bsp",    QNN_SUBJECT_NAILS,              QNN_QUAL_NONE,      50,  QNN_SELF_NAILS_CAP},
-	{"maps/b_rock0.bsp",    QNN_SUBJECT_ROCKETS,            QNN_QUAL_NONE,      5,   QNN_SELF_ROCKETS_CAP},
-	{"maps/b_rock1.bsp",    QNN_SUBJECT_ROCKETS,            QNN_QUAL_NONE,      10,  QNN_SELF_ROCKETS_CAP},
-	{"maps/b_batt0.bsp",    QNN_SUBJECT_CELLS,              QNN_QUAL_NONE,      6,   QNN_SELF_CELLS_CAP},
-	{"maps/b_batt1.bsp",    QNN_SUBJECT_CELLS,              QNN_QUAL_NONE,      12,  QNN_SELF_CELLS_CAP},
-	{"progs/g_shot.mdl",    QNN_SUBJECT_SHOTGUN,            QNN_QUAL_NONE,      0, 0},
-	{"progs/g_nail.mdl",    QNN_SUBJECT_NAILGUN,            QNN_QUAL_NONE,      0, 0},
-	{"progs/g_nail2.mdl",   QNN_SUBJECT_NAILGUN,            QNN_QUAL_NONE,      0, 0},
-	{"progs/g_rock.mdl",    QNN_SUBJECT_GRENADE_LAUNCHER,   QNN_QUAL_NONE,      0, 0},
-	{"progs/g_rock2.mdl",   QNN_SUBJECT_ROCKET_LAUNCHER,    QNN_QUAL_NONE,      0, 0},
-	{"progs/g_light.mdl",   QNN_SUBJECT_THUNDERBOLT,        QNN_QUAL_NONE,      0, 0},
-	{"progs/quaddama.mdl",  QNN_SUBJECT_QUAD,               QNN_QUAL_NONE,      1, 1},
-	{"progs/invulner.mdl",  QNN_SUBJECT_PENT,               QNN_QUAL_NONE,      1, 1},
-	{"progs/invisibl.mdl",  QNN_SUBJECT_RING,               QNN_QUAL_NONE,      1, 1},
-	{"progs/suit.mdl",      QNN_SUBJECT_SUIT,               QNN_QUAL_NONE,      1, 1},
+	{"progs/player.mdl",    QNN_SUBJECT_PLAYER,             0,      0, 0},
+	{"progs/eyes.mdl",      QNN_SUBJECT_PLAYER,             0, 0, 0},
+	{"progs/backpack.mdl",  QNN_SUBJECT_BACKPACK,           0,      0, 0},
+	{"progs/spike.mdl",     QNN_SUBJECT_PROJECTILE_NAIL,    0,      0, 0},
+	{"progs/s_spike.mdl",   QNN_SUBJECT_PROJECTILE_NAIL,    0,      0, 0},
+	{"progs/grenade.mdl",   QNN_SUBJECT_PROJECTILE_GRENADE, 0,      0, 0},
+	{"progs/missile.mdl",   QNN_SUBJECT_PROJECTILE_ROCKET,  0,      0, 0},
+	{"progs/bolt2.mdl",     QNN_SUBJECT_LIGHTNING_BEAM,     0,      0, 0},
+	{"progs/bolt3.mdl",     QNN_SUBJECT_LIGHTNING_BEAM,     0,      0, 0},
+	{"progs/teleport.mdl",  QNN_SUBJECT_TELEPORTER,         0,      0, 0},
+	{"maps/b_bh10.bsp",     QNN_SUBJECT_HEALTH,             0,      15,  QNN_MAX_HEALTH},
+	{"maps/b_bh25.bsp",     QNN_SUBJECT_HEALTH,             0,      25,  QNN_MAX_HEALTH},
+	{"maps/b_bh100.bsp",    QNN_SUBJECT_MEGAHEALTH,         0,      100, QNN_MAX_HEALTH},
+	{"maps/b_shell0.bsp",   QNN_SUBJECT_SHELLS,             0,      20,  QNN_MAX_SHELLS},
+	{"maps/b_shell1.bsp",   QNN_SUBJECT_SHELLS,             0,      40,  QNN_MAX_SHELLS},
+	{"maps/b_nail0.bsp",    QNN_SUBJECT_NAILS,              0,      25,  QNN_MAX_NAILS},
+	{"maps/b_nail1.bsp",    QNN_SUBJECT_NAILS,              0,      50,  QNN_MAX_NAILS},
+	{"maps/b_rock0.bsp",    QNN_SUBJECT_ROCKETS,            0,      5,   QNN_MAX_ROCKETS},
+	{"maps/b_rock1.bsp",    QNN_SUBJECT_ROCKETS,            0,      10,  QNN_MAX_ROCKETS},
+	{"maps/b_batt0.bsp",    QNN_SUBJECT_CELLS,              0,      6,   QNN_MAX_CELLS},
+	{"maps/b_batt1.bsp",    QNN_SUBJECT_CELLS,              0,      12,  QNN_MAX_CELLS},
+	{"progs/g_shot.mdl",    QNN_SUBJECT_SHOTGUN,            0,      0, 0},
+	{"progs/g_nail.mdl",    QNN_SUBJECT_NAILGUN,            0,      0, 0},
+	{"progs/g_nail2.mdl",   QNN_SUBJECT_NAILGUN,            0,      0, 0},
+	{"progs/g_rock.mdl",    QNN_SUBJECT_GRENADE_LAUNCHER,   0,      0, 0},
+	{"progs/g_rock2.mdl",   QNN_SUBJECT_ROCKET_LAUNCHER,    0,      0, 0},
+	{"progs/g_light.mdl",   QNN_SUBJECT_THUNDERBOLT,        0,      0, 0},
+	{"progs/quaddama.mdl",  QNN_SUBJECT_QUAD,               0,      1, 1},
+	{"progs/invulner.mdl",  QNN_SUBJECT_PENT,               0,      1, 1},
+	{"progs/invisibl.mdl",  QNN_SUBJECT_RING,               0,      1, 1},
+	{"progs/suit.mdl",      QNN_SUBJECT_SUIT,               0,      1, 1},
 	{NULL, 0, 0, 0, 0}
 };
 
@@ -114,65 +114,65 @@ static qboolean QNN_ClassifyItemSubject(const char *classname, int spawnflags, i
 		if (spawnflags & 2)
 		{
 			*subject_id = QNN_SUBJECT_MEGAHEALTH;
-			*magnitude = QNN_Normalize(100.0f, QNN_SELF_HEALTH_CAP);
+			*magnitude = QNN_Normalize(100.0f, QNN_MAX_HEALTH);
 			return true;
 		}
 		*subject_id = QNN_SUBJECT_HEALTH;
-		*magnitude = (spawnflags & 1) ? QNN_Normalize(15.0f, QNN_SELF_HEALTH_CAP) : QNN_Normalize(25.0f, QNN_SELF_HEALTH_CAP);
+		*magnitude = (spawnflags & 1) ? QNN_Normalize(15.0f, QNN_MAX_HEALTH) : QNN_Normalize(25.0f, QNN_MAX_HEALTH);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_health_rotten"))
 	{
 		*subject_id = QNN_SUBJECT_HEALTH;
-		*magnitude = QNN_Normalize(15.0f, QNN_SELF_HEALTH_CAP);
+		*magnitude = QNN_Normalize(15.0f, QNN_MAX_HEALTH);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_health_mega"))
 	{
 		*subject_id = QNN_SUBJECT_MEGAHEALTH;
-		*magnitude = QNN_Normalize(100.0f, QNN_SELF_HEALTH_CAP);
+		*magnitude = QNN_Normalize(100.0f, QNN_MAX_HEALTH);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_armor1"))
 	{
 		*subject_id = QNN_SUBJECT_ARMOR_GREEN;
-		*magnitude = (100.0f * 0.3f) / QNN_SELF_HEALTH_CAP; /* effective armor, same scale as self token */
+		*magnitude = (100.0f * 0.3f) / QNN_MAX_ARMOR;
 		return true;
 	}
 	if (!strcasecmp(classname, "item_armor2"))
 	{
 		*subject_id = QNN_SUBJECT_ARMOR_YELLOW;
-		*magnitude = (150.0f * 0.6f) / QNN_SELF_HEALTH_CAP; /* effective armor */
+		*magnitude = (150.0f * 0.6f) / QNN_MAX_ARMOR;
 		return true;
 	}
 	if (!strcasecmp(classname, "item_armorInv"))
 	{
 		*subject_id = QNN_SUBJECT_ARMOR_RED;
-		*magnitude = (200.0f * 0.8f) / QNN_SELF_HEALTH_CAP; /* effective armor */
+		*magnitude = (200.0f * 0.8f) / QNN_MAX_ARMOR;
 		return true;
 	}
 	if (!strcasecmp(classname, "item_shells"))
 	{
 		*subject_id = QNN_SUBJECT_SHELLS;
-		*magnitude = (spawnflags & 1) ? QNN_Normalize(40.0f, QNN_SELF_SHELLS_CAP) : QNN_Normalize(20.0f, QNN_SELF_SHELLS_CAP);
+		*magnitude = (spawnflags & 1) ? QNN_Normalize(40.0f, QNN_MAX_SHELLS) : QNN_Normalize(20.0f, QNN_MAX_SHELLS);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_spikes"))
 	{
 		*subject_id = QNN_SUBJECT_NAILS;
-		*magnitude = (spawnflags & 1) ? QNN_Normalize(50.0f, QNN_SELF_NAILS_CAP) : QNN_Normalize(25.0f, QNN_SELF_NAILS_CAP);
+		*magnitude = (spawnflags & 1) ? QNN_Normalize(50.0f, QNN_MAX_NAILS) : QNN_Normalize(25.0f, QNN_MAX_NAILS);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_rockets"))
 	{
 		*subject_id = QNN_SUBJECT_ROCKETS;
-		*magnitude = (spawnflags & 1) ? QNN_Normalize(10.0f, QNN_SELF_ROCKETS_CAP) : QNN_Normalize(5.0f, QNN_SELF_ROCKETS_CAP);
+		*magnitude = (spawnflags & 1) ? QNN_Normalize(10.0f, QNN_MAX_ROCKETS) : QNN_Normalize(5.0f, QNN_MAX_ROCKETS);
 		return true;
 	}
 	if (!strcasecmp(classname, "item_cells"))
 	{
 		*subject_id = QNN_SUBJECT_CELLS;
-		*magnitude = (spawnflags & 1) ? QNN_Normalize(12.0f, QNN_SELF_CELLS_CAP) : QNN_Normalize(6.0f, QNN_SELF_CELLS_CAP);
+		*magnitude = (spawnflags & 1) ? QNN_Normalize(12.0f, QNN_MAX_CELLS) : QNN_Normalize(6.0f, QNN_MAX_CELLS);
 		return true;
 	}
 	if (!strcasecmp(classname, "weapon_supershotgun"))
@@ -243,7 +243,7 @@ qboolean QNN_ClassifyStaticSubject(const qnn_static_object_t *obj, int *subject_
 	int spawnflags;
 
 	*subject_id = QNN_SUBJECT_NONE;
-	*qualifier_id = QNN_QUAL_NONE;
+	*qualifier_id = 0;
 	*magnitude = 0.0f;
 	*is_item = false;
 	*respawn_s = 0.0f;
@@ -292,7 +292,7 @@ qboolean QNN_ClassifyByModel(const char *model_name, int skin, int *subject_id, 
 	const qnn_model_classify_t *row;
 
 	*subject_id = QNN_SUBJECT_NONE;
-	*qualifier_id = QNN_QUAL_NONE;
+	*qualifier_id = 0;
 	*magnitude = 0.0f;
 
 	if (model_name == NULL || model_name[0] == '\0')
@@ -313,9 +313,9 @@ qboolean QNN_ClassifyByModel(const char *model_name, int skin, int *subject_id, 
 	/* Armor: subject depends on skin */
 	if (!strcmp(model_name, "progs/armor.mdl"))
 	{
-		if (skin <= 0)      { *subject_id = QNN_SUBJECT_ARMOR_GREEN;  *magnitude = (100.0f * 0.3f) / QNN_SELF_HEALTH_CAP; }
-		else if (skin == 1) { *subject_id = QNN_SUBJECT_ARMOR_YELLOW; *magnitude = (150.0f * 0.6f) / QNN_SELF_HEALTH_CAP; }
-		else                { *subject_id = QNN_SUBJECT_ARMOR_RED;    *magnitude = (200.0f * 0.8f) / QNN_SELF_HEALTH_CAP; }
+		if (skin <= 0)      { *subject_id = QNN_SUBJECT_ARMOR_GREEN;  *magnitude = (100.0f * 0.3f) / QNN_MAX_ARMOR; }
+		else if (skin == 1) { *subject_id = QNN_SUBJECT_ARMOR_YELLOW; *magnitude = (150.0f * 0.6f) / QNN_MAX_ARMOR; }
+		else                { *subject_id = QNN_SUBJECT_ARMOR_RED;    *magnitude = (200.0f * 0.8f) / QNN_MAX_ARMOR; }
 		return true;
 	}
 
@@ -526,7 +526,7 @@ int QNN_EntityClassifyStatic(const qnn_raw_entity_t *raw, int raw_count,
 
 		/* Classify subject */
 		subject_id = QNN_SUBJECT_NONE;
-		qualifier_id = QNN_QUAL_NONE;
+		qualifier_id = 0;
 		magnitude = 0.0f;
 		is_item = false;
 		respawn_s = 0.0f;
@@ -619,7 +619,7 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 		if (is_brush)
 		{
 			subject_id = QNN_SUBJECT_NONE;
-			qualifier_id = QNN_QUAL_NONE;
+			qualifier_id = 0;
 			magnitude = 0.0f;
 		}
 		else if (!QNN_ClassifyByModel(model_name, entity->skinnum, &subject_id, &qualifier_id, &magnitude))
@@ -633,7 +633,8 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 		is_item = (!is_brush && QNN_SubjectIsItem(subject_id));
 		in_fov = QNN_InFov(snapshot->player_origin, snapshot->player_view_angles, entity->origin);
 
-		if (is_item)
+		/* Items and brush movers go into PVS list for timestamp stamping */
+		if (is_item || is_brush)
 		{
 			if (pvs_count < max_pvs)
 			{
@@ -644,7 +645,9 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 				out_pvs[pvs_count].in_fov = in_fov;
 				pvs_count++;
 			}
-			continue;
+			if (is_item)
+				continue;
+			/* Brush movers also need entity_updates for position/state */
 		}
 
 		/* Non-item entities: collect regardless of FOV.

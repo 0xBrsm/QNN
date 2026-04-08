@@ -487,8 +487,6 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     _best_max_reg = float("inf")  # for checkpoint selection: min of max(move_reg, look_reg)
     _best_reg_epoch = -1
     _reg_violations = 0
-    _prev_ext_norm = 0.0
-    _prev_hint_norm = 0.0
 
     # NAS archive: save every epoch checkpoint to SMB share for offsite backup.
     _NAS_CHECKPOINTS = r"\\pi.local\nqcorpus\bc_checkpoints"
@@ -631,33 +629,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
               f"{'*' if improved else ''}  "
               f"{mae_str}")
 
-        # Track per-column learning on new object_proj slots (8-12).
-        # Slots 8-10: bbox extents, slots 11-12: look hints.
-        _col_norms = {}
-        for name, param in model.model.named_parameters():
-            if "object_proj.weight" in name and param.shape[1] >= 13:
-                w = param.detach()
-                for slot, label in ((8, "ext_x"), (9, "ext_y"), (10, "ext_z"),
-                                     (11, "hint_yaw"), (12, "hint_pitch")):
-                    _col_norms[label] = float(w[:, slot].norm().item())
-                break
-        _ext_norm = sum(_col_norms.get(k, 0) ** 2 for k in ("ext_x", "ext_y", "ext_z")) ** 0.5
-        _hint_norm = sum(_col_norms.get(k, 0) ** 2 for k in ("hint_yaw", "hint_pitch")) ** 0.5
-        _ext_delta = _ext_norm - _prev_ext_norm if epoch > 0 else _ext_norm
-        _hint_delta = _hint_norm - _prev_hint_norm if epoch > 0 else _hint_norm
-        _prev_ext_norm = _ext_norm
-        _prev_hint_norm = _hint_norm
-        print(f"  [bc] obj_proj extents norm={_ext_norm:.4f} delta={_ext_delta:+.4f}  "
-              f"hints norm={_hint_norm:.4f} delta={_hint_delta:+.4f}")
-
         # Assemble and record per-epoch metrics.
         epoch_metrics: Dict[str, float] = {"epoch": float(epoch)}
-        for label, norm in _col_norms.items():
-            epoch_metrics[f"obj_proj_{label}_norm"] = norm
-        epoch_metrics["obj_proj_extents_norm"] = _ext_norm
-        epoch_metrics["obj_proj_extents_delta"] = _ext_delta
-        epoch_metrics["obj_proj_hints_norm"] = _hint_norm
-        epoch_metrics["obj_proj_hints_delta"] = _hint_delta
         for key, value in train_metrics.items():
             if key == "_next_hidden":
                 continue

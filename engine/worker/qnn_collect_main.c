@@ -12,6 +12,52 @@
 #define QNN_WORKER_MAX_LINE 8192
 #define QNN_WORKER_MAX_COMMAND_TEXT 1024
 
+/* ── Match state from svc_print text ──────────────────────────── */
+
+static int qnn_match_state; /* 0=pre, 1=in match, 2=post match */
+
+/*
+ * Called from Con_Printf (patched) for every svc_print line.
+ * Scans for mod-generated match start/end text.
+ */
+void QNN_MatchCheckPrint(const char *text)
+{
+	if (qnn_match_state == 0)
+	{
+		if (strstr(text, "match has begun") ||
+		    strstr(text, "Match has begun") ||
+		    strstr(text, "Match Started") ||
+		    strstr(text, "match started") ||
+		    strstr(text, "match has started") ||
+		    strstr(text, "Game Is Starting In 1 Second") ||
+		    strstr(text, "Match is 1v1") || strstr(text, "Match is 2v2") ||
+		    strstr(text, "Match is 3v3") || strstr(text, "Match is 4v4") ||
+		    strstr(text, "Match is 5v5") || strstr(text, "Match is 6v6") ||
+		    strstr(text, "Match is 7v7") || strstr(text, "Match is 8v8") ||
+		    strstr(text, "Game Is Starting In 1 Sec"))
+		{
+			qnn_match_state = 1;
+			fprintf(stderr, "[demo] match start detected: %.*s\n",
+				(int)strcspn(text, "\n"), text);
+		}
+	}
+	else if (qnn_match_state == 1)
+	{
+		if (strstr(text, "match is over") ||
+		    strstr(text, "Match is over") ||
+		    strstr(text, "The match is over") ||
+		    strstr(text, "Match Over") ||
+		    strstr(text, "Game Over") ||
+		    strstr(text, "has WON over") ||
+		    strstr(text, "has won over"))
+		{
+			qnn_match_state = 2;
+			fprintf(stderr, "[demo] match end detected: %.*s\n",
+				(int)strcspn(text, "\n"), text);
+		}
+	}
+}
+
 #define QNN_DEMO_MOUSE_DEGREES_PER_COUNT 0.066f
 #define QNN_DEMO_MOVEMENT_THRESHOLD_DEFAULT 4.0f
 #define QNN_DEMO_JUMP_VELOCITY_THRESHOLD 160.0f
@@ -69,8 +115,6 @@ static float QNN_MovementThresholdForDt(float dt)
 
 static void QNN_InferAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 {
-	float yaw_delta;
-	float pitch_delta;
 	float forward_x;
 	float forward_y;
 	float left_x;
@@ -81,21 +125,24 @@ static void QNN_InferAction(qnn_action_t *action, const qnn_snapshot_t *snapshot
 	float left_proj;
 	float yaw_rad;
 	float movement_threshold;
-	int mouse_yaw;
-	int mouse_pitch;
 
 	QNN_ClearAction(action);
 
 	if (!qnn_runtime.has_prev)
 		return;
 
-	yaw_delta = QNN_NormalizeYaw(snapshot->player_view_angles[1] - qnn_runtime.prev_view_angles[1]);
-	pitch_delta = snapshot->player_view_angles[0] - qnn_runtime.prev_view_angles[0];
-
-	mouse_yaw = (int)roundf(-yaw_delta / QNN_DEMO_MOUSE_DEGREES_PER_COUNT);
-	mouse_pitch = (int)roundf(pitch_delta / QNN_DEMO_MOUSE_DEGREES_PER_COUNT);
-	action->look[0] = QNN_LookAxisFromMouseCount(mouse_yaw);
-	action->look[1] = QNN_LookAxisFromMouseCount(mouse_pitch);
+	/* View-relative look label: record the NEXT frame's forward direction
+	   in the PREVIOUS frame's view-relative coordinates.  This captures
+	   the turn delta as a direction vector the model can learn to emit.
+	   When the player isn't turning, this is (1,0,0) (straight ahead). */
+	{
+		vec3_t forward, right, up, cur_forward;
+		AngleVectors(qnn_runtime.prev_view_angles, forward, right, up);
+		QNN_ForwardFromAngles(snapshot->player_view_angles, cur_forward);
+		action->look[0] = DotProduct(cur_forward, forward);
+		action->look[1] = DotProduct(cur_forward, right);
+		action->look[2] = DotProduct(cur_forward, up);
+	}
 
 	yaw_rad = (float)(qnn_runtime.prev_view_angles[1] * M_PI / 180.0);
 	forward_x = cosf(yaw_rad);
@@ -429,6 +476,10 @@ static int QNN_HandleCollect(const char *line)
 	memset(demo_path, 0, sizeof(demo_path));
 	memset(error, 0, sizeof(error));
 	seed = QNN_JsonExtractInt(line, "\"seed\"", -1);
+	{
+		int trim = QNN_JsonExtractInt(line, "\"trim_match\"", 0);
+		qnn_match_state = trim ? 0 : 1; /* state 1 = emitting immediately */
+	}
 	if (!QNN_JsonExtractString(line, "\"demo_path\"", demo_path, sizeof(demo_path)))
 	{
 		QNN_WriteError("reset options must include demo_path");
@@ -454,8 +505,24 @@ static int QNN_HandleCollect(const char *line)
 		QNN_CaptureSnapshotLocal(&snapshot, true);
 		QNN_SavePrev(&snapshot);
 		QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
-		QNN_WriteObsTick(stdout, &snapshot, qnn_runtime.tick,
-			qnn_runtime.steps, emit_hz, true);
+
+		/*
+		 * Match trimming: if svc_print contains match start/end text,
+		 * only emit ticks during the match (state 1). If no match text
+		 * is ever seen, emit all ticks (no trimming).
+		 *
+		 * Pass 1: run the demo, buffer ticks to a temp file if in
+		 * pre-match state. This is too complex — instead we do two
+		 * passes or just accept that demos without match text emit
+		 * everything.
+		 *
+		 * Simple approach: skip pre-match ticks. If the demo ends
+		 * still in state 0 (no match text found), re-run without
+		 * trimming. This is wasteful but correct and rare — only
+		 * 16 demos have no match text and they don't need trimming.
+		 */
+		{
+			qboolean emitting = false;
 
 		while (!qnn_runtime.done)
 		{
@@ -464,8 +531,31 @@ static int QNN_HandleCollect(const char *line)
 			qnn_runtime.steps += 1;
 			if (!cls.demoplayback || cls.state == ca_disconnected)
 				qnn_runtime.done = true;
+
+			/* Match ended — stop collecting. */
+			if (qnn_match_state == 2)
+			{
+				snapshot.done = true;
+				qnn_runtime.done = true;
+			}
+
 			QNN_CaptureSnapshotLocal(&snapshot, false);
 			QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
+
+			/* Start emitting when match begins. */
+			if (!emitting && qnn_match_state == 1)
+			{
+				emitting = true;
+				fprintf(stderr, "[demo] emitting from tick %d\n", qnn_runtime.tick);
+			}
+
+			/* Pre-match or no match text yet: skip ticks. */
+			if (!emitting && !qnn_runtime.done)
+			{
+				QNN_SavePrev(&snapshot);
+				continue;
+			}
+
 			/* Store update now runs inside QNN_IOUpdate → QNN_ObjectUpdate */
 			if (qnn_runtime.store_dump != NULL)
 			{
@@ -487,6 +577,19 @@ static int QNN_HandleCollect(const char *line)
 				QNN_InferAction(&snapshot.action_label, &snapshot);
 				QNN_SavePrev(&snapshot);
 			}
+		}
+
+		/* If no match text was ever seen, emit a done tick so the
+		   reader doesn't block. The Python side will see 0 real
+		   ticks for trimmed spectator demos, or collect untrimmed
+		   via a second pass for demos without match text. */
+		if (!emitting)
+		{
+			snapshot.done = true;
+			QNN_WriteObsTick(stdout, &snapshot, qnn_runtime.tick,
+				qnn_runtime.steps, emit_hz, true);
+			fprintf(stderr, "[demo] no match text found, emitted done marker only\n");
+		}
 		}
 	}
 	fflush(stdout);

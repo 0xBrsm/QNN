@@ -16,7 +16,7 @@ ACTION_SCHEMA_VERSION = 1
 
 ACTION_HEADS = {
     "move": 2,
-    "look": 2,
+    "look": 3,
     "jump": 2,
     "fire": 2,
     "switch": WEAPON_SWITCH_SLOTS + 1,
@@ -62,15 +62,6 @@ def clamp_unit(value: float) -> float:
     return max(-1.0, min(float(value), 1.0))
 
 
-def _is_vector_like(value: object) -> bool:
-    if value is None or isinstance(value, (str, bytes, bytearray)):
-        return False
-    try:
-        return len(value) == 2  # type: ignore[arg-type]
-    except Exception:
-        return False
-
-
 def _vector2(value: object, *, default: tuple[float, float]) -> tuple[float, float]:
     if value is None:
         return default
@@ -80,6 +71,18 @@ def _vector2(value: object, *, default: tuple[float, float]) -> tuple[float, flo
     except Exception as exc:  # pragma: no cover - defensive input validation
         raise ValueError(f"Expected a 2-vector, got {value!r}") from exc
     return (clamp_unit(first), clamp_unit(second))
+
+
+def _vector3(value: object, *, default: tuple[float, float, float]) -> tuple[float, float, float]:
+    if value is None:
+        return default
+    try:
+        x = float(value[0])  # type: ignore[index]
+        y = float(value[1])  # type: ignore[index]
+        z = float(value[2])  # type: ignore[index]
+    except Exception as exc:  # pragma: no cover - defensive input validation
+        raise ValueError(f"Expected a 3-vector, got {value!r}") from exc
+    return (clamp_unit(x), clamp_unit(y), clamp_unit(z))
 
 
 def move_vector_from_buttons(move_button: int, strafe_button: int) -> tuple[float, float]:
@@ -178,6 +181,7 @@ def normalized_action_features(action: Mapping[str, object]) -> List[float]:
         float(labels.move[1]),
         float(labels.look[0]),
         float(labels.look[1]),
+        float(labels.look[2]),
         float(labels.fire),
         float(labels.jump),
         float(labels.switch) / float(WEAPON_SWITCH_SLOTS),
@@ -187,7 +191,7 @@ def normalized_action_features(action: Mapping[str, object]) -> List[float]:
 @dataclass(slots=True)
 class ActionLabels:
     move: tuple[float, float] = (0.0, 0.0)
-    look: tuple[float, float] = (0.0, 0.0)
+    look: tuple[float, float, float] = (0.0, 0.0, 0.0)
     jump: int = 0
     fire: int = 0
     switch: int = 0
@@ -199,7 +203,7 @@ class ActionLabels:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "ActionLabels":
         move = _vector2(payload.get("move"), default=(0.0, 0.0))
-        look = _vector2(payload.get("look"), default=(0.0, 0.0))
+        look = _vector3(payload.get("look"), default=(0.0, 0.0, 0.0))
 
         action = cls(
             move=move,
@@ -233,7 +237,7 @@ class ActionLabels:
     def to_dict(self) -> Dict[str, object]:
         return {
             "move": [float(self.move[0]), float(self.move[1])],
-            "look": [float(self.look[0]), float(self.look[1])],
+            "look": [float(self.look[0]), float(self.look[1]), float(self.look[2])],
             "jump": int(self.jump),
             "fire": int(self.fire),
             "switch": int(self.switch),
@@ -251,6 +255,7 @@ def flatten_action(action: Mapping[str, object]) -> List[float]:
         float(labels.move[1]),
         float(labels.look[0]),
         float(labels.look[1]),
+        float(labels.look[2]),
         float(labels.jump),
         float(labels.fire),
         float(labels.switch),
@@ -262,18 +267,18 @@ def flatten_action(action: Mapping[str, object]) -> List[float]:
 
 
 def action_from_list(values: Sequence[float]) -> Dict[str, object]:
-    if len(values) != 11:
-        raise ValueError(f"Expected 11 values, got {len(values)}")
+    if len(values) != 12:
+        raise ValueError(f"Expected 12 values, got {len(values)}")
     payload: Dict[str, object] = {
         "move": [float(values[0]), float(values[1])],
-        "look": [float(values[2]), float(values[3])],
-        "jump": int(round(float(values[4]))),
-        "fire": int(round(float(values[5]))),
-        "switch": int(round(float(values[6]))),
-        "recall_0": int(round(float(values[7]))),
-        "recall_1": int(round(float(values[8]))),
-        "recall_2": int(round(float(values[9]))),
-        "recall_3": int(round(float(values[10]))),
+        "look": [float(values[2]), float(values[3]), float(values[4])],
+        "jump": int(round(float(values[5]))),
+        "fire": int(round(float(values[6]))),
+        "switch": int(round(float(values[7]))),
+        "recall_0": int(round(float(values[8]))),
+        "recall_1": int(round(float(values[9]))),
+        "recall_2": int(round(float(values[10]))),
+        "recall_3": int(round(float(values[11]))),
     }
     return ActionLabels.from_dict(payload).to_dict()
 

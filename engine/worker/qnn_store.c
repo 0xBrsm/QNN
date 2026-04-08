@@ -121,6 +121,47 @@ static void QNN_LookupMoverDef(int subject_id, float *speed, float *wait)
 	*wait = 0.0f;
 }
 
+/* ── Mover classname → subject mapping for StoreInit ─────────── */
+
+typedef struct {
+	const char *classname;
+	int prefix_len;
+	int subject_id;
+	qboolean read_wait;   /* true = read "wait" from BSP props */
+} qnn_mover_init_t;
+
+static const qnn_mover_init_t qnn_mover_init[] = {
+	{"func_door",   9,  QNN_SUBJECT_DOOR,     true},
+	{"func_plat",   9,  QNN_SUBJECT_PLATFORM,  false},
+	{"func_train",  10, QNN_SUBJECT_TRAIN,     false},
+	{"func_button", 11, QNN_SUBJECT_BUTTON,    true},
+};
+static const int qnn_mover_init_count = sizeof(qnn_mover_init) / sizeof(qnn_mover_init[0]);
+
+/* Stamp PVS + visibility timestamps. */
+static void QNN_StampPvs(qnn_entity_t *e, float now, qboolean in_fov)
+{
+	e->pvs = now;
+	if (in_fov)
+		e->vis = now;
+}
+
+/* Compute velocity from positional delta, clamped at 1000 u/s. */
+static void QNN_ComputeStoreVelocity(qnn_entity_t *e, const vec3_t new_origin, float emit_dt)
+{
+	vec3_t delta;
+	float speed_sq;
+	VectorSubtract(new_origin, e->origin, delta);
+	VectorScale(delta, 1.0f / emit_dt, e->velocity);
+	speed_sq = DotProduct(e->velocity, e->velocity);
+	if (speed_sq > 1000.0f * 1000.0f)
+	{
+		e->velocity[0] = 0.0f;
+		e->velocity[1] = 0.0f;
+		e->velocity[2] = 0.0f;
+	}
+}
+
 static qboolean QNN_IsEphemeral(int subject_id)
 {
 	return (subject_id == QNN_SUBJECT_PROJECTILE_NAIL
@@ -172,7 +213,7 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 		item = QNN_LookupItem(r->classname, r->spawnflags);
 		if (item)
 		{
-			e->active = true;
+
 			e->type = QNN_ENT_ITEM;
 			e->subject_id = item->subject_id;
 			e->entity_num = r->entity_num;
@@ -183,61 +224,27 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 			continue;
 		}
 
-		if (!strncasecmp(r->classname, "func_door", 9))
 		{
-			float ds, dw;
-			QNN_LookupMoverDef(QNN_SUBJECT_DOOR, &ds, &dw);
-			e->active = true;
-			e->type = QNN_ENT_MOVER;
-			e->subject_id = QNN_SUBJECT_DOOR;
-			e->entity_num = r->entity_num;
-			VectorCopy(r->origin, e->origin);
-			VectorCopy(r->origin, e->baseline_origin);
-			e->speed = QNN_RawPropFloat(r, "speed", ds);
-			e->wait = QNN_RawPropFloat(r, "wait", dw);
-			continue;
-		}
-		if (!strncasecmp(r->classname, "func_plat", 9))
-		{
-			float ds, dw;
-			QNN_LookupMoverDef(QNN_SUBJECT_PLATFORM, &ds, &dw);
-			e->active = true;
-			e->type = QNN_ENT_MOVER;
-			e->subject_id = QNN_SUBJECT_PLATFORM;
-			e->entity_num = r->entity_num;
-			VectorCopy(r->origin, e->origin);
-			VectorCopy(r->origin, e->baseline_origin);
-			e->speed = QNN_RawPropFloat(r, "speed", ds);
-			e->wait = dw;
-			continue;
-		}
-		if (!strncasecmp(r->classname, "func_train", 10))
-		{
-			float ds, dw;
-			QNN_LookupMoverDef(QNN_SUBJECT_TRAIN, &ds, &dw);
-			e->active = true;
-			e->type = QNN_ENT_MOVER;
-			e->subject_id = QNN_SUBJECT_TRAIN;
-			e->entity_num = r->entity_num;
-			VectorCopy(r->origin, e->origin);
-			VectorCopy(r->origin, e->baseline_origin);
-			e->speed = QNN_RawPropFloat(r, "speed", ds);
-			e->wait = dw;
-			continue;
-		}
-		if (!strncasecmp(r->classname, "func_button", 11))
-		{
-			float ds, dw;
-			QNN_LookupMoverDef(QNN_SUBJECT_BUTTON, &ds, &dw);
-			e->active = true;
-			e->type = QNN_ENT_MOVER;
-			e->subject_id = QNN_SUBJECT_BUTTON;
-			e->entity_num = r->entity_num;
-			VectorCopy(r->origin, e->origin);
-			VectorCopy(r->origin, e->baseline_origin);
-			e->speed = QNN_RawPropFloat(r, "speed", ds);
-			e->wait = QNN_RawPropFloat(r, "wait", dw);
-			continue;
+			int mi;
+			for (mi = 0; mi < qnn_mover_init_count; ++mi)
+			{
+				const qnn_mover_init_t *m = &qnn_mover_init[mi];
+				if (!strncasecmp(r->classname, m->classname, m->prefix_len))
+				{
+					float ds, dw;
+					QNN_LookupMoverDef(m->subject_id, &ds, &dw);
+					e->type = QNN_ENT_MOVER;
+					e->subject_id = m->subject_id;
+					e->entity_num = r->entity_num;
+					VectorCopy(r->origin, e->origin);
+					VectorCopy(r->origin, e->baseline_origin);
+					e->speed = QNN_RawPropFloat(r, "speed", ds);
+					e->wait = m->read_wait ? QNN_RawPropFloat(r, "wait", dw) : dw;
+					break;
+				}
+			}
+			if (mi < qnn_mover_init_count)
+				continue;
 		}
 	}
 
@@ -247,13 +254,16 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 		qnn_raw_entity_t *r = &bsp_raw[i];
 
 		/* Movers from BSP (may overlap with baselines) */
-		if (!strncasecmp(r->classname, "func_door", 9)
-			|| !strncasecmp(r->classname, "func_plat", 9)
-			|| !strncasecmp(r->classname, "func_train", 10)
-			|| !strncasecmp(r->classname, "func_button", 11))
 		{
-			/* Already populated from baseline if entity_num matched */
-			continue;
+			int mi;
+			qboolean is_mover = false;
+			for (mi = 0; mi < qnn_mover_init_count; ++mi)
+			{
+				if (!strncasecmp(r->classname, qnn_mover_init[mi].classname, qnn_mover_init[mi].prefix_len))
+				{ is_mover = true; break; }
+			}
+			if (is_mover)
+				continue;
 		}
 
 		/* Teleporters → overflow */
@@ -264,7 +274,7 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 			{
 				qnn_entity_t *e = &qnn_store[idx];
 				const char *target;
-				e->active = true;
+	
 				e->type = QNN_ENT_TELEPORTER;
 				e->subject_id = QNN_SUBJECT_TELEPORTER;
 				if (r->has_origin) VectorCopy(r->origin, e->origin);
@@ -294,7 +304,7 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 			if (idx < MAX_EDICTS + QNN_STORE_OVERFLOW)
 			{
 				qnn_entity_t *e = &qnn_store[idx];
-				e->active = true;
+	
 				e->type = QNN_ENT_PUSH;
 				e->subject_id = QNN_SUBJECT_NONE;
 				if (r->has_origin) VectorCopy(r->origin, e->origin);
@@ -313,21 +323,20 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
  * Update
  * ══════════════════════════════════════════════════════════════════ */
 
-void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float dt)
+void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 {
 	qnn_entity_update_t entity_updates[QNN_MAX_ENTITY_UPDATES];
 	qnn_pvs_item_t pvs_items[QNN_MAX_PVS_ITEMS];
 	int entity_count, pvs_count;
 	int i;
 	float now = (float)cl.mtime[0];
-	float server_dt = (float)(cl.mtime[0] - cl.mtime[1]);
 	qboolean ephemeral_seen[MAX_EDICTS];
 
-	if (server_dt < 0.001f || server_dt > 0.5f)
-		server_dt = 1.0f / 20.0f;
+	if (emit_dt < 0.001f)
+		emit_dt = 1.0f / 20.0f;
 	memset(ephemeral_seen, 0, sizeof(ephemeral_seen));
 
-	/* ---- Connect/disconnect detection ---- */
+	/* ---- Scoreboard connect/disconnect cleanup ---- */
 	if (cl.scores != NULL)
 	{
 		for (i = 1; i <= cl.maxclients && i < MAX_EDICTS; ++i)
@@ -338,7 +347,6 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float dt)
 			else if (!qnn_player_present[i] && has_name)
 			{
 				memset(&qnn_store[i], 0, sizeof(qnn_store[i]));
-				qnn_store[i].active = true;
 				qnn_store[i].type = QNN_ENT_ACTOR;
 				qnn_store[i].subject_id = QNN_SUBJECT_PLAYER;
 				qnn_store[i].entity_num = i;
@@ -352,14 +360,18 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float dt)
 	entity_count = QNN_EntityClassifyKnown(snapshot, entity_updates, QNN_MAX_ENTITY_UPDATES,
 		pvs_items, QNN_MAX_PVS_ITEMS, &pvs_count);
 
-	/* Items from PVS */
+	/* Static entities from PVS (items + movers) */
 	for (i = 0; i < pvs_count; ++i)
 	{
 		qnn_entity_t *e = &qnn_store[pvs_items[i].entity_num];
-		if (e->active && e->type == QNN_ENT_ITEM)
+		if (e->type == QNN_ENT_ITEM)
 		{
 			e->regen = 0.0f;
-			e->pvs = now;
+			QNN_StampPvs(e, now, pvs_items[i].in_fov);
+		}
+		else if (e->type == QNN_ENT_MOVER)
+		{
+			QNN_StampPvs(e, now, pvs_items[i].in_fov);
 		}
 	}
 
@@ -376,10 +388,10 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float dt)
 		/* Brush movers: update existing mover entry */
 		if (eu->is_brush)
 		{
-			if (e->active && e->type == QNN_ENT_MOVER)
+			if (e->type == QNN_ENT_MOVER)
 			{
 				VectorCopy(eu->origin, e->origin);
-				e->pvs = now;
+				QNN_StampPvs(e, now, eu->in_fov);
 				{
 					float disp_sq = QNN_DistSq(e->origin, e->baseline_origin);
 					e->state = (disp_sq > 1.0f) ? 1.0f : 0.0f;
@@ -397,29 +409,16 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float dt)
 			if (eu->entity_num == cl.viewentity)
 				continue;
 
-			e->active = true;
+
 			e->type = QNN_ENT_ACTOR;
 			e->subject_id = QNN_SUBJECT_PLAYER;
 			e->qualifier_id = eu->qualifier_id;
 			e->entity_num = eu->entity_num;
+
+			QNN_ComputeStoreVelocity(e, cl_ent->msg_origins[0], emit_dt);
 			VectorCopy(cl_ent->msg_origins[0], e->origin);
 			VectorCopy(eu->angles, e->angles);
-			e->pvs = now;
-
-			/* Velocity from msg_origins delta, clamped at 1000 u/s */
-			{
-				vec3_t delta;
-				float speed_sq;
-				VectorSubtract(cl_ent->msg_origins[0], cl_ent->msg_origins[1], delta);
-				VectorScale(delta, 1.0f / server_dt, e->velocity);
-				speed_sq = DotProduct(e->velocity, e->velocity);
-				if (speed_sq > 1000.0f * 1000.0f)
-				{
-					e->velocity[0] = 0.0f;
-					e->velocity[1] = 0.0f;
-					e->velocity[2] = 0.0f;
-				}
-			}
+			QNN_StampPvs(e, now, eu->in_fov);
 
 			if (cl.scores != NULL && (eu->entity_num - 1) >= 0
 				&& (eu->entity_num - 1) < cl.maxclients)
@@ -446,51 +445,31 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float dt)
 		if (QNN_IsEphemeral(eu->subject_id))
 		{
 			entity_t *cl_ent = &cl_entities[eu->entity_num];
-			e->active = true;
+
 			e->type = (eu->subject_id == QNN_SUBJECT_BACKPACK) ? QNN_ENT_BACKPACK : QNN_ENT_PROJECTILE;
 			e->subject_id = eu->subject_id;
 			e->entity_num = eu->entity_num;
-			VectorCopy(cl_ent->msg_origins[0], e->origin);
-			e->pvs = now;
 
-			{
-				vec3_t delta;
-				float speed_sq;
-				VectorSubtract(cl_ent->msg_origins[0], cl_ent->msg_origins[1], delta);
-				VectorScale(delta, 1.0f / server_dt, e->velocity);
-				speed_sq = DotProduct(e->velocity, e->velocity);
-				if (speed_sq > 1000.0f * 1000.0f)
-				{
-					e->velocity[0] = 0.0f;
-					e->velocity[1] = 0.0f;
-					e->velocity[2] = 0.0f;
-				}
-			}
+			QNN_ComputeStoreVelocity(e, cl_ent->msg_origins[0], emit_dt);
+			VectorCopy(cl_ent->msg_origins[0], e->origin);
+			QNN_StampPvs(e, now, eu->in_fov);
 
 			ephemeral_seen[eu->entity_num] = true;
 			continue;
 		}
 	}
 
-	/* Delete ephemeral entities that disappeared */
+	/* Keep ephemeral presence tracking for transport disappearance */
 	for (i = 1; i < MAX_EDICTS; ++i)
-	{
-		if (qnn_ephemeral_present[i] && !ephemeral_seen[i])
-		{
-			if (qnn_store[i].active
-				&& (qnn_store[i].type == QNN_ENT_PROJECTILE || qnn_store[i].type == QNN_ENT_BACKPACK))
-				memset(&qnn_store[i], 0, sizeof(qnn_store[i]));
-		}
 		qnn_ephemeral_present[i] = ephemeral_seen[i];
-	}
 
 	/* ---- Item regen countdown ---- */
 	for (i = 1; i < MAX_EDICTS; ++i)
 	{
 		qnn_entity_t *e = &qnn_store[i];
-		if (e->active && e->type == QNN_ENT_ITEM && e->regen > 0.0f)
+		if (e->type == QNN_ENT_ITEM && e->regen > 0.0f)
 		{
-			e->regen -= dt;
+			e->regen -= emit_dt;
 			if (e->regen < 0.0f)
 				e->regen = 0.0f;
 		}
@@ -500,9 +479,9 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float dt)
 	for (i = 1; i < MAX_EDICTS; ++i)
 	{
 		qnn_entity_t *e = &qnn_store[i];
-		if (e->active && e->type == QNN_ENT_ACTOR && e->powerup_warning_elapsed > 0.0f)
+		if (e->type == QNN_ENT_ACTOR && e->powerup_warning_elapsed > 0.0f)
 		{
-			e->powerup_warning_elapsed += dt;
+			e->powerup_warning_elapsed += emit_dt;
 			if (e->powerup_warning_elapsed >= 3.0f)
 			{
 				e->powerup_subject_id = 0;
@@ -538,14 +517,14 @@ static const char *QNN_EntTypeName(int type)
 void QNN_StoreDumpTick(FILE *out, int tick, float server_time)
 {
 	int i, first;
-	int size = QNN_StoreSize();
+	int size = QNN_StoreCapacity();
 
 	fprintf(out, "{\"tick\":%d,\"time\":%.3f,\"entities\":[", tick, server_time);
 	first = 1;
 	for (i = 0; i < size; ++i)
 	{
 		qnn_entity_t *e = &qnn_store[i];
-		if (!e->active)
+		if (e->type == QNN_ENT_NONE)
 			continue;
 		if (e->pvs <= 0 && e->snd <= 0 && e->mem <= 0)
 			continue;

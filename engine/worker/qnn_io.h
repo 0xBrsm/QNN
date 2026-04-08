@@ -17,17 +17,14 @@
 #include <stdint.h>
 
 /* ── Observation dimensions (must match obs_format.py) ─────────── */
-/* Entity-level capacities come from qnn_oracle_store.h:
-   QNN_MAX_TOKEN_OBJECTS, QNN_MAX_ROUTE_CLUSTERS,
-   QNN_MAX_ENTITY_EVENTS, QNN_ENTITY_EVENT_ID_DIM */
+/* Entity-level capacities: QNN_MAX_TOKEN_OBJECTS, QNN_MAX_ENTITY_EVENTS
+   from qnn_vocab.h.  Per-type scalar/ID dims from qnn_object.h. */
 
 #define QNN_OBS_SELF_SCALAR_DIM      14
-#define QNN_OBS_OBJECT_ID_DIM         7
-#define QNN_OBS_OBJECT_SCALAR_DIM    17
 #define QNN_OBS_SPATIAL_COUNT         9
-#define QNN_OBS_SPATIAL_SCALAR_DIM   10
+#define QNN_OBS_SPATIAL_SCALAR_DIM   13
 #define QNN_OBS_ACTION_HISTORY_LEN    8
-#define QNN_OBS_ACTION_HISTORY_DIM    7
+#define QNN_OBS_ACTION_HISTORY_DIM    8
 #define QNN_OBS_SELF_POWERUP_SLOTS    5
 
 /* ── Normalization constants ───────────────────────────────────── */
@@ -41,47 +38,30 @@
 
 #define QNN_ACTION_SWITCH_SLOTS 5
 
-/* ── Obs buffer wire format (3820 bytes, little-endian) ────────── */
+/* ── Obs buffer wire format (little-endian) ───────────────────── */
 
 /*  Offset  Field                        Type       Shape             Bytes */
 /*       0  self_scalars                 float32    [14]                 56 */
 /*      56  self_weapon_id               int32      [1]                   4 */
 /*      60  self_armor_type_id           int32      [1]                   4 */
 /*      64  self_powerup_ids             int32      [5]                  20 */
-/*      84  self_powerup_count           int32      [1]                   4 */
-/*      88  self_movement_id             int32      [1]                   4 */
-/*      92  self_cluster_id              int32      [1]                   4 */
-/*      96  object_ids                   int32      [16,7]              448 */
-/*     544  object_scalars               float32    [16,17]            1088 */
-/*    1632  object_mask                  uint8      [16]                 16 */
-/*    1648  object_route_cluster_ids     int32      [16,8]              512 */
-/*    2160  object_event_ids             int32      [16,4,3]            768 */
-/*    2928  object_event_scalars         float32    [16,4]              256 */
-/*    3184  object_event_counts          uint8      [16]                 16 */
-/*    3200  spatial_ids                  int32      [9]                  36 */
-/*    3236  spatial_scalars              float32    [9,10]              360 */
-/*    3596  action_history               float32    [8,7]               224 */
-/*   Total:                                                           3820 */
+/*      84  self_movement_id             int32      [1]                   4 */
+/*      88  spatial_scalars              float32    [9,13]              468 */
+/*     556  action_history               float32    [8,8]               256 */
+/*     812  entity_stream                variable   (see token_spec_v9) ~1825 max */
+/*   Total (max):                                                     2637 */
+/*   Buffer oversized for safety. */
 
-#define QNN_OBS_BUFFER_SIZE 3820
+#define QNN_OBS_BUFFER_SIZE 4096
 
 #define QNN_OBS_OFF_SELF_SCALARS            0
 #define QNN_OBS_OFF_SELF_WEAPON_ID         56
 #define QNN_OBS_OFF_SELF_ARMOR_TYPE_ID     60
 #define QNN_OBS_OFF_SELF_POWERUP_IDS       64
-#define QNN_OBS_OFF_SELF_POWERUP_COUNT     84
-#define QNN_OBS_OFF_SELF_MOVEMENT_ID       88
-#define QNN_OBS_OFF_SELF_CLUSTER_ID        92
-#define QNN_OBS_OFF_OBJECT_IDS             96
-#define QNN_OBS_OFF_OBJECT_SCALARS        544
-#define QNN_OBS_OFF_OBJECT_MASK          1632
-#define QNN_OBS_OFF_OBJECT_ROUTE_IDS     1648
-#define QNN_OBS_OFF_OBJECT_EVENT_IDS     2160
-#define QNN_OBS_OFF_OBJECT_EVENT_SCALARS 2928
-#define QNN_OBS_OFF_OBJECT_EVENT_COUNTS  3184
-#define QNN_OBS_OFF_SPATIAL_IDS          3200
-#define QNN_OBS_OFF_SPATIAL_SCALARS      3236
-#define QNN_OBS_OFF_ACTION_HISTORY       3596
+#define QNN_OBS_OFF_SELF_MOVEMENT_ID       84
+#define QNN_OBS_OFF_SPATIAL                88
+#define QNN_OBS_OFF_ACTION_HISTORY        556
+#define QNN_OBS_OFF_ENTITY_STREAM         812
 
 /* ── Buffer write helpers (little-endian) ──────────────────────── */
 
@@ -123,14 +103,12 @@ typedef struct
 	int weapon_id;
 	int armor_type_id;
 	int movement_id;
-	int cluster_id;
 	int powerup_ids[QNN_OBS_SELF_POWERUP_SLOTS];
-	int powerup_count;
 } qnn_self_token_t;
 
 typedef struct
 {
-	int	sector_id;
+	float	dir[3];
 	float	nearest_dist;
 	float	mean_dist;
 	float	openness;
@@ -146,25 +124,22 @@ typedef struct
 typedef struct
 {
 	float move[2];
-	float look[2];
+	float look[3];
 	float fire;
 	float jump;
 	float switch_norm;
 } qnn_action_token_t;
-
-/* qnn_entity_token_t defined in qnn_oracle_store.h */
 
 /* ── Tick result ───────────────────────────────────────────────── */
 
 typedef struct
 {
 	qnn_self_token_t	self;
-	qnn_entity_token_t	entities[QNN_MAX_TOKEN_OBJECTS];
+	qnn_tagged_token_t	entities[QNN_MAX_TOKEN_OBJECTS];
 	int			entity_count;
 	qnn_spatial_token_t	spatial[QNN_SPATIAL_TOKEN_COUNT];
 	qnn_action_token_t	action_history[QNN_OBS_ACTION_HISTORY_LEN];
 	int			action_history_count;
-	int			player_cluster_id;
 } qnn_tick_result_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
@@ -177,7 +152,7 @@ void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *result);
 
 /* ── Internal module functions (called by qnn_io.c) ──────────── */
 
-void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot, int player_cluster_id);
+void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot);
 void QNN_SpatialEmitTokens(const qnn_snapshot_t *snapshot, qnn_spatial_token_t tokens[QNN_SPATIAL_TOKEN_COUNT]);
 
 #endif /* QNN_IO_H */

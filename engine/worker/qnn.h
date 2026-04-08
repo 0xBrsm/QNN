@@ -21,7 +21,7 @@ typedef struct qnn_route_runtime_s qnn_route_runtime_t;
 #define QNN_MAX_MAP_ID 64
 #define QNN_MAX_MODEL_NAME 64
 #define QNN_MAX_STATIC_PROPERTIES 16
-#define QNN_MAX_SOUNDS 16
+#define QNN_MAX_SOUNDS 128
 #define QNN_MAX_SOUND_NAME 64
 #define QNN_MAX_VISIBLE 64
 #define QNN_MAX_EVENTS 16
@@ -103,7 +103,7 @@ typedef struct
 typedef struct
 {
 	float	move[2];
-	float	look[2];
+	float	look[3];
 	int	fire;
 	int	jump;
 	int	switch_slot;

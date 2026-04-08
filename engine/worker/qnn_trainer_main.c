@@ -807,7 +807,7 @@ static int QNN_HandleStep(const char *line)
 
 	QNN_ClearAction(&action);
 	QNN_JsonExtractVec2(line, "\"move\"", action.move);
-	QNN_JsonExtractVec2(line, "\"look\"", action.look);
+	QNN_JsonExtractVec3(line, "\"look\"", action.look);
 	action.fire = QNN_JsonExtractInt(line, "\"fire\"", 0);
 	action.jump = QNN_JsonExtractInt(line, "\"jump\"", 0);
 	action.switch_slot = QNN_JsonExtractInt(line, "\"switch\"", 0);

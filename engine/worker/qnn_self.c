@@ -83,7 +83,7 @@ void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot)
 
 /* ── Token emission ────────────────────────────────────────────── */
 
-void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot, int player_cluster_id)
+void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot)
 {
 	int items = snapshot->items_owned;
 	vec3_t vel_view;
@@ -91,17 +91,17 @@ void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot, in
 
 	memset(out, 0, sizeof(*out));
 
-	out->health = (float)snapshot->health / QNN_SELF_HEALTH_CAP;
-	out->armor = (float)snapshot->armor * snapshot->armor_type / QNN_SELF_HEALTH_CAP;
+	out->health = (float)snapshot->health / QNN_MAX_HEALTH;
+	out->armor = (float)snapshot->armor * snapshot->armor_type / QNN_MAX_ARMOR;
 	out->weapon_sg = (items & IT_SUPER_SHOTGUN) ? 1.0f : (items & IT_SHOTGUN) ? 0.5f : 0.0f;
 	out->weapon_ng = (items & IT_SUPER_NAILGUN) ? 1.0f : (items & IT_NAILGUN) ? 0.5f : 0.0f;
 	out->weapon_gl = (items & IT_GRENADE_LAUNCHER) ? 1.0f : 0.0f;
 	out->weapon_rl = (items & IT_ROCKET_LAUNCHER) ? 1.0f : 0.0f;
 	out->weapon_lg = (items & IT_LIGHTNING) ? 1.0f : 0.0f;
-	out->ammo_shells = QNN_Clamp((float)snapshot->ammo_shells / QNN_SELF_SHELLS_CAP, 0.0f, 1.0f);
-	out->ammo_nails = QNN_Clamp((float)snapshot->ammo_nails / QNN_SELF_NAILS_CAP, 0.0f, 1.0f);
-	out->ammo_rockets = QNN_Clamp((float)snapshot->ammo_rockets / QNN_SELF_ROCKETS_CAP, 0.0f, 1.0f);
-	out->ammo_cells = QNN_Clamp((float)snapshot->ammo_cells / QNN_SELF_CELLS_CAP, 0.0f, 1.0f);
+	out->ammo_shells = QNN_Clamp((float)snapshot->ammo_shells / QNN_MAX_SHELLS, 0.0f, 1.0f);
+	out->ammo_nails = QNN_Clamp((float)snapshot->ammo_nails / QNN_MAX_NAILS, 0.0f, 1.0f);
+	out->ammo_rockets = QNN_Clamp((float)snapshot->ammo_rockets / QNN_MAX_ROCKETS, 0.0f, 1.0f);
+	out->ammo_cells = QNN_Clamp((float)snapshot->ammo_cells / QNN_MAX_CELLS, 0.0f, 1.0f);
 
 	QNN_RelativeFrame(snapshot->player_view_angles, snapshot->player_velocity, vel_view);
 	out->vel[0] = QNN_Normalize(vel_view[0], QNN_VELOCITY_SCALE);
@@ -125,8 +125,6 @@ void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot, in
 	default: out->movement_id = snapshot->grounded ? 0 : 1; break;
 	}
 
-	out->cluster_id = player_cluster_id;
-
 	i = 0;
 	if (items & IT_QUAD)
 		out->powerup_ids[i++] = QNN_SUBJECT_QUAD;
@@ -138,5 +136,4 @@ void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot, in
 		out->powerup_ids[i++] = QNN_SUBJECT_SUIT;
 	if (snapshot->health > 100)
 		out->powerup_ids[i++] = QNN_SUBJECT_MEGAHEALTH;
-	out->powerup_count = i;
 }

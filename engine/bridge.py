@@ -72,7 +72,6 @@ class NativeProcessBase:
         self.proc: subprocess.Popen[bytes] | None = None
         self.hello: Dict[str, object] | None = None
         self.capabilities: tuple[str, ...] = ()
-        self.map_id: str | None = None
         self._training_requested = self.training_format == "binary_v1"
         self._training_enabled = False
         self._last_training_extras: TrustedTrainingExtrasV1 | None = None
@@ -157,17 +156,17 @@ class NativeProcessBase:
 
     # -- Action helpers ------------------------------------------------------
 
-    # Binary step protocol: 1-byte opcode + packed action struct (44 bytes).
-    # Matches qnn_worker_action_t layout: move[2] look[2] fire jump switch recall[4].
+    # Binary step protocol: 1-byte opcode + packed action struct (48 bytes).
+    # Matches qnn_action_t layout: move[2] look[3] fire jump switch recall[4].
     _BINARY_OP_STEP = b"\x01"
-    _ACTION_PACK_FORMAT = "<2f2f7i"  # 4 floats + 7 ints = 44 bytes
+    _ACTION_PACK_FORMAT = "<2f3f7i"  # 5 floats + 7 ints = 48 bytes
 
     def _binary_step_request(self, action: Mapping[str, object]) -> bytes:
         labels = ActionLabels.from_dict(action)
         return self._BINARY_OP_STEP + struct.pack(
             self._ACTION_PACK_FORMAT,
             float(labels.move[0]), float(labels.move[1]),
-            float(labels.look[0]), float(labels.look[1]),
+            float(labels.look[0]), float(labels.look[1]), float(labels.look[2]),
             int(labels.fire), int(labels.jump), int(labels.switch),
             int(labels.recall_0), int(labels.recall_1),
             int(labels.recall_2), int(labels.recall_3),

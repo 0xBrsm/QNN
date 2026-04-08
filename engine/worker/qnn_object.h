@@ -48,15 +48,14 @@ typedef struct {
 
 typedef struct {
 	int entity_num;
-	int subject_id;
 	int action_id;
-	int qualifier_id;
-	float magnitude;
+	int source_id;
 	vec3_t origin;
 	int pickup_category;
 	qboolean is_respawn;
 	int weapon_subject_id;
 	int powerup_subject_id;
+	int match_subject_id;  /* for mover spatial matching — DOOR, PLATFORM, etc. */
 } qnn_event_record_t;
 
 /* ── Static entity init (entity.c → object.c at map load) ──────── */
@@ -92,7 +91,7 @@ typedef struct
 #define QNN_MAX_ROUTE_PATHS           3
 #define QNN_MAX_ROUTE_CLUSTERS        8
 #define QNN_MAX_ENTITY_EVENTS         4
-#define QNN_ENTITY_EVENT_ID_DIM       3
+#define QNN_ENTITY_EVENT_ID_DIM       2
 
 /* Old qnn_entity_core_t / qnn_world_object_t / qnn_actor_t removed.
    The oracle reads directly from store entries in qnn_store.h. */
@@ -104,50 +103,107 @@ typedef struct
 	qboolean active;
 	int owner_index;
 	int next_for_owner;
-	int subject_id;
 	int action_id;
-	int qualifier_id;
-	int modality_id;
-	float recency;
-	float confidence;
-	float magnitude;
+	int source_id;
+	float timestamp;       /* cl.mtime[0] when event was created */
 } qnn_semantic_event_atom_t;
 
 #define QNN_EVENT_HEAD_CAPACITY (MAX_EDICTS + 1024)
 
-/* ── Entity token (ready-to-consume output) ────────────────────── */
+/* ── Per-type entity tokens ────────────────────────────────────── */
 
+/* Event attachment (shared by all token types) */
+typedef struct
+{
+	int action_id;
+	int source_id;
+} qnn_token_event_t;
+
+/* Projectile: 8 scalars, 2 IDs */
 typedef struct
 {
 	int subject_id;
-	int qualifier_id;
+	int modality_id;
+	float rel[3];
+	float dist;
+	float vel[3];
+	float recency;
+	qnn_token_event_t events[QNN_MAX_ENTITY_EVENTS];
+	int event_count;
+} qnn_projectile_token_t;
+
+/* Actor: 19 scalars, 3 IDs */
+typedef struct
+{
+	int subject_id;
 	int modality_id;
 	int player_id;
-	int cluster_id;
-	int powerup_subject_id;
-	int weapon_subject_id;
-
-	float rel[3];
-	float distance;
-	float route_cost;
-	float vel[3];
-	float rel_yaw;
-	float rel_pitch;
 	float half_extents[3];
+	float rel[3];
+	float dist;
+	float vel[3];
+	float path[3];
+	float path_dist;
+	float eta;
+	float facing;
+	float team;
+	float score;
 	float recency;
-	float confidence;
-	float magnitude;
-	float state;
-
-	int route_cluster_ids[QNN_MAX_ROUTE_CLUSTERS];
-	int route_cluster_count;
-
-	int event_subject[QNN_MAX_ENTITY_EVENTS];
-	int event_action[QNN_MAX_ENTITY_EVENTS];
-	int event_qualifier[QNN_MAX_ENTITY_EVENTS];
-	float event_recency[QNN_MAX_ENTITY_EVENTS];
+	qnn_token_event_t events[QNN_MAX_ENTITY_EVENTS];
 	int event_count;
-} qnn_entity_token_t;
+} qnn_actor_token_t;
+
+/* Item: 15 scalars, 2 IDs */
+typedef struct
+{
+	int subject_id;
+	int modality_id;
+	float half_extents[3];
+	float rel[3];
+	float dist;
+	float path[3];
+	float path_dist;
+	float eta;
+	float amount;
+	float regen;
+	float recency;
+	qnn_token_event_t events[QNN_MAX_ENTITY_EVENTS];
+	int event_count;
+} qnn_item_token_t;
+
+/* Mover: 14 scalars, 2 IDs */
+typedef struct
+{
+	int subject_id;
+	int modality_id;
+	float half_extents[3];
+	float rel[3];
+	float dist;
+	float path[3];
+	float path_dist;
+	float eta;
+	float state;
+	float recency;
+	qnn_token_event_t events[QNN_MAX_ENTITY_EVENTS];
+	int event_count;
+} qnn_mover_token_t;
+
+/* Tagged token for the variable-length stream */
+#define QNN_TOKEN_PROJECTILE  0
+#define QNN_TOKEN_ACTOR       1
+#define QNN_TOKEN_ITEM        2
+#define QNN_TOKEN_MOVER       3
+
+typedef struct
+{
+	int type; /* QNN_TOKEN_* */
+	union {
+		qnn_projectile_token_t projectile;
+		qnn_actor_token_t actor;
+		qnn_item_token_t item;
+		qnn_mover_token_t mover;
+	};
+} qnn_tagged_token_t;
 
 /* ── Event atom globals (defined in qnn_event.c) ──────────────── */
 
@@ -163,7 +219,7 @@ int QNN_ObjectStaticPropertyInt(const qnn_static_object_t *obj, const char *key,
 
 /* ── Oracle token emission (qnn_oracle.c) ─────────────────────── */
 
-int QNN_OracleEmitTokens(qnn_entity_token_t *out_tokens, int max_tokens,
+int QNN_OracleEmitTokens(qnn_tagged_token_t *out_tokens, int max_tokens,
 	const qnn_snapshot_t *snapshot, const qnn_map_state_t *map_state,
 	int *out_player_cluster_id);
 
@@ -172,10 +228,9 @@ int QNN_OracleEmitTokens(qnn_entity_token_t *out_tokens, int max_tokens,
 typedef struct
 {
 	const char *name;
-	int subject_id;
 	int action_id;
-	int qualifier_id;
-	float magnitude;
+	int source_id;
+	int match_subject_id;  /* entity subject to match for spatial lookup (movers) */
 } qnn_sound_rule_t;
 
 /* ── Event system (qnn_event.c) ────────────────────────────────── */

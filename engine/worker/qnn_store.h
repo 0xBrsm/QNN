@@ -54,7 +54,6 @@ extern const int qnn_mover_def_count;
 #define QNN_STORE_OVERFLOW 128
 
 typedef struct {
-	qboolean active;
 	int type;              /* QNN_ENT_* */
 	int subject_id;
 	int qualifier_id;
@@ -65,10 +64,11 @@ typedef struct {
 	vec3_t velocity;
 	vec3_t angles;
 
-	/* Timestamps (cl.mtime[0] when last updated, 0 = never) */
-	float pvs;
-	float snd;
-	float mem;
+	/* Observation timestamps (cl.mtime[0] when last observed, 0 = never) */
+	float pvs;             /* last in PVS transport */
+	float vis;             /* last visible (PVS + FOV for actors, == pvs for others) */
+	float snd;             /* last heard via sound */
+	float mem;             /* last recalled by model */
 
 	/* Item */
 	int amount;
@@ -104,12 +104,12 @@ extern int qnn_store_overflow_count; /* BSP-only entries after MAX_EDICTS */
 /* ── Store API ────────────────────────────────────────────────── */
 
 void QNN_StoreInit(const qnn_map_state_t *map_state);
-void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float dt);
+void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt);
 
-/* Total store size (for oracle iteration) */
-static inline int QNN_StoreSize(void)
+/* Total store capacity (MAX_EDICTS + full overflow pool) */
+static inline int QNN_StoreCapacity(void)
 {
-	return MAX_EDICTS + qnn_store_overflow_count;
+	return MAX_EDICTS + QNN_STORE_OVERFLOW;
 }
 
 /* Debug dump */

@@ -21,74 +21,73 @@
 
 #define QNN_SUBJECT_NONE               0
 #define QNN_SUBJECT_PLAYER             1
-#define QNN_SUBJECT_BACKPACK           2
+#define QNN_SOURCE_WEAPON              2
 #define QNN_SUBJECT_AXE                3
 #define QNN_SUBJECT_SHOTGUN            4
 #define QNN_SUBJECT_NAILGUN            5
 #define QNN_SUBJECT_GRENADE_LAUNCHER   6
 #define QNN_SUBJECT_ROCKET_LAUNCHER    7
 #define QNN_SUBJECT_THUNDERBOLT        8
-#define QNN_SUBJECT_SHELLS             9
-#define QNN_SUBJECT_NAILS             10
-#define QNN_SUBJECT_ROCKETS           11
-#define QNN_SUBJECT_CELLS             12
-#define QNN_SUBJECT_ARMOR_GREEN       13
-#define QNN_SUBJECT_ARMOR_YELLOW      14
-#define QNN_SUBJECT_ARMOR_RED         15
-#define QNN_SUBJECT_HEALTH            16
-#define QNN_SUBJECT_MEGAHEALTH        17
-#define QNN_SUBJECT_QUAD              18
-#define QNN_SUBJECT_PENT              19
-#define QNN_SUBJECT_RING              20
-#define QNN_SUBJECT_SUIT              21
-#define QNN_SUBJECT_POWERUP           22
-#define QNN_SUBJECT_PROJECTILE_NAIL   23
-#define QNN_SUBJECT_PROJECTILE_GRENADE 24
-#define QNN_SUBJECT_PROJECTILE_ROCKET 25
-#define QNN_SUBJECT_LIGHTNING_BEAM    26
-#define QNN_SUBJECT_TELEPORTER        27
-#define QNN_SUBJECT_DOOR              28
-#define QNN_SUBJECT_PLATFORM          29
-#define QNN_SUBJECT_TRAIN             30
-#define QNN_SUBJECT_BUTTON            31
-#define QNN_SUBJECT_COUNT             32
+#define QNN_SOURCE_AMMO                9
+#define QNN_SUBJECT_SHELLS            10
+#define QNN_SUBJECT_NAILS             11
+#define QNN_SUBJECT_ROCKETS           12
+#define QNN_SUBJECT_CELLS             13
+#define QNN_SUBJECT_BACKPACK          14
+#define QNN_SOURCE_ARMOR              15
+#define QNN_SUBJECT_ARMOR_GREEN       16
+#define QNN_SUBJECT_ARMOR_YELLOW      17
+#define QNN_SUBJECT_ARMOR_RED         18
+#define QNN_SUBJECT_HEALTH            19
+#define QNN_SUBJECT_MEGAHEALTH        20
+#define QNN_SUBJECT_POWERUP           21
+#define QNN_SUBJECT_QUAD              22
+#define QNN_SUBJECT_PENT              23
+#define QNN_SUBJECT_RING              24
+#define QNN_SUBJECT_SUIT              25
+#define QNN_SUBJECT_PROJECTILE_NAIL   26
+#define QNN_SUBJECT_PROJECTILE_GRENADE 27
+#define QNN_SUBJECT_PROJECTILE_ROCKET 28
+#define QNN_SUBJECT_LIGHTNING_BEAM    29
+#define QNN_SOURCE_GROUND             30
+#define QNN_SOURCE_WATER              31
+#define QNN_SOURCE_SLIME              32
+#define QNN_SOURCE_LAVA               33
+#define QNN_SOURCE_GIB                34
+#define QNN_SUBJECT_BUTTON            35
+#define QNN_SUBJECT_PLATFORM          36
+#define QNN_SUBJECT_TELEPORTER        37
+#define QNN_SUBJECT_DOOR              38
+#define QNN_SOURCE_KEYED              39
+#define QNN_SOURCE_SECRET             40
+#define QNN_SUBJECT_TRAIN             41
 
 /* ── Action IDs ────────────────────────────────────────────────── */
 
-#define QNN_ACTION_NONE      0
-#define QNN_ACTION_FIRE      1
-#define QNN_ACTION_IMPACT    2
-#define QNN_ACTION_BOUNCE    3
-#define QNN_ACTION_PICKUP    4
-#define QNN_ACTION_RESPAWN   5
-#define QNN_ACTION_PAIN      6
-#define QNN_ACTION_DEATH     7
-#define QNN_ACTION_WARNING   8
-#define QNN_ACTION_ACTIVE    9
-#define QNN_ACTION_JUMP     10
-#define QNN_ACTION_LAND     11
-#define QNN_ACTION_ENTER    12
-#define QNN_ACTION_EXIT     13
-#define QNN_ACTION_TELEPORT 14
-#define QNN_ACTION_MOVE     15
-#define QNN_ACTION_ACTIVATE 16
-#define QNN_ACTION_REJECT   17
-#define QNN_ACTION_BREATH      18
-#define QNN_ACTION_DISCONNECT  19
-#define QNN_ACTION_CONNECT     20
+#define QNN_ACTION_NONE         0
+#define QNN_ACTION_FIRE         1
+#define QNN_ACTION_JUMP         2
+#define QNN_ACTION_LAND         3
+#define QNN_ACTION_PICKUP       4
+#define QNN_ACTION_ENTER        5
+#define QNN_ACTION_BREATH       6
+#define QNN_ACTION_EXIT         7
+#define QNN_ACTION_PAIN         8
+#define QNN_ACTION_DEATH        9
+#define QNN_ACTION_CONNECT     10
+#define QNN_ACTION_DISCONNECT  11
+#define QNN_ACTION_RESPAWN     12
+#define QNN_ACTION_ACTIVE      13
+#define QNN_ACTION_ENDING      14
+#define QNN_ACTION_BOUNCE      15
+#define QNN_ACTION_TELEPORT    16
+#define QNN_ACTION_MOVE        17
+#define QNN_ACTION_ACTIVATE    18
+#define QNN_ACTION_REJECT      19
+#define QNN_ACTION_COUNT       20
 
-/* ── Qualifier IDs ─────────────────────────────────────────────── */
-
-#define QNN_QUAL_NONE      0
-#define QNN_QUAL_DROWN     1
-#define QNN_QUAL_WATER     2
-#define QNN_QUAL_LAVA      3
-#define QNN_QUAL_SLIME     4
-#define QNN_QUAL_FLESH     5
-#define QNN_QUAL_WORLD     6
-#define QNN_QUAL_KEYED     7
-#define QNN_QUAL_SECRET    8
-#define QNN_QUAL_INVISIBLE 9
+#define QNN_SOURCE_NONE    0  /* alias for QNN_SUBJECT_NONE */
+#define QNN_ENTITY_VOCAB_SIZE 42  /* total entries in shared subject/source table */
 
 /* ── Spatial sector IDs ────────────────────────────────────────── */
 
@@ -105,8 +104,26 @@
 /* ── Tuning constants ──────────────────────────────────────────── */
 
 #define QNN_FOV_HALF_DEG               60.0f
-#define QNN_RECENCY_DECAY_S             0.1f
+#define QNN_RECENCY_MAX_EVENT             0.1f
 #define QNN_RECENCY_DECAY_PLAYER_S      2.0f
+
+/* Per-modality recency thresholds (seconds) */
+#define QNN_RECENCY_MAX_SIGHT      2.0f
+#define QNN_RECENCY_MAX_PROXIMITY  0.1f
+#define QNN_RECENCY_MAX_SOUND      0.1f
+#define QNN_RECENCY_MAX_MEMORY     1.0f
+
+static inline float QNN_RecencyMaxForModality(int modality)
+{
+	switch (modality)
+	{
+	case QNN_MODALITY_SIGHT:     return QNN_RECENCY_MAX_SIGHT;
+	case QNN_MODALITY_PROXIMITY: return QNN_RECENCY_MAX_PROXIMITY;
+	case QNN_MODALITY_SOUND:     return QNN_RECENCY_MAX_SOUND;
+	case QNN_MODALITY_MEMORY:    return QNN_RECENCY_MAX_MEMORY;
+	default:                     return 0.0f;
+	}
+}
 
 #define QNN_ITEM_PVS_MATCH_SQ         (16.0f * 16.0f)
 #define QNN_ITEM_PICKUP_MATCH_SQ      (64.0f * 64.0f)
@@ -119,12 +136,13 @@
 #define QNN_NAIL_STREAM_DOT_THRESHOLD  0.97f
 #define QNN_MAX_NAIL_STREAMS           16
 
-#define QNN_SELF_HEALTH_CAP    100.0f
-#define QNN_SELF_ARMOR_CAP     200.0f
-#define QNN_SELF_SHELLS_CAP    100.0f
-#define QNN_SELF_NAILS_CAP     200.0f
-#define QNN_SELF_ROCKETS_CAP   100.0f
-#define QNN_SELF_CELLS_CAP     100.0f
+/* Game resource caps — used for normalization everywhere. */
+#define QNN_MAX_HEALTH     100.0f   /* normal health cap (mega decays to this) */
+#define QNN_MAX_ARMOR      160.0f   /* max effective armor HP: red 200 * 0.8 */
+#define QNN_MAX_SHELLS     100.0f
+#define QNN_MAX_NAILS      200.0f
+#define QNN_MAX_ROCKETS    100.0f
+#define QNN_MAX_CELLS      100.0f
 
 #define QNN_EF_DIMLIGHT 8  /* EF_DIMLIGHT from quake engine — powerup glow */
 

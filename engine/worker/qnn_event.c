@@ -14,6 +14,9 @@
 #include "qnn_store.h"
 #include "qnn_io.h"
 
+/* Forward declaration — defined below in sound capture section */
+FILE *qnn_sound_dump;
+
 #include <ctype.h>
 #include <math.h>
 #include <string.h>
@@ -24,85 +27,99 @@
  * ══════════════════════════════════════════════════════════════════ */
 
 static const qnn_sound_rule_t qnn_player_sound_rules[] = {
-	{"player/h2odeath.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_DEATH, QNN_QUAL_DROWN, 0.0f},
-	{"player/plyrjmp8.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_JUMP, QNN_QUAL_NONE, 0.0f},
-	{"player/land.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_LAND, QNN_QUAL_NONE, 0.0f},
-	{"player/land2.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_LAND, QNN_QUAL_NONE, 1.0f},
-	{"player/h2ojump.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_LAND, QNN_QUAL_WATER, 0.0f},
-	/* misc/h2ohit1.wav removed — engine plays it for ANY entity hitting
-	   water (projectiles, gibs, debris), not just players.  Was creating
-	   ghost player objects from teleporter effect entities on DM3. */
-	{"player/gasp1.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_BREATH, QNN_QUAL_WATER, 0.0f},
-	{"player/gasp2.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_BREATH, QNN_QUAL_WATER, 0.0f},
-	{"player/inh2o.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_ENTER, QNN_QUAL_WATER, 0.0f},
-	{"misc/outwater.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_EXIT, QNN_QUAL_WATER, 0.0f},
-	{"player/inlava.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_ENTER, QNN_QUAL_LAVA, 0.0f},
-	{"player/slimbrn2.wav", QNN_SUBJECT_PLAYER, QNN_ACTION_ENTER, QNN_QUAL_SLIME, 0.0f},
-	{"player/axhit1.wav", QNN_SUBJECT_AXE, QNN_ACTION_IMPACT, QNN_QUAL_FLESH, 0.0f},
-	{"player/axhit2.wav", QNN_SUBJECT_AXE, QNN_ACTION_IMPACT, QNN_QUAL_WORLD, 0.0f},
-	{NULL, 0, 0, 0, 0.0f},
+	/* Death */
+	{"player/death1.wav",   QNN_ACTION_DEATH, QNN_SOURCE_NONE, 0},
+	{"player/death2.wav",   QNN_ACTION_DEATH, QNN_SOURCE_NONE, 0},
+	{"player/death3.wav",   QNN_ACTION_DEATH, QNN_SOURCE_NONE, 0},
+	{"player/death4.wav",   QNN_ACTION_DEATH, QNN_SOURCE_NONE, 0},
+	{"player/death5.wav",   QNN_ACTION_DEATH, QNN_SOURCE_NONE, 0},
+	{"player/teledth1.wav", QNN_ACTION_DEATH, QNN_SOURCE_NONE, 0},
+	{"player/gib.wav",      QNN_ACTION_DEATH, QNN_SOURCE_GIB, 0},
+	{"player/udeath.wav",   QNN_ACTION_DEATH, QNN_SOURCE_GIB, 0},
+	{"player/h2odeath.wav", QNN_ACTION_DEATH, QNN_SOURCE_WATER, 0},
+	/* Pain */
+	{"player/pain1.wav",    QNN_ACTION_PAIN, QNN_SOURCE_NONE, 0},
+	{"player/pain2.wav",    QNN_ACTION_PAIN, QNN_SOURCE_NONE, 0},
+	{"player/pain3.wav",    QNN_ACTION_PAIN, QNN_SOURCE_NONE, 0},
+	{"player/pain4.wav",    QNN_ACTION_PAIN, QNN_SOURCE_NONE, 0},
+	{"player/pain5.wav",    QNN_ACTION_PAIN, QNN_SOURCE_NONE, 0},
+	{"player/pain6.wav",    QNN_ACTION_PAIN, QNN_SOURCE_NONE, 0},
+	{"player/drown1.wav",   QNN_ACTION_PAIN, QNN_SOURCE_WATER, 0},
+	{"player/drown2.wav",   QNN_ACTION_PAIN, QNN_SOURCE_WATER, 0},
+	{"player/lburn1.wav",   QNN_ACTION_PAIN, QNN_SOURCE_LAVA, 0},
+	{"player/lburn2.wav",   QNN_ACTION_PAIN, QNN_SOURCE_LAVA, 0},
+	{"player/axhit1.wav",   QNN_ACTION_PAIN, QNN_SUBJECT_AXE, 0},
+	/* Movement */
+	{"player/plyrjmp8.wav", QNN_ACTION_JUMP, QNN_SOURCE_NONE, 0},
+	{"player/land.wav",     QNN_ACTION_LAND, QNN_SOURCE_NONE, 0},
+	{"player/land2.wav",    QNN_ACTION_LAND, QNN_SOURCE_NONE, 0},
+	{"player/h2ojump.wav",  QNN_ACTION_LAND, QNN_SOURCE_WATER, 0},
+	{"player/gasp1.wav",    QNN_ACTION_BREATH, QNN_SOURCE_WATER, 0},
+	{"player/gasp2.wav",    QNN_ACTION_BREATH, QNN_SOURCE_WATER, 0},
+	{"player/inh2o.wav",    QNN_ACTION_ENTER, QNN_SOURCE_WATER, 0},
+	{"misc/outwater.wav",   QNN_ACTION_EXIT, QNN_SOURCE_WATER, 0},
+	{"player/inlava.wav",   QNN_ACTION_ENTER, QNN_SOURCE_LAVA, 0},
+	{"player/slimbrn2.wav", QNN_ACTION_ENTER, QNN_SOURCE_SLIME, 0},
+	/* Disconnect */
+	{"player/tornoff2.wav", QNN_ACTION_DISCONNECT, QNN_SOURCE_NONE, 0},
+	{NULL, 0, 0, 0},
 };
 
 static const qnn_sound_rule_t qnn_weapon_sound_rules[] = {
-	{"weapons/ax1.wav", QNN_SUBJECT_AXE, QNN_ACTION_FIRE, QNN_QUAL_NONE, 0.0f},
-	{"weapons/guncock.wav", QNN_SUBJECT_SHOTGUN, QNN_ACTION_FIRE, QNN_QUAL_NONE, 0.0f},
-	{"weapons/shotgn2.wav", QNN_SUBJECT_SHOTGUN, QNN_ACTION_FIRE, QNN_QUAL_NONE, 1.0f},
-	{"weapons/rocket1i.wav", QNN_SUBJECT_NAILGUN, QNN_ACTION_FIRE, QNN_QUAL_NONE, 0.0f},
-	{"weapons/spike2.wav", QNN_SUBJECT_NAILGUN, QNN_ACTION_FIRE, QNN_QUAL_NONE, 1.0f},
-	{"weapons/grenade.wav", QNN_SUBJECT_GRENADE_LAUNCHER, QNN_ACTION_FIRE, QNN_QUAL_NONE, 0.0f},
-	{"weapons/sgun1.wav", QNN_SUBJECT_ROCKET_LAUNCHER, QNN_ACTION_FIRE, QNN_QUAL_NONE, 0.0f},
-	{"weapons/lstart.wav", QNN_SUBJECT_THUNDERBOLT, QNN_ACTION_FIRE, QNN_QUAL_NONE, 0.0f},
-	{NULL, 0, 0, 0, 0.0f},
+	{"weapons/ax1.wav", QNN_ACTION_FIRE, QNN_SUBJECT_AXE, 0},
+	{"weapons/guncock.wav", QNN_ACTION_FIRE, QNN_SUBJECT_SHOTGUN, 0},
+	{"weapons/shotgn2.wav", QNN_ACTION_FIRE, QNN_SUBJECT_SHOTGUN, 0},
+	{"weapons/rocket1i.wav", QNN_ACTION_FIRE, QNN_SUBJECT_NAILGUN, 0},
+	{"weapons/spike2.wav", QNN_ACTION_FIRE, QNN_SUBJECT_NAILGUN, 0},
+	{"weapons/grenade.wav", QNN_ACTION_FIRE, QNN_SUBJECT_GRENADE_LAUNCHER, 0},
+	{"weapons/sgun1.wav", QNN_ACTION_FIRE, QNN_SUBJECT_ROCKET_LAUNCHER, 0},
+	{"weapons/lstart.wav", QNN_ACTION_FIRE, QNN_SUBJECT_THUNDERBOLT, 0},
+	{"weapons/lhit.wav", QNN_ACTION_FIRE, QNN_SUBJECT_THUNDERBOLT, 0},
+	{NULL, 0, 0, 0},
 };
 
 static const qnn_sound_rule_t qnn_projectile_sound_rules[] = {
-	{"weapons/bounce.wav", QNN_SUBJECT_PROJECTILE_GRENADE, QNN_ACTION_BOUNCE, QNN_QUAL_WORLD, 0.0f},
-	{"weapons/tink1.wav", QNN_SUBJECT_PROJECTILE_NAIL, QNN_ACTION_IMPACT, QNN_QUAL_WORLD, 0.0f},
-	{"weapons/ric1.wav", QNN_SUBJECT_PROJECTILE_NAIL, QNN_ACTION_IMPACT, QNN_QUAL_WORLD, 0.0f},
-	{"weapons/ric2.wav", QNN_SUBJECT_PROJECTILE_NAIL, QNN_ACTION_IMPACT, QNN_QUAL_WORLD, 0.0f},
-	{"weapons/ric3.wav", QNN_SUBJECT_PROJECTILE_NAIL, QNN_ACTION_IMPACT, QNN_QUAL_WORLD, 0.0f},
-	{"weapons/r_exp3.wav", QNN_SUBJECT_PROJECTILE_ROCKET, QNN_ACTION_IMPACT, QNN_QUAL_WORLD, 0.0f},
-	{"weapons/lhit.wav", QNN_SUBJECT_LIGHTNING_BEAM, QNN_ACTION_IMPACT, QNN_QUAL_NONE, 0.0f},
-	{NULL, 0, 0, 0, 0.0f},
+	{"weapons/bounce.wav", QNN_ACTION_BOUNCE, QNN_SOURCE_NONE, 0},
+	{NULL, 0, 0, 0},
 };
 
 static const qnn_sound_rule_t qnn_static_sound_rules[] = {
-	{"misc/r_tele1.wav", QNN_SUBJECT_TELEPORTER, QNN_ACTION_TELEPORT, QNN_QUAL_NONE, 0.0f},
-	{"misc/r_tele2.wav", QNN_SUBJECT_TELEPORTER, QNN_ACTION_TELEPORT, QNN_QUAL_NONE, 0.0f},
-	{"misc/r_tele3.wav", QNN_SUBJECT_TELEPORTER, QNN_ACTION_TELEPORT, QNN_QUAL_NONE, 0.0f},
-	{"misc/r_tele4.wav", QNN_SUBJECT_TELEPORTER, QNN_ACTION_TELEPORT, QNN_QUAL_NONE, 0.0f},
-	{"misc/r_tele5.wav", QNN_SUBJECT_TELEPORTER, QNN_ACTION_TELEPORT, QNN_QUAL_NONE, 0.0f},
-	{"doors/medtry.wav", QNN_SUBJECT_DOOR, QNN_ACTION_REJECT, QNN_QUAL_KEYED, 0.0f},
-	{"doors/runetry.wav", QNN_SUBJECT_DOOR, QNN_ACTION_REJECT, QNN_QUAL_KEYED, 0.0f},
-	{"doors/basetry.wav", QNN_SUBJECT_DOOR, QNN_ACTION_REJECT, QNN_QUAL_KEYED, 0.0f},
-	{"doors/meduse.wav", QNN_SUBJECT_DOOR, QNN_ACTION_ACTIVATE, QNN_QUAL_KEYED, 0.0f},
-	{"doors/runeuse.wav", QNN_SUBJECT_DOOR, QNN_ACTION_ACTIVATE, QNN_QUAL_KEYED, 0.0f},
-	{"doors/baseuse.wav", QNN_SUBJECT_DOOR, QNN_ACTION_ACTIVATE, QNN_QUAL_KEYED, 0.0f},
-	{"doors/drclos4.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"doors/doormv1.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"doors/hydro1.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"doors/hydro2.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"doors/stndr1.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"doors/stndr2.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"doors/ddoor1.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"doors/ddoor2.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"doors/latch2.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_SECRET, 0.0f},
-	{"doors/winch2.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_SECRET, 0.0f},
-	{"doors/airdoor1.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_SECRET, 0.0f},
-	{"doors/airdoor2.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_SECRET, 0.0f},
-	{"doors/basesec1.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_SECRET, 0.0f},
-	{"doors/basesec2.wav", QNN_SUBJECT_DOOR, QNN_ACTION_MOVE, QNN_QUAL_SECRET, 0.0f},
-	{"plats/plat1.wav", QNN_SUBJECT_PLATFORM, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"plats/plat2.wav", QNN_SUBJECT_PLATFORM, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"plats/medplat1.wav", QNN_SUBJECT_PLATFORM, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"plats/medplat2.wav", QNN_SUBJECT_PLATFORM, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"plats/train1.wav", QNN_SUBJECT_TRAIN, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"plats/train2.wav", QNN_SUBJECT_TRAIN, QNN_ACTION_MOVE, QNN_QUAL_NONE, 0.0f},
-	{"buttons/airbut1.wav", QNN_SUBJECT_BUTTON, QNN_ACTION_ACTIVATE, QNN_QUAL_NONE, 0.0f},
-	{"buttons/switch21.wav", QNN_SUBJECT_BUTTON, QNN_ACTION_ACTIVATE, QNN_QUAL_NONE, 0.0f},
-	{"buttons/switch02.wav", QNN_SUBJECT_BUTTON, QNN_ACTION_ACTIVATE, QNN_QUAL_NONE, 0.0f},
-	{"buttons/switch04.wav", QNN_SUBJECT_BUTTON, QNN_ACTION_ACTIVATE, QNN_QUAL_NONE, 0.0f},
-	{NULL, 0, 0, 0, 0.0f},
+	{"misc/r_tele1.wav", QNN_ACTION_TELEPORT, QNN_SOURCE_NONE, QNN_SUBJECT_TELEPORTER},
+	{"misc/r_tele2.wav", QNN_ACTION_TELEPORT, QNN_SOURCE_NONE, QNN_SUBJECT_TELEPORTER},
+	{"misc/r_tele3.wav", QNN_ACTION_TELEPORT, QNN_SOURCE_NONE, QNN_SUBJECT_TELEPORTER},
+	{"misc/r_tele4.wav", QNN_ACTION_TELEPORT, QNN_SOURCE_NONE, QNN_SUBJECT_TELEPORTER},
+	{"misc/r_tele5.wav", QNN_ACTION_TELEPORT, QNN_SOURCE_NONE, QNN_SUBJECT_TELEPORTER},
+	{"doors/medtry.wav", QNN_ACTION_REJECT, QNN_SOURCE_KEYED, QNN_SUBJECT_DOOR},
+	{"doors/runetry.wav", QNN_ACTION_REJECT, QNN_SOURCE_KEYED, QNN_SUBJECT_DOOR},
+	{"doors/basetry.wav", QNN_ACTION_REJECT, QNN_SOURCE_KEYED, QNN_SUBJECT_DOOR},
+	{"doors/meduse.wav", QNN_ACTION_ACTIVATE, QNN_SOURCE_KEYED, QNN_SUBJECT_DOOR},
+	{"doors/runeuse.wav", QNN_ACTION_ACTIVATE, QNN_SOURCE_KEYED, QNN_SUBJECT_DOOR},
+	{"doors/baseuse.wav", QNN_ACTION_ACTIVATE, QNN_SOURCE_KEYED, QNN_SUBJECT_DOOR},
+	{"doors/drclos4.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_DOOR},
+	{"doors/doormv1.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_DOOR},
+	{"doors/hydro1.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_DOOR},
+	{"doors/hydro2.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_DOOR},
+	{"doors/stndr1.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_DOOR},
+	{"doors/stndr2.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_DOOR},
+	{"doors/ddoor1.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_DOOR},
+	{"doors/ddoor2.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_DOOR},
+	{"doors/latch2.wav", QNN_ACTION_MOVE, QNN_SOURCE_SECRET, QNN_SUBJECT_DOOR},
+	{"doors/winch2.wav", QNN_ACTION_MOVE, QNN_SOURCE_SECRET, QNN_SUBJECT_DOOR},
+	{"doors/airdoor1.wav", QNN_ACTION_MOVE, QNN_SOURCE_SECRET, QNN_SUBJECT_DOOR},
+	{"doors/airdoor2.wav", QNN_ACTION_MOVE, QNN_SOURCE_SECRET, QNN_SUBJECT_DOOR},
+	{"doors/basesec1.wav", QNN_ACTION_MOVE, QNN_SOURCE_SECRET, QNN_SUBJECT_DOOR},
+	{"doors/basesec2.wav", QNN_ACTION_MOVE, QNN_SOURCE_SECRET, QNN_SUBJECT_DOOR},
+	{"plats/plat1.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_PLATFORM},
+	{"plats/plat2.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_PLATFORM},
+	{"plats/medplat1.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_PLATFORM},
+	{"plats/medplat2.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_PLATFORM},
+	{"plats/train1.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_TRAIN},
+	{"plats/train2.wav", QNN_ACTION_MOVE, QNN_SOURCE_NONE, QNN_SUBJECT_TRAIN},
+	{"buttons/airbut1.wav", QNN_ACTION_ACTIVATE, QNN_SOURCE_NONE, QNN_SUBJECT_BUTTON},
+	{"buttons/switch21.wav", QNN_ACTION_ACTIVATE, QNN_SOURCE_NONE, QNN_SUBJECT_BUTTON},
+	{"buttons/switch02.wav", QNN_ACTION_ACTIVATE, QNN_SOURCE_NONE, QNN_SUBJECT_BUTTON},
+	{"buttons/switch04.wav", QNN_ACTION_ACTIVATE, QNN_SOURCE_NONE, QNN_SUBJECT_BUTTON},
+	{NULL, 0, 0, 0},
 };
 
 /* ══════════════════════════════════════════════════════════════════
@@ -148,17 +165,18 @@ static const qnn_sound_rule_t *QNN_FindSoundRule(const qnn_sound_rule_t *rules, 
 }
 
 static qboolean QNN_EmitRecord(qnn_event_record_t *out, int *count, int max,
-	const qnn_sound_event_t *snd, int subject_id, int action_id, int qualifier_id, float magnitude)
+	const qnn_sound_event_t *snd, int action_id, int source_id)
 {
 	if (*count >= max)
 		return false;
 	memset(&out[*count], 0, sizeof(out[*count]));
 	out[*count].entity_num = snd->entity_num;
-	out[*count].subject_id = subject_id;
 	out[*count].action_id = action_id;
-	out[*count].qualifier_id = qualifier_id;
-	out[*count].magnitude = magnitude;
+	out[*count].source_id = source_id;
 	VectorCopy(snd->origin, out[*count].origin);
+	if (qnn_sound_dump)
+		fprintf(qnn_sound_dump, "CLASSIFY\t%.3f\tent=%d\tact=%d\tsrc=%d\n",
+			(float)cl.mtime[0], snd->entity_num, action_id, source_id);
 	(*count)++;
 	return true;
 }
@@ -184,15 +202,8 @@ int QNN_EventClassifySounds(const qnn_snapshot_t *snapshot, qnn_event_record_t *
 		/* Item respawn */
 		if (!strcmp(name, "items/itembk2.wav"))
 		{
-			if (count < max)
-			{
-				memset(&out[count], 0, sizeof(out[count]));
-				out[count].entity_num = snapshot->sounds[i].entity_num;
-				VectorCopy(snapshot->sounds[i].origin, out[count].origin);
-				out[count].action_id = QNN_ACTION_RESPAWN;
-				out[count].is_respawn = true;
-				count++;
-			}
+			if (QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], QNN_ACTION_RESPAWN, QNN_SOURCE_NONE))
+				out[count - 1].is_respawn = true;
 			continue;
 		}
 
@@ -202,16 +213,19 @@ int QNN_EventClassifySounds(const qnn_snapshot_t *snapshot, qnn_event_record_t *
 			int pickup_cat = pickup_sub > 0 ? QNN_SubjectPickupCategory(pickup_sub) : 0;
 			if (pickup_cat > 0 && snapshot->sounds[i].entity_num > 0)
 			{
-				int sub = QNN_SoundPickupSubject(name);
-				if (sub > 0 && count < max)
+				if (pickup_sub > 0)
 				{
-					memset(&out[count], 0, sizeof(out[count]));
-					out[count].entity_num = snapshot->sounds[i].entity_num;
-					out[count].subject_id = sub;
-					out[count].action_id = QNN_ACTION_PICKUP;
-					out[count].pickup_category = pickup_cat;
-					VectorCopy(snapshot->sounds[i].origin, out[count].origin);
-					count++;
+					/* Map pickup subject to source ID */
+					int src = pickup_sub; /* reuse subject ID for specific items */
+					if (pickup_sub == QNN_SUBJECT_ARMOR_GREEN)
+						src = QNN_SOURCE_ARMOR; /* generic armor */
+					else if (pickup_sub == QNN_SUBJECT_BACKPACK && pickup_cat == 4)
+						src = QNN_SOURCE_WEAPON;
+					else if (pickup_sub == QNN_SUBJECT_BACKPACK && pickup_cat == 5)
+						src = QNN_SOURCE_AMMO;
+
+					if (QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], QNN_ACTION_PICKUP, src))
+						out[count - 1].pickup_category = pickup_cat;
 				}
 				continue;
 			}
@@ -223,22 +237,14 @@ int QNN_EventClassifySounds(const qnn_snapshot_t *snapshot, qnn_event_record_t *
 			if (!strcmp(name, "items/damage3.wav"))       { pu_sub = QNN_SUBJECT_QUAD; pu_act = QNN_ACTION_ACTIVE; }
 			else if (!strcmp(name, "items/protect3.wav"))  { pu_sub = QNN_SUBJECT_PENT; pu_act = QNN_ACTION_ACTIVE; }
 			else if (!strcmp(name, "items/inv3.wav"))      { pu_sub = QNN_SUBJECT_RING; pu_act = QNN_ACTION_ACTIVE; }
-			else if (!strcmp(name, "items/damage2.wav"))   { pu_sub = QNN_SUBJECT_QUAD; pu_act = QNN_ACTION_WARNING; }
-			else if (!strcmp(name, "items/protect2.wav"))  { pu_sub = QNN_SUBJECT_PENT; pu_act = QNN_ACTION_WARNING; }
-			else if (!strcmp(name, "items/inv2.wav"))      { pu_sub = QNN_SUBJECT_RING; pu_act = QNN_ACTION_WARNING; }
-			else if (!strcmp(name, "items/suit2.wav"))     { pu_sub = QNN_SUBJECT_SUIT; pu_act = QNN_ACTION_WARNING; }
+			else if (!strcmp(name, "items/damage2.wav"))   { pu_sub = QNN_SUBJECT_QUAD; pu_act = QNN_ACTION_ENDING; }
+			else if (!strcmp(name, "items/protect2.wav"))  { pu_sub = QNN_SUBJECT_PENT; pu_act = QNN_ACTION_ENDING; }
+			else if (!strcmp(name, "items/inv2.wav"))      { pu_sub = QNN_SUBJECT_RING; pu_act = QNN_ACTION_ENDING; }
+			else if (!strcmp(name, "items/suit2.wav"))     { pu_sub = QNN_SUBJECT_SUIT; pu_act = QNN_ACTION_ENDING; }
 			if (pu_sub > 0)
 			{
-				if (count < max)
-				{
-					memset(&out[count], 0, sizeof(out[count]));
-					out[count].entity_num = snapshot->sounds[i].entity_num;
-					out[count].subject_id = pu_sub;
-					out[count].action_id = pu_act;
-					out[count].powerup_subject_id = pu_sub;
-					VectorCopy(snapshot->sounds[i].origin, out[count].origin);
-					count++;
-				}
+				if (QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], pu_act, pu_sub))
+					out[count - 1].powerup_subject_id = pu_sub;
 				continue;
 			}
 		}
@@ -247,65 +253,34 @@ int QNN_EventClassifySounds(const qnn_snapshot_t *snapshot, qnn_event_record_t *
 		rule = QNN_FindSoundRule(qnn_player_sound_rules, name);
 		if (rule != NULL)
 		{
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], rule->subject_id, rule->action_id, rule->qualifier_id, rule->magnitude);
+			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], rule->action_id, rule->source_id);
 			continue;
 		}
-		if (!strncmp(name, "player/pain", 11))
-		{
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], QNN_SUBJECT_PLAYER, QNN_ACTION_PAIN, QNN_QUAL_NONE, 0.0f);
-			continue;
-		}
-		if (!strncmp(name, "player/drown", 12))
-		{
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], QNN_SUBJECT_PLAYER, QNN_ACTION_PAIN, QNN_QUAL_DROWN, 0.0f);
-			continue;
-		}
-		if (!strncmp(name, "player/lburn", 12))
-		{
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], QNN_SUBJECT_PLAYER, QNN_ACTION_PAIN, QNN_QUAL_LAVA, 0.0f);
-			continue;
-		}
-		if (!strncmp(name, "player/death", 12))
-		{
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], QNN_SUBJECT_PLAYER, QNN_ACTION_DEATH, QNN_QUAL_NONE, 0.0f);
-			continue;
-		}
-		if (!strcmp(name, "player/gib.wav") || !strcmp(name, "player/udeath.wav"))
-		{
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], QNN_SUBJECT_PLAYER, QNN_ACTION_DEATH, QNN_QUAL_NONE, 1.0f);
-			continue;
-		}
-		if (!strcmp(name, "player/tornoff2.wav"))
-		{
-			/* tornoff2.wav is only played by ClientDisconnect — always a disconnect. */
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], QNN_SUBJECT_PLAYER, QNN_ACTION_DISCONNECT, QNN_QUAL_NONE, 0.0f);
-			continue;
-		}
-
 		/* Weapon fire */
 		rule = QNN_FindSoundRule(qnn_weapon_sound_rules, name);
 		if (rule != NULL)
 		{
-			if (count < max)
-			{
-				QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], rule->subject_id, rule->action_id, rule->qualifier_id, rule->magnitude);
-				out[count - 1].weapon_subject_id = rule->subject_id;
-			}
+			if (QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], rule->action_id, rule->source_id))
+				out[count - 1].weapon_subject_id = rule->source_id;
 			continue;
 		}
 
-		/* Projectile impact/bounce */
+		/* Projectile bounce */
 		rule = QNN_FindSoundRule(qnn_projectile_sound_rules, name);
 		if (rule != NULL)
 		{
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], rule->subject_id, rule->action_id, rule->qualifier_id, rule->magnitude);
+			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], rule->action_id, rule->source_id);
 			continue;
 		}
 
 		/* Static objects (doors, platforms, teleporters) */
 		rule = QNN_FindSoundRule(qnn_static_sound_rules, name);
 		if (rule != NULL)
-			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], rule->subject_id, rule->action_id, rule->qualifier_id, rule->magnitude);
+		{
+			QNN_EmitRecord(out, &count, max, &snapshot->sounds[i], rule->action_id, rule->source_id);
+			if (count > 0)
+				out[count - 1].match_subject_id = rule->match_subject_id;
+		}
 	}
 
 	return count;
@@ -407,6 +382,9 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin, float f
 			name = sfx->name;
 	}
 
+	if (qnn_sound_dump != NULL)
+		fprintf(qnn_sound_dump, "%.3f\t%d\t%s\n", (float)cl.mtime[0], entnum, name);
+
 	snd = &qnn_sound_buffer[qnn_sound_count];
 	VectorCopy(origin, snd->origin);
 	snd->volume = fvol;
@@ -479,7 +457,7 @@ void S_LocalSound(char *s)
  * Event atom pool — persistent per-entity event history.
  *
  * Atoms are created from classified sound records.  They decay
- * over QNN_RECENCY_DECAY_S and are read by the oracle at emission
+ * over QNN_RECENCY_MAX_EVENT and are read by the oracle at emission
  * time to attach per-entity event tokens.
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -488,7 +466,7 @@ int qnn_event_head[QNN_EVENT_HEAD_CAPACITY];
 int qnn_prev_object_indices[QNN_MAX_TOKEN_OBJECTS];
 int qnn_prev_object_count = 0;
 
-static void QNN_AppendEvent(int owner_index, int subject_id, int action_id, int qualifier_id, int modality_id, float confidence, float magnitude)
+static void QNN_AppendEvent(int owner_index, int action_id, int source_id)
 {
 	int i;
 	int free_index;
@@ -503,31 +481,32 @@ static void QNN_AppendEvent(int owner_index, int subject_id, int action_id, int 
 			continue;
 		}
 		if (qnn_semantic_events[i].owner_index == owner_index
-			&& qnn_semantic_events[i].subject_id == subject_id
 			&& qnn_semantic_events[i].action_id == action_id
-			&& qnn_semantic_events[i].qualifier_id == qualifier_id
-			&& qnn_semantic_events[i].modality_id == modality_id)
+			&& qnn_semantic_events[i].source_id == source_id)
 		{
-			qnn_semantic_events[i].recency = 1.0f;
-			if (confidence > qnn_semantic_events[i].confidence)
-				qnn_semantic_events[i].confidence = confidence;
-			if (magnitude > qnn_semantic_events[i].magnitude)
-				qnn_semantic_events[i].magnitude = magnitude;
+			qnn_semantic_events[i].timestamp = (float)cl.mtime[0];
+			if (qnn_sound_dump)
+				fprintf(qnn_sound_dump, "APPEND_DEDUP\t%.3f\town=%d\tact=%d\tsrc=%d\n",
+					(float)cl.mtime[0], owner_index, action_id, source_id);
 			return;
 		}
 	}
 	if (free_index < 0)
+	{
+		if (qnn_sound_dump)
+			fprintf(qnn_sound_dump, "APPEND_FULL\t%.3f\town=%d\tact=%d\tsrc=%d\n",
+				(float)cl.mtime[0], owner_index, action_id, source_id);
 		return;
+	}
 	memset(&qnn_semantic_events[free_index], 0, sizeof(qnn_semantic_events[free_index]));
 	qnn_semantic_events[free_index].active = true;
 	qnn_semantic_events[free_index].owner_index = owner_index;
-	qnn_semantic_events[free_index].subject_id = subject_id;
 	qnn_semantic_events[free_index].action_id = action_id;
-	qnn_semantic_events[free_index].qualifier_id = qualifier_id;
-	qnn_semantic_events[free_index].modality_id = modality_id;
-	qnn_semantic_events[free_index].recency = 1.0f;
-	qnn_semantic_events[free_index].confidence = confidence;
-	qnn_semantic_events[free_index].magnitude = magnitude;
+	qnn_semantic_events[free_index].source_id = source_id;
+	qnn_semantic_events[free_index].timestamp = (float)cl.mtime[0];
+	if (qnn_sound_dump)
+		fprintf(qnn_sound_dump, "APPEND_NEW\t%.3f\town=%d\tact=%d\tsrc=%d\n",
+			(float)cl.mtime[0], owner_index, action_id, source_id);
 
 	qnn_semantic_events[free_index].next_for_owner = -1;
 	if (owner_index >= 0 && owner_index < QNN_EVENT_HEAD_CAPACITY)
@@ -537,34 +516,33 @@ static void QNN_AppendEvent(int owner_index, int subject_id, int action_id, int 
 	}
 }
 
-static void QNN_DecayEvents(float dt)
+static void QNN_ExpireEvents(float now)
 {
 	int i;
+	int cap = QNN_StoreCapacity() < QNN_EVENT_HEAD_CAPACITY
+		? QNN_StoreCapacity() : QNN_EVENT_HEAD_CAPACITY;
 
+	/* Deactivate expired events */
 	for (i = 0; i < QNN_MAX_EVENT_ATOMS; ++i)
 	{
 		if (!qnn_semantic_events[i].active)
 			continue;
-		qnn_semantic_events[i].recency = QNN_Clamp(qnn_semantic_events[i].recency - (dt / QNN_RECENCY_DECAY_S), 0.0f, 1.0f);
-		if (qnn_semantic_events[i].recency <= 0.0f)
+		if (now - qnn_semantic_events[i].timestamp > QNN_RECENCY_MAX_EVENT)
 			qnn_semantic_events[i].active = false;
 	}
 
+	/* Rebuild per-entity event head linked list */
+	memset(qnn_event_head, -1, (size_t)cap * sizeof(int));
+	for (i = 0; i < QNN_MAX_EVENT_ATOMS; ++i)
 	{
-		int cap = QNN_StoreSize() < QNN_EVENT_HEAD_CAPACITY
-			? QNN_StoreSize() : QNN_EVENT_HEAD_CAPACITY;
-		memset(qnn_event_head, -1, (size_t)cap * sizeof(int));
-		for (i = 0; i < QNN_MAX_EVENT_ATOMS; ++i)
+		int oi;
+		if (!qnn_semantic_events[i].active)
+			continue;
+		oi = qnn_semantic_events[i].owner_index;
+		if (oi >= 0 && oi < QNN_EVENT_HEAD_CAPACITY)
 		{
-			int oi;
-			if (!qnn_semantic_events[i].active)
-				continue;
-			oi = qnn_semantic_events[i].owner_index;
-			if (oi >= 0 && oi < QNN_EVENT_HEAD_CAPACITY)
-			{
-				qnn_semantic_events[i].next_for_owner = qnn_event_head[oi];
-				qnn_event_head[oi] = i;
-			}
+			qnn_semantic_events[i].next_for_owner = qnn_event_head[oi];
+			qnn_event_head[oi] = i;
 		}
 	}
 }
@@ -583,8 +561,10 @@ static void QNN_ApplyRecall(const qnn_action_t *action, int prev_count, int *pre
 		if (target <= 0 || target > prev_count)
 			continue;
 		idx = prev_indices[target - 1];
-		if (idx >= 0 && idx < QNN_StoreSize() && qnn_store[idx].active)
+		if (idx >= 0 && idx < QNN_StoreCapacity() && qnn_store[idx].type != QNN_ENT_NONE)
+		{
 			qnn_store[idx].mem = (float)cl.mtime[0];
+		}
 	}
 }
 
@@ -599,6 +579,66 @@ static void QNN_ApplyRecall(const qnn_action_t *action, int prev_count, int *pre
  * calls the classifier directly.
  * ══════════════════════════════════════════════════════════════════ */
 
+/* Allocate an overflow slot for an unknown player heard at origin.
+   Reuses expired slots (snd outside QNN_RECENCY_MAX_SOUND).
+   Returns the store index, or -1 if pool is full. */
+static int QNN_AllocUnknownPlayer(const vec3_t origin, float now)
+{
+	int base = MAX_EDICTS + qnn_store_overflow_count;
+	int limit = MAX_EDICTS + QNN_STORE_OVERFLOW;
+	int j, oldest = -1;
+	float oldest_snd = now;
+
+	for (j = base; j < limit; ++j)
+	{
+		qnn_entity_t *e = &qnn_store[j];
+		/* Free slot */
+		if (e->type == QNN_ENT_NONE)
+		{
+			oldest = j;
+			break;
+		}
+		/* Expired unknown player — recycle */
+		if (e->type == QNN_ENT_ACTOR && e->snd < oldest_snd)
+		{
+			oldest_snd = e->snd;
+			oldest = j;
+		}
+	}
+	if (oldest < 0)
+		return -1;
+
+	memset(&qnn_store[oldest], 0, sizeof(qnn_store[oldest]));
+	qnn_store[oldest].type = QNN_ENT_ACTOR;
+	qnn_store[oldest].subject_id = QNN_SUBJECT_PLAYER;
+	qnn_store[oldest].entity_num = 0;
+	qnn_store[oldest].snd = now;
+	VectorCopy(origin, qnn_store[oldest].origin);
+	return oldest;
+}
+
+/* Find the nearest player entity to a position.
+   Returns the store index, or -1 if no player is within max_dsq. */
+static int QNN_FindNearestPlayer(const vec3_t origin, float max_dsq)
+{
+	int j, best = -1;
+	float best_dsq = max_dsq;
+	for (j = 1; j <= cl.maxclients && j < MAX_EDICTS; ++j)
+	{
+		qnn_entity_t *e = &qnn_store[j];
+		float dsq;
+		if (e->type != QNN_ENT_ACTOR)
+			continue;
+		dsq = QNN_DistSq(e->origin, origin);
+		if (dsq < best_dsq)
+		{
+			best_dsq = dsq;
+			best = j;
+		}
+	}
+	return best;
+}
+
 static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 {
 	qnn_event_record_t event_records[QNN_MAX_EVENT_RECORDS];
@@ -610,37 +650,36 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 	for (i = 0; i < event_count; ++i)
 	{
 		qnn_event_record_t *ev = &event_records[i];
+		int owner = -1;  /* entity index that owns this event */
 
-		/* ---- Item respawn ---- */
+		/* ---- Side effects by event type ---- */
+
 		if (ev->is_respawn)
 		{
 			if (ev->entity_num > 0 && ev->entity_num < MAX_EDICTS)
 			{
 				qnn_entity_t *e = &qnn_store[ev->entity_num];
-				if (e->active && e->type == QNN_ENT_ITEM)
+				if (e->type == QNN_ENT_ITEM)
 				{
 					e->regen = 0.0f;
 					e->snd = now;
-					QNN_AppendEvent(ev->entity_num, e->subject_id,
-						QNN_ACTION_RESPAWN, QNN_QUAL_NONE, QNN_MODALITY_SOUND, 1.0f, 0.0f);
 				}
 			}
-			continue;
+			owner = ev->entity_num;
+			ev->action_id = QNN_ACTION_RESPAWN;
+			ev->source_id = QNN_SOURCE_NONE;
 		}
-
-		/* ---- Item pickup ---- */
-		if (ev->pickup_category > 0)
+		else if (ev->pickup_category > 0)
 		{
 			int j;
 			float best_dsq = QNN_ITEM_PICKUP_PLAYER_SQ;
 			qnn_entity_t *best = NULL;
-			int best_idx = -1;
 
 			for (j = 1; j < MAX_EDICTS; ++j)
 			{
 				qnn_entity_t *e = &qnn_store[j];
 				float dsq;
-				if (!e->active || e->type != QNN_ENT_ITEM || e->regen > 0.0f)
+				if (e->type != QNN_ENT_ITEM || e->regen > 0.0f)
 					continue;
 				if (QNN_SubjectPickupCategory(e->subject_id) != ev->pickup_category)
 					continue;
@@ -649,7 +688,6 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 				{
 					best = e;
 					best_dsq = dsq;
-					best_idx = j;
 				}
 			}
 			if (best)
@@ -657,86 +695,35 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 				best->regen = best->regen_time;
 				best->snd = now;
 			}
-			if (ev->entity_num > 0)
-				QNN_AppendEvent(ev->entity_num, ev->subject_id, QNN_ACTION_PICKUP,
-					ev->qualifier_id, QNN_MODALITY_SOUND, 1.0f, ev->magnitude);
-			continue;
+			owner = ev->entity_num;
 		}
-
-		/* ---- Player disconnect ---- */
-		if (ev->action_id == QNN_ACTION_DISCONNECT)
+		else if (ev->action_id == QNN_ACTION_DISCONNECT)
+			continue; /* scoreboard check in StoreUpdate handles cleanup */
+		else if (ev->action_id == QNN_ACTION_TELEPORT)
 		{
-			if (ev->entity_num > 0 && ev->entity_num < MAX_EDICTS
-				&& qnn_store[ev->entity_num].active
-				&& qnn_store[ev->entity_num].type == QNN_ENT_ACTOR)
-				memset(&qnn_store[ev->entity_num], 0, sizeof(qnn_store[ev->entity_num]));
-			continue;
+			/* Teleport sounds play at the destination marker, not a player.
+			   Match to the nearest player, or allocate an unknown. */
+			owner = QNN_FindNearestPlayer(ev->origin, QNN_ITEM_PICKUP_PLAYER_SQ);
+			if (owner <= 0)
+				owner = QNN_AllocUnknownPlayer(ev->origin, now);
 		}
-
-		/* ---- Player-attributed sounds ---- */
-		if (ev->entity_num > 0 && ev->entity_num <= cl.maxclients)
+		else if (ev->entity_num <= 0)
 		{
-			int owner_subject = ev->subject_id;
-			qnn_entity_t *e;
-
-			if (ev->weapon_subject_id > 0
-				|| ev->subject_id == QNN_SUBJECT_PLAYER
-				|| ev->powerup_subject_id > 0)
-				owner_subject = QNN_SUBJECT_PLAYER;
-			if (owner_subject != QNN_SUBJECT_PLAYER)
-				continue;
-			if (ev->entity_num == cl.viewentity)
-				continue;
-			if (cl.scores != NULL && cl.scores[ev->entity_num - 1].name[0] == '\0')
-				continue;
-
-			e = &qnn_store[ev->entity_num];
-			e->snd = now;
-
-			if (e->pvs < now - 0.001f)
-			{
-				e->active = true;
-				e->type = QNN_ENT_ACTOR;
-				e->subject_id = QNN_SUBJECT_PLAYER;
-				e->entity_num = ev->entity_num;
-				VectorCopy(ev->origin, e->origin);
-			}
-
-			if (ev->weapon_subject_id > 0)
-				e->weapon_subject_id = ev->weapon_subject_id;
-			if (ev->powerup_subject_id > 0)
-			{
-				e->powerup_subject_id = ev->powerup_subject_id;
-				if (ev->action_id == QNN_ACTION_WARNING)
-					e->powerup_warning_elapsed = 0.001f;
-				else if (ev->action_id == QNN_ACTION_ACTIVE)
-					e->powerup_warning_elapsed = 0.0f;
-			}
-			if (ev->action_id == QNN_ACTION_DEATH)
-			{
-				e->powerup_subject_id = 0;
-				e->powerup_warning_elapsed = 0.0f;
-				e->weapon_subject_id = 0;
-			}
-
-			QNN_AppendEvent(ev->entity_num, ev->subject_id, ev->action_id,
-				ev->qualifier_id, QNN_MODALITY_SOUND, 1.0f, ev->magnitude);
-			continue;
-		}
-
-		/* ---- Mover sounds (entity_num <= 0, spatial match) ---- */
-		if (ev->entity_num <= 0)
-		{
+			/* Mover sounds: no entity_num in demo, match by position.
+			   Includes overflow slots for BSP-only entities (teleporters, push). */
 			int j;
+			int store_size = QNN_StoreCapacity();
 			float best_dsq = QNN_STATIC_SOUND_MATCH_SQ;
 			qnn_entity_t *best = NULL;
 			int best_idx = -1;
 
-			for (j = 1; j < MAX_EDICTS; ++j)
+			for (j = 1; j < store_size; ++j)
 			{
 				qnn_entity_t *e = &qnn_store[j];
 				float dsq;
-				if (!e->active || e->type != QNN_ENT_MOVER || e->subject_id != ev->subject_id)
+				if (e->type != QNN_ENT_MOVER && e->type != QNN_ENT_TELEPORTER)
+					continue;
+				if (e->subject_id != ev->match_subject_id)
 					continue;
 				dsq = QNN_DistSq(e->origin, ev->origin);
 				if (dsq < best_dsq)
@@ -751,16 +738,98 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 				best->snd = now;
 				if (best->pvs < now - 0.001f)
 				{
-					if (ev->subject_id == QNN_SUBJECT_DOOR
-						|| ev->subject_id == QNN_SUBJECT_PLATFORM
-						|| ev->subject_id == QNN_SUBJECT_TRAIN)
+					if (ev->match_subject_id == QNN_SUBJECT_DOOR
+						|| ev->match_subject_id == QNN_SUBJECT_PLATFORM
+						|| ev->match_subject_id == QNN_SUBJECT_TRAIN)
 						best->state = (best->state >= 1.0f) ? 0.0f : 1.0f;
-					else if (ev->subject_id == QNN_SUBJECT_BUTTON)
+					else if (ev->match_subject_id == QNN_SUBJECT_BUTTON)
 						best->state = 1.0f;
 				}
-				QNN_AppendEvent(best_idx, ev->subject_id, ev->action_id,
-					ev->qualifier_id, QNN_MODALITY_SOUND, 1.0f, ev->magnitude);
+				owner = best_idx;
 			}
+		}
+		else
+		{
+			/* Entity-attributed sound (player, projectile, etc.).
+			   If entity is not a known player, try nearest player match. */
+			owner = ev->entity_num;
+			if (owner <= 0 || owner > cl.maxclients
+				|| qnn_store[owner].type != QNN_ENT_ACTOR)
+			{
+				int nearest = QNN_FindNearestPlayer(ev->origin, QNN_ITEM_PICKUP_PLAYER_SQ);
+				if (nearest > 0)
+					owner = nearest;
+				else
+					owner = QNN_AllocUnknownPlayer(ev->origin, now);
+			}
+		}
+
+		/* ---- Player-specific side effects ---- */
+		if (owner > 0 && owner <= cl.maxclients && owner != cl.viewentity)
+		{
+			qnn_entity_t *e = &qnn_store[owner];
+
+			if (cl.scores != NULL && cl.scores[owner - 1].name[0] == '\0')
+				goto skip_event; /* empty scoreboard slot */
+
+			e->snd = now;
+			if (qnn_sound_dump)
+				fprintf(qnn_sound_dump, "SET_SND\t%.3f\town=%d\tact=%d\n", now, owner, ev->action_id);
+
+			if (e->pvs < now - 0.001f)
+			{
+
+				e->type = QNN_ENT_ACTOR;
+				e->subject_id = QNN_SUBJECT_PLAYER;
+				e->entity_num = owner;
+				VectorCopy(ev->origin, e->origin);
+			}
+
+			if (ev->weapon_subject_id > 0)
+				e->weapon_subject_id = ev->weapon_subject_id;
+			if (ev->powerup_subject_id > 0)
+			{
+				e->powerup_subject_id = ev->powerup_subject_id;
+				if (ev->action_id == QNN_ACTION_ENDING)
+					e->powerup_warning_elapsed = 0.001f;
+				else if (ev->action_id == QNN_ACTION_ACTIVE)
+					e->powerup_warning_elapsed = 0.0f;
+			}
+			if (ev->action_id == QNN_ACTION_DEATH)
+			{
+				e->powerup_subject_id = 0;
+				e->powerup_warning_elapsed = 0.0f;
+				e->weapon_subject_id = 0;
+			}
+		}
+
+		/* ---- Stamp snd for non-player entities (movers, teleporters) ---- */
+		if (owner > 0 && owner < QNN_StoreCapacity()
+			&& qnn_store[owner].type != QNN_ENT_NONE
+			&& qnn_store[owner].type != QNN_ENT_ACTOR)
+			qnn_store[owner].snd = now;
+
+		/* ---- Universal event emit ---- */
+		if (owner > 0 && owner < QNN_StoreCapacity() && qnn_store[owner].type != QNN_ENT_NONE)
+			QNN_AppendEvent(owner, ev->action_id, ev->source_id);
+
+	skip_event:
+		;
+	}
+
+	/* ---- Sight-derived events: dimlight = active powerup ---- */
+	for (i = 1; i < MAX_EDICTS; ++i)
+	{
+		qnn_entity_t *e = &qnn_store[i];
+		if (e->type == QNN_ENT_ACTOR
+			&& e->effects & QNN_EF_DIMLIGHT
+			&& e->pvs >= now - 0.001f)
+		{
+			/* Player is glowing — emit ACTIVE/POWERUP (generic, unknown type).
+			   If a specific powerup hum/ending sound also fires this tick,
+			   both events will be on the actor — the sound event carries
+			   the specific powerup, this one carries the visual confirmation. */
+			QNN_AppendEvent(i, QNN_ACTION_ACTIVE, QNN_SUBJECT_POWERUP);
 		}
 	}
 }
@@ -771,30 +840,46 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 
 void QNN_EventInit(const qnn_map_state_t *map_state)
 {
+	const char *dump_path;
+
 	memset(qnn_semantic_events, 0, sizeof(qnn_semantic_events));
 	memset(qnn_event_head, -1, sizeof(qnn_event_head));
 	qnn_prev_object_count = 0;
+
+	if (qnn_sound_dump != NULL)
+	{
+		fclose(qnn_sound_dump);
+		qnn_sound_dump = NULL;
+	}
+	dump_path = getenv("QNN_SOUND_DUMP");
+	if (dump_path != NULL && dump_path[0] != '\0')
+	{
+		qnn_sound_dump = fopen(dump_path, "w");
+		if (qnn_sound_dump != NULL)
+			fprintf(stderr, "[demo] sound dump: %s\n", dump_path);
+	}
+
 	QNN_StoreInit(map_state);
 }
 
 void QNN_EventTick(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag)
 {
-	float sdt;
-
 	if (reset_flag)
 	{
 		memset(qnn_semantic_events, 0, sizeof(qnn_semantic_events));
 		memset(qnn_event_head, -1, sizeof(qnn_event_head));
 	}
 
-	QNN_DecayEvents(dt);
+	{
+		float now = (float)cl.mtime[0];
 
-	sdt = (float)(cl.mtime[0] - cl.mtime[1]);
-	if (sdt < 0.001f || sdt > 0.5f)
-		sdt = dt;
-	QNN_StoreUpdate(snapshot, sdt);
+		/* 1. Expire old events before processing new ones */
+		QNN_ExpireEvents(now);
 
-	QNN_EventProcessTick(snapshot);
+		/* 2. Process new sounds — updates timestamps, adds events */
+		QNN_EventProcessTick(snapshot);
+
+	}
 
 	if (!reset_flag)
 		QNN_ApplyRecall(&snapshot->action_label, qnn_prev_object_count, qnn_prev_object_indices);

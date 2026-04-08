@@ -327,7 +327,7 @@ def _warm_start_policy(
         # best_*.pth for its own save_best tracking — if the seed
         # occupies that name, SF's new-best writes silently collide
         # with the seed file and the checkpoint is lost.
-        from quake_ai.ppo.checkpoint_converter import migrate_modality_embed, migrate_object_proj
+        from quake_ai.ppo.checkpoint_converter import migrate_modality_embed
         from quake_ai.utils.io import trusted_torch_load
 
         name = Path(ckpt).name.replace("best_", "checkpoint_")
@@ -337,9 +337,6 @@ def _warm_start_policy(
         if "model" in payload:
             if migrate_modality_embed(payload["model"], optimizer=payload.get("optimizer")):
                 print(f"[quake_ppo] Migrated modality_embed in {ckpt}")
-                migrated = True
-            if migrate_object_proj(payload["model"], optimizer_state=payload.get("optimizer")):
-                print(f"[quake_ppo] Migrated object_proj in {ckpt}")
                 migrated = True
         if migrated:
             # Scrub numpy scalars so SF's weights_only=True torch.load works.

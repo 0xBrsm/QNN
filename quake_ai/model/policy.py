@@ -33,7 +33,7 @@ _CONTINUOUS_HEAD_STD_INIT = -1.0
 
 # Sparse binary heads: skip true-negative ticks in BC loss.
 # Only train on ticks where the demonstrator acted or the model predicted action.
-_SPARSE_BINARY_HEADS = frozenset({"fire", "jump"})
+_SPARSE_BINARY_HEADS = frozenset({"fire", "jump", "switch"})
 
 
 def _focal_cross_entropy(
@@ -90,11 +90,11 @@ def _continuous_head_metrics(
         }
 
     if head == "look":
-        s0, s1, st = l1[:, 0].sum(), l1[:, 1].sum(), l1.sum()
+        s0, s1, s2, st = l1[:, 0].sum(), l1[:, 1].sum(), l1[:, 2].sum(), l1.sum()
         return {
             "n_look": n,
-            "l1_sum_look_yaw": s0.item(), "l1_sum_look_pitch": s1.item(), "l1_sum_look": st.item(),
-            "mae_look_yaw": (s0 / n).item(), "mae_look_pitch": (s1 / n).item(), "mae_look": (st / n).item(),
+            "l1_sum_look_x": s0.item(), "l1_sum_look_y": s1.item(), "l1_sum_look_z": s2.item(), "l1_sum_look": st.item(),
+            "mae_look_x": (s0 / n).item(), "mae_look_y": (s1 / n).item(), "mae_look_z": (s2 / n).item(), "mae_look": (st / n).item(),
         }
 
     raise ValueError(f"Unsupported continuous head for metrics: {head}")
@@ -708,18 +708,14 @@ class QNNPolicy:
                     if sparse_mask.any():
                         masked_logits = head_logits[sparse_mask]
                         masked_target = target[sparse_mask]
-                        if class_weights is not None:
-                            w = self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
-                            head_loss = _focal_cross_entropy(masked_logits, masked_target, focal_gamma, weight=w)
-                        else:
-                            head_loss = _focal_cross_entropy(masked_logits, masked_target, focal_gamma)
+                        head_loss = F.cross_entropy(masked_logits, masked_target)
                     else:
                         head_loss = torch.tensor(0.0, device=head_logits.device)
-                elif class_weights is not None:
-                    w = self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
-                    head_loss = _focal_cross_entropy(head_logits, target, focal_gamma, weight=w)
                 else:
-                    head_loss = _focal_cross_entropy(head_logits, target, focal_gamma)
+                    head_loss = _focal_cross_entropy(head_logits, target, focal_gamma, weight=(
+                        self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
+                        if class_weights is not None else None
+                    ))
 
                 match = pred == target
                 # Stack 7 scalars into one tensor: n, correct, tp, fp, fn, target_pos, pred_pos
@@ -997,9 +993,8 @@ class QNNPolicy:
             readout=str(meta.get("readout", "cls")),
             action_history_tokens=int(meta.get("action_history_tokens", 0)),
         )
-        from quake_ai.ppo.checkpoint_converter import migrate_modality_embed, migrate_object_proj
+        from quake_ai.ppo.checkpoint_converter import migrate_modality_embed
         migrate_modality_embed(payload["state_dict"])
-        migrate_object_proj(payload["state_dict"])
         try:
             model.model.load_state_dict(payload["state_dict"])
         except RuntimeError as exc:

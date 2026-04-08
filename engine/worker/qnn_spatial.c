@@ -45,10 +45,9 @@ static float QNN_TraceLineDistance(const vec3_t start, const vec3_t end, vec3_t 
 
 /* ── Spatial token internals ───────────────────────────────────── */
 
-static void QNN_SpatialReset(qnn_spatial_token_t *token, int sector_id)
+static void QNN_SpatialReset(qnn_spatial_token_t *token)
 {
 	memset(token, 0, sizeof(*token));
-	token->sector_id = sector_id;
 }
 
 static void QNN_SpatialFinalize(qnn_spatial_token_t *token, int samples, float max_dist)
@@ -110,6 +109,20 @@ static void QNN_BuildHorizontalSpatial(const qnn_snapshot_t *snapshot, qnn_spati
 	float max_dist;
 	float clear_dist;
 	float ground_dist;
+	float center_rad;
+	vec3_t forward, right, up;
+
+	/* Store view-relative unit direction for the sector center */
+	center_rad = center_deg * (float)M_PI / 180.0f;
+	AngleVectors(snapshot->player_view_angles, forward, right, up);
+	{
+		float world_x = cosf(snapshot->player_view_angles[1] * (float)M_PI / 180.0f + center_rad);
+		float world_y = sinf(snapshot->player_view_angles[1] * (float)M_PI / 180.0f + center_rad);
+		float world_dir[3] = { world_x, world_y, 0.0f };
+		token->dir[0] = DotProduct(world_dir, forward);
+		token->dir[1] = DotProduct(world_dir, right);
+		token->dir[2] = DotProduct(world_dir, up);
+	}
 
 	samples = 5;
 	max_dist = 1024.0f;
@@ -157,6 +170,14 @@ static void QNN_BuildGroundSpatial(const qnn_snapshot_t *snapshot, qnn_spatial_t
 	float max_dist;
 	float dist;
 	int contents;
+	vec3_t forward, right, up;
+	float world_down[3] = { 0.0f, 0.0f, -1.0f };
+
+	/* View-relative direction: straight down */
+	AngleVectors(snapshot->player_view_angles, forward, right, up);
+	token->dir[0] = DotProduct(world_down, forward);
+	token->dir[1] = DotProduct(world_down, right);
+	token->dir[2] = DotProduct(world_down, up);
 
 	samples = 5;
 	max_dist = 128.0f;
@@ -201,6 +222,14 @@ static void QNN_BuildCeilingSpatial(const qnn_snapshot_t *snapshot, qnn_spatial_
 	float max_dist;
 	float dist;
 	int contents;
+	vec3_t forward, right, up;
+	float world_up[3] = { 0.0f, 0.0f, 1.0f };
+
+	/* View-relative direction: straight up */
+	AngleVectors(snapshot->player_view_angles, forward, right, up);
+	token->dir[0] = DotProduct(world_up, forward);
+	token->dir[1] = DotProduct(world_up, right);
+	token->dir[2] = DotProduct(world_up, up);
 
 	samples = 5;
 	max_dist = 128.0f;
@@ -240,7 +269,7 @@ void QNN_SpatialEmitTokens(const qnn_snapshot_t *snapshot, qnn_spatial_token_t t
 	int i;
 
 	for (i = 0; i < QNN_SPATIAL_TOKEN_COUNT; ++i)
-		QNN_SpatialReset(&tokens[i], i);
+		QNN_SpatialReset(&tokens[i]);
 	QNN_BuildHorizontalSpatial(snapshot, &tokens[QNN_SPATIAL_FOV_CENTER], 0.0f, 40.0f);
 	QNN_BuildHorizontalSpatial(snapshot, &tokens[QNN_SPATIAL_FOV_LEFT], 40.0f, 40.0f);
 	QNN_BuildHorizontalSpatial(snapshot, &tokens[QNN_SPATIAL_FOV_RIGHT], -40.0f, 40.0f);

@@ -31,12 +31,6 @@ from quake_ai.actions import ACTION_HEADS, CONTINUOUS_ACTION_HEADS, HEAD_ORDER
 from quake_ai.model.observation import (
     ACTION_HISTORY_DIM,
     ACTION_HISTORY_LEN,
-    ENTITY_EVENT_ID_DIM,
-    MAX_ENTITY_EVENTS,
-    MAX_OBJECT_TOKENS,
-    MAX_ROUTE_CLUSTERS,
-    OBJECT_ID_DIM,
-    OBJECT_SCALAR_DIM,
     SELF_SCALAR_DIM,
     SPATIAL_SCALAR_DIM,
     SPATIAL_TOKEN_COUNT,
@@ -243,27 +237,10 @@ def save_sf_format(
 # SF normalizer buffers
 # ------------------------------------------------------------------
 
-# Observation space shapes that SF's RunningMeanStdInPlace normalizes.
-# Must match QuakeEnv.observation_space exactly.
-_OBS_SHAPES: Dict[str, tuple[int, ...]] = {
-    "self_scalars": (SELF_SCALAR_DIM,),
-    "self_weapon_id": (1,),
-    "self_armor_type_id": (1,),
-    "self_powerup_ids": (5,),
-    "self_powerup_count": (1,),
-    "self_movement_id": (1,),
-    "self_cluster_id": (1,),
-    "object_ids": (MAX_OBJECT_TOKENS, OBJECT_ID_DIM),
-    "object_scalars": (MAX_OBJECT_TOKENS, OBJECT_SCALAR_DIM),
-    "object_mask": (MAX_OBJECT_TOKENS,),
-    "object_route_cluster_ids": (MAX_OBJECT_TOKENS, MAX_ROUTE_CLUSTERS),
-    "object_event_ids": (MAX_OBJECT_TOKENS, MAX_ENTITY_EVENTS, ENTITY_EVENT_ID_DIM),
-    "object_event_scalars": (MAX_OBJECT_TOKENS, MAX_ENTITY_EVENTS),
-    "object_event_counts": (MAX_OBJECT_TOKENS,),
-    "spatial_ids": (SPATIAL_TOKEN_COUNT,),
-    "spatial_scalars": (SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM),
-    "action_history": (ACTION_HISTORY_LEN, ACTION_HISTORY_DIM),
-}
+# Observation space shapes — derived from the canonical schema.
+from quake_ai.model.observation import OBS_SCHEMA
+
+_OBS_SHAPES = OBS_SCHEMA
 
 
 def migrate_modality_embed(state: Dict[str, torch.Tensor], expected_rows: int = 4,
@@ -326,70 +303,6 @@ def _add_sf_normalizer_buffers(sf_state: Dict[str, torch.Tensor]) -> None:
     sf_state["returns_normalizer.running_mean"] = torch.zeros([1], dtype=torch.float64)
     sf_state["returns_normalizer.running_var"] = torch.ones([1], dtype=torch.float64)
     sf_state["returns_normalizer.count"] = torch.ones([1], dtype=torch.float64)
-
-
-# ------------------------------------------------------------------
-# Checkpoint migration: object_proj (OBJECT_SCALAR_DIM widening)
-# ------------------------------------------------------------------
-
-
-def migrate_object_proj(
-    model_state: Dict[str, torch.Tensor],
-    optimizer_state: Dict[str, Any] | None = None,
-) -> bool:
-    """Zero-pad object_proj weights and SF normalizer buffers for wider OBJECT_SCALAR_DIM.
-
-    Returns True if any tensors were migrated.
-    """
-    expected_dim = OBJECT_SCALAR_DIM  # current (new) dimension
-    migrated = False
-
-    # --- model weights: object_proj.weight has shape [d_model, in_features] ---
-    for key in list(model_state.keys()):
-        if not key.endswith("object_proj.weight"):
-            continue
-        tensor = model_state[key]
-        old_in = tensor.shape[1]
-        if old_in >= expected_dim:
-            continue
-        pad_cols = expected_dim - old_in
-        model_state[key] = torch.cat(
-            [tensor, torch.zeros(tensor.shape[0], pad_cols, dtype=tensor.dtype, device=tensor.device)],
-            dim=1,
-        )
-        migrated = True
-        # Also pad the bias if present (bias shape is [d_model], no padding needed)
-
-    # --- SF normalizer buffers for object_scalars ---
-    for key in list(model_state.keys()):
-        if "object_scalars" not in key:
-            continue
-        if not (key.endswith(".running_mean") or key.endswith(".running_var")):
-            continue
-        tensor = model_state[key]
-        if tensor.ndim < 1:
-            continue
-        old_last = tensor.shape[-1]
-        if old_last >= expected_dim:
-            continue
-        pad_size = expected_dim - old_last
-        if key.endswith(".running_var"):
-            pad_val = torch.ones(*tensor.shape[:-1], pad_size, dtype=tensor.dtype, device=tensor.device)
-        else:
-            pad_val = torch.zeros(*tensor.shape[:-1], pad_size, dtype=tensor.dtype, device=tensor.device)
-        model_state[key] = torch.cat([tensor, pad_val], dim=-1)
-        migrated = True
-
-    # --- optimizer state ---
-    # When the observation dimension changes, optimizer momentum buffers
-    # (exp_avg, exp_avg_sq) no longer match the parameter shapes.  Rather
-    # than trying to pad individual buffers (which breaks when SF's
-    # _foreach_lerp_ batches parameters with mismatched shapes), clear
-    # the entire optimizer state so Adam restarts cleanly.
-    if migrated and optimizer_state is not None and "state" in optimizer_state:
-        optimizer_state["state"].clear()
-
-    return migrated
 
 
 # ------------------------------------------------------------------

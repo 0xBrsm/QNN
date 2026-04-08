@@ -17,10 +17,9 @@ except ImportError as exc:
 from quake_ai.actions import ACTION_HEADS, ActionLabels
 from quake_ai.rl.environment import NativeWorldEnv
 from quake_ai.rl.metrics import EpisodeStatAccumulator
-from quake_ai.model.observation import (
-    ACTION_HISTORY_DIM, ACTION_HISTORY_LEN, ENTITY_EVENT_ID_DIM,
-    MAX_ENTITY_EVENTS, MAX_OBJECT_TOKENS, MAX_ROUTE_CLUSTERS, OBJECT_ID_DIM,
-    OBJECT_SCALAR_DIM, SELF_SCALAR_DIM, SPATIAL_SCALAR_DIM, SPATIAL_TOKEN_COUNT,
+from quake_ai.model.observation import OBS_SCHEMA
+from quake_ai.vocab import (
+    ENTITY_VOCAB_SIZE, ACTION_VOCAB_SIZE, MAX_ENTITY_EVENTS,
 )
 from mapgen.pool import PROCGEN_SENTINEL
 
@@ -87,6 +86,7 @@ def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
             float(labels.move[1]),
             float(labels.look[0]),
             float(labels.look[1]),
+            float(labels.look[2]),
             int(labels.jump),
             int(labels.fire),
             int(labels.switch),
@@ -97,6 +97,35 @@ def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+
+_OBS_SPACE_SPEC: dict[str, tuple[np.dtype, float, float]] = {
+    # (dtype, low, high) — float32 fields default to (-inf, inf)
+    "self_weapon_id":        (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "self_armor_type_id":    (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "self_powerup_ids":      (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "self_movement_id":      (np.dtype(np.int32), 0, 4),
+    "entity_types":          (np.dtype(np.int32), -1, 3),
+    "entity_ids":            (np.dtype(np.int32), 0, 255),
+    "entity_event_actions":  (np.dtype(np.int32), 0, ACTION_VOCAB_SIZE - 1),
+    "entity_event_sources":  (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "entity_event_counts":   (np.dtype(np.uint8), 0, MAX_ENTITY_EVENTS),
+}
+
+
+def _build_observation_space() -> gymnasium.spaces.Dict:
+    """Build observation space from canonical OBS_SCHEMA."""
+    spaces = {}
+    for key, shape in OBS_SCHEMA.items():
+        spec = _OBS_SPACE_SPEC.get(key)
+        if spec is not None:
+            dtype, low, high = spec
+        else:
+            dtype, low, high = np.float32, -np.inf, np.inf
+        spaces[key] = gymnasium.spaces.Box(
+            low=low, high=high, shape=shape, dtype=dtype,
+        )
+    return gymnasium.spaces.Dict(spaces)
 
 
 class QuakeEnv(gymnasium.Env):
@@ -196,89 +225,7 @@ class QuakeEnv(gymnasium.Env):
         # Episode-level accumulators for SF custom metrics
         self._episode_stats = EpisodeStatAccumulator()
 
-        self.observation_space = gymnasium.spaces.Dict({
-            "self_scalars": gymnasium.spaces.Box(
-                low=-np.inf, high=np.inf, shape=(SELF_SCALAR_DIM,), dtype=np.float32,
-            ),
-            "self_weapon_id": gymnasium.spaces.Box(
-                low=0, high=31, shape=(1,), dtype=np.int32,
-            ),
-            "self_armor_type_id": gymnasium.spaces.Box(
-                low=0, high=31, shape=(1,), dtype=np.int32,
-            ),
-            "self_powerup_ids": gymnasium.spaces.Box(
-                low=0, high=31, shape=(5,), dtype=np.int32,
-            ),
-            "self_powerup_count": gymnasium.spaces.Box(
-                low=0, high=5, shape=(1,), dtype=np.int32,
-            ),
-            "self_movement_id": gymnasium.spaces.Box(
-                low=0, high=4, shape=(1,), dtype=np.int32,
-            ),
-            "self_cluster_id": gymnasium.spaces.Box(
-                low=0, high=255, shape=(1,), dtype=np.int32,
-            ),
-            "object_ids": gymnasium.spaces.Box(
-                low=0,
-                high=255,
-                shape=(MAX_OBJECT_TOKENS, OBJECT_ID_DIM),
-                dtype=np.int32,
-            ),
-            "object_scalars": gymnasium.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(MAX_OBJECT_TOKENS, OBJECT_SCALAR_DIM),
-                dtype=np.float32,
-            ),
-            "object_mask": gymnasium.spaces.Box(
-                low=0,
-                high=1,
-                shape=(MAX_OBJECT_TOKENS,),
-                dtype=np.uint8,
-            ),
-            "object_route_cluster_ids": gymnasium.spaces.Box(
-                low=0,
-                high=255,
-                shape=(MAX_OBJECT_TOKENS, MAX_ROUTE_CLUSTERS),
-                dtype=np.int32,
-            ),
-            "object_event_ids": gymnasium.spaces.Box(
-                low=0,
-                high=255,
-                shape=(MAX_OBJECT_TOKENS, MAX_ENTITY_EVENTS, ENTITY_EVENT_ID_DIM),
-                dtype=np.int32,
-            ),
-            "object_event_scalars": gymnasium.spaces.Box(
-                low=0.0,
-                high=1.0,
-                shape=(MAX_OBJECT_TOKENS, MAX_ENTITY_EVENTS),
-                dtype=np.float32,
-            ),
-            "object_event_counts": gymnasium.spaces.Box(
-                low=0,
-                high=MAX_ENTITY_EVENTS,
-                shape=(MAX_OBJECT_TOKENS,),
-                dtype=np.uint8,
-            ),
-            "spatial_ids": gymnasium.spaces.Box(
-                low=0,
-                high=8,
-                shape=(SPATIAL_TOKEN_COUNT,),
-                dtype=np.int32,
-            ),
-            "spatial_scalars": gymnasium.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM),
-                dtype=np.float32,
-            ),
-            "action_history": gymnasium.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(ACTION_HISTORY_LEN, ACTION_HISTORY_DIM),
-                dtype=np.float32,
-            ),
-        })
+        self.observation_space = _build_observation_space()
         self.action_space = gymnasium.spaces.Tuple(
             (
                 gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_MOVE_DIM,), dtype=np.float32),

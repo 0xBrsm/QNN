@@ -1,4 +1,5 @@
 #include "qnn.h"
+#include "qnn_io.h"
 
 #define QNN_INPUT_MOVE_DEADZONE 0.25f
 #define QNN_INPUT_DEGREES_PER_COUNT 0.066f
@@ -38,9 +39,17 @@ void IN_Move(usercmd_t *cmd)
 	else if (qnn_pending_action.move[1] > QNN_INPUT_MOVE_DEADZONE)
 		cmd->sidemove += cl_sidespeed.value;
 
+	/* View-relative look: look[3] = (forward, right, up) in view frame.
+	   The right and up components directly give yaw/pitch turn axes. */
 	{
-		int look_yaw_count = QNN_MouseCountFromLookAxis(qnn_pending_action.look[0]);
-		int look_pitch_count = QNN_MouseCountFromLookAxis(qnn_pending_action.look[1]);
+		float yaw_axis, pitch_axis;
+		int look_yaw_count, look_pitch_count;
+
+		yaw_axis = QNN_Clamp(qnn_pending_action.look[1], -1.0f, 1.0f);
+		pitch_axis = QNN_Clamp(-qnn_pending_action.look[2], -1.0f, 1.0f);
+
+		look_yaw_count = QNN_MouseCountFromLookAxis(yaw_axis);
+		look_pitch_count = QNN_MouseCountFromLookAxis(pitch_axis);
 
 		if (look_yaw_count != 0)
 			cl.viewangles[YAW] = anglemod(cl.viewangles[YAW] - (QNN_INPUT_DEGREES_PER_COUNT * look_yaw_count));
