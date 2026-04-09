@@ -26,6 +26,7 @@ CUSTOM_SOURCES=(
   "${ENGINE_DIR}/worker/qnn_io.c"
   "${ENGINE_DIR}/worker/qnn_metrics.c"
   "${ENGINE_DIR}/worker/qnn_store.c"
+  "${ENGINE_DIR}/worker/qnn_phys.c"
 )
 
 check_build_deps "the Quake demo worker"

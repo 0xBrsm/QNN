@@ -181,11 +181,11 @@ static void QNN_BuildGroundSpatial(const qnn_snapshot_t *snapshot, qnn_spatial_t
 
 	samples = 5;
 	max_dist = 128.0f;
-	offsets[0][0] = 0.0f; offsets[0][1] = 0.0f; offsets[0][2] = 0.0f;
-	offsets[1][0] = 16.0f; offsets[1][1] = 0.0f; offsets[1][2] = 0.0f;
-	offsets[2][0] = -16.0f; offsets[2][1] = 0.0f; offsets[2][2] = 0.0f;
-	offsets[3][0] = 0.0f; offsets[3][1] = 16.0f; offsets[3][2] = 0.0f;
-	offsets[4][0] = 0.0f; offsets[4][1] = -16.0f; offsets[4][2] = 0.0f;
+	offsets[0][0] = 0.0f;               offsets[0][1] = 0.0f;               offsets[0][2] = 0.0f;
+	offsets[1][0] = QNN_PLAYER_MAXS_X;  offsets[1][1] = 0.0f;               offsets[1][2] = 0.0f;
+	offsets[2][0] = QNN_PLAYER_MINS_X;  offsets[2][1] = 0.0f;               offsets[2][2] = 0.0f;
+	offsets[3][0] = 0.0f;               offsets[3][1] = QNN_PLAYER_MAXS_Y;  offsets[3][2] = 0.0f;
+	offsets[4][0] = 0.0f;               offsets[4][1] = QNN_PLAYER_MINS_Y;  offsets[4][2] = 0.0f;
 	for (i = 0; i < samples; ++i)
 	{
 		VectorAdd(snapshot->player_origin, offsets[i], start);
@@ -233,11 +233,11 @@ static void QNN_BuildCeilingSpatial(const qnn_snapshot_t *snapshot, qnn_spatial_
 
 	samples = 5;
 	max_dist = 128.0f;
-	offsets[0][0] = 0.0f; offsets[0][1] = 0.0f; offsets[0][2] = 24.0f;
-	offsets[1][0] = 16.0f; offsets[1][1] = 0.0f; offsets[1][2] = 24.0f;
-	offsets[2][0] = -16.0f; offsets[2][1] = 0.0f; offsets[2][2] = 24.0f;
-	offsets[3][0] = 0.0f; offsets[3][1] = 16.0f; offsets[3][2] = 24.0f;
-	offsets[4][0] = 0.0f; offsets[4][1] = -16.0f; offsets[4][2] = 24.0f;
+	offsets[0][0] = 0.0f;               offsets[0][1] = 0.0f;               offsets[0][2] = QNN_PLAYER_MAXS_Z - 8.0f;
+	offsets[1][0] = QNN_PLAYER_MAXS_X;  offsets[1][1] = 0.0f;               offsets[1][2] = QNN_PLAYER_MAXS_Z - 8.0f;
+	offsets[2][0] = QNN_PLAYER_MINS_X;  offsets[2][1] = 0.0f;               offsets[2][2] = QNN_PLAYER_MAXS_Z - 8.0f;
+	offsets[3][0] = 0.0f;               offsets[3][1] = QNN_PLAYER_MAXS_Y;  offsets[3][2] = QNN_PLAYER_MAXS_Z - 8.0f;
+	offsets[4][0] = 0.0f;               offsets[4][1] = QNN_PLAYER_MINS_Y;  offsets[4][2] = QNN_PLAYER_MAXS_Z - 8.0f;
 	for (i = 0; i < samples; ++i)
 	{
 		VectorAdd(snapshot->player_origin, offsets[i], start);

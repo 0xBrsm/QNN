@@ -59,9 +59,7 @@ void QNN_MatchCheckPrint(const char *text)
 }
 
 #define QNN_DEMO_MOUSE_DEGREES_PER_COUNT 0.066f
-#define QNN_DEMO_MOVEMENT_THRESHOLD_DEFAULT 4.0f
 #define QNN_DEMO_JUMP_VELOCITY_THRESHOLD 160.0f
-#define QNN_DEMO_BASE_DT (1.0f / 20.0f)
 
 typedef struct
 {
@@ -69,7 +67,6 @@ typedef struct
 	float	fixed_dt;
 	qboolean auto_detect_tick_hz;
 	int	resample_hz;	/* requested resample target; 0 = use detected rate */
-	float	movement_threshold;	/* position delta threshold for move labels */
 	int	seed;
 	int	tick;
 	int	steps;
@@ -77,11 +74,17 @@ typedef struct
 	qboolean done;
 	vec3_t	prev_origin;
 	vec3_t	prev_view_angles;
-	vec3_t	prev_velocity;
+	vec3_t	prev_velocity;	/* reconstructed from position deltas */
+	qboolean prev_grounded;
+	int	prev_waterlevel;
 	int	prev_weapon_id;
 	int	prev_ammo;
 	qboolean has_prev;
 	FILE	*store_dump;	/* NULL = no dump, set from QNN_STORE_DUMP env var */
+	/* Buffered obs for one-tick delay: we emit obs(t) paired with
+	   the action computed at t+1 (the transition FROM state t). */
+	uint8_t	buffered_obs[QNN_OBS_BUFFER_SIZE];
+	qboolean has_buffered_obs;
 } qnn_runtime_t;
 
 static qnn_runtime_t qnn_runtime;
@@ -105,26 +108,11 @@ static float QNN_NormalizeYaw(float delta)
 	return delta;
 }
 
-static float QNN_MovementThresholdForDt(float dt)
-{
-	float step_dt;
 
-	step_dt = dt > 0.0f ? dt : QNN_DEMO_BASE_DT;
-	return qnn_runtime.movement_threshold * (step_dt / QNN_DEMO_BASE_DT);
-}
 
 static void QNN_InferAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 {
-	float forward_x;
-	float forward_y;
-	float left_x;
-	float left_y;
-	float dx;
-	float dy;
-	float forward_proj;
-	float left_proj;
-	float yaw_rad;
-	float movement_threshold;
+	float dt;
 
 	QNN_ClearAction(action);
 
@@ -144,28 +132,28 @@ static void QNN_InferAction(qnn_action_t *action, const qnn_snapshot_t *snapshot
 		action->look[2] = DotProduct(cur_forward, up);
 	}
 
-	yaw_rad = (float)(qnn_runtime.prev_view_angles[1] * M_PI / 180.0);
-	forward_x = cosf(yaw_rad);
-	forward_y = sinf(yaw_rad);
-	left_x = -forward_y;
-	left_y = forward_x;
+	/* Velocity-based movement labels: reconstruct velocity from position
+	   deltas (demos don't reliably include SU_VELOCITY), simulate one
+	   frame of engine physics with zero input, compare residual. */
+	dt = qnn_resample.target_hz > 0 ? qnn_resample.target_dt : qnn_runtime.fixed_dt;
+	{
+		vec3_t cur_vel;
+		int i;
+		if (dt > 0.0f)
+			for (i = 0; i < 3; i++)
+				cur_vel[i] = (snapshot->player_origin[i] - qnn_runtime.prev_origin[i]) / dt;
+		else
+			cur_vel[0] = cur_vel[1] = cur_vel[2] = 0.0f;
 
-	dx = snapshot->player_origin[0] - qnn_runtime.prev_origin[0];
-	dy = snapshot->player_origin[1] - qnn_runtime.prev_origin[1];
-	forward_proj = dx * forward_x + dy * forward_y;
-	left_proj = dx * left_x + dy * left_y;
-	movement_threshold = QNN_MovementThresholdForDt(
-		qnn_resample.target_hz > 0 ? qnn_resample.target_dt : qnn_runtime.fixed_dt);
-
-	if (forward_proj > movement_threshold)
-		action->move[0] = 1.0f;
-	else if (forward_proj < -movement_threshold)
-		action->move[0] = -1.0f;
-
-	if (left_proj > movement_threshold)
-		action->move[1] = -1.0f;
-	else if (left_proj < -movement_threshold)
-		action->move[1] = 1.0f;
+		QNN_PhysInferMove(action,
+			qnn_runtime.prev_velocity,
+			cur_vel,
+			qnn_runtime.prev_origin,
+			qnn_runtime.prev_view_angles,
+			qnn_runtime.prev_grounded,
+			qnn_runtime.prev_waterlevel,
+			dt);
+	}
 
 	action->fire = (snapshot->ammo < qnn_runtime.prev_ammo) ? 1 : 0;
 
@@ -176,25 +164,13 @@ static void QNN_InferAction(qnn_action_t *action, const qnn_snapshot_t *snapshot
 		action->switch_slot = QNN_SwitchSlotFromWeaponId(snapshot->weapon_id);
 }
 
-/* Write a single tick in obs_buffer format: obs + action label + framing. */
-static void QNN_WriteObsTick(FILE *out, const qnn_snapshot_t *snapshot,
-	int tick, int steps, int tick_hz, qboolean reset_flag)
+/* Emit one framed tick: header + obs + action. */
+static void QNN_EmitTick(FILE *out, const uint8_t *obs,
+	const qnn_action_t *action, int tick, int steps, int tick_hz,
+	uint16_t flags)
 {
-	static uint8_t obs[QNN_OBS_BUFFER_SIZE];
-	qnn_tick_result_t result;
 	uint8_t header[16];
-	uint16_t flags = 0;
 
-	(void)tick_hz;
-	(void)reset_flag;
-	QNN_IOEmit(snapshot, &result);
-	QNN_IOPackObsBuffer(obs, &result);
-	QNN_IOPushAction(snapshot);
-
-	if (reset_flag) flags |= 0x01;
-	if (snapshot->done) flags |= 0x02;
-
-	/* Header: tick(4) + steps(4) + tick_hz(4) + flags(2) + action_size(2) */
 	memcpy(header + 0, &tick, 4);
 	memcpy(header + 4, &steps, 4);
 	memcpy(header + 8, &tick_hz, 4);
@@ -206,15 +182,80 @@ static void QNN_WriteObsTick(FILE *out, const qnn_snapshot_t *snapshot,
 	fwrite("QOBS", 1, 4, out);
 	fwrite(header, 1, sizeof(header), out);
 	fwrite(obs, 1, QNN_OBS_BUFFER_SIZE, out);
-	fwrite(&snapshot->action_label, 1, sizeof(qnn_action_t), out);
+	fwrite(action, 1, sizeof(qnn_action_t), out);
 	fflush(out);
 }
 
-static void QNN_SavePrev(const qnn_snapshot_t *snapshot)
+/* Write a single tick in obs_buffer format: obs + action label + framing.
+ *
+ * One-tick buffer: the obs from tick t is held until tick t+1 so we can
+ * pair it with the action computed at t+1 (the transition FROM state t).
+ * This ensures the model sees obs(t) with the action taken from that state,
+ * not the action that arrived at that state. */
+static void QNN_WriteObsTick(FILE *out, const qnn_snapshot_t *snapshot,
+	int tick, int steps, int tick_hz, qboolean reset_flag)
 {
+	uint8_t cur_obs[QNN_OBS_BUFFER_SIZE];
+	qnn_tick_result_t result;
+	uint16_t flags = 0;
+
+	(void)tick_hz;
+	(void)reset_flag;
+	QNN_IOEmit(snapshot, &result);
+	QNN_IOPackObsBuffer(cur_obs, &result);
+	QNN_IOPushAction(snapshot);
+
+	if (!qnn_runtime.has_buffered_obs)
+	{
+		if (snapshot->done)
+		{
+			/* Degenerate: done on first tick (0-1 tick episode).
+			   Emit directly so the reader sees the DONE flag. */
+			QNN_EmitTick(out, cur_obs, &snapshot->action_label,
+				tick, steps, tick_hz, 0x02);
+			return;
+		}
+		/* First tick: buffer the obs; no action to pair yet. */
+		memcpy(qnn_runtime.buffered_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
+		qnn_runtime.has_buffered_obs = true;
+		return;
+	}
+
+	/* Emit the buffered obs with the current action (transition from
+	   the buffered state to this state). */
+	if (snapshot->done) flags |= 0x02;
+	if (reset_flag) flags |= 0x01;
+	QNN_EmitTick(out, qnn_runtime.buffered_obs, &snapshot->action_label,
+		tick, steps, tick_hz, flags);
+
+	/* Buffer current obs for next emit (unless this was the done tick,
+	   in which case there is no next action to pair with). */
+	if (!snapshot->done)
+		memcpy(qnn_runtime.buffered_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
+	else
+		qnn_runtime.has_buffered_obs = false;
+}
+
+static void QNN_SavePrev(const qnn_snapshot_t *snapshot, float dt)
+{
+	/* Reconstruct velocity from position delta before overwriting prev_origin. */
+	if (qnn_runtime.has_prev && dt > 0.0f)
+	{
+		int i;
+		for (i = 0; i < 3; i++)
+			qnn_runtime.prev_velocity[i] =
+				(snapshot->player_origin[i] - qnn_runtime.prev_origin[i]) / dt;
+	}
+	else
+	{
+		qnn_runtime.prev_velocity[0] = 0.0f;
+		qnn_runtime.prev_velocity[1] = 0.0f;
+		qnn_runtime.prev_velocity[2] = 0.0f;
+	}
 	VectorCopy(snapshot->player_origin, qnn_runtime.prev_origin);
 	VectorCopy(snapshot->player_view_angles, qnn_runtime.prev_view_angles);
-	VectorCopy(snapshot->player_velocity, qnn_runtime.prev_velocity);
+	qnn_runtime.prev_grounded = snapshot->grounded;
+	qnn_runtime.prev_waterlevel = snapshot->waterlevel;
 	qnn_runtime.prev_weapon_id = snapshot->weapon_id;
 	qnn_runtime.prev_ammo = snapshot->ammo;
 	qnn_runtime.has_prev = true;
@@ -226,7 +267,6 @@ static void QNN_RuntimeReset(void)
 	qnn_runtime.fixed_tick_hz = 20;
 	qnn_runtime.fixed_dt = 1.0f / 20.0f;
 	qnn_runtime.auto_detect_tick_hz = false;
-	qnn_runtime.movement_threshold = QNN_DEMO_MOVEMENT_THRESHOLD_DEFAULT;
 	qnn_runtime.store_dump = NULL;
 	{
 		const char *dump_path = getenv("QNN_STORE_DUMP");
@@ -435,12 +475,6 @@ static int QNN_HandleHello(const char *line)
 	 * >0 = fixed target, 0 = use auto-detected source rate. */
 	qnn_runtime.resample_hz = QNN_JsonExtractInt(line, "\"resample_hz\"", 0);
 
-	{
-		float mt = (float)QNN_JsonExtractInt(line, "\"movement_threshold\"", 0);
-		if (mt > 0.0f)
-			qnn_runtime.movement_threshold = mt;
-	}
-
 	if (!QNN_PrepareMap(map_id, error, sizeof(error)))
 	{
 		QNN_WriteError(error);
@@ -491,6 +525,9 @@ static int QNN_HandleCollect(const char *line)
 		return 0;
 	}
 
+	/* Set up minimal server state for velocity-based move labeling. */
+	QNN_PhysInit();
+
 	/* Init resampler. resample_hz=0 means pass-through (emit every frame
 	 * at native recording FPS). resample_hz>0 means downsample to target. */
 	QNN_ResampleInit(qnn_runtime.resample_hz);
@@ -503,7 +540,7 @@ static int QNN_HandleCollect(const char *line)
 			? qnn_resample.target_hz : qnn_runtime.fixed_tick_hz;
 
 		QNN_CaptureSnapshotLocal(&snapshot, true);
-		QNN_SavePrev(&snapshot);
+		QNN_SavePrev(&snapshot, 0.0f);  /* first tick, no dt */
 		QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
 
 		/*
@@ -552,7 +589,7 @@ static int QNN_HandleCollect(const char *line)
 			/* Pre-match or no match text yet: skip ticks. */
 			if (!emitting && !qnn_runtime.done)
 			{
-				QNN_SavePrev(&snapshot);
+				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
 				continue;
 			}
 
@@ -566,16 +603,19 @@ static int QNN_HandleCollect(const char *line)
 			QNN_ResampleAccumulate(&snapshot, qnn_runtime.fixed_dt);
 			if (QNN_ResampleShouldEmit() || qnn_runtime.done)
 			{
-				QNN_InferAction(&snapshot.action_label, &snapshot);
+				if (!snapshot.done)
+					QNN_InferAction(&snapshot.action_label, &snapshot);
+				else
+					QNN_ClearAction(&snapshot.action_label);
 				QNN_ResampleApplyActionMerge(&snapshot);
 				QNN_WriteObsTick(stdout, &snapshot, qnn_runtime.tick,
 					qnn_runtime.steps, emit_hz, false);
-				QNN_SavePrev(&snapshot);
+				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
 			}
-			else if (qnn_resample.target_hz <= 0)
+			else if (qnn_resample.target_hz <= 0 && !snapshot.done)
 			{
 				QNN_InferAction(&snapshot.action_label, &snapshot);
-				QNN_SavePrev(&snapshot);
+				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
 			}
 		}
 

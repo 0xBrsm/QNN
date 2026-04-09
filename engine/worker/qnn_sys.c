@@ -397,7 +397,10 @@ static float QNN_ClampUnit(float value)
 	return value;
 }
 
-#define QNN_LOOK_DEADZONE 0.03f
+/* TODO(ppo): tune deadzone as eval-time parameter sweep once PPO is
+   training.  0.03 ate 43% of non-zero yaw and 72% of non-zero pitch
+   ticks.  Zero for now so BC fine-aim signal passes through. */
+#define QNN_LOOK_DEADZONE 0.0f
 #define QNN_LOOK_BASE_COUNT 256.0f
 #define QNN_LOOK_HIGH_GAIN 2.0f
 

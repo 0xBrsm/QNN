@@ -306,11 +306,9 @@ def prepare_bc_run_outputs(run_cfg: dict[str, Any], *, resume: bool) -> None:
     outputs = run_output_dirs(run_cfg)
     checkpoint_path = outputs["checkpoints"] / "bc_training_checkpoint.pt"
     if resume:
-        if not checkpoint_path.exists():
-            raise RuntimeError(
-                f"run.json.resume is true, but no BC checkpoint exists at {checkpoint_path}"
-            )
-        return
+        if checkpoint_path.exists():
+            return
+        # Nothing to resume from — start fresh.
 
     for path in (
         outputs["checkpoints"] / "bc_training_checkpoint.pt",

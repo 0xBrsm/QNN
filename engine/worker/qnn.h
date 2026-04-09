@@ -240,6 +240,26 @@ static inline void QNN_ClearAction(qnn_action_t *action)
 	memset(action, 0, sizeof(*action));
 }
 
+/* Standard Quake player hull dimensions (from QuakeC VEC_HULL_MIN/MAX). */
+#define QNN_PLAYER_MINS_X (-16.0f)
+#define QNN_PLAYER_MINS_Y (-16.0f)
+#define QNN_PLAYER_MINS_Z (-24.0f)
+#define QNN_PLAYER_MAXS_X  (16.0f)
+#define QNN_PLAYER_MAXS_Y  (16.0f)
+#define QNN_PLAYER_MAXS_Z  (32.0f)
+
+/* Velocity-based movement label inference (qnn_phys.c) */
+void QNN_PhysInit(void);
+void QNN_PhysInferMove(
+	qnn_action_t *action,
+	const vec3_t prev_vel,
+	const vec3_t cur_vel,
+	const vec3_t prev_origin,
+	const vec3_t prev_view_angles,
+	qboolean is_grounded,
+	int waterlevel,
+	float dt);
+
 /* Entity classification helpers (qnn_entity.c) */
 int QNN_CategoryOrder(const char *category);
 const char *QNN_Classify(const char *classname);

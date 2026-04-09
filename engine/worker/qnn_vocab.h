@@ -105,7 +105,6 @@
 
 #define QNN_FOV_HALF_DEG               60.0f
 #define QNN_RECENCY_MAX_EVENT             0.1f
-#define QNN_RECENCY_DECAY_PLAYER_S      2.0f
 
 /* Per-modality recency thresholds (seconds) */
 #define QNN_RECENCY_MAX_SIGHT      2.0f

@@ -675,6 +675,8 @@ class QNNPolicy:
         class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
         head_loss_weights: Mapping[str, float] | None = None,
         focal_gamma: float = 0.0,
+        sparse_discrete: bool = True,
+        look_deadzone: float = 0.0,
     ) -> tuple[list[torch.Tensor], Dict[str, float]]:
         """Shared per-head loss + metrics for both train and eval.
 
@@ -694,8 +696,21 @@ class QNNPolicy:
             if head in CONTINUOUS_ACTION_HEADS:
                 pred = torch.tanh(head_logits)
                 target = self._continuous_targets_for_head(actions, head, head_logits)
-                head_loss = F.smooth_l1_loss(pred, target)
-                metrics.update(_continuous_head_metrics(head, pred, target))
+                # Look deadzone: zero out labels where turn magnitude is below
+                # threshold.  Train on cleaned targets, evaluate against raw.
+                if head == "look" and look_deadzone > 0:
+                    raw_target = target
+                    turn_mag = torch.sqrt(target[:, 1] ** 2 + target[:, 2] ** 2)
+                    mask = turn_mag < look_deadzone
+                    target = target.clone()
+                    target[mask, 0] = 1.0
+                    target[mask, 1] = 0.0
+                    target[mask, 2] = 0.0
+                    head_loss = F.smooth_l1_loss(pred, target)
+                    metrics.update(_continuous_head_metrics(head, pred, raw_target))
+                else:
+                    head_loss = F.smooth_l1_loss(pred, target)
+                    metrics.update(_continuous_head_metrics(head, pred, target))
             else:
                 target = self._action_targets_for_head(actions, head, head_logits)
                 pred = torch.argmax(head_logits, dim=1)
@@ -703,7 +718,7 @@ class QNNPolicy:
                 # Sparse binary heads (fire, jump): skip true negatives.
                 # Only compute loss on ticks where demonstrator acted OR model
                 # predicted action — avoids rewarding trivial "always predict 0".
-                if head in _SPARSE_BINARY_HEADS:
+                if sparse_discrete and head in _SPARSE_BINARY_HEADS:
                     sparse_mask = (target != 0) | (pred != 0)
                     if sparse_mask.any():
                         masked_logits = head_logits[sparse_mask]
@@ -768,6 +783,8 @@ class QNNPolicy:
         accumulate_only: bool = False,
         head_loss_weights: Mapping[str, float] | None = None,
         focal_gamma: float = 0.0,
+        sparse_discrete: bool = True,
+        look_deadzone: float = 0.0,
     ) -> Dict[str, float]:
         optimizer = self._optimizer("bc", self.model.parameters(), lr)
         if not accumulate_only:
@@ -776,10 +793,12 @@ class QNNPolicy:
         _, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
         losses, metrics = self._compute_head_losses_and_metrics(
             logits, actions, class_weights=class_weights, head_loss_weights=head_loss_weights,
-            focal_gamma=focal_gamma,
+            focal_gamma=focal_gamma, sparse_discrete=sparse_discrete,
+            look_deadzone=look_deadzone,
         )
 
-        loss = torch.stack(losses).mean()
+        nonzero = [l for l in losses if l.requires_grad or l.item() != 0.0]
+        loss = torch.stack(nonzero).mean() if nonzero else torch.tensor(0.0, device=losses[0].device)
         loss.backward()
         if not accumulate_only:
             optimizer.step()
@@ -797,12 +816,15 @@ class QNNPolicy:
         masks: np.ndarray | torch.Tensor | None = None,
         head_loss_weights: Mapping[str, float] | None = None,
         focal_gamma: float = 0.0,
+        sparse_discrete: bool = True,
+        look_deadzone: float = 0.0,
     ) -> Dict[str, float]:
         with torch.inference_mode():
             _, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
             losses, metrics = self._compute_head_losses_and_metrics(
                 logits, actions, head_loss_weights=head_loss_weights,
-                focal_gamma=focal_gamma,
+                focal_gamma=focal_gamma, sparse_discrete=sparse_discrete,
+                look_deadzone=look_deadzone,
             )
 
         nonzero_losses = [l.item() for l in losses if l.item() != 0.0]
@@ -964,9 +986,16 @@ class QNNPolicy:
             "resolved_device": self.device_spec.resolved,
             "accelerator_backend": self.device_spec.backend,
         }
+        # Strip _orig_mod. prefix from torch.compile so checkpoints are
+        # always in uncompiled format (loadable with or without compile).
+        raw_sd = self.model.state_dict()
+        clean_sd = {
+            key.replace("_orig_mod.", ""): value.detach().cpu()
+            for key, value in raw_sd.items()
+        }
         payload = {
             "meta": meta,
-            "state_dict": {key: value.detach().cpu() for key, value in self.model.state_dict().items()},
+            "state_dict": clean_sd,
         }
         torch.save(payload, target)
         target.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")

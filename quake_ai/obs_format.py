@@ -1,11 +1,16 @@
-"""Observation buffer format — v9 variable-length token stream.
+"""Observation buffer format — v9 variable-length entity stream.
 
 Single source of truth for the obs buffer wire format in Python.
-Must match qnn_io.h / qnn_io.c on the C side.
+Must match qnn_io.h on the C side.
 
-v9 changes: entity tokens are variable-length with type tags.
-Self section is fixed at bytes 0-95. Entity stream starts at 96.
-Spatial and action history follow the entity stream (variable offset).
+Wire layout (all offsets fixed, little-endian):
+  0..87    self section (scalars + embed IDs)
+  88..555  spatial tokens (9 × 13 float32)
+  556..811 action history (8 × 8 float32)
+  812..    entity stream (variable-length, type-tagged tokens)
+
+See OBS_SCHEMA in quake_ai/model/observation.py for the canonical
+model-facing dict shape contract.
 """
 
 import struct

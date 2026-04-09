@@ -81,10 +81,13 @@ class BCConfig:
     # Set recall_0..3 to 0.0 to exclude them from gradient budget.
     head_loss_weights: str  # JSON string, e.g. '{"move":1.5,"recall_0":0.0}'
     focal_gamma: float  # 0.0 = standard CE, >0 = focal loss for discrete heads
+    sparse_discrete: bool  # true = sparse masking for fire/jump/switch, false = use focal/CE on all ticks
+    look_deadzone: float  # >0 zeros look labels where turn magnitude < threshold; 0.0 = disabled
     regression_stop: bool  # use regression-based stopping instead of patience
     regression_threshold: float  # max acceptable regression from per-head best
     regression_patience: int  # consecutive epochs above threshold before stopping
     lr_min: float  # >0 enables cosine decay from lr to lr_min over all epochs
+    warmup_epochs: int  # >0 enables linear warmup from ~0 to lr over this many epochs
     prometheus_pushgateway_url: str  # e.g. "http://pi:9091"; empty = disabled
 
 
@@ -174,6 +177,8 @@ def _run_precomputed_supervised(
     tbptt_limit: int = 256,
     head_loss_weights: Mapping[str, float] | None = None,
     focal_gamma: float = 0.0,
+    sparse_discrete: bool = True,
+    look_deadzone: float = 0.0,
     step_callback: Any | None = None,  # called every report_every optimizer steps with running metrics
     report_every: int = 0,  # 0 = disabled
 ) -> Dict[str, float]:
@@ -210,6 +215,7 @@ def _run_precomputed_supervised(
     _report_rows = 0
     _report_loss = 0.0
     _report_avg_totals: Dict[str, float] = {}
+    _report_raw_totals: Dict[str, float] = {}
 
     if training:
         model.bc_zero_grad()
@@ -250,12 +256,16 @@ def _run_precomputed_supervised(
                     accumulate_only=True,
                     head_loss_weights=head_loss_weights,
                     focal_gamma=focal_gamma,
+                    sparse_discrete=sparse_discrete,
+                    look_deadzone=look_deadzone,
                 )
             else:
                 metrics = model.evaluate_supervised(
                     obs_chunk, act_chunk,
                     hidden=hidden,
                     focal_gamma=focal_gamma,
+                    sparse_discrete=sparse_discrete,
+                    look_deadzone=look_deadzone,
                 )
 
             # Carry hidden state forward (detached to truncate BPTT).
@@ -292,16 +302,21 @@ def _run_precomputed_supervised(
                         for key, val in metrics.items():
                             if key.startswith(_AVERAGED_METRIC_PREFIXES):
                                 _report_avg_totals[key] = _report_avg_totals.get(key, 0.0) + float(val) * length
+                            elif key.startswith(_RAW_SUM_METRIC_PREFIXES):
+                                _report_raw_totals[key] = _report_raw_totals.get(key, 0.0) + float(val)
 
                         if opt_steps % report_every == 0:
                             rd = max(_report_rows, 1)
                             step_metrics = {"loss": _report_loss / rd, "n_rows": float(_report_rows), "opt_step": opt_steps}
                             for key, total in _report_avg_totals.items():
                                 step_metrics[key] = total / rd
+                            for key, total in _report_raw_totals.items():
+                                step_metrics[key] = total
                             step_callback(step_metrics)
                             _report_rows = 0
                             _report_loss = 0.0
                             _report_avg_totals.clear()
+                            _report_raw_totals.clear()
 
     # Flush any remaining accumulated gradients.
     if training and accum_count > 0:
@@ -528,6 +543,11 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     else:
         _resume_optimizer_state = None
 
+    # torch.compile: tested but net negative for this model size (189K params).
+    # The fused kernels don't help when individual ops are already microseconds,
+    # and the compile wrapper adds overhead (val: 100s → 120s per epoch).
+    # Revisit if model size increases significantly.
+
     # Per-step reporting: log every ~1024 samples (report_every optimizer steps).
     _report_every = max(1, 1024 // max(config.batch_size, 1)) if config.batch_size > 0 else 0
     _step_log: List[Dict[str, float]] = []
@@ -546,6 +566,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     _lr_override_path = output / "lr_override.json"
 
     import math as _math
+    import time as _time
+    from datetime import datetime as _datetime, timezone as _tz
 
     for epoch in range(start_epoch, config.epochs):
         # Hot-reload LR: drop {"lr": 0.001, "lr_min": 0.0003} into lr_override.json.
@@ -553,16 +575,24 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         _lr_min = config.lr_min
         if _lr_override_path.exists():
             try:
-                _ovr = json.loads(_lr_override_path.read_text())
+                _ovr = _json.loads(_lr_override_path.read_text())
                 _lr = float(_ovr.get("lr", _lr))
                 _lr_min = float(_ovr.get("lr_min", _lr_min))
                 print(f"  [bc] lr_override.json: lr={_lr}, lr_min={_lr_min}")
             except Exception as exc:
                 print(f"  [bc] lr_override.json parse error: {exc}")
 
-        # Cosine LR decay: lr anneals from lr to lr_min over all epochs.
-        if _lr_min > 0:
-            progress = epoch / max(config.epochs - 1, 1)
+        # LR schedule: optional linear warmup then optional cosine decay.
+        _warmup = config.warmup_epochs
+        if _warmup > 0 and epoch < _warmup:
+            # Linear warmup from lr_min (or near-zero) to lr.
+            _base = _lr_min if _lr_min > 0 else _lr * 0.01
+            _active_lr = _base + (_lr - _base) * (epoch / _warmup)
+        elif _lr_min > 0:
+            # Cosine decay from lr to lr_min over post-warmup epochs.
+            _post_warmup = epoch - _warmup
+            _post_total = max(config.epochs - 1 - _warmup, 1)
+            progress = _post_warmup / _post_total
             _active_lr = _lr_min + 0.5 * (_lr - _lr_min) * (1 + _math.cos(_math.pi * progress))
         else:
             _active_lr = _lr
@@ -570,6 +600,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         if epoch == start_epoch or epoch > start_epoch:
             print(f"  [bc] LR={_active_lr:.6f}")
 
+        _t_train_start = _time.monotonic()
         train_metrics = _run_precomputed_supervised(
             model,
             train_episodes,
@@ -582,15 +613,19 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             tbptt_limit=config.tbptt_limit,
             head_loss_weights=hlw,
             focal_gamma=config.focal_gamma,
+            sparse_discrete=config.sparse_discrete,
+            look_deadzone=config.look_deadzone,
             step_callback=_on_step,
             report_every=_report_every,
         )
+        _t_train_end = _time.monotonic()
         # Restore optimizer state on first epoch after resume.
         if _resume_optimizer_state is not None:
             bc_opt = model._optimizers.get("bc")
             if bc_opt is not None:
                 bc_opt.load_state_dict(_resume_optimizer_state)
                 _resume_optimizer_state = None
+        _t_val_start = _time.monotonic()
         val_metrics = _run_precomputed_supervised(
             model,
             val_episodes,
@@ -599,6 +634,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             tbptt_limit=config.tbptt_limit,
             head_loss_weights=hlw,
             focal_gamma=config.focal_gamma,
+            sparse_discrete=config.sparse_discrete,
+            look_deadzone=config.look_deadzone,
         )
         # Clean train eval (model.eval mode, no dropout) on val-sized subset
         # for accurate generalization gap measurement.
@@ -610,7 +647,14 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             tbptt_limit=config.tbptt_limit,
             head_loss_weights=hlw,
             focal_gamma=config.focal_gamma,
+            sparse_discrete=config.sparse_discrete,
+            look_deadzone=config.look_deadzone,
         )
+        _t_val_end = _time.monotonic()
+        _train_secs = _t_train_end - _t_train_start
+        _val_secs = _t_val_end - _t_val_start
+        _wall_clock = _datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"  [bc] timing: train={_train_secs:.1f}s  val={_val_secs:.1f}s  total={_train_secs + _val_secs:.1f}s  [{_wall_clock}]")
         mae_str = "  ".join(
             f"{k}={v:.4f}" for k, v in sorted(val_metrics.items()) if k.startswith("mae_")
         )
@@ -630,7 +674,12 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
               f"{mae_str}")
 
         # Assemble and record per-epoch metrics.
-        epoch_metrics: Dict[str, float] = {"epoch": float(epoch)}
+        epoch_metrics: Dict[str, Any] = {
+            "epoch": float(epoch),
+            "train_secs": _train_secs,
+            "val_secs": _val_secs,
+            "wall_clock": _wall_clock,
+        }
         for key, value in train_metrics.items():
             if key == "_next_hidden":
                 continue
@@ -649,6 +698,12 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         write_json(output / "bc_history.json", {"history": history})
         if _step_log:
             write_json(output / "bc_step_log.json", {"steps": _step_log})
+
+        # Epoch sentinel: external watchers can poll this file to detect
+        # epoch completion across any training mode (BC, PPO, etc.).
+        (output / "epoch_done").write_text(
+            _json.dumps({"epoch": epoch, "wall_clock": _wall_clock, "mode": "bc"}) + "\n"
+        )
 
         # Push metrics to Prometheus pushgateway (no-op when URL is empty).
         if config.prometheus_pushgateway_url:
@@ -696,7 +751,10 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         bc_opt = model._optimizers.get("bc")
         ckpt_data = {
             "epoch": epoch,
-            "model_state_dict": model.model.state_dict(),
+            "model_state_dict": {
+                k.replace("_orig_mod.", ""): v
+                for k, v in model.model.state_dict().items()
+            },
             "optimizer_state_dict": bc_opt.state_dict() if bc_opt else None,
             "best_val_loss": best_val_loss,
             "best_epoch": best_epoch,
@@ -748,6 +806,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         sequence_length=config.sequence_length,
         tbptt_limit=config.tbptt_limit,
         focal_gamma=config.focal_gamma,
+        sparse_discrete=config.sparse_discrete,
     ) if val_episodes else {"loss": 0.0}
 
     summary: Dict[str, Any] = {
