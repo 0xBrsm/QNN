@@ -1,5 +1,6 @@
-"""Shared Quake demo parsing and classification utilities."""
+"""Shared Quake demo parsing, classification, and analysis utilities."""
 
+from .analyze import analyze_demo
 from .parser import (
     DemoMetadata,
     DemoProbe,
@@ -13,6 +14,7 @@ from .parser import (
 __all__ = [
     "DemoMetadata",
     "DemoProbe",
+    "analyze_demo",
     "canonical_map_id",
     "classify_competitive",
     "classify_demo",

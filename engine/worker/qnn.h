@@ -188,7 +188,9 @@ extern qnn_action_t qnn_pending_action;
  * Call QNN_ResampleInit() once, then QNN_ResampleShouldEmit()
  * every frame.  When it returns true, emit the token tick.
  * Action labels are merged across the window: fire/jump use OR,
- * look/move use emission-to-emission deltas (computed in InferAction).
+ * move is inferred once per emission via BSP-clipped physics, and
+ * look/switch remain emission-to-emission labels computed by the
+ * collector.
  */
 typedef struct
 {
@@ -204,9 +206,9 @@ extern qnn_resample_state_t qnn_resample;
 #define QNN_DEMO_MOUSE_DEGREES_PER_COUNT 0.066f
 
 void QNN_ResampleInit(int target_hz);
-void QNN_ResampleAccumulate(const qnn_snapshot_t *snapshot, float frame_dt);
+void QNN_ResampleAccumulate(const qnn_action_t *action, float frame_dt);
 qboolean QNN_ResampleShouldEmit(void);
-void QNN_ResampleApplyActionMerge(qnn_snapshot_t *snapshot);
+void QNN_ResampleApplyActionMerge(qnn_action_t *action);
 extern qnn_sound_event_t qnn_sound_buffer[QNN_MAX_SOUNDS];
 extern int qnn_sound_count;
 
@@ -255,10 +257,15 @@ void QNN_PhysInferMove(
 	const vec3_t prev_vel,
 	const vec3_t cur_vel,
 	const vec3_t prev_origin,
-	const vec3_t prev_view_angles,
-	qboolean is_grounded,
-	int waterlevel,
-	float dt);
+	const vec3_t cmd_view_angles,
+	qboolean prev_grounded,
+	int prev_waterlevel,
+	const vec3_t cur_origin,
+	qboolean cur_grounded,
+	int cur_waterlevel,
+	float dt,
+	float native_dt,
+	float movement_threshold);
 
 /* Entity classification helpers (qnn_entity.c) */
 int QNN_CategoryOrder(const char *category);
@@ -276,6 +283,8 @@ int QNN_WeaponId(void);
 int QNN_CurrentFrags(void);
 void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot);
 void QNN_DrainSounds(qnn_snapshot_t *snapshot);
+qboolean QNN_SnapshotHasSelfWeaponFireSound(const qnn_snapshot_t *snapshot);
+qboolean QNN_SnapshotHasSelfJumpSound(const qnn_snapshot_t *snapshot);
 
 /* IO (qnn_io.c) — see qnn_io.h for full typed token API */
 

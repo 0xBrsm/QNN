@@ -16,69 +16,68 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
 
-# ---------------------------------------------------------------------------
-# Quake network protocol constants
-# ---------------------------------------------------------------------------
-
-U_MOREBITS = 1 << 0
-U_ORIGIN1 = 1 << 1
-U_ORIGIN2 = 1 << 2
-U_ORIGIN3 = 1 << 3
-U_ANGLE2 = 1 << 4
-U_FRAME = 1 << 6
-U_ANGLE1 = 1 << 8
-U_ANGLE3 = 1 << 9
-U_MODEL = 1 << 10
-U_COLORMAP = 1 << 11
-U_SKIN = 1 << 12
-U_EFFECTS = 1 << 13
-U_LONGENTITY = 1 << 14
-
-SU_VIEWHEIGHT = 1 << 0
-SU_IDEALPITCH = 1 << 1
-SU_PUNCH1 = 1 << 2
-SU_VELOCITY1 = 1 << 5
-SU_ITEMS = 1 << 9
-SU_WEAPONFRAME = 1 << 12
-SU_ARMOR = 1 << 13
-SU_WEAPON = 1 << 14
-
-SVC_NOP = 1
-SVC_DISCONNECT = 2
-SVC_UPDATESTAT = 3
-SVC_VERSION = 4
-SVC_SETVIEW = 5
-SVC_SOUND = 6
-SVC_TIME = 7
-SVC_PRINT = 8
-SVC_STUFFTEXT = 9
-SVC_SETANGLE = 10
-SVC_SERVERINFO = 11
-SVC_LIGHTSTYLE = 12
-SVC_UPDATENAME = 13
-SVC_UPDATEFRAGS = 14
-SVC_CLIENTDATA = 15
-SVC_STOPSOUND = 16
-SVC_UPDATECOLORS = 17
-SVC_PARTICLE = 18
-SVC_DAMAGE = 19
-SVC_SPAWNSTATIC = 20
-SVC_SPAWNBASELINE = 22
-SVC_TEMP_ENTITY = 23
-SVC_SETPAUSE = 24
-SVC_SIGNONNUM = 25
-SVC_CENTERPRINT = 26
-SVC_KILLEDMONSTER = 27
-SVC_FOUNDSECRET = 28
-SVC_SPAWNSTATICSOUND = 29
-SVC_INTERMISSION = 30
-SVC_FINALE = 31
-SVC_CDTRACK = 32
-SVC_SELLSCREEN = 33
-SVC_CUTSCENE = 34
-
-TE_SIMPLE_COORD = {0, 1, 2, 3, 4, 7, 8, 10, 11}
-TE_BEAM = {5, 6, 9, 13}
+from .protocol import (
+    Reader,
+    SU_ARMOR,
+    SU_IDEALPITCH,
+    SU_ITEMS,
+    SU_PUNCH1,
+    SU_VELOCITY1,
+    SU_VIEWHEIGHT,
+    SU_WEAPON,
+    SU_WEAPONFRAME,
+    SVC_CDTRACK,
+    SVC_CENTERPRINT,
+    SVC_CLIENTDATA,
+    SVC_CUTSCENE,
+    SVC_DAMAGE,
+    SVC_DISCONNECT,
+    SVC_FINALE,
+    SVC_FOUNDSECRET,
+    SVC_INTERMISSION,
+    SVC_KILLEDMONSTER,
+    SVC_LIGHTSTYLE,
+    SVC_NOP,
+    SVC_PARTICLE,
+    SVC_PRINT,
+    SVC_SELLSCREEN,
+    SVC_SERVERINFO,
+    SVC_SETANGLE,
+    SVC_SETPAUSE,
+    SVC_SETVIEW,
+    SVC_SIGNONNUM,
+    SVC_SOUND,
+    SVC_SPAWNBASELINE,
+    SVC_SPAWNSTATIC,
+    SVC_SPAWNSTATICSOUND,
+    SVC_STOPSOUND,
+    SVC_STUFFTEXT,
+    SVC_TEMP_ENTITY,
+    SVC_TIME,
+    SVC_UPDATECOLORS,
+    SVC_UPDATEFRAGS,
+    SVC_UPDATENAME,
+    SVC_UPDATESTAT,
+    SVC_VERSION,
+    U_ANGLE1,
+    U_ANGLE2,
+    U_ANGLE3,
+    U_COLORMAP,
+    U_EFFECTS,
+    U_FRAME,
+    U_LONGENTITY,
+    U_MODEL,
+    U_MOREBITS,
+    U_ORIGIN1,
+    U_ORIGIN2,
+    U_ORIGIN3,
+    U_SKIN,
+    skip_clientdata,
+    skip_damage,
+    skip_particle,
+    skip_sound,
+    skip_temp_entity,
+)
 
 # ---------------------------------------------------------------------------
 # Text / cvar extraction patterns
@@ -132,57 +131,6 @@ def canonical_map_id(value: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Binary reader
-# ---------------------------------------------------------------------------
-
-
-class _Reader:
-    def __init__(self, payload: bytes) -> None:
-        self.payload = payload
-        self.offset = 0
-
-    def _read(self, size: int) -> bytes:
-        if self.offset + size > len(self.payload):
-            raise ValueError("Unexpected end of demo message")
-        out = self.payload[self.offset : self.offset + size]
-        self.offset += size
-        return out
-
-    def byte(self) -> int:
-        return struct.unpack("<B", self._read(1))[0]
-
-    def char(self) -> int:
-        return struct.unpack("<b", self._read(1))[0]
-
-    def short(self) -> int:
-        return struct.unpack("<h", self._read(2))[0]
-
-    def ushort(self) -> int:
-        return struct.unpack("<H", self._read(2))[0]
-
-    def long(self) -> int:
-        return struct.unpack("<i", self._read(4))[0]
-
-    def float(self) -> float:
-        return struct.unpack("<f", self._read(4))[0]
-
-    def coord(self) -> float:
-        return self.short() * (1.0 / 8.0)
-
-    def angle(self) -> float:
-        return self.char() * (360.0 / 256.0)
-
-    def string(self) -> str:
-        chars: List[int] = []
-        while True:
-            value = self.char()
-            if value in (-1, 0):
-                break
-            chars.append(value & 0xFF)
-        return bytes(chars).decode("latin-1", errors="replace")
-
-
-# ---------------------------------------------------------------------------
 # Entity state (needed to advance reader past entity updates)
 # ---------------------------------------------------------------------------
 
@@ -210,11 +158,11 @@ class _EntityState:
 
 
 # ---------------------------------------------------------------------------
-# Protocol parsing helpers (advance reader past message payloads)
+# Protocol parsing helpers
 # ---------------------------------------------------------------------------
 
 
-def _parse_baseline(reader: _Reader, entity: _EntityState) -> None:
+def _parse_baseline(reader: Reader, entity: _EntityState) -> None:
     entity.baseline.modelindex = reader.byte()
     entity.baseline.frame = reader.byte()
     entity.baseline.colormap = reader.byte()
@@ -230,55 +178,7 @@ def _parse_baseline(reader: _Reader, entity: _EntityState) -> None:
     entity.angles = entity.baseline.angles[:]
 
 
-def _read_sound(reader: _Reader) -> None:
-    field_mask = reader.byte()
-    if field_mask & 1:
-        reader.byte()
-    if field_mask & 2:
-        reader.byte()
-    reader.short()
-    reader.byte()
-    for _ in range(3):
-        reader.coord()
-
-
-def _read_particle(reader: _Reader) -> None:
-    for _ in range(3):
-        reader.coord()
-    for _ in range(3):
-        reader.char()
-    reader.byte()
-    reader.byte()
-
-
-def _read_damage(reader: _Reader) -> None:
-    reader.byte()
-    reader.byte()
-    for _ in range(3):
-        reader.coord()
-
-
-def _read_temp_entity(reader: _Reader) -> None:
-    temp_type = reader.byte()
-    if temp_type in TE_SIMPLE_COORD:
-        for _ in range(3):
-            reader.coord()
-        return
-    if temp_type in TE_BEAM:
-        reader.short()
-        for _ in range(6):
-            reader.coord()
-        return
-    if temp_type == 12:
-        for _ in range(3):
-            reader.coord()
-        reader.byte()
-        reader.byte()
-        return
-    raise ValueError(f"Unsupported temp entity type {temp_type}")
-
-
-def _parse_serverinfo(reader: _Reader) -> Dict[str, object]:
+def _parse_serverinfo(reader: Reader) -> Dict[str, object]:
     info: Dict[str, object] = {}
     try:
         info["protocol"] = reader.long()
@@ -325,33 +225,7 @@ def _parse_serverinfo(reader: _Reader) -> Dict[str, object]:
     return info
 
 
-def _skip_clientdata(reader: _Reader) -> None:
-    """Advance reader past an SVC_CLIENTDATA message."""
-    bits = reader.ushort()
-    if bits & SU_VIEWHEIGHT:
-        reader.char()
-    if bits & SU_IDEALPITCH:
-        reader.char()
-    for axis in range(3):
-        if bits & (SU_PUNCH1 << axis):
-            reader.char()
-        if bits & (SU_VELOCITY1 << axis):
-            reader.char()
-    reader.long()  # items
-    if bits & SU_WEAPONFRAME:
-        reader.byte()
-    if bits & SU_ARMOR:
-        reader.byte()
-    if bits & SU_WEAPON:
-        reader.byte()
-    reader.short()  # health
-    reader.byte()   # ammo
-    for _ in range(4):
-        reader.byte()  # shells, nails, rockets, cells
-    reader.byte()  # active weapon
-
-
-def _parse_update(reader: _Reader, entities: Dict[int, _EntityState], bits: int) -> None:
+def _parse_update(reader: Reader, entities: Dict[int, _EntityState], bits: int) -> None:
     if bits & U_MOREBITS:
         bits |= reader.byte() << 8
     entity_num = reader.short() if (bits & U_LONGENTITY) else reader.byte()
@@ -579,11 +453,11 @@ def parse_demo_metadata(
 
         message = body[offset : offset + message_size]
         offset += message_size
-        reader = _Reader(message)
+        reader = Reader(message)
         parse_error: ValueError | None = None
         saw_disconnect = False
 
-        while reader.offset < len(message):
+        while reader.pos < len(message):
             try:
                 cmd = reader.byte()
                 if cmd == 255:
@@ -607,7 +481,7 @@ def parse_demo_metadata(
                     reader.short()
                     continue
                 if cmd == SVC_SOUND:
-                    _read_sound(reader)
+                    skip_sound(reader)
                     continue
                 if cmd == SVC_TIME:
                     current_time = reader.float()
@@ -656,7 +530,7 @@ def parse_demo_metadata(
                     maxclients = max(maxclients, int(slot) + 1)
                     continue
                 if cmd == SVC_CLIENTDATA:
-                    _skip_clientdata(reader)
+                    skip_clientdata(reader)
                     continue
                 if cmd == SVC_STOPSOUND:
                     reader.short()
@@ -668,10 +542,10 @@ def parse_demo_metadata(
                     maxclients = max(maxclients, int(slot) + 1)
                     continue
                 if cmd == SVC_PARTICLE:
-                    _read_particle(reader)
+                    skip_particle(reader)
                     continue
                 if cmd == SVC_DAMAGE:
-                    _read_damage(reader)
+                    skip_damage(reader)
                     continue
                 if cmd == SVC_SPAWNSTATIC:
                     _parse_baseline(reader, _EntityState())
@@ -680,7 +554,7 @@ def parse_demo_metadata(
                     _parse_baseline(reader, entities.setdefault(reader.short(), _EntityState()))
                     continue
                 if cmd == SVC_TEMP_ENTITY:
-                    _read_temp_entity(reader)
+                    skip_temp_entity(reader)
                     continue
                 if cmd == SVC_SETPAUSE:
                     reader.byte()

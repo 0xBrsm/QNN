@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.13.0
+
+### Changed
+- Demo movement labels reconstructed via BSP-clipped emission-window physics instead of position deltas
+- Velocity derived from position deltas — spectator `cl.velocity` is always zero
+- `evaluate.py`, `init_run.py`, `bc_collect.py`, `quickeval.py`, `observe.py` moved into `quake_ai/rl/`
+- Demo package consolidated under `demo/`; `mapgen_cpp` removed
+
+### Fixed
+- Movement key inference: three bugs in button state, strafe direction, and ground detection
+- Z-delta ground detection and BSP ground trace for spectator demos
+
+## 0.12.0
+
+### Changed
+- Obs/action pairing aligned so actions are taken FROM the observed state
+- Training loss averages only active heads; step log includes discrete metrics
+- `torch.compile` evaluated and reverted — net negative for 189K param model
+
+### Added
+- `warmup_epochs` config for linear LR warmup before cosine decay
+- `look_deadzone` config to zero jitter in look labels
+- `sparse_discrete` config toggle for BC discrete head loss
+- Per-epoch timing (`train_secs`, `val_secs`), wall clock timestamps, `epoch_done` sentinel
+
+### Fixed
+- BC resume starts fresh when no checkpoint exists instead of crashing
+- Skip physics inference on done tick to prevent BSP crash
+- `lr_override.json` used wrong json import alias
+
+## 0.11.0
+
+### Changed
+- Per-type entity tokens (projectile/actor/item/mover) with type-specific scalar dims and projections
+- Variable-length wire format with type tags replaces fixed entity struct
+- Event vocab v2: subject/action/source triples — qualifier and magnitude dropped
+- Cartesian look: 3D direction vector replaces yaw/pitch axes
+- View-relative spatial directions; `dist` and `path_dist` added as explicit entity scalars
+- `qualifier_embed` and `cluster_embed` removed from token pipeline
+
+### Added
+- Python v9 obs parser, tokenizer, and vocab (`obs_format.py`, `vocab.py`)
+- Per-modality recency thresholds (SIGHT 2s, PROXIMITY/SOUND 0.1s, MEMORY 1s)
+- DIMLIGHT sight-derived ACTIVE/POWERUP events on actors
+
+### Fixed
+- Armor and powerup embed masking (0-as-none convention)
+- `entity_types` bounds, env/checkpoint schema tests
+- `map_id` bridge bug; obs schema unified across env and checkpoint
+
+## 0.10.0
+
+### Changed
+- C worker split into `qnn_entity.c`, `qnn_event.c`, `qnn_oracle.c`, `qnn_store.c` with typed structs
+- Three-store world state (actor/object/projectile) wired into oracle, old structs removed
+- Unified tick IO in `qnn_io.c`; action history folded in, headers merged
+- v8 token spec implemented in C worker (Phases 1–3)
+- Entity store populated from server baselines instead of BSP parse order
+- Modality system: SIGHT requires FOV, PROXIMITY for PVS-only, SOUND omnidirectional
+- Legacy region system and server edict dependency removed
+
+### Added
+- Sparse binary loss masking for fire and jump BC heads
+- Hot-reload LR from `lr_override.json` during BC training
+- Mover state tracking (doors, platforms, trains, buttons)
+- Per-store token emitters with normalized scalars
+
+### Fixed
+- Health normalization /100 (mega=2.5), effective armor /160
+- Nav oracle walk speed 300 → 320 (`sv_maxspeed` default)
+- Pickup/respawn/teleport sound classification via `QNN_EmitRecord`
+- `QNN_MAX_SOUNDS` 16 → 128 to match engine `MAX_CHANNELS`
+- Corpse filtering, powerup lifecycle, edict reuse, velocity spikes
+
 ## 0.9.0
 
 ### Changed

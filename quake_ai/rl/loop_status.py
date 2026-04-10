@@ -196,7 +196,7 @@ def build_loop_status(
             status["reason"] = "The run has crossed the hard gate; use retained eval to either promote it or change one thing."
 
     if eval_run_dir:
-        status["recommended_eval_command"] = f"docker compose -f src/docker/compose.yaml run --rm trainer scripts/train.sh {Path(eval_run_dir)}"
+        status["recommended_eval_command"] = f"docker compose -f src/docker/compose.yaml run --rm trainer agents/skills/train/scripts/train.sh {Path(eval_run_dir)}"
     else:
         status["recommended_eval_command"] = None
     status["recommended_summary_command"] = (

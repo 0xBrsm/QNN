@@ -1,79 +1,75 @@
 # Quake AI
 
-This repo has one promoted training workflow: create a frozen run directory,
-then execute it through the training router.
+Transformer policy trained via behavioral cloning and PPO for PvP Quake.
+Packaged as `quake-ai-v0`.
 
-## Current Path
+## Packages
 
-| Item | Current state |
-|------|---------------|
-| Observation contract | token dict with `self`, `object`, `event`, and `spatial` tensors |
-| Policy | transformer trunk + GRU actor-critic |
-| PPO backend | Sample Factory APPO |
-| Public run modes | `bc`, `ppo`, `pbt`, `eval`, `optuna` |
-| Run entry point | `runs/<name>/run.json` |
-| Templates | `src/quake_ai/rl/run_templates/` |
-| Resume control | explicit `run.json.resume` |
-| Warm start | explicit `run.json.checkpoint_path` |
-| PPO artifact root | `run.json.output.checkpoints` |
+| Package | Purpose |
+|---------|---------|
+| `quake_ai` | Python model, training pipeline, and observation contract |
+| `quake_ai.model` | Transformer tokenizer, trunk, and GRU actor-critic policy |
+| `quake_ai.ppo` | Sample Factory APPO integration (env, encoder, worker) |
+| `quake_ai.rl` | Run management, training router, runners, reward, evaluation |
+| `quake_ai.utils` | Device detection, reproducibility, IO helpers |
+| `demo` | Quake `.dem` parser and action-label extraction |
+| `engine` | C worker source, build scripts, and engine patches |
+| `mapgen` | Procedural `.map` generation and compilation |
 
-Campaign-era and profile-era training surfaces are not the promoted path
-anymore. Use frozen run directories for everything.
+## Observation Contract
 
-## What Matters
+v9 token-dict observation. Wire format defined in `engine/worker/qnn_io.h`,
+Python adapter in `quake_ai/obs_format.py`, model shapes in
+`quake_ai/model/observation.py`.
 
-- [`docs/overview.md`](../docs/overview.md) is the source of truth for architecture and observation layout.
-- `python -m quake_ai.rl.training --run-dir runs/<name>` is the runtime router.
-- `scripts/init_run.py` is the only promoted way to create a run.
-- `scripts/train.sh runs/<name>` is the promoted launch wrapper inside the trainer container.
-- Every training and eval action is driven by a frozen run directory under `runs/`.
+| Token type | Count | Scalars | Notes |
+|------------|-------|---------|-------|
+| Self | 1 | 14 + 4 embed IDs | health, armor, weapons, ammo, velocity |
+| Entity | up to 16 | 8/19/15/14 by type | projectile/actor/item/mover, type-tagged |
+| Spatial | 9 | 13 | view-relative directional sectors |
+| Action history | up to 8 | 8 | recent action frames |
 
-## Install
+Action space: 5 play heads (move, look, fire, jump, switch) + 4 recall heads.
 
-From `src/`:
+## Run Modes
+
+All training runs are driven by a frozen run directory. The training router
+dispatches to the correct runner based on `run.json.mode`:
+
+| Mode | Runner | Entry point |
+|------|--------|-------------|
+| `bc` | `quake_ai.rl.runners.bc` | Behavioral cloning from demo data |
+| `ppo` | `quake_ai.rl.runners.ppo` | PPO via Sample Factory APPO |
+| `pbt` | `quake_ai.rl.runners.pbt` | Population-based training |
+| `optuna` | `quake_ai.rl.runners.optuna` | Hyperparameter search |
+| `eval` | `quake_ai.rl.runners.eval` | Evaluation only |
+
+## Commands
 
 ```bash
+# Install (editable)
 python -m pip install -e .
 python -m pip install -e .[dev]
+
+# Create a run
+python -m quake_ai.rl.init_run \
+    --name <run_name> \
+    --checkpoint-path <ckpt> \
+    --resume true
+
+# Launch training
+python -m quake_ai.rl.training --run-dir runs/<run_name>
+
+# GPU check
+python -m quake_ai.utils.check_accelerator --device gpu
 ```
 
-For Sample Factory:
-
-```bash
-pip install numpy==1.26.4
-pip install sample-factory==2.1.1 --no-deps
-pip install gymnasium==0.29.1
-pip install psutil tensorboard tensorboardX signal-slot-mp wandb colorlog opencv-python-headless pyglet threadpoolctl huggingface-hub
-```
-
-For AMD GPUs, use the training container instead of modifying the editor
-environment.
-
-## Promoted Commands
-
-From the repo root:
-
-```bash
-docker compose -f src/docker/compose.yaml build trainer
-docker compose -f src/docker/compose.yaml run --rm trainer python -m quake_ai.utils.check_accelerator --device gpu
-docker compose -f src/docker/compose.yaml run --rm trainer bash
-python scripts/init_run.py --name <run_name> --checkpoint-path <ckpt> --trainer src/quake_ai/rl/run_templates/trainer.json --scenario src/quake_ai/rl/run_templates/scenario.json --reward src/quake_ai/rl/run_templates/reward.json --machine src/quake_ai/rl/run_templates/machine.json --model src/quake_ai/rl/run_templates/model.json
-docker compose -f src/docker/compose.yaml run --rm trainer scripts/train.sh runs/<run_name>
-```
-
-Use the same path for every mode:
-
-- `ppo` is the default comparison lane
-- `pbt` is still a run dir launched through the same wrapper
-- `optuna` is still a run dir launched through the same wrapper
-- `eval` is a run dir with `mode: "eval"`
-
-## Run Layout
+## Run Directory Layout
 
 ```text
 runs/<name>/
-  run.json
-  run.md
+  run.json          # manifest (mode, resume, checkpoint_path, output paths)
+  run.md            # notes
   config/
     trainer.json
     scenario.json
@@ -85,34 +81,35 @@ runs/<name>/
   logs/
 ```
 
-Generated Optuna trial wrappers live under `runs/<name>/trials/`. Each wrapper
-stores trial metadata plus a child PPO run under `ppo/`. Treat them as runtime
-output, not curated run manifests.
+Run templates live in `quake_ai/rl/run_templates/`. `init_run` freezes
+copies into the run directory at creation time.
 
-## Scenario Ladder
+## Config Templates
 
-The default ladder template is
-`src/quake_ai/rl/run_templates/scenario.json`. Each run freezes its own copy in
-`runs/<name>/config/scenario.json`.
+Training config is split by concern under `quake_ai/rl/run_templates/`:
 
-## Config Surface
+| Template | Scope |
+|----------|-------|
+| `trainer.json` | Learning rate, batch size, PPO hyperparameters |
+| `scenario.json` | Bot ladder, map pool, episode settings |
+| `model.json` | Architecture (d_model, heads, layers, GRU) |
+| `reward.json` | Reward shaping weights |
+| `machine.json` | Workers, devices, memory limits |
+| `eval.json` | Evaluation-specific overrides |
+| `run.json` | Mode, checkpoint, resume, output paths |
 
-Training config is split by concern under `src/quake_ai/rl/run_templates/`:
+## Docker
 
-- `machine.json`
-- `scenario.json`
-- `model.json`
-- `trainer.json`
-- `reward.json`
-- `run.json`
+The trainer container is defined in `docker/`:
 
-See [`docs/training-config-matrix.md`](../docs/training-config-matrix.md) for
-the required key matrix.
+```bash
+docker compose -f docker/compose.yaml build trainer
+docker compose -f docker/compose.yaml run --rm trainer bash
+```
 
-## Related Docs
+## Engine Worker
 
-- [`docs/overview.md`](../docs/overview.md)
-- [`docs/token-spec.md`](../docs/token-spec.md)
-- [`agents/training-quality-plan.md`](../agents/training-quality-plan.md)
-- [`agents/training-status.md`](../agents/training-status.md)
-- [`agents/environment.md`](../agents/environment.md)
+C worker source lives in `engine/worker/`. Build scripts and engine patches
+are in `engine/build/` and `engine/patches/`. The worker implements the
+observation packing (`qnn_io.h`), reward computation (`qnn_reward.c`),
+and game-state oracle (`qnn_oracle.c`, `qnn_store.c`).

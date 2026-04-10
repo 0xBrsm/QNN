@@ -729,14 +729,15 @@ void QNN_ResampleInit(int target_hz)
 	}
 }
 
-void QNN_ResampleAccumulate(const qnn_snapshot_t *snapshot, float frame_dt)
+void QNN_ResampleAccumulate(const qnn_action_t *action, float frame_dt)
 {
 	qnn_resample.accumulated_dt += frame_dt;
 
-	/* Merge discrete actions across the window (OR — any press counts). */
-	if (snapshot->action_label.fire)
+	/* Merge discrete actions across the window (OR — any press counts).
+	 * Move labels are inferred once at emission time, not accumulated. */
+	if (action->fire)
 		qnn_resample.fire_any = 1;
-	if (snapshot->action_label.jump)
+	if (action->jump)
 		qnn_resample.jump_any = 1;
 }
 
@@ -751,16 +752,22 @@ qboolean QNN_ResampleShouldEmit(void)
 	return false;
 }
 
-void QNN_ResampleApplyActionMerge(qnn_snapshot_t *snapshot)
+void QNN_ResampleApplyActionMerge(qnn_action_t *action)
 {
-	/* Apply the OR-merged discrete actions to the snapshot being emitted. */
-	if (qnn_resample.fire_any)
-		snapshot->action_label.fire = 1;
-	if (qnn_resample.jump_any)
-		snapshot->action_label.jump = 1;
+	/* Move is already set by QNN_InferEmitMove — no accumulation needed. */
 
-	/* Reset accumulators for next window. */
-	qnn_resample.accumulated_dt = 0.0f;
+	if (qnn_resample.fire_any)
+		action->fire = 1;
+	if (qnn_resample.jump_any)
+		action->jump = 1;
+
+	/* Subtract one window instead of zeroing so the fractional remainder
+	 * carries forward.  This lets low-rate demos (native < target) produce
+	 * the correct number of emissions over time. */
+	if (qnn_resample.target_dt > 0.0f)
+		qnn_resample.accumulated_dt -= qnn_resample.target_dt;
+	else
+		qnn_resample.accumulated_dt = 0.0f;
 	qnn_resample.fire_any = 0;
 	qnn_resample.jump_any = 0;
 }

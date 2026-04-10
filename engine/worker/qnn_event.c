@@ -164,6 +164,38 @@ static const qnn_sound_rule_t *QNN_FindSoundRule(const qnn_sound_rule_t *rules, 
 	return NULL;
 }
 
+static qboolean QNN_SoundMatchesAction(const qnn_sound_rule_t *rules, const char *name, int action_id)
+{
+	const qnn_sound_rule_t *rule = QNN_FindSoundRule(rules, name);
+	return (rule != NULL && rule->action_id == action_id) ? true : false;
+}
+
+static qboolean QNN_SnapshotHasSelfActionSound(const qnn_snapshot_t *snapshot,
+	const qnn_sound_rule_t *rules, int action_id)
+{
+	int i;
+
+	for (i = 0; i < snapshot->sound_count; ++i)
+	{
+		const qnn_sound_event_t *sound = &snapshot->sounds[i];
+		if (sound->entity_num != cl.viewentity)
+			continue;
+		if (QNN_SoundMatchesAction(rules, sound->name, action_id))
+			return true;
+	}
+	return false;
+}
+
+qboolean QNN_SnapshotHasSelfWeaponFireSound(const qnn_snapshot_t *snapshot)
+{
+	return QNN_SnapshotHasSelfActionSound(snapshot, qnn_weapon_sound_rules, QNN_ACTION_FIRE);
+}
+
+qboolean QNN_SnapshotHasSelfJumpSound(const qnn_snapshot_t *snapshot)
+{
+	return QNN_SnapshotHasSelfActionSound(snapshot, qnn_player_sound_rules, QNN_ACTION_JUMP);
+}
+
 static qboolean QNN_EmitRecord(qnn_event_record_t *out, int *count, int max,
 	const qnn_sound_event_t *snd, int action_id, int source_id)
 {

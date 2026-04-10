@@ -696,3 +696,84 @@ def run_evaluation(
             if isinstance(value, (int, float)):
                 flattened[f"{mode}_{key}"] = float(value)
     return flattened
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point (python -m quake_ai.rl.evaluation)
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    import argparse
+
+    from quake_ai.rl.run_config import (
+        load_run_config,
+        build_run_eval_config,
+        run_output_dirs,
+        _require_mapping,
+        _require_string,
+    )
+    from quake_ai.rl.planning import _resolve_asset_root, _validate_native_mod_assets
+
+    parser = argparse.ArgumentParser(description="Multi-episode evaluation of a checkpoint")
+    parser.add_argument("run_dir", type=Path, help="Run directory containing run.json")
+    parser.add_argument("--checkpoint", required=True, help="Checkpoint path relative to run's checkpoints dir")
+    parser.add_argument("--num-episodes", type=int, default=None, help="Override eval_num_episodes from config")
+    parser.add_argument("--num-envs", type=int, default=None, help="Override eval_num_envs from config")
+    parser.add_argument("--device", default="cpu", help="Torch device (default: cpu)")
+    args = parser.parse_args()
+
+    run_cfg = load_run_config(args.run_dir.resolve())
+    machine = _require_mapping(run_cfg, "machine", "run config")
+    model_config = _require_mapping(run_cfg, "model", "run config")
+
+    outputs = run_output_dirs(run_cfg)
+    checkpoint_path = outputs["checkpoints"] / args.checkpoint
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    asset_root = _resolve_asset_root(_require_string(machine, "asset_root", "machine.json"))
+    worker_path = Path(run_cfg["run_dir"]).parent.parent / _require_string(machine, "worker_binary", "machine.json")
+    if not worker_path.exists():
+        worker_path = Path.cwd() / _require_string(machine, "worker_binary", "machine.json")
+    if not worker_path.exists():
+        raise FileNotFoundError(f"Worker binary not found: {worker_path}")
+
+    native_args = _require_mapping(run_cfg, "scenario", "run config").get("native_args", [])
+    _validate_native_mod_assets(asset_root, native_args)
+
+    run_cfg["checkpoint_path"] = str(checkpoint_path)
+    eval_cfg = build_run_eval_config(run_cfg, args.device)
+    eval_cfg["native_env"] = {"QUAKE_BASEDIR": str(asset_root)}
+    eval_cfg["native_executable"] = str(worker_path)
+
+    if args.num_episodes is not None:
+        eval_cfg["num_episodes"] = args.num_episodes
+    if args.num_envs is not None:
+        eval_cfg["num_envs"] = args.num_envs
+
+    config = EvalConfig(**eval_cfg)
+    print(f"Run:        {run_cfg['run_dir']}")
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"Episodes:   {config.num_episodes}")
+    print(f"Envs:       {config.num_envs}")
+    print(f"Modes:      {config.policy_modes}")
+    print(f"Device:     {config.device}")
+    print()
+
+    results = run_evaluation(config, model_config=model_config)
+
+    print()
+    print("=== Evaluation Summary ===")
+    for key in ("mean_episode_return", "death_rate", "stuck_rate",
+                "episode_frag_delta_mean", "episode_damage_dealt_mean",
+                "episode_hit_count_mean", "episode_shots_fired_mean"):
+        if key in results:
+            print(f"  {key}: {results[key]:.3f}")
+
+    output_dir = Path(eval_cfg["output_dir"])
+    print(f"\n  Results written to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()

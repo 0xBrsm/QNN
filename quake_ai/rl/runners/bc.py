@@ -1,7 +1,7 @@
 """Behavior cloning runner.
 
 Expects precomputed .npy caches at {asset_root}/bc/precomputed_train/
-and precomputed_val/. Run scripts/bc_collect.py first to generate them.
+and precomputed_val/. Run python -m quake_ai.rl.bc_collect first to generate them.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def run(ctx: RunnerContext) -> dict[str, object]:
     if not train_cache.exists():
         raise RuntimeError(
             f"BC training data not found at {train_cache}. "
-            f"Run scripts/bc_collect.py first."
+            f"Run python -m quake_ai.rl.bc_collect first."
         )
 
     seed_checkpoint = str(ctx.run_cfg.get("checkpoint_path", ""))

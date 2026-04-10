@@ -420,12 +420,12 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    # Load precomputed .npy caches (produced by scripts/bc_collect.py)
+    # Load precomputed .npy caches (produced by python -m quake_ai.rl.bc_collect)
     bc_data_dir = Path(config.bc_data_dir) if hasattr(config, "bc_data_dir") else Path(config.output_dir).parent
     train_cache = bc_data_dir / "precomputed_train"
     val_cache = bc_data_dir / "precomputed_val"
     if not train_cache.exists():
-        raise RuntimeError(f"BC training data not found at {train_cache}. Run scripts/bc_collect.py first.")
+        raise RuntimeError(f"BC training data not found at {train_cache}. Run python -m quake_ai.rl.bc_collect first.")
 
     print(f"  [bc] Loading training data: {train_cache}")
     train_episodes = _load_precomputed(train_cache)
