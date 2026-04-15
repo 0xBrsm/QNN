@@ -1,7 +1,9 @@
 #include "qnn.h"
 #include "qnn_io.h"
 
-#define QNN_INPUT_MOVE_DEADZONE 0.25f
+/* Move output is in [-1, 1].  Scale to sv_maxspeed: any larger value
+ * is clipped to maxspeed by SV_AirMove anyway. */
+#define QNN_INPUT_JUMP_THRESHOLD 0.5f
 #define QNN_INPUT_DEGREES_PER_COUNT 0.066f
 
 qnn_action_t qnn_pending_action;
@@ -29,15 +31,14 @@ void IN_Commands(void)
 
 void IN_Move(usercmd_t *cmd)
 {
-	if (qnn_pending_action.move[0] > QNN_INPUT_MOVE_DEADZONE)
-		cmd->forwardmove += cl_forwardspeed.value;
-	else if (qnn_pending_action.move[0] < -QNN_INPUT_MOVE_DEADZONE)
-		cmd->forwardmove -= cl_backspeed.value;
-
-	if (qnn_pending_action.move[1] < -QNN_INPUT_MOVE_DEADZONE)
-		cmd->sidemove -= cl_sidespeed.value;
-	else if (qnn_pending_action.move[1] > QNN_INPUT_MOVE_DEADZONE)
-		cmd->sidemove += cl_sidespeed.value;
+	/* 3D view-relative move: (forward, right, up).
+	 * Continuous pass-through to forwardmove/sidemove — the engine
+	 * physics handles any value in [-1, 1] * QNN_INPUT_MOVE_SCALE.
+	 * BC labels are snapped to keyboard directions; PPO can interpolate. */
+	cmd->forwardmove = QNN_Clamp(qnn_pending_action.move[0], -1.0f, 1.0f)
+		* QNN_SV_MAXSPEED;
+	cmd->sidemove = QNN_Clamp(qnn_pending_action.move[1], -1.0f, 1.0f)
+		* QNN_SV_MAXSPEED;
 
 	/* View-relative look: look[3] = (forward, right, up) in view frame.
 	   The right and up components directly give yaw/pitch turn axes. */
@@ -88,7 +89,8 @@ void IN_Move(usercmd_t *cmd)
 	else
 		in_attack.state = 0;
 
-	if (cl.stats[STAT_HEALTH] > 0 && qnn_pending_action.jump)
+	/* move[2] > threshold = jump (grounded) or swim up (water). */
+	if (cl.stats[STAT_HEALTH] > 0 && qnn_pending_action.move[2] > QNN_INPUT_JUMP_THRESHOLD)
 		QNN_PressButton(&in_jump);
 	else if (cl.stats[STAT_HEALTH] > 0)
 		in_jump.state = 0;

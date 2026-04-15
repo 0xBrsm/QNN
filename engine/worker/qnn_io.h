@@ -24,7 +24,7 @@
 #define QNN_OBS_SPATIAL_COUNT         9
 #define QNN_OBS_SPATIAL_SCALAR_DIM   13
 #define QNN_OBS_ACTION_HISTORY_LEN    8
-#define QNN_OBS_ACTION_HISTORY_DIM    8
+#define QNN_OBS_ACTION_HISTORY_DIM    8  /* move[3] + look[3] + fire + switch */
 #define QNN_OBS_SELF_POWERUP_SLOTS    5
 
 /* ── Normalization constants ───────────────────────────────────── */
@@ -32,7 +32,7 @@
 #define QNN_DIST_SCALE      1000.0f
 #define QNN_VELOCITY_SCALE  2000.0f
 #define QNN_TIME_SCALE        60.0f
-#define QNN_SV_MAXSPEED      320.0f
+/* Engine physics constants moved to qnn.h (shared with snap/inference). */
 
 /* ── Action history ────────────────────────────────────────────── */
 
@@ -123,10 +123,9 @@ typedef struct
 
 typedef struct
 {
-	float move[2];
+	float move[3];
 	float look[3];
 	float fire;
-	float jump;
 	float switch_norm;
 } qnn_action_token_t;
 

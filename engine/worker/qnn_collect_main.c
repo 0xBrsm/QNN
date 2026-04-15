@@ -58,26 +58,29 @@ void QNN_MatchCheckPrint(const char *text)
 	}
 }
 
-#define QNN_DEMO_MOUSE_DEGREES_PER_COUNT 0.066f
-#define QNN_DEMO_JUMP_VELOCITY_THRESHOLD 160.0f
+/* Per-native-frame buffers for entity interaction (movers, players). */
+#define QNN_MAX_NATIVE_FRAMES 16
+
+/* trigger_push: max tracked push triggers. */
+#define QNN_MAX_PUSH_TRIGGERS 8
+
+/* Emission-level frame filters. */
+#define QNN_GOD_MODE_HEALTH     250
+#define QNN_DEAD_MAX_EMIT       20   /* 1 s at 20 Hz */
+#define QNN_FROZEN_MAX_EMIT     40   /* 2 s at 20 Hz */
+#define QNN_FROZEN_LOOK_TOL     0.025f
 
 typedef struct
 {
 	int	fixed_tick_hz;
 	float	fixed_dt;
 	int	resample_hz;	/* requested resample target; 0 = use detected rate */
-	float	movement_threshold;
-	int	seed;
 	int	tick;
 	int	steps;
 	qboolean has_reset;
 	qboolean done;
 	vec3_t	prev_origin;
 	vec3_t	prev_velocity;	/* reconstructed from position deltas */
-	qboolean prev_grounded;
-	int	prev_waterlevel;
-	int	prev_health;
-	int	prev_weapon_id;
 	int	prev_ammo;
 	qboolean has_prev;
 	vec3_t	emit_view_angles;
@@ -85,22 +88,130 @@ typedef struct
 	vec3_t	emit_velocity;
 	qboolean emit_grounded;
 	int	emit_waterlevel;
-	/* Z-delta ground detection for spectator demos where cl.onground
-	 * reflects the spectator, not the tracked player. */
-	float	prev_z;
-	int	ground_frames;	/* native frames with |dz| < threshold */
-	int	total_frames;	/* total native frames in current window */
 	int	emit_weapon_id;
 	qboolean has_emit_anchor;
-	float	prev_move[2];	/* last inferred move — carried forward for zero-frame emissions */
+	int	native_frame_count;
+	qboolean phys_grounded;
+	/* Mover tracking for per-frame entity interaction. */
+	int	mover_entity_nums[QNN_MAX_PHYS_MOVERS];
+	int	mover_model_indices[QNN_MAX_PHYS_MOVERS];
+	int	mover_count;
+	vec3_t	mover_emit_origins[QNN_MAX_PHYS_MOVERS];
+	vec3_t	mover_origins[QNN_MAX_NATIVE_FRAMES][QNN_MAX_PHYS_MOVERS];
+	/* Other player positions per native frame for body-block collision. */
+	vec3_t	player_origins[QNN_MAX_NATIVE_FRAMES][QNN_MAX_PHYS_PLAYERS];
+	int	player_entity_nums[QNN_MAX_PHYS_PLAYERS];
+	int	player_count;
+	/* trigger_push tracking. */
+	int	push_model_indices[QNN_MAX_PUSH_TRIGGERS];
+	vec3_t	push_velocities[QNN_MAX_PUSH_TRIGGERS]; /* speed * direction */
+	int	push_count;
+	float	prev_move[3];	/* last inferred move — carried forward for zero-frame emissions */
+	int	prev_fwd_sign;	/* last candidate forward sign for continuity bias */
+	int	prev_strafe_sign;
 	FILE	*store_dump;	/* NULL = no dump, set from QNN_STORE_DUMP env var */
 	/* Buffered obs for one-tick delay: we emit obs(t) paired with
 	   the action computed at t+1 (the transition FROM state t). */
 	uint8_t	buffered_obs[QNN_OBS_BUFFER_SIZE];
 	qboolean has_buffered_obs;
+	/* Second buffer for 3-frame jitter filter: holds the previous
+	   tick's obs+action so we can check if its move is an outlier
+	   before emitting.  prev_prev_move holds the move from the tick
+	   before the buffered one. */
+	uint8_t	jitter_obs[QNN_OBS_BUFFER_SIZE];
+	qnn_action_t jitter_action;
+	int	jitter_tick;
+	int	jitter_steps;
+	int	jitter_tick_hz;
+	uint16_t jitter_flags;
+	FILE	*jitter_out;	/* NULL = filtered (skip), stdout = emit */
+	qboolean has_jitter_buf;
+	float	prev_prev_move[3];
+	qboolean has_prev_prev_move;
+	/* Frame filter counters (emission-rate) */
+	int	dead_emit_count;
+	int	frozen_emit_count;
 } qnn_runtime_t;
 
 static qnn_runtime_t qnn_runtime;
+
+/* Scan the entity store for movers and record their entity_num +
+ * modelindex for BSP collision during physics baseline steps. */
+static void QNN_BuildMoverRefs(void)
+{
+	int i, count;
+
+	count = 0;
+	for (i = 0; i < MAX_EDICTS && count < QNN_MAX_PHYS_MOVERS; i++)
+	{
+		entity_t *ent;
+		if (qnn_store[i].type != QNN_ENT_MOVER)
+			continue;
+		ent = &cl_entities[i];
+		if (ent->model == NULL || ent->model->name[0] != '*')
+			continue;
+		qnn_runtime.mover_entity_nums[count] = i;
+		/* Find modelindex by matching model pointer against precache. */
+		{
+			int j;
+			qnn_runtime.mover_model_indices[count] = 0;
+			for (j = 1; j < MAX_MODELS; j++)
+			{
+				if (cl.model_precache[j] == ent->model)
+				{
+					qnn_runtime.mover_model_indices[count] = j;
+					break;
+				}
+			}
+		}
+		if (qnn_runtime.mover_model_indices[count] > 0)
+			count++;
+	}
+	qnn_runtime.mover_count = count;
+	if (count > 0)
+		fprintf(stderr, "[demo] tracking %d movers for physics baseline\n", count);
+}
+
+/* Build push trigger references from the entity store overflow. */
+static void QNN_BuildPushRefs(void)
+{
+	int i, count;
+
+	count = 0;
+	for (i = MAX_EDICTS; i < QNN_StoreCapacity() && count < QNN_MAX_PUSH_TRIGGERS; i++)
+	{
+		qnn_entity_t *e = &qnn_store[i];
+		if (e->type != QNN_ENT_PUSH || e->push_model_index <= 0)
+			continue;
+		qnn_runtime.push_model_indices[count] = e->push_model_index;
+		qnn_runtime.push_velocities[count][0] = e->push_direction[0] * e->push_speed;
+		qnn_runtime.push_velocities[count][1] = e->push_direction[1] * e->push_speed;
+		qnn_runtime.push_velocities[count][2] = e->push_direction[2] * e->push_speed;
+		count++;
+	}
+	qnn_runtime.push_count = count;
+	if (count > 0)
+		fprintf(stderr, "[demo] tracking %d push triggers for velocity subtraction\n", count);
+}
+
+/* Scan for other players (actors) in the entity store. */
+static void QNN_BuildPlayerRefs(void)
+{
+	int i, count;
+
+	count = 0;
+	for (i = 1; i <= cl.maxclients && count < QNN_MAX_PHYS_PLAYERS; i++)
+	{
+		if (i == cl.viewentity)
+			continue;
+		if (qnn_store[i].type != QNN_ENT_ACTOR)
+			continue;
+		qnn_runtime.player_entity_nums[count++] = i;
+	}
+	qnn_runtime.player_count = count;
+	if (count > 0)
+		fprintf(stderr, "[demo] tracking %d other players for body-block collision\n", count);
+}
 
 static qboolean QNN_ClientReady(void)
 {
@@ -110,20 +221,6 @@ static qboolean QNN_ClientReady(void)
 		&& cl.worldmodel != NULL
 		&& cl.viewentity > 0
 		&& cl.viewentity < MAX_EDICTS) ? true : false;
-}
-
-static void QNN_ReconstructVelocity(vec3_t out, const qnn_snapshot_t *snapshot, float dt)
-{
-	int i;
-
-	if (!qnn_runtime.has_prev || dt <= 0.0f)
-	{
-		out[0] = out[1] = out[2] = 0.0f;
-		return;
-	}
-
-	for (i = 0; i < 3; i++)
-		out[i] = (snapshot->player_origin[i] - qnn_runtime.prev_origin[i]) / dt;
 }
 
 static void QNN_InferEmitAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
@@ -150,84 +247,124 @@ static void QNN_InferEmitAction(qnn_action_t *action, const qnn_snapshot_t *snap
 		action->switch_slot = QNN_SwitchSlotFromWeaponId(snapshot->weapon_id);
 }
 
-/* Per-native-frame: infer discrete actions (fire, jump) from sound
- * and state cues.  Move is NOT inferred here — it's done once per
- * emission window in QNN_InferEmitMove. */
+/* Per-native-frame: infer fire from sound/ammo cues. */
 static void QNN_InferNativeAction(qnn_action_t *action,
-	const qnn_snapshot_t *snapshot, float dt)
+	const qnn_snapshot_t *snapshot)
 {
-	vec3_t cur_vel;
-	qboolean in_water;
-
 	QNN_ClearAction(action);
 
 	if (!qnn_runtime.has_prev)
 		return;
 
-	QNN_ReconstructVelocity(cur_vel, snapshot, dt);
-
-	action->fire = (snapshot->ammo < qnn_runtime.prev_ammo
-		|| QNN_SnapshotHasSelfWeaponFireSound(snapshot)
-		|| (qnn_runtime.prev_health <= 0 && snapshot->health > 0)) ? 1 : 0;
-
-	in_water = (snapshot->waterlevel >= 2 || qnn_runtime.prev_waterlevel >= 2);
-	if (QNN_SnapshotHasSelfJumpSound(snapshot)
-		|| (in_water && cur_vel[2] > 0.0f)
-		|| (!in_water
-			&& qnn_runtime.prev_grounded
-			&& !snapshot->grounded
-			&& qnn_runtime.prev_velocity[2] <= 32.0f
-			&& cur_vel[2] >= QNN_DEMO_JUMP_VELOCITY_THRESHOLD))
-		action->jump = 1;
+	action->fire = (QNN_SnapshotHasSelfWeaponFireSound(snapshot)
+		|| snapshot->ammo < qnn_runtime.prev_ammo) ? 1 : 0;
 }
 
-/* Per-emission: infer move labels from the full emission window.
- * Uses BSP-clipped physics simulation over the window duration. */
+/* Per-emission: determine the player's input by simulating all 9 key
+ * combinations and picking the one whose BSP-clipped endpoint best
+ * matches the observed position.  All candidates start from the same
+ * state and go through the same geometry — no path divergence.
+ *
+ * Output is snapped to the 9 legal keyboard directions via QNN_SnapMove.
+ * Z is handled separately: sound-based jump on ground/air, inversion
+ * snap in water. */
 static void QNN_InferEmitMove(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot, float emit_dt)
 {
-	vec3_t cur_vel;
+	int fwd_sign, strafe_sign;
+	float raw[3];
+	int medium, i;
 
 	if (!qnn_runtime.has_emit_anchor || emit_dt <= 0.0f)
 		return;
 
+	/* Need BSP hull for candidate simulation. */
+	if (sv.worldmodel == NULL || sv.worldmodel->hulls[1].firstclipnode < 0)
 	{
-		vec3_t emit_vel_xy;
-		qboolean on_ground;
-
-		/* Determine ground state from Z deltas across native frames in
-		 * this emission window.  cl.onground is unreliable for spectator
-		 * demos (reflects spectator, not tracked player). */
-		on_ground = (qnn_runtime.total_frames > 0
-			&& qnn_runtime.ground_frames > qnn_runtime.total_frames / 2)
-			? true : false;
-
-		/* Zero Z velocity — the simulation applies gravity internally. */
-		emit_vel_xy[0] = qnn_runtime.emit_velocity[0];
-		emit_vel_xy[1] = qnn_runtime.emit_velocity[1];
-		emit_vel_xy[2] = 0.0f;
-		/* Reconstruct velocity from position deltas — cl.velocity is the
-		 * spectator's velocity in spectator demos, not the tracked player's. */
-		{
-			int i;
-			for (i = 0; i < 3; i++)
-				cur_vel[i] = (snapshot->player_origin[i] - qnn_runtime.emit_origin[i]) / emit_dt;
-		}
-
-		QNN_PhysInferMove(action,
-			emit_vel_xy,
-			cur_vel,
-			qnn_runtime.emit_origin,
-			qnn_runtime.emit_view_angles,
-			on_ground,
-			qnn_runtime.emit_waterlevel,
-			snapshot->player_origin,
-			on_ground,
-			snapshot->waterlevel,
-			emit_dt,
-			qnn_runtime.fixed_dt,
-			qnn_runtime.movement_threshold);
+		/* Fallback: raw delta → snap. */
+		vec3_t delta, rel;
+		for (i = 0; i < 3; i++)
+			delta[i] = (snapshot->player_origin[i] - qnn_runtime.emit_origin[i]) / emit_dt;
+		QNN_RelativeFrame(qnn_runtime.emit_view_angles, delta, rel);
+		raw[0] = rel[0] / QNN_SV_MAXSPEED;
+		raw[1] = rel[1] / QNN_SV_MAXSPEED;
+		raw[2] = rel[2] / QNN_SV_MAXSPEED;
+		goto snap;
 	}
+
+	/* Set up movers at their emission-start positions + velocities. */
+	if (qnn_runtime.mover_count > 0)
+	{
+		qnn_mover_state_t ms[QNN_MAX_PHYS_MOVERS];
+		int m;
+		for (m = 0; m < qnn_runtime.mover_count; m++)
+		{
+			int nf = qnn_runtime.native_frame_count;
+			float *mend = (nf > 0) ? qnn_runtime.mover_origins[nf - 1][m]
+				: qnn_runtime.mover_emit_origins[m];
+			ms[m].model_index = qnn_runtime.mover_model_indices[m];
+			VectorCopy(qnn_runtime.mover_emit_origins[m], ms[m].origin);
+			for (i = 0; i < 3; i++)
+				ms[m].velocity[i] = (mend[i] - qnn_runtime.mover_emit_origins[m][i]) / emit_dt;
+		}
+		QNN_PhysSetupMovers(ms, qnn_runtime.mover_count);
+	}
+
+	/* Set up other players at mid-window positions. */
+	if (qnn_runtime.player_count > 0)
+	{
+		int nf = qnn_runtime.native_frame_count;
+		int mid = (nf > 0) ? nf / 2 : 0;
+		if (mid < nf)
+			QNN_PhysSetupPlayers(qnn_runtime.player_origins[mid],
+				qnn_runtime.player_count);
+	}
+
+	{
+		qboolean unreachable;
+
+		QNN_PhysBestCandidate(
+			qnn_runtime.emit_velocity, qnn_runtime.emit_origin,
+			qnn_runtime.emit_view_angles, qnn_runtime.emit_grounded,
+			qnn_runtime.emit_waterlevel, emit_dt,
+			snapshot->player_origin,
+			qnn_runtime.prev_fwd_sign, qnn_runtime.prev_strafe_sign,
+			&fwd_sign, &strafe_sign, &unreachable);
+
+		/* External force (knockback, trigger_push) moved the player
+		 * beyond what any key combo can explain — carry forward. */
+		if (unreachable)
+		{
+			fwd_sign = qnn_runtime.prev_fwd_sign;
+			strafe_sign = qnn_runtime.prev_strafe_sign;
+		}
+	}
+	qnn_runtime.prev_fwd_sign = fwd_sign;
+	qnn_runtime.prev_strafe_sign = strafe_sign;
+
+	/* Convert candidate signs to raw move vector for QNN_SnapMove. */
+	raw[0] = (float)fwd_sign;
+	raw[1] = (float)strafe_sign;
+	/* Z: use raw position delta for water inversion, or 0 for ground. */
+	{
+		vec3_t delta, rel;
+		for (i = 0; i < 3; i++)
+			delta[i] = (snapshot->player_origin[i] - qnn_runtime.emit_origin[i]) / emit_dt;
+		QNN_RelativeFrame(qnn_runtime.emit_view_angles, delta, rel);
+		raw[2] = rel[2] / QNN_SV_MAXSPEED;
+	}
+
+snap:
+	if (qnn_runtime.emit_waterlevel >= 2)
+		medium = QNN_MEDIUM_WATER;
+	else if (qnn_runtime.emit_grounded)
+		medium = QNN_MEDIUM_GROUND;
+	else
+		medium = QNN_MEDIUM_AIR;
+
+	QNN_SnapMove(raw, medium,
+		QNN_SnapshotHasSelfJumpSound(snapshot),
+		action->move);
 }
 
 /* Emit one framed tick: header + obs + action. */
@@ -252,12 +389,65 @@ static void QNN_EmitTick(FILE *out, const uint8_t *obs,
 	fflush(out);
 }
 
+/* 3-frame jitter filter: if the buffered tick's XY move reverses
+ * the previous tick (dot < -0.866, >150°) and the current tick
+ * agrees with the previous (dot > 0.6, <~45°), replace the
+ * buffered tick's move with the previous tick's move.
+ * Only operates on the XY plane; Z is independent (jump/swim). */
+static void QNN_JitterFilter(qnn_action_t *mid, const float *prev_move,
+	const float *next_move)
+{
+	float mp, mm, mn;
+	float dp[2], dm[2], dn[2];
+	float dot_neighbors, dot_mid_prev, dot_mid_next;
+
+	mp = sqrtf(prev_move[0] * prev_move[0] + prev_move[1] * prev_move[1]);
+	mm = sqrtf(mid->move[0] * mid->move[0] + mid->move[1] * mid->move[1]);
+	mn = sqrtf(next_move[0] * next_move[0] + next_move[1] * next_move[1]);
+
+	if (mp < 0.01f || mm < 0.01f || mn < 0.01f)
+		return;
+
+	dp[0] = prev_move[0] / mp;  dp[1] = prev_move[1] / mp;
+	dm[0] = mid->move[0] / mm;  dm[1] = mid->move[1] / mm;
+	dn[0] = next_move[0] / mn;  dn[1] = next_move[1] / mn;
+
+	dot_neighbors = dp[0] * dn[0] + dp[1] * dn[1];
+	dot_mid_prev  = dm[0] * dp[0] + dm[1] * dp[1];
+	dot_mid_next  = dm[0] * dn[0] + dm[1] * dn[1];
+
+	if (dot_neighbors > 0.6f && dot_mid_prev < 0.0f && dot_mid_next < 0.0f)
+	{
+		mid->move[0] = prev_move[0];
+		mid->move[1] = prev_move[1];
+	}
+}
+
+/* Flush the jitter buffer — emit the held tick without a future frame
+ * to compare against (used at episode end). */
+static void QNN_FlushJitterBuf(void)
+{
+	if (!qnn_runtime.has_jitter_buf)
+		return;
+	if (qnn_runtime.jitter_out != NULL)
+		QNN_EmitTick(qnn_runtime.jitter_out, qnn_runtime.jitter_obs,
+			&qnn_runtime.jitter_action,
+			qnn_runtime.jitter_tick, qnn_runtime.jitter_steps,
+			qnn_runtime.jitter_tick_hz, qnn_runtime.jitter_flags);
+	qnn_runtime.has_prev_prev_move = true;
+	qnn_runtime.prev_prev_move[0] = qnn_runtime.jitter_action.move[0];
+	qnn_runtime.prev_prev_move[1] = qnn_runtime.jitter_action.move[1];
+	qnn_runtime.prev_prev_move[2] = qnn_runtime.jitter_action.move[2];
+	qnn_runtime.has_jitter_buf = false;
+}
+
 /* Write a single tick in obs_buffer format: obs + action label + framing.
  *
- * One-tick buffer: the obs from tick t is held until tick t+1 so we can
- * pair it with the action computed at t+1 (the transition FROM state t).
- * This ensures the model sees obs(t) with the action taken from that state,
- * not the action that arrived at that state. */
+ * Two-level buffer:
+ *   Level 1 (obs buffer): obs from tick t is held until tick t+1 so we
+ *   can pair it with the action computed at t+1.
+ *   Level 2 (jitter buffer): the paired obs+action is held one more tick
+ *   so the 3-frame jitter filter can check it against prev and next. */
 static void QNN_WriteObsTick(FILE *out, const qnn_snapshot_t *snapshot,
 	int tick, int steps, int tick_hz, qboolean reset_flag)
 {
@@ -275,31 +465,76 @@ static void QNN_WriteObsTick(FILE *out, const qnn_snapshot_t *snapshot,
 	{
 		if (snapshot->done)
 		{
-			/* Degenerate: done on first tick (0-1 tick episode).
-			   Emit directly so the reader sees the DONE flag. */
-			QNN_EmitTick(out, cur_obs, &snapshot->action_label,
-				tick, steps, tick_hz, 0x02);
+			if (out != NULL)
+				QNN_EmitTick(out, cur_obs, &snapshot->action_label,
+					tick, steps, tick_hz, 0x02);
 			return;
 		}
-		/* First tick: buffer the obs; no action to pair yet. */
 		memcpy(qnn_runtime.buffered_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
 		qnn_runtime.has_buffered_obs = true;
 		return;
 	}
 
-	/* Emit the buffered obs with the current action (transition from
-	   the buffered state to this state). */
+	/* We now have a complete obs+action pair ready for the jitter buffer. */
 	if (snapshot->done) flags |= 0x02;
 	if (reset_flag) flags |= 0x01;
-	QNN_EmitTick(out, qnn_runtime.buffered_obs, &snapshot->action_label,
-		tick, steps, tick_hz, flags);
 
-	/* Buffer current obs for next emit (unless this was the done tick,
-	   in which case there is no next action to pair with). */
-	if (!snapshot->done)
-		memcpy(qnn_runtime.buffered_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
+	if (!qnn_runtime.has_jitter_buf)
+	{
+		/* First real pair: push into jitter buffer, can't filter yet. */
+		memcpy(qnn_runtime.jitter_obs, qnn_runtime.buffered_obs,
+			QNN_OBS_BUFFER_SIZE);
+		qnn_runtime.jitter_action = snapshot->action_label;
+		qnn_runtime.jitter_tick = tick;
+		qnn_runtime.jitter_steps = steps;
+		qnn_runtime.jitter_tick_hz = tick_hz;
+		qnn_runtime.jitter_flags = flags;
+		qnn_runtime.jitter_out = out;
+		qnn_runtime.has_jitter_buf = true;
+	}
 	else
+	{
+		/* We have prev_prev (if any), jitter_buf (middle), and current
+		   action (next).  Apply the 3-frame filter to the middle. */
+		if (qnn_runtime.has_prev_prev_move)
+			QNN_JitterFilter(&qnn_runtime.jitter_action,
+				qnn_runtime.prev_prev_move,
+				snapshot->action_label.move);
+
+		/* Emit the (possibly corrected) jitter-buffered tick. */
+		if (qnn_runtime.jitter_out != NULL)
+			QNN_EmitTick(qnn_runtime.jitter_out, qnn_runtime.jitter_obs,
+				&qnn_runtime.jitter_action,
+				qnn_runtime.jitter_tick,
+				qnn_runtime.jitter_steps,
+				qnn_runtime.jitter_tick_hz,
+				qnn_runtime.jitter_flags);
+
+		/* Advance: jitter_buf move becomes prev_prev, current becomes jitter_buf. */
+		qnn_runtime.prev_prev_move[0] = qnn_runtime.jitter_action.move[0];
+		qnn_runtime.prev_prev_move[1] = qnn_runtime.jitter_action.move[1];
+		qnn_runtime.prev_prev_move[2] = qnn_runtime.jitter_action.move[2];
+		qnn_runtime.has_prev_prev_move = true;
+
+		memcpy(qnn_runtime.jitter_obs, qnn_runtime.buffered_obs,
+			QNN_OBS_BUFFER_SIZE);
+		qnn_runtime.jitter_action = snapshot->action_label;
+		qnn_runtime.jitter_tick = tick;
+		qnn_runtime.jitter_steps = steps;
+		qnn_runtime.jitter_tick_hz = tick_hz;
+		qnn_runtime.jitter_flags = flags;
+		qnn_runtime.jitter_out = out;
+	}
+
+	/* If this was the done tick, flush the jitter buffer and close out. */
+	if (snapshot->done)
+	{
+		QNN_FlushJitterBuf();
 		qnn_runtime.has_buffered_obs = false;
+		return;
+	}
+
+	memcpy(qnn_runtime.buffered_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
 }
 
 static void QNN_SavePrev(const qnn_snapshot_t *snapshot, float dt)
@@ -319,10 +554,6 @@ static void QNN_SavePrev(const qnn_snapshot_t *snapshot, float dt)
 		qnn_runtime.prev_velocity[2] = 0.0f;
 	}
 	VectorCopy(snapshot->player_origin, qnn_runtime.prev_origin);
-	qnn_runtime.prev_grounded = snapshot->grounded;
-	qnn_runtime.prev_waterlevel = snapshot->waterlevel;
-	qnn_runtime.prev_health = snapshot->health;
-	qnn_runtime.prev_weapon_id = snapshot->weapon_id;
 	qnn_runtime.prev_ammo = snapshot->ammo;
 	qnn_runtime.has_prev = true;
 }
@@ -331,9 +562,6 @@ static void QNN_SaveEmitAnchor(const qnn_snapshot_t *snapshot)
 {
 	VectorCopy(snapshot->player_view_angles, qnn_runtime.emit_view_angles);
 	VectorCopy(snapshot->player_origin, qnn_runtime.emit_origin);
-	qnn_runtime.prev_z = snapshot->player_origin[2];
-	qnn_runtime.ground_frames = 0;
-	qnn_runtime.total_frames = 0;
 	if (qnn_runtime.has_prev)
 	{
 		VectorCopy(qnn_runtime.prev_velocity, qnn_runtime.emit_velocity);
@@ -348,6 +576,79 @@ static void QNN_SaveEmitAnchor(const qnn_snapshot_t *snapshot)
 	qnn_runtime.emit_waterlevel = snapshot->waterlevel;
 	qnn_runtime.emit_weapon_id = snapshot->weapon_id;
 	qnn_runtime.has_emit_anchor = true;
+	qnn_runtime.native_frame_count = 0;
+
+	/* Snapshot mover origins at the emission anchor. */
+	{
+		int m;
+		for (m = 0; m < qnn_runtime.mover_count; m++)
+		{
+			entity_t *e = &cl_entities[qnn_runtime.mover_entity_nums[m]];
+			VectorCopy(e->origin, qnn_runtime.mover_emit_origins[m]);
+		}
+	}
+}
+
+/* Returns true if the action label indicates a completely frozen state:
+ * zero move, identity look, no fire, no switch. */
+static qboolean QNN_ActionIsFrozen(const qnn_action_t *a)
+{
+	return a->move[0] == 0.0f && a->move[1] == 0.0f && a->move[2] == 0.0f
+		&& a->fire == 0 && a->switch_slot == 0
+		&& fabsf(a->look[0] - 1.0f) < QNN_FROZEN_LOOK_TOL
+		&& fabsf(a->look[1]) < QNN_FROZEN_LOOK_TOL
+		&& fabsf(a->look[2]) < QNN_FROZEN_LOOK_TOL;
+}
+
+/* Apply emission-level frame filters.  Returns the FILE* to pass to
+ * QNN_WriteObsTick: stdout to emit, NULL to buffer-only (skip). */
+static FILE *QNN_EmitFilter(qnn_snapshot_t *snapshot)
+{
+	int health = snapshot->health;
+
+	/* Always emit the done marker. */
+	if (snapshot->done)
+	{
+		qnn_runtime.dead_emit_count = 0;
+		qnn_runtime.frozen_emit_count = 0;
+		return stdout;
+	}
+
+	/* God-mode: skip entirely. */
+	if (health > QNN_GOD_MODE_HEALTH)
+		return NULL;
+
+	/* Dead: keep first QNN_DEAD_MAX_EMIT frames, inject fire=1,
+	 * zero move (corpse physics ≠ player input, sim diverges
+	 * because it runs alive friction+accel vs dead velocity decay). */
+	if (health <= 0)
+	{
+		qnn_runtime.frozen_emit_count = 0;
+		qnn_runtime.dead_emit_count++;
+		if (qnn_runtime.dead_emit_count > QNN_DEAD_MAX_EMIT)
+			return NULL;
+		snapshot->action_label.fire = 1;
+		snapshot->action_label.move[0] = 0.0f;
+		snapshot->action_label.move[1] = 0.0f;
+		snapshot->action_label.move[2] = 0.0f;
+		return stdout;
+	}
+
+	/* Alive — reset dead counter. */
+	qnn_runtime.dead_emit_count = 0;
+
+	/* Frozen-alive: keep first QNN_FROZEN_MAX_EMIT frames. */
+	if (QNN_ActionIsFrozen(&snapshot->action_label))
+	{
+		qnn_runtime.frozen_emit_count++;
+		if (qnn_runtime.frozen_emit_count > QNN_FROZEN_MAX_EMIT)
+			return NULL;
+		return stdout;
+	}
+
+	/* Active gameplay — reset frozen counter. */
+	qnn_runtime.frozen_emit_count = 0;
+	return stdout;
 }
 
 static void QNN_RuntimeReset(void)
@@ -430,7 +731,7 @@ static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, qboolean reset_fl
 	QNN_DrainSounds(snapshot);
 }
 
-static qboolean QNN_ResetWorldLocal(const char *demo_path, int seed, char *error, size_t error_size)
+static qboolean QNN_ResetWorldLocal(const char *demo_path, char *error, size_t error_size)
 {
 	char command[QNN_WORKER_MAX_COMMAND_TEXT];
 	int frame;
@@ -447,9 +748,24 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, int seed, char *error
 	}
 
 	QNN_ClearAction(&qnn_pending_action);
-	qnn_runtime.seed = seed >= 0 ? seed : 0;
-	qnn_runtime.done = false;
-	qnn_runtime.has_reset = false;
+
+	/* Reset all per-demo runtime state.  Worker reuse across demos would
+	 * otherwise leak prev_velocity, emit anchors, mover/player/push tracking,
+	 * buffered obs, jitter filter state, and frame counters into the first
+	 * few ticks of the next demo — causing small label drift vs a
+	 * fresh-worker collect.  Preserve only the config fields set at hello. */
+	{
+		int saved_tick_hz = qnn_runtime.fixed_tick_hz;
+		float saved_dt = qnn_runtime.fixed_dt;
+		int saved_resample = qnn_runtime.resample_hz;
+		FILE *saved_store_dump = qnn_runtime.store_dump;
+		memset(&qnn_runtime, 0, sizeof(qnn_runtime));
+		qnn_runtime.fixed_tick_hz = saved_tick_hz;
+		qnn_runtime.fixed_dt = saved_dt;
+		qnn_runtime.resample_hz = saved_resample;
+		qnn_runtime.store_dump = saved_store_dump;
+	}
+
 	qnn_sound_count = 0;
 	cls.demonum = -1;
 	cls.timedemo = false;
@@ -459,6 +775,15 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, int seed, char *error
 	if (sv.active)
 		Host_ShutdownServer(false);
 	cls.state = ca_disconnected;
+
+	/* Nuke any residual stufftext from the previous demo.  svc_stufftext
+	 * messages in demos (cvar sets, disconnect, map loads) accumulate in
+	 * cmd_text and would otherwise run before — or worse, after — our
+	 * playdemo, corrupting the newly-started demo's state. */
+	{
+		extern sizebuf_t cmd_text;
+		SZ_Clear(&cmd_text);
+	}
 
 	snprintf(command, sizeof(command), "playdemo %s\n", demo_path);
 	Cbuf_AddText(command);
@@ -516,7 +841,7 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, int seed, char *error
 	qnn_runtime.has_reset = true;
 	qnn_runtime.done = false;
 	QNN_IOInit(&qnn_map_state);
-	/* Store init is now called inside QNN_ObjectInit */
+	QNN_PhysInit();
 	return true;
 }
 
@@ -548,7 +873,7 @@ static int QNN_HandleHello(const char *line)
 
 	/* Resample target Hz: >0 = downsample to target, 0 = emit at native rate. */
 	qnn_runtime.resample_hz = QNN_JsonExtractInt(line, "\"resample_hz\"", 0);
-	qnn_runtime.movement_threshold = QNN_JsonExtractFloat(line, "\"movement_threshold\"", 0.0f);
+
 
 	if (!QNN_PrepareMap(map_id, error, sizeof(error)))
 	{
@@ -560,49 +885,29 @@ static int QNN_HandleHello(const char *line)
 	return 0;
 }
 
-static int QNN_HandleReset(const char *line)
-{
-	qnn_snapshot_t snapshot;
-	char demo_path[MAX_OSPATH];
-	char error[256];
-	int seed;
-
-	memset(demo_path, 0, sizeof(demo_path));
-	memset(error, 0, sizeof(error));
-	/* Interactive reset/step removed — use collect for batch processing. */
-	(void)line;
-	QNN_WriteError("reset not supported — use collect");
-	return 0;
-}
-
 static int QNN_HandleCollect(const char *line)
 {
 	qnn_action_t native_action;
 	qnn_snapshot_t snapshot;
 	char demo_path[MAX_OSPATH];
 	char error[256];
-	int seed;
 
 	memset(demo_path, 0, sizeof(demo_path));
 	memset(error, 0, sizeof(error));
-	seed = QNN_JsonExtractInt(line, "\"seed\"", -1);
 	{
 		int trim = QNN_JsonExtractInt(line, "\"trim_match\"", 0);
-		qnn_match_state = trim ? 0 : 1; /* state 1 = emitting immediately */
+		qnn_match_state = trim ? 0 : 1;
 	}
 	if (!QNN_JsonExtractString(line, "\"demo_path\"", demo_path, sizeof(demo_path)))
 	{
 		QNN_WriteError("reset options must include demo_path");
 		return 0;
 	}
-	if (!QNN_ResetWorldLocal(demo_path, seed, error, sizeof(error)))
+	if (!QNN_ResetWorldLocal(demo_path, error, sizeof(error)))
 	{
 		QNN_WriteError(error);
 		return 0;
 	}
-
-	/* Set up minimal server state for velocity-based move labeling. */
-	QNN_PhysInit();
 
 	/* Init resampler. resample_hz=0 means pass-through (emit every frame
 	 * at native recording FPS). resample_hz>0 means downsample to target. */
@@ -617,24 +922,16 @@ static int QNN_HandleCollect(const char *line)
 
 		QNN_CaptureSnapshotLocal(&snapshot, true);
 		QNN_SavePrev(&snapshot, 0.0f);  /* first tick, no dt */
+		qnn_runtime.phys_grounded = snapshot.grounded; /* seed from demo */
 		QNN_SaveEmitAnchor(&snapshot);
 		QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
+		QNN_BuildMoverRefs();
+		QNN_BuildPlayerRefs();
+		QNN_BuildPushRefs();
 
-		/*
-		 * Match trimming: if svc_print contains match start/end text,
-		 * only emit ticks during the match (state 1). If no match text
-		 * is ever seen, emit all ticks (no trimming).
-		 *
-		 * Pass 1: run the demo, buffer ticks to a temp file if in
-		 * pre-match state. This is too complex — instead we do two
-		 * passes or just accept that demos without match text emit
-		 * everything.
-		 *
-		 * Simple approach: skip pre-match ticks. If the demo ends
-		 * still in state 0 (no match text found), re-run without
-		 * trimming. This is wasteful but correct and rare — only
-		 * 16 demos have no match text and they don't need trimming.
-		 */
+		/* Match trimming: skip pre-match ticks until svc_print
+		 * contains match start text.  Demos with no match text
+		 * emit a done-only marker (Python re-collects untrimmed). */
 		{
 			qboolean emitting = (qnn_match_state == 1);
 
@@ -654,13 +951,14 @@ static int QNN_HandleCollect(const char *line)
 			}
 
 			QNN_CaptureSnapshotLocal(&snapshot, false);
-			QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
 
 			/* Start emitting when match begins. */
 			if (!emitting && qnn_match_state == 1)
 			{
 				emitting = true;
+				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
 				QNN_ResampleInit(qnn_runtime.resample_hz);
+				qnn_runtime.phys_grounded = snapshot.grounded;
 				QNN_SaveEmitAnchor(&snapshot);
 				fprintf(stderr, "[demo] emitting from tick %d\n", qnn_runtime.tick);
 				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
@@ -674,25 +972,39 @@ static int QNN_HandleCollect(const char *line)
 				continue;
 			}
 
-			/* Store update now runs inside QNN_IOUpdate → QNN_ObjectUpdate */
+			QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
+
 			if (qnn_runtime.store_dump != NULL)
 			{
 				QNN_StoreDumpSounds(qnn_runtime.store_dump, qnn_runtime.tick, &snapshot);
 				QNN_StoreDumpTick(qnn_runtime.store_dump, qnn_runtime.tick, (float)cl.mtime[0]);
 			}
 
-			/* Track Z-delta for ground detection (works for spectator
-			 * demos where cl.onground is the spectator's state). */
+			if (qnn_runtime.native_frame_count < QNN_MAX_NATIVE_FRAMES)
 			{
-				float dz = snapshot.player_origin[2] - qnn_runtime.prev_z;
-				qnn_runtime.prev_z = snapshot.player_origin[2];
-				qnn_runtime.total_frames++;
-				if (dz > -0.5f && dz < 0.5f)
-					qnn_runtime.ground_frames++;
+				int nf = qnn_runtime.native_frame_count;
+				int m;
+				for (m = 0; m < qnn_runtime.mover_count; m++)
+				{
+					entity_t *me = &cl_entities[qnn_runtime.mover_entity_nums[m]];
+					VectorCopy(me->origin, qnn_runtime.mover_origins[nf][m]);
+				}
+				for (m = 0; m < qnn_runtime.player_count; m++)
+				{
+					entity_t *pe = &cl_entities[qnn_runtime.player_entity_nums[m]];
+					VectorCopy(pe->origin, qnn_runtime.player_origins[nf][m]);
+				}
+				qnn_runtime.native_frame_count++;
+			}
+			else if (qnn_runtime.native_frame_count == QNN_MAX_NATIVE_FRAMES)
+			{
+				fprintf(stderr, "[demo] native frame buffer full at tick %d\n",
+					qnn_runtime.tick);
+				qnn_runtime.native_frame_count++; /* warn once */
 			}
 
 			if (!snapshot.done)
-				QNN_InferNativeAction(&native_action, &snapshot, qnn_runtime.fixed_dt);
+				QNN_InferNativeAction(&native_action, &snapshot);
 			else
 				QNN_ClearAction(&native_action);
 
@@ -702,37 +1014,26 @@ static int QNN_HandleCollect(const char *line)
 				if (!snapshot.done)
 				{
 					QNN_InferEmitAction(&snapshot.action_label, &snapshot);
-					/* Move labels: simulate over the actual native
-					 * frames using BSP-clipped physics.  Use
-					 * total_frames * fixed_dt (not accumulated_dt)
-					 * because the resampler carry makes accumulated_dt
-					 * longer than the actual position-delta timespan.
-					 * When upsampling (source < target), some emissions
-					 * have zero native frames — carry forward the
-					 * previous inference since there's no new data. */
-					if (qnn_runtime.total_frames > 0)
+					if (qnn_runtime.native_frame_count > 0)
 					{
-						float phys_dt = qnn_runtime.total_frames * qnn_runtime.fixed_dt;
+						float phys_dt = qnn_runtime.native_frame_count * qnn_runtime.fixed_dt;
 						QNN_InferEmitMove(&snapshot.action_label,
 							&snapshot, phys_dt);
-						qnn_runtime.prev_move[0] = snapshot.action_label.move[0];
-						qnn_runtime.prev_move[1] = snapshot.action_label.move[1];
+						VectorCopy(snapshot.action_label.move, qnn_runtime.prev_move);
 					}
 					else
 					{
-						snapshot.action_label.move[0] = qnn_runtime.prev_move[0];
-						snapshot.action_label.move[1] = qnn_runtime.prev_move[1];
+						VectorCopy(qnn_runtime.prev_move, snapshot.action_label.move);
 					}
 				}
 				else
 					QNN_ClearAction(&snapshot.action_label);
 				QNN_ResampleApplyActionMerge(&snapshot.action_label);
-				QNN_WriteObsTick(stdout, &snapshot, qnn_runtime.tick,
+				QNN_WriteObsTick(QNN_EmitFilter(&snapshot),
+					&snapshot, qnn_runtime.tick,
 					qnn_runtime.steps, emit_hz, false);
 				if (!snapshot.done)
 					QNN_SaveEmitAnchor(&snapshot);
-				/* Break after one emission when resampler is disabled
-				 * (pass-through) or when the demo is finished. */
 				if (qnn_resample.target_hz <= 0 || qnn_runtime.done)
 					break;
 			}

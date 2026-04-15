@@ -28,7 +28,7 @@ SPATIAL_TOKEN_COUNT = 9
 SPATIAL_SCALAR_DIM = 13
 
 ACTION_HISTORY_LEN = 8
-ACTION_HISTORY_DIM = 8  # move[2] + look[3] + fire + jump + switch
+ACTION_HISTORY_DIM = 8  # move[3] + look[3] + fire + switch
 
 SELF_SCALAR_DIM = 14
 

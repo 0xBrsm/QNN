@@ -8,7 +8,10 @@
   "policy_workers_per_policy": 1,
   "batched_sampling": false,
   "worker_inference": false,
+  "batch_size": 64,
   "minibatch_size": 8192,
   "eval_num_envs": 32,
-  "eval_num_episodes": 32
+  "eval_num_episodes": 32,
+  "pin_memory": true,
+  "prefetch": false
 }

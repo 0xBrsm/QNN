@@ -9,13 +9,13 @@
 #ifndef QNN_VOCAB_H
 #define QNN_VOCAB_H
 
-/* ── Modality priority (lower = higher priority) ───────────────── */
+/* ── Modality (priority order: lower = higher priority) ────────── */
 
-#define QNN_MODALITY_NONE      0
-#define QNN_MODALITY_SIGHT     1
-#define QNN_MODALITY_PROXIMITY 2
-#define QNN_MODALITY_SOUND     3
-#define QNN_MODALITY_MEMORY    4
+#define QNN_MODALITY_SIGHT     0
+#define QNN_MODALITY_PROXIMITY 1
+#define QNN_MODALITY_SOUND     2
+#define QNN_MODALITY_MEMORY    3
+#define QNN_MODALITY_VOCAB_SIZE 4
 
 /* ── Subject IDs ───────────────────────────────────────────────── */
 

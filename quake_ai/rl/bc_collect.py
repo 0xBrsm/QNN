@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
@@ -46,6 +47,16 @@ from quake_ai.obs_format import (
 )
 
 TICK_TOTAL_SIZE = TICK_HEADER_SIZE + OBS_BUFFER_SIZE + ACTION_SIZE
+_WORKER_DEMO_PROC: subprocess.Popen | None = None
+_WORKER_DEMO_ARGS: tuple[str, str, int] | None = None
+_ACTION_RECORD_DTYPE = np.dtype(
+    {
+        "names": list(ACTION_FIELDS.keys()),
+        "formats": [dtype if not shape else (dtype, shape) for _, dtype, shape in ACTION_FIELDS.values()],
+        "offsets": [offset for offset, _, _ in ACTION_FIELDS.values()],
+        "itemsize": ACTION_SIZE,
+    }
+)
 
 
 def _start_worker(demo_worker: str, asset_root: str, resample_hz: int) -> subprocess.Popen:
@@ -63,6 +74,43 @@ def _start_worker(demo_worker: str, asset_root: str, resample_hz: int) -> subpro
         err = proc.stderr.read(500).decode(errors="replace")
         raise RuntimeError(f"Demo worker hello failed: {err}")
     return proc
+
+
+def _shutdown_worker() -> None:
+    global _WORKER_DEMO_PROC
+    proc = _WORKER_DEMO_PROC
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None and proc.stdin is not None:
+            proc.stdin.write(json.dumps({"op": "shutdown"}).encode() + b"\n")
+            proc.stdin.flush()
+            proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    finally:
+        _WORKER_DEMO_PROC = None
+
+
+def _init_collect_worker(demo_worker: str, asset_root: str, resample_hz: int) -> None:
+    global _WORKER_DEMO_ARGS
+    _WORKER_DEMO_ARGS = (demo_worker, asset_root, int(resample_hz))
+    _shutdown_worker()
+    atexit.register(_shutdown_worker)
+
+
+def _get_collect_worker() -> subprocess.Popen:
+    global _WORKER_DEMO_PROC
+    if _WORKER_DEMO_ARGS is None:
+        raise RuntimeError("collect worker not initialized")
+    if _WORKER_DEMO_PROC is not None and _WORKER_DEMO_PROC.poll() is None:
+        return _WORKER_DEMO_PROC
+    demo_worker, asset_root, resample_hz = _WORKER_DEMO_ARGS
+    _WORKER_DEMO_PROC = _start_worker(demo_worker, asset_root, resample_hz)
+    return _WORKER_DEMO_PROC
 
 
 def _collect_one_demo(proc: subprocess.Popen, demo_name: str, trim_match: bool = False) -> list[dict] | None:
@@ -107,17 +155,10 @@ def _save_episode_npy(output_dir: Path, episode_index: int, ticks: list[dict]) -
     n = len(ticks)
     prefix = f"ep{episode_index:04d}"
 
-    # Unpack each tick's obs buffer using the v9 parser
+    # Unpack each tick's obs buffer using the v9 parser.
+    # Frame-level filters (god-mode, dead-time, frozen-alive) are applied
+    # in the C demo worker before emission — see QNN_EmitFilter().
     obs_list = [unpack_obs_buffer(t["obs"]) for t in ticks]
-
-    # Remove all god-mode ticks (health > 250, normalized > 2.5).
-    # These are pre/post match warmup, match abort, or respawn
-    # invulnerability from mods that set health to 666/998.
-    keep = [i for i, obs in enumerate(obs_list) if obs["self_scalars"][0] <= 2.5]
-    if len(keep) < n:
-        ticks = [ticks[i] for i in keep]
-        obs_list = [obs_list[i] for i in keep]
-        n = len(ticks)
     if n == 0:
         return {"n_samples": 0, "obs": {}, "actions": {}}
 
@@ -128,14 +169,11 @@ def _save_episode_npy(output_dir: Path, episode_index: int, ticks: list[dict]) -
 
     # Unpack action fields (fixed layout)
     action_blob = b"".join(t["action"] for t in ticks)
+    records = np.frombuffer(action_blob, dtype=_ACTION_RECORD_DTYPE, count=n)
     act_arrays: dict[str, np.ndarray] = {}
-    for name, (offset, dtype, shape) in ACTION_FIELDS.items():
-        count = int(np.prod(shape)) if shape else 1
-        arr = np.empty((n, *shape) if shape else (n,), dtype=dtype)
-        for i in range(n):
-            vals = np.frombuffer(action_blob, dtype=dtype, offset=i * ACTION_SIZE + offset, count=count)
-            arr[i] = vals.reshape(shape) if shape else vals[0]
-        act_arrays[name] = arr
+    for name, (_, _, shape) in ACTION_FIELDS.items():
+        field = np.asarray(records[name])
+        act_arrays[name] = field.copy().reshape(n, *shape) if shape else field.copy()
 
     # Save
     for name, arr in obs_arrays.items():
@@ -152,33 +190,17 @@ def _save_episode_npy(output_dir: Path, episode_index: int, ticks: list[dict]) -
 
 def _collect_and_save(args: tuple) -> dict | None:
     """Collect one demo and save to staging. Runs in a worker process."""
-    demo_name, episode_index, stage_dir, demo_worker, asset_root, resample_hz, trim_match = args
+    demo_name, episode_index, stage_dir, trim_match = args
 
     try:
-        proc = _start_worker(demo_worker, asset_root, resample_hz)
-    except Exception as exc:
-        return {"demo": demo_name, "status": "error", "msg": str(exc)[:200]}
-
-    try:
+        proc = _get_collect_worker()
         ticks = _collect_one_demo(proc, demo_name, trim_match=trim_match)
     except Exception as exc:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _shutdown_worker()
         return {"demo": demo_name, "status": "error", "msg": str(exc)[:200]}
 
-    try:
-        proc.stdin.write(json.dumps({"op": "shutdown"}).encode() + b"\n")
-        proc.stdin.flush()
-        proc.wait(timeout=5)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
     if ticks is None:
+        _shutdown_worker()
         return {"demo": demo_name, "status": "crash"}
     if len(ticks) < 10:
         return {"demo": demo_name, "status": "skipped", "ticks": len(ticks)}
@@ -187,6 +209,89 @@ def _collect_and_save(args: tuple) -> dict | None:
     meta = {"demo": demo_name, "entry": entry}
     (Path(stage_dir) / f"ep{episode_index:04d}_meta.json").write_text(json.dumps(meta))
     return {"demo": demo_name, "status": "ok", "ticks": len(ticks)}
+
+
+def _clear_split_outputs(split_dir: Path) -> None:
+    for pattern in ("ep*.npy", "shard*.npy", "manifest.json", "class_counts.json"):
+        for path in split_dir.glob(pattern):
+            path.unlink()
+
+
+def _write_split_shards(
+    *,
+    stage_dir: Path,
+    episodes_info: list[dict],
+    split_indices: list[int],
+    split_dir: Path,
+    shard_rows: int,
+) -> list[dict]:
+    shard_target = max(1, int(shard_rows))
+    shards: list[dict] = []
+    cursor = 0
+    shard_idx = 0
+
+    while cursor < len(split_indices):
+        current_indices: list[int] = []
+        current_rows = 0
+        while cursor < len(split_indices):
+            global_idx = split_indices[cursor]
+            entry = episodes_info[global_idx]["entry"]
+            ep_rows = int(entry["n_samples"])
+            if current_indices and current_rows + ep_rows > shard_target:
+                break
+            current_indices.append(global_idx)
+            current_rows += ep_rows
+            cursor += 1
+            if current_rows >= shard_target:
+                break
+
+        first_entry = episodes_info[current_indices[0]]["entry"]
+        obs_files: dict[str, str] = {}
+        action_files: dict[str, str] = {}
+        episode_lengths: list[int] = []
+
+        obs_buffers: dict[str, np.ndarray] = {}
+        for key, fname in first_entry["obs"].items():
+            sample = np.load(stage_dir / fname, mmap_mode="r")
+            obs_buffers[key] = np.empty((current_rows, *sample.shape[1:]), dtype=sample.dtype)
+        action_buffers: dict[str, np.ndarray] = {}
+        for key, fname in first_entry["actions"].items():
+            sample = np.load(stage_dir / fname, mmap_mode="r")
+            action_buffers[key] = np.empty((current_rows, *sample.shape[1:]), dtype=sample.dtype)
+
+        row = 0
+        for global_idx in current_indices:
+            entry = episodes_info[global_idx]["entry"]
+            ep_rows = int(entry["n_samples"])
+            episode_lengths.append(ep_rows)
+            next_row = row + ep_rows
+            for key, fname in entry["obs"].items():
+                obs_buffers[key][row:next_row] = np.load(stage_dir / fname, mmap_mode="r")
+            for key, fname in entry["actions"].items():
+                action_buffers[key][row:next_row] = np.load(stage_dir / fname, mmap_mode="r")
+            row = next_row
+
+        shard_prefix = f"shard{shard_idx:04d}"
+        for key, arr in obs_buffers.items():
+            fname = f"{shard_prefix}_obs_{key}.npy"
+            np.save(split_dir / fname, arr)
+            obs_files[key] = fname
+        for key, arr in action_buffers.items():
+            fname = f"{shard_prefix}_act_{key}.npy"
+            np.save(split_dir / fname, arr)
+            action_files[key] = fname
+
+        shards.append(
+            {
+                "rows": current_rows,
+                "episode_lengths": episode_lengths,
+                "obs": obs_files,
+                "actions": action_files,
+            }
+        )
+        shard_idx += 1
+
+    return shards
 
 
 def _load_manifest(manifest_path: Path) -> list[dict]:
@@ -210,6 +315,7 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--workers", type=int, default=0, help="Parallel workers (0 = CPU count - 2)")
+    parser.add_argument("--shard-rows", type=int, default=262144, help="Rows per split shard in final precomputed caches")
     args = parser.parse_args()
 
     demo_dir = Path(args.demo_dir)
@@ -255,7 +361,7 @@ def main() -> None:
         if demo.name in done_demos:
             continue
         trim = trim_lookup.get(demo.name, False)
-        work.append((demo.name, next_index, str(stage_dir), demo_worker, args.asset_root, args.resample_hz, trim))
+        work.append((demo.name, next_index, str(stage_dir), trim))
         next_index += 1
 
     n_workers = args.workers if args.workers > 0 else max(1, (os.cpu_count() or 4) - 2)
@@ -263,7 +369,11 @@ def main() -> None:
     print(f"Workers: {n_workers}")
 
     if work:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_collect_worker,
+            initargs=(demo_worker, args.asset_root, args.resample_hz),
+        ) as pool:
             futures = {pool.submit(_collect_and_save, w): w[0] for w in work}
             for future in as_completed(futures):
                 demo_name = futures[future]
@@ -306,24 +416,22 @@ def main() -> None:
     for split_name, split_indices in [("train", train_indices), ("val", val_indices)]:
         split_dir = output / f"precomputed_{split_name}"
         split_dir.mkdir(parents=True, exist_ok=True)
-
-        manifest = []
-        for local_idx, global_idx in enumerate(split_indices):
-            src_entry = episodes_info[global_idx]["entry"]
-            new_prefix = f"ep{local_idx:04d}"
-            new_entry = {"n_samples": src_entry["n_samples"], "obs": {}, "actions": {}}
-            for key, fname in src_entry["obs"].items():
-                new_fname = f"{new_prefix}_obs_{key}.npy"
-                shutil.copy2(stage_dir / fname, split_dir / new_fname)
-                new_entry["obs"][key] = new_fname
-            for key, fname in src_entry["actions"].items():
-                new_fname = f"{new_prefix}_act_{key}.npy"
-                shutil.copy2(stage_dir / fname, split_dir / new_fname)
-                new_entry["actions"][key] = new_fname
-            manifest.append(new_entry)
-
+        _clear_split_outputs(split_dir)
+        shards = _write_split_shards(
+            stage_dir=stage_dir,
+            episodes_info=episodes_info,
+            split_indices=split_indices,
+            split_dir=split_dir,
+            shard_rows=args.shard_rows,
+        )
+        manifest = {
+            "format": "sharded_v1",
+            "episodes": len(split_indices),
+            "shard_rows": int(args.shard_rows),
+            "shards": shards,
+        }
         (split_dir / "manifest.json").write_text(json.dumps(manifest))
-        print(f"  {split_name}: {len(split_indices)} episodes → {split_dir}")
+        print(f"  {split_name}: {len(split_indices)} episodes in {len(shards)} shards → {split_dir}")
 
     # Metadata
     metadata = {

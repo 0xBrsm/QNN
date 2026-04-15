@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.14.0
+
+### Changed
+- Unified 3D wishdir move action: `move` float[3] replaces `move` float[2] + separate `jump` head
+- 9-candidate BSP-clipped move inference with entity interaction, continuity bias, jitter filter, and outlier rejection
+- Frame filtering (god-mode, dead-time, frozen-alive) moved from Python to C emission layer
+- Span-based GRU forward batches contiguous sequences between resets; vectorized obs/action unpacking
+- NONE sentinel removed from modality vocab (5 → 4)
+
+### Added
+- Binary snap labels for keyboard demos with sound-based jump Z detection
+- Sharded precomputed caches, batch prefetch, pinned host memory for BC training throughput
+- Train eval schedule with proxy gap and val regression early triggers
+- Persistent demo worker subprocess reused across collections
+- Demo corpus manifest and inventory; BC v6/v7 ablation run configs
+
+### Fixed
+- Demo worker state isolation between sequential collects
+- Continuous move pass-through for PPO (was truncated to 2D)
+- Mover over-push bug and dm4 hull guard crash in physics sim
+- Match trimming for CHTV demos without match text markers
+
 ## 0.13.0
 
 ### Changed

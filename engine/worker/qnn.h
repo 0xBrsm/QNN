@@ -102,10 +102,9 @@ typedef struct
 
 typedef struct
 {
-	float	move[2];
+	float	move[3];	/* view-relative direction: (forward, right, up) */
 	float	look[3];
 	int	fire;
-	int	jump;
 	int	switch_slot;
 	int	recall[4];
 } qnn_action_t;
@@ -187,8 +186,8 @@ extern qnn_action_t qnn_pending_action;
  * Accumulates engine frames and emits at a fixed target Hz.
  * Call QNN_ResampleInit() once, then QNN_ResampleShouldEmit()
  * every frame.  When it returns true, emit the token tick.
- * Action labels are merged across the window: fire/jump use OR,
- * move is inferred once per emission via BSP-clipped physics, and
+ * Action labels are merged across the window: fire uses OR,
+ * move is a continuous wishdir inferred per emission, and
  * look/switch remain emission-to-emission labels computed by the
  * collector.
  */
@@ -198,12 +197,9 @@ typedef struct
 	float	target_dt;		/* 1.0 / target_hz */
 	float	accumulated_dt;		/* time since last emission */
 	int	fire_any;		/* OR accumulator for fire */
-	int	jump_any;		/* OR accumulator for jump */
 } qnn_resample_state_t;
 
 extern qnn_resample_state_t qnn_resample;
-
-#define QNN_DEMO_MOUSE_DEGREES_PER_COUNT 0.066f
 
 void QNN_ResampleInit(int target_hz);
 void QNN_ResampleAccumulate(const qnn_action_t *action, float frame_dt);
@@ -250,22 +246,9 @@ static inline void QNN_ClearAction(qnn_action_t *action)
 #define QNN_PLAYER_MAXS_Y  (16.0f)
 #define QNN_PLAYER_MAXS_Z  (32.0f)
 
-/* Velocity-based movement label inference (qnn_phys.c) */
-void QNN_PhysInit(void);
-void QNN_PhysInferMove(
-	qnn_action_t *action,
-	const vec3_t prev_vel,
-	const vec3_t cur_vel,
-	const vec3_t prev_origin,
-	const vec3_t cmd_view_angles,
-	qboolean prev_grounded,
-	int prev_waterlevel,
-	const vec3_t cur_origin,
-	qboolean cur_grounded,
-	int cur_waterlevel,
-	float dt,
-	float native_dt,
-	float movement_threshold);
+/* Continuous wishdir label inference — projects velocity delta onto
+ * the view-relative frame to produce a 3D (forward, right, up)
+ * movement direction vector.  No BSP simulation needed. */
 
 /* Entity classification helpers (qnn_entity.c) */
 int QNN_CategoryOrder(const char *category);
@@ -288,11 +271,130 @@ qboolean QNN_SnapshotHasSelfJumpSound(const qnn_snapshot_t *snapshot);
 
 /* IO (qnn_io.c) — see qnn_io.h for full typed token API */
 
+/* Physics sim (qnn_phys.c) — 9-candidate forward search for move labels. */
+#define QNN_MAX_PHYS_MOVERS 8
+#define QNN_MAX_PHYS_PLAYERS 16
+
+typedef struct {
+	int	model_index;		/* sv.models[] / cl.model_precache[] index */
+	vec3_t	origin;			/* world position at start of step */
+	vec3_t	velocity;		/* demo-observed velocity for SV_PushMove */
+} qnn_mover_state_t;
+
+void QNN_PhysInit(void);
+void QNN_PhysSetupMovers(const qnn_mover_state_t *movers, int count);
+void QNN_PhysPushMovers(float dt);
+void QNN_PhysSetupPlayers(const vec3_t *origins, int count);
+void QNN_PhysBestCandidate(
+	const vec3_t vel, const vec3_t origin,
+	const vec3_t view_angles, qboolean grounded, int waterlevel,
+	float dt, const vec3_t observed,
+	int prev_forward, int prev_strafe,
+	int *out_forward, int *out_strafe,
+	qboolean *out_unreachable);
+
 /* Reward (qnn_reward.c) */
 void QNN_TrainingResetEpisode(void);
 void QNN_TrainingResetTick(void);
 void QNN_TrainingParseRewardWeights(const char *line);
 void QNN_WriteTrainingExtrasBinary(FILE *out, const qnn_snapshot_t *snapshot, int tick, int steps, qboolean reset_flag);
+/* ── Engine physics constants (shared by collector, physics, inference) ── */
+
+#define QNN_SV_MAXSPEED      320.0f
+#define QNN_SV_ACCELERATE     10.0f
+#define QNN_SV_GRAVITY       800.0f
+#define QNN_SV_JUMP_SPEED    270.0f
+#define QNN_SV_SWIM_SPEED    100.0f  /* water; slime=80, lava=50 */
+
+/* ── Move snap — used by collector for keyboard demo label generation ── */
+
+#define QNN_MEDIUM_GROUND 0
+#define QNN_MEDIUM_AIR    1
+#define QNN_MEDIUM_WATER  2
+
+#define QNN_SNAP_THRESHOLD 0.1f
+
+/* Snap a raw move vector (view-relative, scaled by maxspeed) to the
+ * nearest legal key combination.
+ * Ground: 9 XY directions from candidate search, Z from jump sound.
+ * Air: strafe only (L/R/none).  Forward is zeroed because SV_AirAccelerate
+ *      has no effect parallel to velocity at cruise speed (addspeed <= 0).
+ *      The effective key is always pure strafe in standard strafejumping.
+ * Water: 27 directions (XY + Z all keyboard-binary).
+ *
+ * in[3]:  raw input (e.g. candidate signs or vel / maxspeed)
+ * medium: QNN_MEDIUM_GROUND, _AIR, or _WATER
+ * has_jump_sound: true if jump sound detected this frame
+ * out[3]: snapped result */
+static inline void QNN_SnapMove(const float *in, int medium,
+	qboolean has_jump_sound, float *out)
+{
+	float sx, sy;
+
+	/* Air: only the perpendicular-to-velocity axis is resolvable.
+	 * SV_AirAccelerate caps wishspeed at 30 — if the player is already
+	 * moving >= 30 ups along the wish direction, addspeed <= 0 and
+	 * nothing happens.  So keys parallel to velocity have zero effect;
+	 * only the perpendicular component produces a measurable signal.
+	 * Project the candidate result onto the perp axis and zero the
+	 * parallel component. */
+	if (medium == QNN_MEDIUM_AIR)
+	{
+		/* Air: only strafe has consistent effect.  SV_AirAccelerate
+		 * has zero effect parallel to velocity (addspeed <= 0 at
+		 * cruise).  The perpendicular axis IS the strafe axis when
+		 * the player looks roughly where they're moving (standard
+		 * strafejump).  Forward component is unresolvable — zero it
+		 * and keep only the strafe sign from the candidate search. */
+		out[0] = 0.0f;
+		if (in[1] > QNN_SNAP_THRESHOLD) out[1] = 1.0f;
+		else if (in[1] < -QNN_SNAP_THRESHOLD) out[1] = -1.0f;
+		else out[1] = 0.0f;
+
+		out[2] = 0.0f;
+		if (has_jump_sound && in[2] > QNN_SNAP_THRESHOLD)
+			out[2] = QNN_SV_JUMP_SPEED / QNN_SV_MAXSPEED;
+		return;
+	}
+
+	/* XY: per-axis snap to {-1, 0, +1}. */
+	if (in[0] > QNN_SNAP_THRESHOLD) sx = 1.0f;
+	else if (in[0] < -QNN_SNAP_THRESHOLD) sx = -1.0f;
+	else sx = 0.0f;
+
+	if (in[1] > QNN_SNAP_THRESHOLD) sy = 1.0f;
+	else if (in[1] < -QNN_SNAP_THRESHOLD) sy = -1.0f;
+	else sy = 0.0f;
+
+	/* Diagonal normalization: (1,1) → (0.707, 0.707). */
+	if (sx != 0.0f && sy != 0.0f)
+	{
+		sx *= 0.70710678f;
+		sy *= 0.70710678f;
+	}
+	out[0] = sx;
+	out[1] = sy;
+
+	/* Z: context-dependent. */
+	if (medium == QNN_MEDIUM_WATER)
+	{
+		/* Water: snap Z to ±swim_speed or zero (27 directions). */
+		if (in[2] > QNN_SNAP_THRESHOLD)
+			out[2] = QNN_SV_SWIM_SPEED / QNN_SV_MAXSPEED;
+		else if (in[2] < -QNN_SNAP_THRESHOLD)
+			out[2] = -QNN_SV_SWIM_SPEED / QNN_SV_MAXSPEED;
+		else
+			out[2] = 0.0f;
+	}
+	else
+	{
+		/* Ground/air: Z only from jump sound detection. */
+		out[2] = 0.0f;
+		if (has_jump_sound && in[2] > QNN_SNAP_THRESHOLD)
+			out[2] = QNN_SV_JUMP_SPEED / QNN_SV_MAXSPEED;
+	}
+}
+
 /* ── Common math macros ──────────────────────────────────────────── */
 
 #define QNN_Clamp(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))

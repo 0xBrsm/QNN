@@ -18,33 +18,32 @@
 
 extern FILE *qnn_sound_dump;
 
-/* Returns the best qualifying modality, or QNN_MODALITY_NONE if stale.
-   Each modality's own timestamp is checked against its own threshold.
-   Priority: sight/proximity (pvs) > sound > memory.
-   Sets *out_age to the age of the qualifying observation. */
-static int QNN_QualifyEntity(const qnn_entity_t *e, float now, float *out_age)
+/* Determine the entity's best qualifying modality.  Returns true and
+ * sets *out_modality + *out_age if any modality threshold is met.
+ * Returns false if all observations are stale or absent.
+ * Priority: sight/proximity (pvs) > sound > memory. */
+static qboolean QNN_QualifyEntity(const qnn_entity_t *e, float now,
+	int *out_modality, float *out_age)
 {
 	/* For actors, "nearby" means visible (PVS + FOV).
 	   For everything else, PVS alone suffices. */
 	float near = (e->type == QNN_ENT_ACTOR) ? e->vis : e->pvs;
 	float newest = near;
-	int modality = QNN_MODALITY_NONE;
+	int modality;
 	float age, threshold;
 
 	if (e->snd > newest) newest = e->snd;
 	if (e->mem > newest) newest = e->mem;
-	if (newest <= 0) return QNN_MODALITY_NONE;
+	if (newest <= 0) return false;
 
 	/* Determine modality from newest observation.
-	   Later checks overwrite earlier: mem < snd < near. */
-	if (e->mem == newest) modality = QNN_MODALITY_MEMORY;
+	   Later checks overwrite earlier: mem < snd < near.
+	   Always sets modality since newest > 0 implies at least one match. */
+	modality = QNN_MODALITY_MEMORY;
 	if (e->snd == newest) modality = QNN_MODALITY_SOUND;
-	if (near == newest && near > 0)
+	if (near == newest)
 		modality = (e->type == QNN_ENT_ACTOR)
 			? QNN_MODALITY_SIGHT : QNN_MODALITY_PROXIMITY;
-
-	if (modality == QNN_MODALITY_NONE)
-		return QNN_MODALITY_NONE;
 
 	/* Check age against modality threshold */
 	age = now - newest;
@@ -60,11 +59,12 @@ static int QNN_QualifyEntity(const qnn_entity_t *e, float now, float *out_age)
 			age = now - e->vis;
 		}
 		else
-			return QNN_MODALITY_NONE;
+			return false;
 	}
 
+	*out_modality = modality;
 	*out_age = age;
-	return modality;
+	return true;
 }
 
 /* ── Candidate types ──────────────────────────────────────────── */
@@ -328,8 +328,7 @@ int QNN_OracleEmitTokens(
 			int cand_type, modality;
 			float age;
 
-			modality = QNN_QualifyEntity(e, now, &age);
-			if (modality == QNN_MODALITY_NONE)
+			if (!QNN_QualifyEntity(e, now, &modality, &age))
 				continue;
 			switch (e->type)
 			{

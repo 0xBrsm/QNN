@@ -23,9 +23,9 @@ static int qnn_action_history_count = 0;
 
 static qboolean QNN_ActionHasSignal(const qnn_action_t *action)
 {
-	return (action->move[0] != 0.0f || action->move[1] != 0.0f
+	return (action->move[0] != 0.0f || action->move[1] != 0.0f || action->move[2] != 0.0f
 		|| action->look[0] != 0.0f || action->look[1] != 0.0f || action->look[2] != 0.0f
-		|| action->fire || action->jump || action->switch_slot) ? true : false;
+		|| action->fire || action->switch_slot) ? true : false;
 }
 
 static void QNN_ActionReset(void)
@@ -41,11 +41,11 @@ static void QNN_ActionPush(const qnn_action_t *action)
 
 	features[0] = action->move[0];
 	features[1] = action->move[1];
-	features[2] = action->look[0];
-	features[3] = action->look[1];
-	features[4] = action->look[2];
-	features[5] = (float)action->fire;
-	features[6] = (float)action->jump;
+	features[2] = action->move[2];
+	features[3] = action->look[0];
+	features[4] = action->look[1];
+	features[5] = action->look[2];
+	features[6] = (float)action->fire;
 	features[7] = (float)(action->switch_slot < 0 ? 0 : action->switch_slot > QNN_ACTION_SWITCH_SLOTS ? QNN_ACTION_SWITCH_SLOTS : action->switch_slot)
 		/ (float)QNN_ACTION_SWITCH_SLOTS;
 
@@ -72,11 +72,11 @@ static int QNN_ActionEmit(qnn_action_token_t *out, int max_tokens)
 	{
 		out[i].move[0]     = qnn_action_history[i][0];
 		out[i].move[1]     = qnn_action_history[i][1];
-		out[i].look[0]     = qnn_action_history[i][2];
-		out[i].look[1]     = qnn_action_history[i][3];
-		out[i].look[2]     = qnn_action_history[i][4];
-		out[i].fire        = qnn_action_history[i][5];
-		out[i].jump        = qnn_action_history[i][6];
+		out[i].move[2]     = qnn_action_history[i][2];
+		out[i].look[0]     = qnn_action_history[i][3];
+		out[i].look[1]     = qnn_action_history[i][4];
+		out[i].look[2]     = qnn_action_history[i][5];
+		out[i].fire        = qnn_action_history[i][6];
 		out[i].switch_norm = qnn_action_history[i][7];
 	}
 	return n;
@@ -196,11 +196,11 @@ void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 		int off = QNN_OBS_OFF_ACTION_HISTORY + i * 8 * 4;
 		QNN_BufWriteF32(obs, off, tok->move[0]); off += 4;
 		QNN_BufWriteF32(obs, off, tok->move[1]); off += 4;
+		QNN_BufWriteF32(obs, off, tok->move[2]); off += 4;
 		QNN_BufWriteF32(obs, off, tok->look[0]); off += 4;
 		QNN_BufWriteF32(obs, off, tok->look[1]); off += 4;
 		QNN_BufWriteF32(obs, off, tok->look[2]); off += 4;
 		QNN_BufWriteF32(obs, off, tok->fire); off += 4;
-		QNN_BufWriteF32(obs, off, tok->jump); off += 4;
 		QNN_BufWriteF32(obs, off, tok->switch_norm); off += 4;
 	}
 

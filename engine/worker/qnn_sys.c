@@ -734,11 +734,9 @@ void QNN_ResampleAccumulate(const qnn_action_t *action, float frame_dt)
 	qnn_resample.accumulated_dt += frame_dt;
 
 	/* Merge discrete actions across the window (OR — any press counts).
-	 * Move labels are inferred once at emission time, not accumulated. */
+	 * Move is a continuous wishdir inferred once at emission time. */
 	if (action->fire)
 		qnn_resample.fire_any = 1;
-	if (action->jump)
-		qnn_resample.jump_any = 1;
 }
 
 qboolean QNN_ResampleShouldEmit(void)
@@ -754,12 +752,8 @@ qboolean QNN_ResampleShouldEmit(void)
 
 void QNN_ResampleApplyActionMerge(qnn_action_t *action)
 {
-	/* Move is already set by QNN_InferEmitMove — no accumulation needed. */
-
 	if (qnn_resample.fire_any)
 		action->fire = 1;
-	if (qnn_resample.jump_any)
-		action->jump = 1;
 
 	/* Subtract one window instead of zeroing so the fractional remainder
 	 * carries forward.  This lets low-rate demos (native < target) produce
@@ -769,7 +763,6 @@ void QNN_ResampleApplyActionMerge(qnn_action_t *action)
 	else
 		qnn_resample.accumulated_dt = 0.0f;
 	qnn_resample.fire_any = 0;
-	qnn_resample.jump_any = 0;
 }
 
 /* ── Binary write helpers (little-endian) ────────────────────────── */
@@ -807,4 +800,12 @@ void QNN_WriteF32LE(FILE *out, float value)
 	union { float f; uint32_t u; } bits;
 	bits.f = value;
 	QNN_WriteU32LE(out, bits.u);
+}
+
+/* Weak stub for match-text detection.  The collector overrides this with
+ * a real implementation in qnn_collect_main.c.  The trainer worker never
+ * sees real match text, so a no-op is fine. */
+__attribute__((weak)) void QNN_MatchCheckPrint(const char *text)
+{
+	(void)text;
 }

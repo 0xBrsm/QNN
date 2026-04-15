@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict
 
@@ -89,6 +90,13 @@ class BCConfig:
     lr_min: float  # >0 enables cosine decay from lr to lr_min over all epochs
     warmup_epochs: int  # >0 enables linear warmup from ~0 to lr over this many epochs
     prometheus_pushgateway_url: str  # e.g. "http://pi:9091"; empty = disabled
+    train_eval_interval: int  # run clean train eval every N epochs (0 = disabled)
+    train_eval_gap_threshold: float  # early trigger when val - train proxy exceeds this
+    train_eval_val_regression_threshold: float  # early trigger when val regresses beyond this
+    train_eval_train_improve_threshold: float  # paired with val regression trigger
+    # Performance tuning (sourced from machine.json by build_run_bc_config).
+    pin_memory: bool = True   # pinned host buffers + non-blocking h2d; ~5% faster on GPU
+    prefetch: bool = False    # ThreadPoolExecutor batch prefetch; net overhead in practice
 
 
 @dataclass(slots=True)
@@ -97,6 +105,74 @@ class _PrecomputedEpisode:
     obs: dict[str, np.ndarray]      # key → (n_samples, ...) arrays
     actions: dict[str, np.ndarray]   # head → (n_samples, ...) arrays
     n_samples: int
+
+
+@dataclass(slots=True)
+class _EpisodeCursor:
+    """Track sequential progress through one episode while preserving hidden state."""
+    episode: _PrecomputedEpisode
+    start: int = 0
+    hidden: torch.Tensor | None = None
+
+
+@dataclass(slots=True)
+class _ChunkBatchPlan:
+    cursors: tuple[_EpisodeCursor, ...]
+    starts: tuple[int, ...]
+    length: int
+
+
+@dataclass(slots=True)
+class _PreparedChunkBatch:
+    plan: _ChunkBatchPlan
+    obs: dict[str, torch.Tensor]
+    actions: dict[str, torch.Tensor]
+
+
+def _mae_sum(metrics: Mapping[str, float]) -> float:
+    return float(metrics.get("mae_move", 0.0)) + float(metrics.get("mae_look", 0.0))
+
+
+def _train_eval_schedule(
+    epoch: int,
+    history: Sequence[Mapping[str, Any]],
+    train_metrics: Mapping[str, float],
+    val_metrics: Mapping[str, float],
+    *,
+    interval: int,
+    gap_threshold: float,
+    val_regression_threshold: float,
+    train_improve_threshold: float,
+) -> tuple[float, float, list[str]]:
+    train_proxy_sum = _mae_sum(train_metrics)
+    val_sum = _mae_sum(val_metrics)
+    proxy_gap = val_sum - train_proxy_sum
+
+    reasons: list[str] = []
+    safe_interval = max(int(interval), 0)
+    if safe_interval > 0 and (epoch + 1) % safe_interval == 0:
+        reasons.append(f"interval/{safe_interval}")
+    if proxy_gap > float(gap_threshold):
+        reasons.append("proxy_gap")
+
+    if history:
+        prev = history[-1]
+        prev_train_proxy_sum = float(
+            prev.get(
+                "train_proxy_sum",
+                float(prev.get("train_mae_move", 0.0)) + float(prev.get("train_mae_look", 0.0)),
+            )
+        )
+        prev_val_sum = float(prev.get("val_mae_move", 0.0)) + float(prev.get("val_mae_look", 0.0))
+        val_regression = val_sum - prev_val_sum
+        train_delta = train_proxy_sum - prev_train_proxy_sum
+        if (
+            val_regression > float(val_regression_threshold)
+            and train_delta < -float(train_improve_threshold)
+        ):
+            reasons.append("val_regressed_train_improved")
+
+    return train_proxy_sum, proxy_gap, reasons
 
 
 
@@ -138,6 +214,25 @@ def _load_precomputed(cache_dir: Path) -> list[_PrecomputedEpisode]:
     import json
     manifest = json.loads((cache_dir / "manifest.json").read_text())
     episodes: list[_PrecomputedEpisode] = []
+    if isinstance(manifest, dict) and manifest.get("format") == "sharded_v1":
+        for shard in manifest.get("shards", []):
+            obs_arrays = {
+                key: np.load(cache_dir / fname, mmap_mode="r")
+                for key, fname in shard["obs"].items()
+            }
+            action_arrays = {
+                head: np.load(cache_dir / fname, mmap_mode="r")
+                for head, fname in shard["actions"].items()
+            }
+            start = 0
+            for n_samples in shard.get("episode_lengths", []):
+                end = start + int(n_samples)
+                obs = {key: values[start:end] for key, values in obs_arrays.items()}
+                actions = {head: values[start:end] for head, values in action_arrays.items()}
+                episodes.append(_PrecomputedEpisode(obs=obs, actions=actions, n_samples=int(n_samples)))
+                start = end
+        return episodes
+
     for entry in manifest:
         obs = {key: np.load(cache_dir / fname, mmap_mode="r")
                for key, fname in entry["obs"].items()}
@@ -164,7 +259,7 @@ def _generate_chunk_indices(
     return indices
 
 
-def _run_precomputed_supervised(
+def _run_precomputed_supervised_sequential(
     model: QNNPolicy,
     episodes: Sequence[_PrecomputedEpisode],
     batch_size: int,
@@ -337,6 +432,411 @@ def _run_precomputed_supervised(
     return result
 
 
+def _run_precomputed_supervised_batched(
+    model: QNNPolicy,
+    episodes: Sequence[_PrecomputedEpisode],
+    batch_size: int,
+    chunk_size: int,
+    *,
+    class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
+    lr: float | None = None,
+    rng: np.random.Generator | None = None,
+    max_grad_norm: float = 1.0,
+    head_loss_weights: Mapping[str, float] | None = None,
+    focal_gamma: float = 0.0,
+    sparse_discrete: bool = True,
+    look_deadzone: float = 0.0,
+    step_callback: Any | None = None,
+    report_every: int = 0,
+    pin_memory: bool = True,
+    prefetch: bool = False,
+) -> Dict[str, float]:
+    _empty: Dict[str, float] = {"loss": 0.0, "accuracy": 0.0, "n_rows": 0.0}
+    if not episodes:
+        return _empty
+
+    training = class_weights is not None and lr is not None
+    if training:
+        model.model.train()
+    else:
+        model.model.eval()
+
+    accum_target = max(1, int(batch_size))
+    microbatch_target = accum_target
+    device_type = model.device.type if isinstance(model.device, torch.device) else str(model.device)
+    # Perf tuning from BCConfig.pin_memory / BCConfig.prefetch (sourced from
+    # machine.json).  Isolation benchmark (4 × 4-epoch variants) showed:
+    #   pin_memory=True  → ~5% faster on GPU (async h2d from pinned buffers)
+    #   prefetch=True    → net overhead (GIL + thread sync > tiny h2d overlap)
+    use_pinned_host = device_type != "cpu" and bool(pin_memory)
+    use_prefetch = bool(prefetch)
+
+    ep_order: list[int] = list(range(len(episodes)))
+    if rng is not None:
+        ep_order = [int(i) for i in rng.permutation(len(episodes))]
+
+    total_rows = 0
+    total_loss = 0.0
+    total_accuracy = 0.0
+    raw_metric_totals: Dict[str, float] = {}
+    averaged_metric_totals: Dict[str, float] = {}
+    accum_count = 0
+
+    opt_steps = 0
+    _report_rows = 0
+    _report_loss = 0.0
+    _report_avg_totals: Dict[str, float] = {}
+    _report_raw_totals: Dict[str, float] = {}
+
+    if training:
+        model.bc_zero_grad()
+
+    ordered_cursors = [_EpisodeCursor(episode=episodes[idx]) for idx in ep_order]
+    active: list[_EpisodeCursor] = []
+    next_episode = 0
+    obs_buffer_slots = []
+    for _ in range(2):
+        slot = {
+            key: torch.empty(
+                (chunk_size, microbatch_target, *episodes[0].obs[key].shape[1:]),
+                dtype=torch.from_numpy(np.empty((), dtype=episodes[0].obs[key].dtype)).dtype,
+                pin_memory=use_pinned_host,
+            )
+            for key in episodes[0].obs
+        }
+        obs_buffer_slots.append(slot)
+    action_buffer_slots = []
+    for _ in range(2):
+        slot = {
+            head: torch.empty(
+                (chunk_size, microbatch_target, *episodes[0].actions[head].shape[1:]),
+                dtype=torch.from_numpy(np.empty((), dtype=episodes[0].actions[head].dtype)).dtype,
+                pin_memory=use_pinned_host,
+            )
+            for head in _ACTION_HEAD_NAMES
+        }
+        action_buffer_slots.append(slot)
+    hidden_buffer = (
+        torch.zeros((microbatch_target, model.gru_hidden), dtype=torch.float32, device=model.device)
+        if model.use_gru
+        else None
+    )
+
+    def _fill_active() -> None:
+        nonlocal next_episode
+        while len(active) < microbatch_target and next_episode < len(ordered_cursors):
+            active.append(ordered_cursors[next_episode])
+            next_episode += 1
+
+    def _remaining(cursor: _EpisodeCursor) -> int:
+        return cursor.episode.n_samples - cursor.start
+
+    def _make_plan_from_specs(
+        specs: Sequence[tuple[_EpisodeCursor, int]],
+        accum_count_value: int,
+    ) -> _ChunkBatchPlan | None:
+        if not specs:
+            return None
+        tail_lengths = [cursor.episode.n_samples - start for cursor, start in specs if (cursor.episode.n_samples - start) < chunk_size]
+        if tail_lengths:
+            tail_length = min(tail_lengths)
+            remaining_to_step = accum_target - accum_count_value if training else microbatch_target
+            selected = [
+                (cursor, start)
+                for cursor, start in specs
+                if (cursor.episode.n_samples - start) == tail_length
+            ][:max(1, min(microbatch_target, remaining_to_step))]
+            return _ChunkBatchPlan(
+                cursors=tuple(cursor for cursor, _ in selected),
+                starts=tuple(start for _, start in selected),
+                length=tail_length,
+            )
+        remaining_to_step = accum_target - accum_count_value if training else microbatch_target
+        group_size = min(len(specs), microbatch_target, remaining_to_step)
+        selected = list(specs[:group_size])
+        return _ChunkBatchPlan(
+            cursors=tuple(cursor for cursor, _ in selected),
+            starts=tuple(start for _, start in selected),
+            length=chunk_size,
+        )
+
+    def _current_specs() -> list[tuple[_EpisodeCursor, int]]:
+        return [(cursor, cursor.start) for cursor in active if _remaining(cursor) > 0]
+
+    def _project_specs_after_plan(plan: _ChunkBatchPlan) -> list[tuple[_EpisodeCursor, int]]:
+        next_starts = {id(cursor): start + plan.length for cursor, start in zip(plan.cursors, plan.starts)}
+        return [
+            (cursor, next_starts.get(id(cursor), cursor.start))
+            for cursor in active
+            if (cursor.episode.n_samples - next_starts.get(id(cursor), cursor.start)) > 0
+        ]
+
+    def _prepare_prefetched_batch(slot_idx: int, plan: _ChunkBatchPlan) -> _PreparedChunkBatch:
+        group_size = len(plan.cursors)
+        obs_batch: dict[str, torch.Tensor] = {}
+        for key in plan.cursors[0].episode.obs:
+            dst = obs_buffer_slots[slot_idx][key][:plan.length, :group_size]
+            for idx, (cursor, start) in enumerate(zip(plan.cursors, plan.starts)):
+                dst[:, idx, ...].copy_(torch.from_numpy(np.asarray(cursor.episode.obs[key][start:start + plan.length])))
+            obs_batch[key] = dst
+        act_batch: dict[str, torch.Tensor] = {}
+        for head in _ACTION_HEAD_NAMES:
+            dst = action_buffer_slots[slot_idx][head][:plan.length, :group_size]
+            for idx, (cursor, start) in enumerate(zip(plan.cursors, plan.starts)):
+                dst[:, idx, ...].copy_(torch.from_numpy(np.asarray(cursor.episode.actions[head][start:start + plan.length])))
+            act_batch[head] = dst
+        return _PreparedChunkBatch(plan=plan, obs=obs_batch, actions=act_batch)
+
+    def _hidden_batch_for_plan(plan: _ChunkBatchPlan) -> torch.Tensor | None:
+        if hidden_buffer is None:
+            return None
+        group_size = len(plan.cursors)
+        batch_hidden = hidden_buffer[:group_size]
+        batch_hidden.zero_()
+        for idx, cursor in enumerate(plan.cursors):
+            if cursor.hidden is not None:
+                batch_hidden[idx].copy_(cursor.hidden)
+        return batch_hidden
+
+    def _record_metrics(metrics: Dict[str, float], rows: int) -> None:
+        nonlocal total_rows, total_loss, total_accuracy
+        total_rows += rows
+        total_loss += float(metrics["loss"]) * rows
+        total_accuracy += float(metrics["accuracy"]) * rows
+        for key, val in metrics.items():
+            if key in {"loss", "accuracy", "_next_hidden"}:
+                continue
+            if key.startswith(_RAW_SUM_METRIC_PREFIXES):
+                raw_metric_totals[key] = raw_metric_totals.get(key, 0.0) + float(val)
+            elif key.startswith(_AVERAGED_METRIC_PREFIXES):
+                averaged_metric_totals[key] = averaged_metric_totals.get(key, 0.0) + float(val) * rows
+
+    def _maybe_step_optimizer(metrics: Dict[str, float], rows: int, chunk_count: int) -> None:
+        nonlocal accum_count, opt_steps, _report_rows, _report_loss
+        accum_count += chunk_count
+        if not training or accum_count < accum_target:
+            return
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_grad_norm)
+        model.bc_step()
+        model.bc_zero_grad()
+        accum_count = 0
+        opt_steps += 1
+
+        if step_callback and report_every > 0:
+            _report_rows += rows
+            _report_loss += float(metrics["loss"]) * rows
+            for key, val in metrics.items():
+                if key.startswith(_AVERAGED_METRIC_PREFIXES):
+                    _report_avg_totals[key] = _report_avg_totals.get(key, 0.0) + float(val) * rows
+                elif key.startswith(_RAW_SUM_METRIC_PREFIXES):
+                    _report_raw_totals[key] = _report_raw_totals.get(key, 0.0) + float(val)
+
+            if opt_steps % report_every == 0:
+                rd = max(_report_rows, 1)
+                step_metrics = {"loss": _report_loss / rd, "n_rows": float(_report_rows), "opt_step": opt_steps}
+                for key, total in _report_avg_totals.items():
+                    step_metrics[key] = total / rd
+                for key, total in _report_raw_totals.items():
+                    step_metrics[key] = total
+                step_callback(step_metrics)
+                _report_rows = 0
+                _report_loss = 0.0
+                _report_avg_totals.clear()
+                _report_raw_totals.clear()
+
+    def _apply_prepared_batch(prepared: _PreparedChunkBatch) -> None:
+        plan = prepared.plan
+        hidden_batch = _hidden_batch_for_plan(plan)
+        if training:
+            metrics = model.supervised_step(
+                prepared.obs,
+                prepared.actions,
+                class_weights,
+                lr=lr,
+                hidden=hidden_batch,
+                accumulate_only=True,
+                head_loss_weights=head_loss_weights,
+                focal_gamma=focal_gamma,
+                sparse_discrete=sparse_discrete,
+                look_deadzone=look_deadzone,
+                loss_scale=float(len(plan.cursors)),
+            )
+        else:
+            metrics = model.evaluate_supervised(
+                prepared.obs,
+                prepared.actions,
+                hidden=hidden_batch,
+                head_loss_weights=head_loss_weights,
+                focal_gamma=focal_gamma,
+                sparse_discrete=sparse_discrete,
+                look_deadzone=look_deadzone,
+            )
+
+        next_hidden = metrics.pop("_next_hidden", None)
+        if next_hidden is not None:
+            for idx, cursor in enumerate(plan.cursors):
+                cursor.hidden = next_hidden[idx].detach()
+
+        rows = plan.length * len(plan.cursors)
+        _record_metrics(metrics, rows)
+        _maybe_step_optimizer(metrics, rows, len(plan.cursors))
+
+        for cursor in plan.cursors:
+            cursor.start += plan.length
+
+    _fill_active()
+    current_specs = _current_specs()
+    current_plan = _make_plan_from_specs(current_specs, accum_count)
+    if current_plan is None:
+        return _empty
+
+    if use_prefetch:
+        with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
+            current_slot = 0
+            current_future: Future[_PreparedChunkBatch] | None = prefetch_executor.submit(
+                _prepare_prefetched_batch,
+                current_slot,
+                current_plan,
+            )
+
+            while active and current_plan is not None and current_future is not None:
+                prepared = current_future.result()
+                projected_specs = _project_specs_after_plan(prepared.plan)
+                projected_accum = accum_count + len(prepared.plan.cursors)
+                if training and projected_accum >= accum_target:
+                    projected_accum = 0
+                projected_next_episode = next_episode
+                while len(projected_specs) < microbatch_target and projected_next_episode < len(ordered_cursors):
+                    cursor = ordered_cursors[projected_next_episode]
+                    projected_specs.append((cursor, cursor.start))
+                    projected_next_episode += 1
+                next_plan = _make_plan_from_specs(projected_specs, projected_accum)
+                next_slot = 1 - current_slot
+                next_future: Future[_PreparedChunkBatch] | None = None
+                if next_plan is not None:
+                    next_future = prefetch_executor.submit(
+                        _prepare_prefetched_batch,
+                        next_slot,
+                        next_plan,
+                    )
+
+                _apply_prepared_batch(prepared)
+                active = [cursor for cursor in active if _remaining(cursor) > 0]
+                _fill_active()
+                current_plan = next_plan
+                current_future = next_future
+                current_slot = next_slot
+    else:
+        # Synchronous path: prepare + apply inline, no thread, single slot.
+        while active and current_plan is not None:
+            prepared = _prepare_prefetched_batch(0, current_plan)
+            _apply_prepared_batch(prepared)
+            active = [cursor for cursor in active if _remaining(cursor) > 0]
+            _fill_active()
+            current_plan = _make_plan_from_specs(_current_specs(), accum_count)
+
+    if training and accum_count > 0:
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_grad_norm)
+        model.bc_step()
+
+    denom = max(total_rows, 1)
+    result: Dict[str, float] = {
+        "loss": total_loss / denom,
+        "accuracy": total_accuracy / denom,
+        "n_rows": float(total_rows),
+    }
+    for key, total in raw_metric_totals.items():
+        result[key] = total
+    for key, total in averaged_metric_totals.items():
+        result[key] = total / denom
+    return result
+
+
+def _run_precomputed_supervised(
+    model: QNNPolicy,
+    episodes: Sequence[_PrecomputedEpisode],
+    batch_size: int,
+    sequence_length: int,
+    *,
+    class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
+    lr: float | None = None,
+    rng: np.random.Generator | None = None,
+    max_grad_norm: float = 1.0,
+    tbptt_limit: int = 256,
+    head_loss_weights: Mapping[str, float] | None = None,
+    focal_gamma: float = 0.0,
+    sparse_discrete: bool = True,
+    look_deadzone: float = 0.0,
+    step_callback: Any | None = None,
+    report_every: int = 0,
+    pin_memory: bool = True,
+    prefetch: bool = False,
+) -> Dict[str, float]:
+    if int(batch_size) <= 1:
+        return _run_precomputed_supervised_sequential(
+            model,
+            episodes,
+            batch_size,
+            sequence_length,
+            class_weights=class_weights,
+            lr=lr,
+            rng=rng,
+            max_grad_norm=max_grad_norm,
+            tbptt_limit=tbptt_limit,
+            head_loss_weights=head_loss_weights,
+            focal_gamma=focal_gamma,
+            sparse_discrete=sparse_discrete,
+            look_deadzone=look_deadzone,
+            step_callback=step_callback,
+            report_every=report_every,
+        )
+
+    use_full_episode = int(sequence_length) <= 0
+    if use_full_episode:
+        if tbptt_limit <= 0:
+            return _run_precomputed_supervised_sequential(
+                model,
+                episodes,
+                batch_size,
+                sequence_length,
+                class_weights=class_weights,
+                lr=lr,
+                rng=rng,
+                max_grad_norm=max_grad_norm,
+                tbptt_limit=tbptt_limit,
+                head_loss_weights=head_loss_weights,
+                focal_gamma=focal_gamma,
+                sparse_discrete=sparse_discrete,
+                look_deadzone=look_deadzone,
+                step_callback=step_callback,
+                report_every=report_every,
+            )
+        chunk_size = max(int(tbptt_limit), 64)
+    else:
+        chunk_size = max(int(sequence_length), 1)
+
+    return _run_precomputed_supervised_batched(
+        model,
+        episodes,
+        batch_size,
+        chunk_size,
+        class_weights=class_weights,
+        lr=lr,
+        rng=rng,
+        max_grad_norm=max_grad_norm,
+        head_loss_weights=head_loss_weights,
+        focal_gamma=focal_gamma,
+        sparse_discrete=sparse_discrete,
+        look_deadzone=look_deadzone,
+        step_callback=step_callback,
+        report_every=report_every,
+        pin_memory=pin_memory,
+        prefetch=prefetch,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prometheus pushgateway integration (optional).
 # ---------------------------------------------------------------------------
@@ -405,7 +905,12 @@ def _push_metrics_to_prometheus(
 
 def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[str, float]:
     set_global_seed(config.seed)
-    rng = np.random.default_rng(config.seed)
+    # Episode shuffle uses a fixed seed (42) independent of the model init
+    # seed, so all ablation runs see the same episode ordering per epoch.
+    # This rng is saved/restored in checkpoints so resume produces the
+    # same ordering as a continuous run.
+    _SHUFFLE_SEED = 42
+    rng = np.random.default_rng(_SHUFFLE_SEED)
 
     # Fall back to PUSHGATEWAY_URL env var if config doesn't specify one.
     if not config.prometheus_pushgateway_url:
@@ -513,7 +1018,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             "pi.local", username="guest", password="",
             auth_protocol="ntlm", require_signing=False,
         )
-        _variant_dir = _NAS_CHECKPOINTS + "\\" + Path(config.output_dir).name
+        _variant_name = output.parent.name or output.name
+        _variant_dir = _NAS_CHECKPOINTS + "\\" + _variant_name
         smbclient.makedirs(_variant_dir, exist_ok=True)
         _smb_available = True
         print(f"  [bc] NAS archive available: {_variant_dir}")
@@ -525,7 +1031,12 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     checkpoint_path = output / "bc_training_checkpoint.pt"
     if checkpoint_path.exists():
         import torch as _torch_resume
+        from quake_ai.ppo.checkpoint_converter import migrate_modality_embed
         ckpt = _torch_resume.load(checkpoint_path, map_location=model.device, weights_only=False)
+        migrate_modality_embed(
+            ckpt["model_state_dict"],
+            optimizer=ckpt.get("optimizer_state_dict"),
+        )
         model.model.load_state_dict(ckpt["model_state_dict"])
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         best_epoch = ckpt.get("best_epoch", -1)
@@ -539,6 +1050,11 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         _reg_violations = ckpt.get("_reg_violations", 0)
         # Optimizer state restored after first supervised step creates it.
         _resume_optimizer_state = ckpt.get("optimizer_state_dict")
+        # Restore rng state so resume produces the same episode ordering
+        # as a continuous run.
+        _saved_rng_state = ckpt.get("rng_state")
+        if _saved_rng_state is not None:
+            rng.bit_generator.state = _saved_rng_state
         print(f"  [bc] Resuming from epoch {start_epoch} (best_val={best_val_loss:.4f} at epoch {best_epoch})")
     else:
         _resume_optimizer_state = None
@@ -617,6 +1133,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             look_deadzone=config.look_deadzone,
             step_callback=_on_step,
             report_every=_report_every,
+            pin_memory=config.pin_memory,
+            prefetch=config.prefetch,
         )
         _t_train_end = _time.monotonic()
         # Restore optimizer state on first epoch after resume.
@@ -636,49 +1154,109 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             focal_gamma=config.focal_gamma,
             sparse_discrete=config.sparse_discrete,
             look_deadzone=config.look_deadzone,
+            pin_memory=config.pin_memory,
+            prefetch=config.prefetch,
         )
-        # Clean train eval (model.eval mode, no dropout) on val-sized subset
-        # for accurate generalization gap measurement.
-        train_eval_metrics = _run_precomputed_supervised(
-            model,
-            train_episodes[:len(val_episodes)],
-            batch_size=config.batch_size,
-            sequence_length=config.sequence_length,
-            tbptt_limit=config.tbptt_limit,
-            head_loss_weights=hlw,
-            focal_gamma=config.focal_gamma,
-            sparse_discrete=config.sparse_discrete,
-            look_deadzone=config.look_deadzone,
+        _t_val_only_end = _time.monotonic()
+        train_proxy_sum, train_proxy_gap, train_eval_reasons = _train_eval_schedule(
+            epoch,
+            history,
+            train_metrics,
+            val_metrics,
+            interval=config.train_eval_interval,
+            gap_threshold=config.train_eval_gap_threshold,
+            val_regression_threshold=config.train_eval_val_regression_threshold,
+            train_improve_threshold=config.train_eval_train_improve_threshold,
         )
+        train_eval_metrics: Dict[str, float] = {}
+        train_eval_sum: float | None = None
+        _train_eval_secs = 0.0
+        train_eval_ran = bool(val_episodes) and bool(train_eval_reasons)
+        if train_eval_ran:
+            # Clean train eval (model.eval mode, no dropout) on a train subset
+            # only when scheduled or when proxy metrics suggest a gap issue.
+            _t_train_eval_start = _time.monotonic()
+            train_eval_metrics = _run_precomputed_supervised(
+                model,
+                train_episodes[:len(val_episodes)],
+                batch_size=config.batch_size,
+                sequence_length=config.sequence_length,
+                tbptt_limit=config.tbptt_limit,
+                head_loss_weights=hlw,
+                focal_gamma=config.focal_gamma,
+                sparse_discrete=config.sparse_discrete,
+                look_deadzone=config.look_deadzone,
+                pin_memory=config.pin_memory,
+                prefetch=config.prefetch,
+            )
+            _train_eval_secs = _time.monotonic() - _t_train_eval_start
+            train_eval_sum = _mae_sum(train_eval_metrics)
         _t_val_end = _time.monotonic()
         _train_secs = _t_train_end - _t_train_start
+        _val_only_secs = _t_val_only_end - _t_val_start
         _val_secs = _t_val_end - _t_val_start
         _wall_clock = _datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"  [bc] timing: train={_train_secs:.1f}s  val={_val_secs:.1f}s  total={_train_secs + _val_secs:.1f}s  [{_wall_clock}]")
+        if train_eval_ran:
+            print(
+                f"  [bc] timing: train={_train_secs:.1f}s  val={_val_only_secs:.1f}s  "
+                f"train_eval={_train_eval_secs:.1f}s  total={_train_secs + _val_secs:.1f}s  [{_wall_clock}]"
+            )
+        else:
+            print(f"  [bc] timing: train={_train_secs:.1f}s  val={_val_only_secs:.1f}s  total={_train_secs + _val_secs:.1f}s  [{_wall_clock}]")
         mae_str = "  ".join(
             f"{k}={v:.4f}" for k, v in sorted(val_metrics.items()) if k.startswith("mae_")
         )
 
+        # Surface discrete head tp/fp/fn in the epoch log line.
+        _discrete_parts = []
+        for _dh in _DISCRETE_HEAD_NAMES:
+            _tp = float(val_metrics.get(f"tp_{_dh}", 0))
+            _fp = float(val_metrics.get(f"fp_{_dh}", 0))
+            _fn = float(val_metrics.get(f"fn_{_dh}", 0))
+            _hlw_val = hlw.get(_dh, 1.0) if hlw else 1.0
+            if _hlw_val > 0 and (_tp + _fp + _fn) > 0:
+                _discrete_parts.append(f"{_dh}:tp={_tp:.0f}/fp={_fp:.0f}/fn={_fn:.0f}")
+        _discrete_str = "  ".join(_discrete_parts)
+
         # Use val MAE sum for model selection when continuous-only (val_loss is
         # polluted by discrete head CE noise that never improves).
-        val_mae_sum = val_metrics.get("mae_move", 0.0) + val_metrics.get("mae_look", 0.0)
+        val_mae_sum = _mae_sum(val_metrics)
         selection_metric = val_mae_sum if val_mae_sum > 0 else val_metrics["loss"]
         improved = selection_metric < best_val_loss
 
-        train_eval_sum = train_eval_metrics.get("mae_move", 0.0) + train_eval_metrics.get("mae_look", 0.0)
-        print(f"  [bc] Epoch {epoch + 1}/{config.epochs}  "
-              f"train_eval={train_eval_sum:.4f}  "
-              f"val={val_mae_sum:.4f}  "
-              f"gap={val_mae_sum - train_eval_sum:+.4f}  "
-              f"{'*' if improved else ''}  "
-              f"{mae_str}")
+        epoch_line = (
+            f"  [bc] Epoch {epoch + 1}/{config.epochs}  "
+            f"train_proxy={train_proxy_sum:.4f}  "
+            f"val={val_mae_sum:.4f}  "
+            f"proxy_gap={train_proxy_gap:+.4f}  "
+        )
+        if train_eval_ran and train_eval_sum is not None:
+            epoch_line += (
+                f"train_eval={train_eval_sum:.4f}  "
+                f"gap={val_mae_sum - train_eval_sum:+.4f}  "
+                f"[{','.join(train_eval_reasons)}]  "
+            )
+        else:
+            epoch_line += "train_eval=skipped  "
+        epoch_line += (
+            f"{'*' if improved else ''}  "
+            f"{mae_str}"
+            f"{'  ' + _discrete_str if _discrete_str else ''}"
+        )
+        print(epoch_line)
 
         # Assemble and record per-epoch metrics.
         epoch_metrics: Dict[str, Any] = {
             "epoch": float(epoch),
             "train_secs": _train_secs,
             "val_secs": _val_secs,
+            "val_only_secs": _val_only_secs,
+            "train_eval_secs": _train_eval_secs,
             "wall_clock": _wall_clock,
+            "train_proxy_sum": train_proxy_sum,
+            "train_proxy_gap": train_proxy_gap,
+            "train_eval_ran": train_eval_ran,
+            "train_eval_reason": ",".join(train_eval_reasons),
         }
         for key, value in train_metrics.items():
             if key == "_next_hidden":
@@ -765,6 +1343,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             "_best_max_reg": _best_max_reg,
             "_best_reg_epoch": _best_reg_epoch,
             "_reg_violations": _reg_violations,
+            "rng_state": rng.bit_generator.state,
         }
         torch.save(ckpt_data, checkpoint_path)
         # Epoch-stamped copy so we can resume from any epoch.
@@ -807,6 +1386,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         tbptt_limit=config.tbptt_limit,
         focal_gamma=config.focal_gamma,
         sparse_discrete=config.sparse_discrete,
+        pin_memory=config.pin_memory,
+        prefetch=config.prefetch,
     ) if val_episodes else {"loss": 0.0}
 
     summary: Dict[str, Any] = {

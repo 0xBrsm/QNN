@@ -204,6 +204,9 @@ def build_run_bc_config(
     bc_cfg["bc_data_dir"] = str(bc_data_dir)
     bc_cfg["device"] = requested_device
     bc_cfg["batch_size"] = int(_require_key(machine, "batch_size", "machine.json"))
+    # Perf tuning — defaults reflect isolation-benchmark winner.
+    bc_cfg["pin_memory"] = bool(machine.get("pin_memory", True))
+    bc_cfg["prefetch"] = bool(machine.get("prefetch", False))
 
     return bc_cfg
 

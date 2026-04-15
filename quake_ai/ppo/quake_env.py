@@ -26,7 +26,6 @@ from mapgen.pool import PROCGEN_SENTINEL
 _MOVE_DIM = ACTION_HEADS["move"]
 _LOOK_DIM = ACTION_HEADS["look"]
 _DISCRETE_HEAD_ORDER = [
-    "jump",
     "fire",
     "switch",
     "recall_0",
@@ -84,10 +83,10 @@ def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
         [
             float(labels.move[0]),
             float(labels.move[1]),
+            float(labels.move[2]),
             float(labels.look[0]),
             float(labels.look[1]),
             float(labels.look[2]),
-            int(labels.jump),
             int(labels.fire),
             int(labels.switch),
             int(labels.recall_0),
@@ -132,8 +131,8 @@ class QuakeEnv(gymnasium.Env):
     """Gymnasium env wrapping NativeWorldEnv for Sample Factory APPO.
 
     Observation space: Dict of self/object/event/spatial token tensors from the inner encoder.
-    Action space: Tuple(Box(2), Box(2), Discrete...) for move/look vectors,
-    discrete jump/fire/switch, and four discrete recall heads.
+    Action space: Tuple(Box(3), Box(3), Discrete...) for move/look vectors,
+    discrete fire/switch, and four discrete recall heads.
 
     SF passes env_config with at least "worker_index" and "env_id" keys.
     Per-worker scenario assignment uses env_id % len(scenarios) if a scenario
@@ -230,7 +229,6 @@ class QuakeEnv(gymnasium.Env):
             (
                 gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_MOVE_DIM,), dtype=np.float32),
                 gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_LOOK_DIM,), dtype=np.float32),
-                gymnasium.spaces.Discrete(ACTION_HEADS["jump"]),
                 gymnasium.spaces.Discrete(ACTION_HEADS["fire"]),
                 gymnasium.spaces.Discrete(ACTION_HEADS["switch"]),
                 gymnasium.spaces.Discrete(ACTION_HEADS["recall_0"]),

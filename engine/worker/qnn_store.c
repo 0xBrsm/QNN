@@ -304,11 +304,40 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 			if (idx < MAX_EDICTS + QNN_STORE_OVERFLOW)
 			{
 				qnn_entity_t *e = &qnn_store[idx];
-	
+				float angle;
+
 				e->type = QNN_ENT_PUSH;
 				e->subject_id = QNN_SUBJECT_NONE;
 				if (r->has_origin) VectorCopy(r->origin, e->origin);
 				e->push_speed = QNN_RawPropFloat(r, "speed", 1000.0f);
+
+				/* Quake movedir from "angle" key:
+				 * -1 = up, -2 = down, else yaw in degrees. */
+				angle = QNN_RawPropFloat(r, "angle", 0.0f);
+				if (angle == -1.0f)
+				{
+					e->push_direction[0] = 0; e->push_direction[1] = 0; e->push_direction[2] = 1;
+				}
+				else if (angle == -2.0f)
+				{
+					e->push_direction[0] = 0; e->push_direction[1] = 0; e->push_direction[2] = -1;
+				}
+				else
+				{
+					float rad = angle * ((float)M_PI / 180.0f);
+					e->push_direction[0] = cosf(rad);
+					e->push_direction[1] = sinf(rad);
+					e->push_direction[2] = 0;
+				}
+
+				/* Brush model index for trigger volume bounds. */
+				e->push_model_index = 0;
+				if (r->has_model && r->model_name[0] == '*')
+				{
+					int mi = atoi(r->model_name + 1);
+					if (mi > 0 && mi < MAX_MODELS)
+						e->push_model_index = mi;
+				}
 				qnn_store_overflow_count++;
 			}
 			continue;

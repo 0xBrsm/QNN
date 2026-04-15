@@ -94,6 +94,7 @@ typedef struct {
 	/* Push */
 	float push_speed;
 	vec3_t push_direction;
+	int push_model_index;  /* brush model for trigger volume bounds */
 } qnn_entity_t;
 
 /* ── Store globals ────────────────────────────────────────────── */

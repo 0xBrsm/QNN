@@ -26,14 +26,13 @@ HEAD_LOSS_WEIGHTS: Dict[str, float] = {
     "move": 1.5,
     "look": 1.25,
     "fire": 2.0,
-    "jump": 1.5,
     "switch": 1.0,
 }
 _CONTINUOUS_HEAD_STD_INIT = -1.0
 
 # Sparse binary heads: skip true-negative ticks in BC loss.
 # Only train on ticks where the demonstrator acted or the model predicted action.
-_SPARSE_BINARY_HEADS = frozenset({"fire", "jump", "switch"})
+_SPARSE_BINARY_HEADS = frozenset({"fire", "switch"})
 
 
 def _focal_cross_entropy(
@@ -82,11 +81,13 @@ def _continuous_head_metrics(
     n = l1.shape[0]
 
     if head == "move":
-        s0, s1, st = l1[:, 0].sum(), l1[:, 1].sum(), l1.sum()
+        s0, s1, s2, st = l1[:, 0].sum(), l1[:, 1].sum(), l1[:, 2].sum(), l1.sum()
         return {
             "n_move": n,
-            "l1_sum_move_forward": s0.item(), "l1_sum_move_strafe": s1.item(), "l1_sum_move": st.item(),
-            "mae_move_forward": (s0 / n).item(), "mae_move_strafe": (s1 / n).item(), "mae_move": (st / n).item(),
+            "l1_sum_move_forward": s0.item(), "l1_sum_move_strafe": s1.item(),
+            "l1_sum_move_up": s2.item(), "l1_sum_move": st.item(),
+            "mae_move_forward": (s0 / n).item(), "mae_move_strafe": (s1 / n).item(),
+            "mae_move_up": (s2 / n).item(), "mae_move": (st / n).item(),
         }
 
     if head == "look":
@@ -157,16 +158,35 @@ class _ActorCriticNet(nn.Module):
         if self.gru is None:
             raise RuntimeError("GRU requested for a feed-forward model")
         current_hidden = hidden.unsqueeze(0)
-        outputs = []
         seq_len = int(trunk_features.shape[0])
         batch_size = int(trunk_features.shape[1])
         if masks is None:
-            masks = torch.ones((seq_len, batch_size), dtype=trunk_features.dtype, device=trunk_features.device)
-        for step_idx in range(seq_len):
-            step_mask = masks[step_idx].view(1, batch_size, 1)
-            current_hidden = current_hidden * step_mask
-            step_out, current_hidden = self.gru(trunk_features[step_idx : step_idx + 1], current_hidden)
-            outputs.append(step_out)
+            outputs, next_hidden = self.gru(trunk_features, current_hidden)
+            return outputs, next_hidden.squeeze(0)
+
+        if masks.ndim != 2 or tuple(masks.shape) != (seq_len, batch_size):
+            raise ValueError(f"Expected masks with shape ({seq_len}, {batch_size})")
+
+        mask_values = masks.to(dtype=trunk_features.dtype)
+        reset_rows = torch.any(mask_values != 1, dim=1)
+        if not bool(reset_rows.any()):
+            outputs, next_hidden = self.gru(trunk_features, current_hidden)
+            return outputs, next_hidden.squeeze(0)
+
+        outputs = []
+        reset_indices = reset_rows.nonzero(as_tuple=False).flatten().tolist()
+        start = 0
+        for idx, reset_t in enumerate(reset_indices):
+            if reset_t > start:
+                span_out, current_hidden = self.gru(trunk_features[start:reset_t], current_hidden)
+                outputs.append(span_out)
+
+            next_reset = reset_indices[idx + 1] if idx + 1 < len(reset_indices) else seq_len
+            current_hidden = current_hidden * mask_values[reset_t].view(1, batch_size, 1)
+            span_out, current_hidden = self.gru(trunk_features[reset_t:next_reset], current_hidden)
+            outputs.append(span_out)
+            start = next_reset
+
         return torch.cat(outputs, dim=0), current_hidden.squeeze(0)
 
     def forward(
@@ -357,7 +377,12 @@ class QNNPolicy:
 
     def _tensor(self, value: np.ndarray | torch.Tensor | Iterable[float], dtype: torch.dtype = torch.float32) -> torch.Tensor:
         if isinstance(value, torch.Tensor):
-            return value.to(device=self.device, dtype=dtype)
+            if value.device == self.device and value.dtype == dtype:
+                return value
+            non_blocking = value.device.type == "cpu" and (
+                not isinstance(self.device, torch.device) or self.device.type != "cpu"
+            )
+            return value.to(device=self.device, dtype=dtype, non_blocking=non_blocking)
         return torch.as_tensor(value, dtype=dtype, device=self.device)
 
     def _hidden_tensor(self, hidden: np.ndarray | torch.Tensor | None, batch_size: int) -> torch.Tensor:
@@ -715,7 +740,7 @@ class QNNPolicy:
                 target = self._action_targets_for_head(actions, head, head_logits)
                 pred = torch.argmax(head_logits, dim=1)
 
-                # Sparse binary heads (fire, jump): skip true negatives.
+                # Sparse binary heads (fire, switch): skip true negatives.
                 # Only compute loss on ticks where demonstrator acted OR model
                 # predicted action — avoids rewarding trivial "always predict 0".
                 if sparse_discrete and head in _SPARSE_BINARY_HEADS:
@@ -785,6 +810,7 @@ class QNNPolicy:
         focal_gamma: float = 0.0,
         sparse_discrete: bool = True,
         look_deadzone: float = 0.0,
+        loss_scale: float = 1.0,
     ) -> Dict[str, float]:
         optimizer = self._optimizer("bc", self.model.parameters(), lr)
         if not accumulate_only:
@@ -799,7 +825,7 @@ class QNNPolicy:
 
         nonzero = [l for l in losses if l.requires_grad or l.item() != 0.0]
         loss = torch.stack(nonzero).mean() if nonzero else torch.tensor(0.0, device=losses[0].device)
-        loss.backward()
+        (loss * float(loss_scale)).backward()
         if not accumulate_only:
             optimizer.step()
 

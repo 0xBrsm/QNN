@@ -247,22 +247,21 @@ def migrate_modality_embed(state: Dict[str, torch.Tensor], expected_rows: int = 
                            optimizer: Dict[str, Any] | None = None) -> bool:
     """Shrink modality_embed from old 5-row layout to current 4-row layout.
 
-    Old vocab had a SPATIAL gap at index 3, putting MENTAL at 4 → [5, d_model].
-    Current vocab packs MENTAL at 3 → [4, d_model].  Rows 3+ were never trained
-    (random noise), so we simply truncate to keep only rows 0-2 (NONE, VISUAL,
-    AUDITORY) and let the new MENTAL row reinitialise from the model's init.
+    Old layout had NONE=0, SIGHT=1, PROXIMITY=2, SOUND=3, MEMORY=4 (5 rows
+    total, but row 0 was a sentinel that the oracle never emitted, so it
+    was never trained).  Current layout packs SIGHT=0, PROXIMITY=1, SOUND=2,
+    MEMORY=3 (4 rows, all trained).  Migration drops row 0 and shifts the
+    rest down.
 
     Works on both SF state dicts (key contains ``encoder.trunk.tokenizer.modality_embed.weight``)
     and BC state dicts (``trunk.tokenizer.modality_embed.weight``).
 
-    If ``optimizer`` is provided, also truncates matching Adam momentum buffers
-    (exp_avg, exp_avg_sq) so the optimizer state stays consistent with the model.
+    If ``optimizer`` is provided, also shifts matching Adam momentum buffers
+    so the optimizer state stays consistent with the model.
 
     Returns True if any tensor was migrated.
     """
     migrated = False
-    # Build ordered list of parameter keys (excluding normalizer buffers) to
-    # map integer param indices in optimizer state to model keys.
     param_keys = [k for k in state
                   if not k.startswith("obs_normalizer.") and not k.startswith("returns_normalizer.")]
 
@@ -271,19 +270,16 @@ def migrate_modality_embed(state: Dict[str, torch.Tensor], expected_rows: int = 
             continue
         tensor = state[key]
         if tensor.shape[0] > expected_rows:
-            # Keep only the first `expected_rows` rows; discard untrained tail.
-            state[key] = tensor[:expected_rows].clone()
+            # Drop the dead NONE row at index 0; keep rows 1..N.
+            state[key] = tensor[1:1 + expected_rows].clone()
             migrated = True
 
-        # Truncate matching optimizer momentum buffers regardless of whether
-        # the model tensor itself needed migration (it may have been migrated
-        # in a prior pass while the optimizer was missed).
         if optimizer is not None and idx in optimizer.get("state", {}):
             opt_entry = optimizer["state"][idx]
             for buf_key in ("exp_avg", "exp_avg_sq"):
                 if buf_key in opt_entry and hasattr(opt_entry[buf_key], "shape"):
                     if opt_entry[buf_key].shape[0] > expected_rows:
-                        opt_entry[buf_key] = opt_entry[buf_key][:expected_rows].clone()
+                        opt_entry[buf_key] = opt_entry[buf_key][1:1 + expected_rows].clone()
                         migrated = True
 
     return migrated

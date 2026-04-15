@@ -85,14 +85,13 @@ ACTION_IDS: Dict[str, int] = {
 ACTION_VOCAB_SIZE = 20
 
 MODALITY_IDS: Dict[str, int] = {
-    "NONE": 0,
-    "SIGHT": 1,
-    "PROXIMITY": 2,
-    "SOUND": 3,
-    "MEMORY": 4,
+    "SIGHT": 0,
+    "PROXIMITY": 1,
+    "SOUND": 2,
+    "MEMORY": 3,
 }
 
-MODALITY_VOCAB_SIZE = 5
+MODALITY_VOCAB_SIZE = 4
 
 MAX_PLAYER_SLOTS = 32
 
