@@ -1,0 +1,210 @@
+#include "qnn.h"
+#include "qnn_route.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+/* ── shared globals ──────────────────────────────────────────────── */
+
+qnn_map_state_t qnn_map_state;
+qnn_resample_state_t qnn_resample;
+char qnn_basedir_storage[MAX_OSPATH] = ".";
+
+qboolean isDedicated;
+int nostdout = 1;
+char *basedir = qnn_basedir_storage;
+char *cachedir = "/tmp";
+cvar_t sys_linerefresh = {"sys_linerefresh", "0"};
+
+/* ── Sys_* stubs (Quake engine system layer) ─────────────────────── */
+
+void Sys_DebugNumber(int y, int val)
+{
+	(void)y;
+	(void)val;
+}
+
+void Sys_Printf(char *fmt, ...)
+{
+	(void)fmt;
+}
+
+void Sys_Quit(void)
+{
+	Host_Shutdown();
+	exit(0);
+}
+
+void Sys_Init(void)
+{
+}
+
+void Sys_Error(char *error, ...)
+{
+	va_list argptr;
+
+	va_start(argptr, error);
+	vfprintf(stderr, error, argptr);
+	va_end(argptr);
+	fputc('\n', stderr);
+	Host_Shutdown();
+	exit(1);
+}
+
+void Sys_Warn(char *warning, ...)
+{
+	va_list argptr;
+
+	va_start(argptr, warning);
+	vfprintf(stderr, warning, argptr);
+	va_end(argptr);
+	fputc('\n', stderr);
+}
+
+int Sys_FileTime(char *path)
+{
+	struct stat st;
+
+	return stat(path, &st) == -1 ? -1 : (int)st.st_mtime;
+}
+
+void Sys_mkdir(char *path)
+{
+	mkdir(path, 0777);
+}
+
+int Sys_FileOpenRead(char *path, int *handle)
+{
+	int h;
+	struct stat st;
+
+	h = open(path, O_RDONLY, 0666);
+	*handle = h;
+	if (h == -1)
+		return -1;
+	if (fstat(h, &st) == -1)
+		Sys_Error("Error fstating %s", path);
+	return (int)st.st_size;
+}
+
+int Sys_FileOpenWrite(char *path)
+{
+	int handle;
+
+	umask(0);
+	handle = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+	if (handle == -1)
+		Sys_Error("Error opening %s: %s", path, strerror(errno));
+	return handle;
+}
+
+int Sys_FileWrite(int handle, void *src, int count)
+{
+	return (int)write(handle, src, count);
+}
+
+void Sys_FileClose(int handle)
+{
+	close(handle);
+}
+
+void Sys_FileSeek(int handle, int position)
+{
+	lseek(handle, position, SEEK_SET);
+}
+
+int Sys_FileRead(int handle, void *dest, int count)
+{
+	return (int)read(handle, dest, count);
+}
+
+void Sys_DebugLog(char *file, char *fmt, ...)
+{
+	(void)file;
+	(void)fmt;
+}
+
+void Sys_EditFile(char *filename)
+{
+	(void)filename;
+}
+
+double Sys_FloatTime(void)
+{
+	struct timeval tv;
+	static int initialized;
+	static double base;
+	double now;
+
+	gettimeofday(&tv, NULL);
+	now = (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+	if (!initialized)
+	{
+		base = now;
+		initialized = 1;
+	}
+	return now - base;
+}
+
+void Sys_LineRefresh(void)
+{
+}
+
+void Sys_SendKeyEvents(void)
+{
+}
+
+void Sys_Sleep(void)
+{
+}
+
+char *Sys_ConsoleInput(void)
+{
+	return NULL;
+}
+
+void Sys_HighFPPrecision(void)
+{
+}
+
+void Sys_LowFPPrecision(void)
+{
+}
+
+void Sys_MakeCodeWriteable(unsigned long startaddr, unsigned long length)
+{
+	long page_size;
+	unsigned long addr;
+
+	page_size = sysconf(_SC_PAGESIZE);
+	addr = startaddr & ~(unsigned long)(page_size - 1);
+	mprotect((void *)addr, length + startaddr - addr, PROT_READ | PROT_WRITE | PROT_EXEC);
+}
+
+/* ── basedir resolution ──────────────────────────────────────────── */
+
+void QNN_ResolveBasedir(char *out, size_t out_size)
+{
+	const char *env = getenv("QUAKE_BASEDIR");
+	if (env && env[0])
+		snprintf(out, out_size, "%s", env);
+	else
+		snprintf(out, out_size, ".");
+}
+
+const char *QNN_ProgString(string_t value)
+{
+	if (!value)
+		return "";
+	return pr_strings + value;
+}
+

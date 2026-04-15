@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
-from quake_ai.actions import (
+from qnn.actions import (
     ActionLabels,
 )
 
@@ -263,7 +263,7 @@ class NativeProcessBase:
 
 import numpy as np
 
-from quake_ai.obs_format import OBS_BUFFER_SIZE, unpack_obs_buffer as _unpack_obs_buffer
+from qnn.wire import OBS_BUFFER_SIZE, unpack_obs_buffer as _unpack_obs_buffer
 
 
 class NativeObsBufferProcess(NativeProcessBase):

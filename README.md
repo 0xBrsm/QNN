@@ -1,115 +1,49 @@
 # Quake AI
 
-Transformer policy trained via behavioral cloning and PPO for PvP Quake.
-Packaged as `quake-ai-v0`.
+Transformer policy for competitive Quake PvP, trained via behavioral cloning
+from demos and PPO fine-tuning against bots. A native C worker observes game
+state and emits semantic tokens; a transformer encoder with GRU temporal core
+produces actions through factored continuous and discrete heads.
 
-## Packages
+## Quick Start
 
-| Package | Purpose |
-|---------|---------|
-| `quake_ai` | Python model, training pipeline, and observation contract |
-| `quake_ai.model` | Transformer tokenizer, trunk, and GRU actor-critic policy |
-| `quake_ai.ppo` | Sample Factory APPO integration (env, encoder, worker) |
-| `quake_ai.rl` | Run management, training router, runners, reward, evaluation |
-| `quake_ai.utils` | Device detection, reproducibility, IO helpers |
-| `demo` | Quake `.dem` parser and action-label extraction |
-| `engine` | C worker source, build scripts, and engine patches |
-| `mapgen` | Procedural `.map` generation and compilation |
-
-## Observation Contract
-
-v9 token-dict observation. Wire format defined in `engine/worker/qnn_io.h`,
-Python adapter in `quake_ai/obs_format.py`, model shapes in
-`quake_ai/model/observation.py`.
-
-| Token type | Count | Scalars | Notes |
-|------------|-------|---------|-------|
-| Self | 1 | 14 + 4 embed IDs | health, armor, weapons, ammo, velocity |
-| Entity | up to 16 | 8/19/15/14 by type | projectile/actor/item/mover, type-tagged |
-| Spatial | 9 | 13 | view-relative directional sectors |
-| Action history | up to 8 | 8 | recent action frames |
-
-Action space: 5 play heads (move, look, fire, jump, switch) + 4 recall heads.
-
-## Run Modes
-
-All training runs are driven by a frozen run directory. The training router
-dispatches to the correct runner based on `run.json.mode`:
-
-| Mode | Runner | Entry point |
-|------|--------|-------------|
-| `bc` | `quake_ai.rl.runners.bc` | Behavioral cloning from demo data |
-| `ppo` | `quake_ai.rl.runners.ppo` | PPO via Sample Factory APPO |
-| `pbt` | `quake_ai.rl.runners.pbt` | Population-based training |
-| `optuna` | `quake_ai.rl.runners.optuna` | Hyperparameter search |
-| `eval` | `quake_ai.rl.runners.eval` | Evaluation only |
-
-## Commands
+See [docs/setup.md](docs/setup.md) for the full path from clone to trained
+model: container setup, building the engine, preparing demos, and running
+training.
 
 ```bash
-# Install (editable)
-python -m pip install -e .
-python -m pip install -e .[dev]
+# Build (inside container)
+scripts/build-mod.sh
 
-# Create a run
-python -m quake_ai.rl.init_run \
-    --name <run_name> \
-    --checkpoint-path <ckpt> \
-    --resume true
-
-# Launch training
-python -m quake_ai.rl.training --run-dir runs/<run_name>
-
-# GPU check
-python -m quake_ai.utils.check_accelerator --device gpu
+# Create and run a BC training run
+python -m qnn.run.init --name bc_v1 --mode bc --resume true
+python -m qnn.run.router --run-dir runs/bc/bc_v1
 ```
 
-## Run Directory Layout
+## Source Layout
 
-```text
-runs/<name>/
-  run.json          # manifest (mode, resume, checkpoint_path, output paths)
-  run.md            # notes
-  config/
-    trainer.json
-    scenario.json
-    reward.json
-    machine.json
-    model.json
-  checkpoints/
-  metrics/
-  logs/
-```
+| Path | Purpose |
+|------|---------|
+| `qnn/` | Python model, training pipeline, observation contract |
+| `qnn/model/` | Transformer tokenizer, trunk, GRU actor-critic policy |
+| `qnn/run/` | Run directory management, config, router |
+| `qnn/bc/` | Behavioral cloning — demo collection and supervised training |
+| `qnn/ppo/` | PPO — Sample Factory APPO integration and RL training |
+| `qnn/eval/` | Evaluation — run checkpoints against bots, record demos |
+| `qnn/env/` | Live engine interface — NativeWorldEnv, reward, planning |
+| `engine/` | C worker source — `common/` (shared), `nq/` (NetQuake), `qw/` (QuakeWorld) |
+| `engine/build/` | Build scripts for worker binaries |
+| `demo/` | Quake `.dem` parser and label extraction |
+| `mapgen/` | Procedural `.map` generation |
+| `docker/` | Trainer container (Dockerfile, compose, entrypoint) |
 
-Run templates live in `quake_ai/rl/run_templates/`. `init_run` freezes
-copies into the run directory at creation time.
+## Documentation
 
-## Config Templates
-
-Training config is split by concern under `quake_ai/rl/run_templates/`:
-
-| Template | Scope |
-|----------|-------|
-| `trainer.json` | Learning rate, batch size, PPO hyperparameters |
-| `scenario.json` | Bot ladder, map pool, episode settings |
-| `model.json` | Architecture (d_model, heads, layers, GRU) |
-| `reward.json` | Reward shaping weights |
-| `machine.json` | Workers, devices, memory limits |
-| `eval.json` | Evaluation-specific overrides |
-| `run.json` | Mode, checkpoint, resume, output paths |
-
-## Docker
-
-The trainer container is defined in `docker/`:
-
-```bash
-docker compose -f docker/compose.yaml build trainer
-docker compose -f docker/compose.yaml run --rm trainer bash
-```
-
-## Engine Worker
-
-C worker source lives in `engine/worker/`. Build scripts and engine patches
-are in `engine/build/` and `engine/patches/`. The worker implements the
-observation packing (`qnn_io.h`), reward computation (`qnn_reward.c`),
-and game-state oracle (`qnn_oracle.c`, `qnn_store.c`).
+| Doc | What it covers |
+|-----|----------------|
+| [setup.md](docs/setup.md) | Prerequisites, building, demo corpus, training walkthrough |
+| [overview.md](docs/overview.md) | Architecture, reward system, training surface, source file map |
+| [run.md](docs/run.md) | Run directory schema and config reference |
+| [token-spec.md](docs/token-spec.md) | Wire format, obs buffer layout, action schema |
+| [vocab.md](docs/vocab.md) | Entity, action, modality IDs and event mapping |
+| [vendor.md](docs/vendor.md) | Third-party dependencies and upstream sources |

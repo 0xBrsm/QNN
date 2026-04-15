@@ -1,0 +1,25 @@
+{
+  "name": "example_ppo_run",
+  "mode": "ppo",
+  "runtime_scale": "live",
+  "resume": true,
+  "description": "",
+  "checkpoint_path": "",
+  "trial_count": 20,
+  "trial_budget_steps": 2000000,
+  "study_name": "reward_weight_search",
+  "storage": "",
+  "config": {
+    "train": "config/train.json",
+    "scenario": "config/scenario.json",
+    "reward": "config/reward.json",
+    "machine": "config/machine.json",
+    "model": "config/model.json",
+    "eval": "config/eval.json"
+  },
+  "output": {
+    "checkpoints": "checkpoints/",
+    "metrics": "metrics/",
+    "logs": "logs/"
+  }
+}

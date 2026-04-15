@@ -1,0 +1,8 @@
+{
+  "device": "gpu",
+  "asset_root": "assets",
+  "bc_data_dir": "assets/collect/prod",
+  "batch_size": 64,
+  "pin_memory": true,
+  "prefetch": false
+}

@@ -27,7 +27,6 @@ for _vol_dir in "${PIP_CACHE_DIR}" "${MIOPEN_USER_DB_PATH}"; do
   fi
 done
 
-mkdir -p "${QUAKE_AI_ARTIFACT_ROOT}/runs"
 mkdir -p "${QUAKE_AI_ARTIFACT_ROOT}/bin"
 
 cd /workspace

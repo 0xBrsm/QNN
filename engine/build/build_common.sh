@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Shared build logic sourced by build_quake_worker.sh and
-# build_quake_demo_worker.sh.  Callers must set SCRIPT_DIR before sourcing.
+# Shared build logic sourced by build_ppo_worker.sh and
+# build_nq_demo_worker.sh.  Callers must set SCRIPT_DIR before sourcing.
 
 set -euo pipefail
 
@@ -86,10 +86,10 @@ UPSTREAM_SOURCES=(
 # ── Shared C++ nav sources ─────────────────────────────────────────
 
 CUSTOM_CXX_SOURCES=(
-  "${ENGINE_DIR}/worker/qnn_navmesh.cpp"
-  "${ENGINE_DIR}/worker/qnn_link.cpp"
-  "${ENGINE_DIR}/worker/qnn_cluster.cpp"
-  "${ENGINE_DIR}/worker/qnn_route.cpp"
+  "${ENGINE_DIR}/common/qnn_navmesh.cpp"
+  "${ENGINE_DIR}/common/qnn_link.cpp"
+  "${ENGINE_DIR}/common/qnn_cluster.cpp"
+  "${ENGINE_DIR}/common/qnn_route.cpp"
 )
 
 NAV_CXX_SOURCES=(
@@ -269,7 +269,8 @@ compile_c() {
     -fcommon \
     -w \
     -I"${WORKTREE_DIR}" \
-    -I"${ENGINE_DIR}/worker" \
+    -I"${ENGINE_DIR}/common" \
+    -I"${ENGINE_DIR}/nq" \
     -c "${src}" \
     -o "${obj}"
   OBJECTS+=("${obj}")
@@ -283,7 +284,8 @@ compile_cxx() {
     -O2 \
     -w \
     -I"${WORKTREE_DIR}" \
-    -I"${ENGINE_DIR}/worker" \
+    -I"${ENGINE_DIR}/common" \
+    -I"${ENGINE_DIR}/nq" \
     -I"${VENDOR_DIR}/Recast/Include" \
     -I"${VENDOR_DIR}/Detour/Include" \
     -c "${src}" \

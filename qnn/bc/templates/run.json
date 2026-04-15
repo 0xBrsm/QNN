@@ -1,0 +1,18 @@
+{
+  "name": "example_bc_run",
+  "mode": "bc",
+  "runtime_scale": "live",
+  "resume": true,
+  "description": "",
+  "checkpoint_path": "",
+  "config": {
+    "train": "config/train.json",
+    "machine": "config/machine.json",
+    "model": "config/model.json"
+  },
+  "output": {
+    "checkpoints": "checkpoints/",
+    "metrics": "metrics/",
+    "logs": "logs/"
+  }
+}

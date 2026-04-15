@@ -1,5 +1,5 @@
 [project]
-name = "quake-ai-v0"
+name = "qnn"
 version = "0.3.0"
 description = "Transformer BC plus Sample Factory APPO pipeline for PvP Quake"
 readme = "README.md"
@@ -25,4 +25,4 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["demo", "engine", "mapgen", "quake_ai", "quake_ai.model", "quake_ai.ppo", "quake_ai.rl", "quake_ai.utils"]
+packages = ["demo", "engine", "mapgen", "qnn", "qnn.model", "qnn.bc", "qnn.ppo", "qnn.eval", "qnn.env", "qnn.run", "qnn.utils"]

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.15.0
+
+### Added
+- QuakeWorld demo worker (`qw_demo_worker`) — headless MVD/QWD playback with full feature parity to the NQ worker: QW physics, PVS culling, MVD playerstate view-angle recovery, sound precache
+- BC collect rewritten for 10K+ demo scale — parallel with resume, sharded `.npy` output, persistent demo worker subprocess per worker, throughput + ETA progress reporting
+- Look head cosine loss on the unit sphere, toggled via `look_cosine`; selection metric replaced with angular look + move + fire F1
+- Copy-previous-action BC baseline (`qnn/bc/baseline.py`) for corpus difficulty benchmarking
+
+### Changed
+- Python package renamed `quake_ai` → `qnn`; reorganized into `bc/`, `ppo/`, `eval/`, `env/`, `run/`; C worker split into `engine/common/` + `engine/nq/` + `engine/qw/`
+- Run templates split per pipeline (`qnn/bc/templates/`, `qnn/ppo/templates/`); BC runs drop `scenario.json`, `reward.json`, `eval.json`. Run directories partitioned by mode: `runs/<mode>/<name>/`
+- Corpus layout moved to `assets/corpus/{dem,qwd}` with sharded output under `assets/collect/{prod,tmp}`
+
+### Fixed
+- Action history patched in the obs buffer at emit time (removes 2-frame lag)
+- MVD playerstate circular-buffer aliasing corrupting view angles; move-label reversal via simvel anchor + pmove substeps
+- QW `MAX_MSGLEN` raised 1450 → 65536 for modern QWD demos; `-game` dir derived from `--demo-dir`; match-text detection handles colored text via `svc_print` hook
+
 ## 0.14.0
 
 ### Changed
@@ -27,7 +45,7 @@
 ### Changed
 - Demo movement labels reconstructed via BSP-clipped emission-window physics instead of position deltas
 - Velocity derived from position deltas — spectator `cl.velocity` is always zero
-- `evaluate.py`, `init_run.py`, `bc_collect.py`, `quickeval.py`, `observe.py` moved into `quake_ai/rl/`
+- `evaluate.py`, `init_run.py`, `bc_collect.py`, `quickeval.py`, `observe.py` moved into `qnn/rl/`
 - Demo package consolidated under `demo/`; `mapgen_cpp` removed
 
 ### Fixed
