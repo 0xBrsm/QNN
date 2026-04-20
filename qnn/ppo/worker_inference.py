@@ -92,7 +92,11 @@ class WorkerInferenceEnvRunner(NonBatchedVectorEnvRunner):
         super().__init__(cfg, env_info, num_envs, worker_idx, split_idx,
                          buffer_mgr, sampling_device, training_info)
         self._param_clients: Dict[int, Any] = {}
-        self._inference_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        requested = str(getattr(cfg, "worker_inference_device", "cpu")).lower()
+        if requested == "cpu":
+            self._inference_device = torch.device("cpu")
+        else:
+            self._inference_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def set_param_clients(self, param_clients: Dict[int, Any]) -> None:
         self._param_clients = param_clients
@@ -186,7 +190,14 @@ class WorkerInferenceEnvRunner(NonBatchedVectorEnvRunner):
                         # Slice (not index) to preserve ndarray type —
                         # val[i] on a 1-D array returns a numpy scalar which
                         # TensorDict._set_data_func rejects.
-                        actor_outputs[name] = val[i:i+1] if val.ndim == 1 else val[i]
+                        if val.ndim == 0:
+                            # 0-D scalar (happens with batch=1 for some outputs) —
+                            # broadcast to a 1-element array.
+                            actor_outputs[name] = np.array([val.item()])
+                        elif val.ndim == 1:
+                            actor_outputs[name] = val[i:i+1]
+                        else:
+                            actor_outputs[name] = val[i]
                     else:
                         actor_outputs[name] = val
 
@@ -372,9 +383,13 @@ class WorkerInferenceRolloutWorker(RolloutWorker):
         # CUDA deserialization issues). ParameterClientAsync creates a local
         # model on the target device and loads the CPU state dict into it.
         import copy
+        requested = str(getattr(self.cfg, "worker_inference_device", "cpu")).lower()
+        use_cpu = requested == "cpu"
         gpu_cfg = copy.copy(self.cfg)
-        gpu_cfg.device = "gpu"
-        inference_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        gpu_cfg.device = "cpu" if use_cpu else "gpu"
+        inference_device = torch.device(
+            "cpu" if use_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         param_client = make_parameter_client(
             self.cfg.serial_mode, param_server, gpu_cfg, self.env_info, self.timing
         )

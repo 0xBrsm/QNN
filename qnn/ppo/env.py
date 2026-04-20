@@ -34,6 +34,28 @@ _DISCRETE_HEAD_ORDER = [
     "recall_3",
 ]
 
+_HEAD_NOOP_VALUES: Dict[str, object] = {
+    "move": [0.0, 0.0, 0.0],
+    "look": [0.0, 0.0, 0.0],
+    "fire": 0,
+    "switch": 0,
+    "recall_0": 0,
+    "recall_1": 0,
+    "recall_2": 0,
+    "recall_3": 0,
+}
+
+
+def _parse_disabled_heads(head_loss_weights_json: str) -> frozenset[str]:
+    """Return the set of head names whose weight is 0.0 (treated as disabled)."""
+    raw = (head_loss_weights_json or "").strip()
+    if not raw:
+        return frozenset()
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        return frozenset()
+    return frozenset(h for h, w in parsed.items() if float(w) == 0.0)
+
 
 def tuple_action_to_heads(action) -> Dict[str, object]:
     """Convert an SF Tuple action to the canonical action dict.
@@ -221,6 +243,14 @@ class QuakeEnv(gymnasium.Env):
             procgen=procgen_cfg,
         )
 
+        # Heads with head_loss_weight==0.0 are "disabled": their sampled
+        # actions are overridden to no-ops here so the environment never sees
+        # the random sample.  Gradient isolation for those heads is handled
+        # upstream in TupleActionDistribution (see train.py).
+        self._disabled_heads: frozenset[str] = _parse_disabled_heads(
+            getattr(cfg, "head_loss_weights", "")
+        )
+
         # Episode-level accumulators for SF custom metrics
         self._episode_stats = EpisodeStatAccumulator()
 
@@ -253,6 +283,21 @@ class QuakeEnv(gymnasium.Env):
 
     def step(self, action):
         action_dict = tuple_action_to_heads(action)
+        for head in self._disabled_heads:
+            action_dict[head] = _HEAD_NOOP_VALUES[head]
+        # Normalize look to the unit sphere before it hits the engine.
+        # qnn_input.c maps look to view-angle deltas via atan2, which is
+        # scale-invariant but ill-defined near the origin; the tanh clamp
+        # at ±1 can also distort large-noise samples.  Normalizing keeps
+        # the semantic "direction" intact, matching BC labels which are
+        # unit vectors.  Skip when look is disabled (noop=[0,0,0]).
+        if "look" not in self._disabled_heads:
+            look = action_dict.get("look")
+            if look is not None:
+                look_arr = np.asarray(look, dtype=np.float32)
+                norm = float(np.linalg.norm(look_arr))
+                if norm > 1e-6:
+                    action_dict["look"] = (look_arr / norm).tolist()
         obs, reward, done, info = self.inner_env.step(action_dict)
         info = dict(info)
         info.setdefault("scenario_id", self.scenario_id)

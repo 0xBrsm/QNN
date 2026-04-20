@@ -499,10 +499,10 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, char *error, size_t e
 		SZ_Clear(&cmd_text);
 	}
 
-	snprintf(command, sizeof(command), "playdemo %s\n", demo_path);
+	snprintf(command, sizeof(command), "playdemo \"%s\"\n", demo_path);
 	Cbuf_AddText(command);
 
-	for (frame = 0; frame < 4096; ++frame)
+	for (frame = 0; frame < 2048; ++frame)
 	{
 		Host_Frame(qnn_runtime.fixed_dt);
 		if (QNN_ClientReady())
@@ -605,13 +605,13 @@ static int QNN_HandleCollect(const char *line)
 	qnn_snapshot_t snapshot;
 	char demo_path[MAX_OSPATH];
 	char error[256];
+	int play_start, play_end;
 
 	memset(demo_path, 0, sizeof(demo_path));
 	memset(error, 0, sizeof(error));
-	{
-		int trim = QNN_JsonExtractInt(line, "\"trim_match\"", 0);
-		qnn_match_state = trim ? 0 : 1;
-	}
+	play_start = QNN_JsonExtractInt(line, "\"play_start\"", 0);
+	play_end = QNN_JsonExtractInt(line, "\"play_end\"", 999999999);
+	qnn_match_state = 1; /* always emit — boundaries are frame-gated */
 	if (!QNN_JsonExtractString(line, "\"demo_path\"", demo_path, sizeof(demo_path)))
 	{
 		QNN_WriteError("reset options must include demo_path");
@@ -641,11 +641,8 @@ static int QNN_HandleCollect(const char *line)
 		QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
 		QNN_BuildAllRefs();
 
-		/* Match trimming: skip pre-match ticks until svc_print
-		 * contains match start text.  Demos with no match text
-		 * emit a done-only marker (Python re-collects untrimmed). */
 		{
-			qboolean emitting = (qnn_match_state == 1);
+			qboolean emitting = false;
 
 		while (!qnn_runtime.done)
 		{
@@ -655,8 +652,9 @@ static int QNN_HandleCollect(const char *line)
 			if (!cls.demoplayback || cls.state == ca_disconnected)
 				qnn_runtime.done = true;
 
-			/* Match ended — stop collecting. */
-			if (qnn_match_state == 2)
+			/* Frame-gated emission: play_start..play_end from the
+			 * offline analyzer.  Everything outside is skipped. */
+			if (qnn_runtime.tick > play_end)
 			{
 				snapshot.done = true;
 				qnn_runtime.done = true;
@@ -664,20 +662,18 @@ static int QNN_HandleCollect(const char *line)
 
 			QNN_CaptureSnapshotLocal(&snapshot, false);
 
-			/* Start emitting when match begins. */
-			if (!emitting && qnn_match_state == 1)
+			if (!emitting && qnn_runtime.tick >= play_start)
 			{
 				emitting = true;
 				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
 				QNN_ResampleInit(qnn_runtime.resample_hz);
-				qnn_runtime.phys_grounded = snapshot.grounded;
 				QNN_SaveEmitAnchor(&snapshot);
-				fprintf(stderr, "[demo] emitting from tick %d\n", qnn_runtime.tick);
+				fprintf(stderr, "[demo] emitting from tick %d (play_start=%d play_end=%d)\n",
+					qnn_runtime.tick, play_start, play_end);
 				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
 				continue;
 			}
 
-			/* Pre-match or no match text yet: skip ticks. */
 			if (!emitting && !qnn_runtime.done)
 			{
 				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
@@ -764,7 +760,7 @@ static int QNN_HandleCollect(const char *line)
 			QNN_WriteObsTick(&qnn_runtime.tick_emit, stdout,
 				&snapshot, qnn_runtime.tick,
 				qnn_runtime.steps, emit_hz, true);
-			fprintf(stderr, "[demo] no match text found, emitted done marker only\n");
+			/* Demo ended before play_start — no data emitted. */
 		}
 		}
 	}

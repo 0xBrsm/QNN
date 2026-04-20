@@ -1,4 +1,4 @@
-# Quake AI
+# Quake Neural Network
 
 Transformer policy for competitive Quake PvP, trained via behavioral cloning
 from demos and PPO fine-tuning against bots. A native C worker observes game

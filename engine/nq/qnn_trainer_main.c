@@ -60,7 +60,7 @@ typedef struct
 	int	fraglimit;
 	int	timelimit;
 	int	samelevel;
-	int	arena_mode;
+	int	train;
 	char	pre_map_commands[QNN_WORKER_MAX_COMMAND_TEXT];
 	char	post_map_commands[QNN_WORKER_MAX_COMMAND_TEXT];
 } qnn_reset_options_t;
@@ -68,8 +68,20 @@ typedef struct
 static qnn_runtime_t qnn_runtime;
 static qnn_reset_options_t qnn_reset_options;
 
-/* Arena mode cvar: when 1, PutClientInServer gives all weapons/ammo on spawn. */
-static cvar_t qnn_arena_mode_cvar = {"qnn_arena_mode", "0", false, false};
+/* Train mode cvar (numeric for QuakeC consumption).  JSON config carries
+   a string name which QNN_TrainModeFromName() maps to one of these values. */
+#define QNN_TRAIN_OFF    0
+#define QNN_TRAIN_ARENA  1  /* bots get full loadout via CheatCommand */
+#define QNN_TRAIN_TARGET 2  /* bots spawn frozen so the model can practice aim */
+static cvar_t qnn_train_cvar = {"qnn_train", "0", false, false};
+
+static int QNN_TrainModeFromName(const char *name)
+{
+	if (name == NULL || name[0] == 0) return QNN_TRAIN_OFF;
+	if (!strcmp(name, "arena"))       return QNN_TRAIN_ARENA;
+	if (!strcmp(name, "target"))      return QNN_TRAIN_TARGET;
+	return QNN_TRAIN_OFF;
+}
 /* Inventory cvars: set by C worker from scenario.json, read by QuakeC PlayerPreThink. */
 static cvar_t qnn_inv_weapons_cvar    = {"qnn_inv_weapons",    "0", false, false};
 static cvar_t qnn_inv_shells_cvar     = {"qnn_inv_shells",     "0", false, false};
@@ -107,7 +119,7 @@ static void QNN_ResetOptionsDefaults(qnn_reset_options_t *options)
 	options->fraglimit = 0;
 	options->timelimit = 0;
 	options->samelevel = 1;
-	options->arena_mode = 0;
+	options->train = 0;
 }
 
 /* Weapon name → IT_ bitmask. */
@@ -156,7 +168,7 @@ static void QNN_ParseInventory(const char *line)
 	int weapons = 0;
 	int powerups = 0;
 
-	/* Default: no custom inventory (cvars = 0 → QC fallback to arena_mode behavior) */
+	/* Default: no custom inventory (cvars = 0 → QC fallback to train-mode behavior) */
 	QNN_CvarSetInt("qnn_inv_weapons", 0);
 	QNN_CvarSetInt("qnn_inv_shells", 0);
 	QNN_CvarSetInt("qnn_inv_nails", 0);
@@ -228,7 +240,11 @@ static void QNN_ParseResetOptions(const char *line, qnn_reset_options_t *options
 	options->fraglimit = QNN_JsonExtractInt(line, "\"fraglimit\"", options->fraglimit);
 	options->timelimit = QNN_JsonExtractInt(line, "\"timelimit\"", options->timelimit);
 	options->samelevel = QNN_JsonExtractInt(line, "\"samelevel\"", options->samelevel);
-	options->arena_mode = QNN_JsonExtractInt(line, "\"arena_mode\"", options->arena_mode);
+	{
+		char train_name[32] = {0};
+		if (QNN_JsonExtractString(line, "\"train\"", train_name, sizeof(train_name)))
+			options->train = QNN_TrainModeFromName(train_name);
+	}
 	QNN_JsonExtractString(line, "\"pre_map_commands\"", options->pre_map_commands, sizeof(options->pre_map_commands));
 	QNN_JsonExtractString(line, "\"post_map_commands\"", options->post_map_commands, sizeof(options->post_map_commands));
 
@@ -571,9 +587,9 @@ static qboolean QNN_ResetWorldLocal(int seed, char *error, size_t error_size)
 		qnn_reset_options.fraglimit,
 		qnn_reset_options.timelimit,
 		qnn_reset_options.samelevel);
-	/* Set arena_mode cvar so QuakeC PlayerPreThink can read it.
+	/* Publish train mode so QuakeC PlayerPreThink can branch on it.
 	   Cvar persists across map changes (unlike console commands in pre_map). */
-	Cvar_Set("qnn_arena_mode", qnn_reset_options.arena_mode ? "1" : "0");
+	QNN_CvarSetInt("qnn_train", qnn_reset_options.train);
 
 	QNN_AppendCommand(command, sizeof(command), qnn_reset_options.pre_map_commands);
 	snprintf(command + strlen(command), sizeof(command) - strlen(command),
@@ -865,7 +881,7 @@ int main(int argc, char **argv)
 	parms.membase = malloc(parms.memsize);
 	parms.basedir = basedir;
 	Host_Init(&parms);
-	Cvar_RegisterVariable(&qnn_arena_mode_cvar);
+	Cvar_RegisterVariable(&qnn_train_cvar);
 	Cvar_RegisterVariable(&qnn_inv_weapons_cvar);
 	Cvar_RegisterVariable(&qnn_inv_shells_cvar);
 	Cvar_RegisterVariable(&qnn_inv_nails_cvar);

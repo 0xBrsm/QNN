@@ -25,7 +25,10 @@ in `compose.yaml`:
 | Variable | Purpose |
 |----------|---------|
 | `QUAKE_BASEDIR` | Asset root — PAK files, demos, compiled binaries |
-| `QUAKE_AI_DEVICE` | `gpu` or `cpu` |
+| `QNN_DEVICE` | `gpu` or `cpu` for torch device |
+| `QNN_ARTIFACT_ROOT` | Asset root inside the container (`/workspace/assets`) |
+| `QNN_AUTOCAST_DTYPE` | `fp32` / `bf16` / `fp16` (defaults to fp32; BC sets it from `train.json.dtype`) |
+| `QNN_ROCM_INFERENCE_PAD_BATCH` | ROCm-only: pad batch size for inference (default 32) |
 | `PYTHONPATH` | Must include the repo root |
 
 For devcontainer users, `.devcontainer/devcontainer.json` provides an
@@ -221,6 +224,30 @@ python -m qnn.run.router --run-dir runs/ppo/ppo_v1
 
 PPO runs the live engine with bots, using the BC checkpoint as the initial
 policy. This requires built `ppo_worker` and `progs.dat`.
+
+### PPO From Random Weights
+
+If you want to exercise the PPO pipeline without a trained BC seed —
+e.g., smoke-testing the trainer — generate a random-init policy and
+point `--checkpoint-path` at it:
+
+```bash
+python scripts/make_random_checkpoint.py \
+    --model qnn/ppo/templates/model.json \
+    --seed 29 \
+    --output assets/seeds/rand_seed29/rand_seed29.pth
+```
+
+The checkpoint has the same architecture/sidecar layout as a BC `bc_best_model.pth`, so `qnn.run.init --mode ppo --checkpoint-path ...` accepts it directly.
+
+### Microbenchmark
+
+Per-process ppo_worker throughput ceiling (bare pipe IPC, no SF, no
+inference) — useful when investigating SF orchestration overhead:
+
+```bash
+python scripts/bench_ppo_worker.py --steps 5000 --warmup 500
+```
 
 ### GPU Check
 

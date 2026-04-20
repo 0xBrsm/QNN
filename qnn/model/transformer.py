@@ -96,7 +96,9 @@ class Tokenizer(nn.Module):
             mask = (entity_types == tok_type)  # (batch, 16)
             if mask.any():
                 raw = entity_scalars_raw[mask][:, :sdim]  # (k, sdim)
-                result[mask] = proj(raw)
+                # Cast back to result.dtype so autocast (e.g. bf16) doesn't
+                # mismatch the fp32 destination buffer.
+                result[mask] = proj(raw).to(result.dtype)
         return result
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:

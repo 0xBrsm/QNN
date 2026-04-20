@@ -163,7 +163,8 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
         raise RuntimeError("run.json.checkpoint_path must be a string")
     result["checkpoint_path"] = _resolve_optional_path(ckpt)
 
-    if mode in {"eval", "ppo", "pbt", "optuna"} and not result["checkpoint_path"]:
+    # eval requires a checkpoint; ppo/pbt/optuna may omit it for random init.
+    if mode == "eval" and not result["checkpoint_path"]:
         raise RuntimeError(f"run.json must define a non-empty checkpoint_path when mode is '{mode}'")
 
     result["output"] = _require_mapping(manifest, "output", "run.json")
@@ -218,7 +219,10 @@ def build_run_bc_config(
     bc_cfg["device"] = requested_device
     bc_cfg["batch_size"] = int(_require_key(machine, "batch_size", "machine.json"))
     bc_cfg["pin_memory"] = bool(_require_key(machine, "pin_memory", "machine.json"))
-    bc_cfg["prefetch"] = bool(_require_key(machine, "prefetch", "machine.json"))
+    bc_cfg["prefetch"] = int(_require_key(machine, "prefetch", "machine.json"))
+    bc_cfg["microbatch_size"] = int(_require_key(machine, "microbatch_size", "machine.json"))
+    bc_cfg["snapshot_interval"] = int(machine.get("snapshot_interval", 15))
+    bc_cfg["dtype"] = str(_require_string(train, "dtype", "train.json"))
 
     return bc_cfg
 
@@ -248,6 +252,7 @@ def build_run_ppo_eval_config(
     ppo_cfg["policy_workers_per_policy"] = int(_require_key(machine, "policy_workers_per_policy", "machine.json"))
     ppo_cfg["batched_sampling"] = bool(_require_key(machine, "batched_sampling", "machine.json"))
     ppo_cfg["worker_inference"] = bool(_require_key(machine, "worker_inference", "machine.json"))
+    ppo_cfg["worker_inference_device"] = str(_require_key(machine, "worker_inference_device", "machine.json")).lower()
     ppo_cfg["num_envs"] = int(ppo_cfg["num_workers"]) * int(ppo_cfg["num_envs_per_worker"])
 
     # Validate minibatch alignment

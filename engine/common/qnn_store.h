@@ -102,6 +102,18 @@ typedef struct {
 extern qnn_entity_t qnn_store[MAX_EDICTS + QNN_STORE_OVERFLOW];
 extern int qnn_store_overflow_count; /* BSP-only entries after MAX_EDICTS */
 
+/* ── Shared observation semantics ─────────────────────────────── */
+
+#define QNN_PRIMARY_OBS_VIS 0
+#define QNN_PRIMARY_OBS_PVS 1
+
+int QNN_PrimaryObservationSourceForType(int entity_type);
+float QNN_PrimaryObservationTimestamp(const qnn_entity_t *entity);
+int QNN_PrimaryObservationModalityId(const qnn_entity_t *entity);
+qboolean QNN_PrimaryObservationIsCurrent(const qnn_entity_t *entity, float now);
+void QNN_LookupEntityBounds(int entity_num, float *out_half, vec3_t out_center_adjust);
+void QNN_EntityAnchorFromModel(int entity_num, const vec3_t raw_origin, vec3_t out_anchor, float *out_half);
+
 /* ── Store API ────────────────────────────────────────────────── */
 
 void QNN_StoreInit(const qnn_map_state_t *map_state);

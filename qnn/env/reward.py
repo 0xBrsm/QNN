@@ -71,10 +71,10 @@ def _remap_tracking(cos: float, fov_deg: float) -> float:
 
     Returns +1 at dead center, 0 at the FOV boundary, -1 at 180° behind.
     ``fov_deg`` is the full field-of-view in degrees (e.g. 90 means ±45°).
-    A value of 360 (default) reproduces the old behaviour (no remapping).
+    A value of 360 means the entire sphere is rewarded: +1 at dead center,
+    0 only at 180° behind, and never negative unless ``fov_deg < 360`` and
+    ``tracking_penalty`` is enabled.
     """
-    if fov_deg >= 360.0:
-        return cos
     half_rad = math.radians(min(fov_deg, 360.0) * 0.5)
     boundary = math.cos(half_rad)  # cosine at the FOV edge
     if cos >= boundary:

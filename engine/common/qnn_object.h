@@ -255,7 +255,6 @@ void QNN_EntityResetTeamCache(void);
 float QNN_IsSameTeam(int entity_num);
 float QNN_FragFraction(int entity_frags);
 qboolean QNN_ClassifyStaticSubject(const qnn_static_object_t *obj, int *subject_id, int *qualifier_id, float *magnitude, qboolean *is_item, float *respawn_s);
-qboolean QNN_ClassifyKnownSubject(const qnn_known_entity_t *ent, int *subject_id, int *qualifier_id, float *magnitude);
 float QNN_ItemRespawnS(const qnn_static_object_t *obj, int subject_id);
 int QNN_SubjectPickupCategory(int subject_id);
 

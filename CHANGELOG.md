@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.16.0
+
+### Added
+
+- PPO rollout workers run inference on CPU in parallel; 2.4× over SF's central GPU inference
+- BC training ~2× faster: bf16 autocast via `QNN_AUTOCAST_DTYPE`, AOTriton + hipBLASLt
+- Deterministic mid-epoch resume via wall-clock `snapshot_interval`; `MADV_SEQUENTIAL`/`MADV_DONTNEED` on mmap shards bounds page-cache usage
+- Threat- and team-aware entity token slot ordering
+- Engine `qnn_train` cvar (`"arena"` / `"target"` / off) replaces boolean `qnn_arena_mode`; `"target"` freezes a frikbot for aim-practice runs
+- Per-head loss weights for PPO (`--head_loss_weights`): weight 0 zeros that head's log-prob, entropy, and KL gradient end-to-end through the SF `TupleActionDistribution`
+- `look_cosine` L2-normalization, look-head bias-init to `[1, 0, 0]`, and look sample normalization in `env.step`; `initial_stddev` plumbed from `train.json`
+- `qnn.env.sim`: offline trainer for static token scenes (oracle / sl / sl-episodic / rl curriculum)
+
+### Changed
+
+- SF `RunningMeanStd` obs normalizer disabled (encoder already pre-scales); Adam uses fused kernel on CUDA/ROCm
+- Demo analyzer split: `demo.analyze` → `demo.classify` with mode classification
+- `worker_inference_device` moved from env var into `machine.json`
+- PPO runs accept empty `checkpoint_path` as random-init; `eval` still requires one
+- Tracking reward + entity metrics migrated from orphaned `snapshot->known[]` to `qnn_store[]` — the latent zero-reward bug from the 0.10.0 entity-pipeline refactor is fixed
+
+### Fixed
+
+- PPO second-reset hang: `QNN_PrepareMap` aliased the buffer `QNN_FreeMapState` zeroed mid-call. Latent since 0.10.x
+- PPO warm-start silently ignored for any seed filename without `best_` in it; SF's scan for `checkpoint_<step>_<envsteps>.pth` missed it and orthogonal-init'd. Now always copies to `checkpoint_000000000_0.pth`
+- QW demo worker stability at scale: per-worker config isolation, BSP presence filter, fail-fast on stuck signon, per-demo SIGALRM timeout, baseline-seeded entities
+- SF `worker_inference` crashes on empty valid-ratios minibatches and on 0-D scatter outputs at `num_envs_per_worker=1`
+
 ## 0.15.0
 
 ### Added

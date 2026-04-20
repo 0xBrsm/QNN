@@ -58,10 +58,18 @@
     {
       "scenario_id": "arena-1v1-box",
       "map_id": "arena_box",
-      "skill_note": "Tiny box arena - 1v1, all weapons, pure combat training.",
+      "skill_note": "Tiny box arena - 1v1, model spawns with 200 RA + RL + LG + full ammo.",
       "options": {
         "maxplayers": 3,
-        "post_map_commands": "impulse 100"
+        "post_map_commands": "impulse 100",
+        "inventory": {
+          "weapons": ["rocket_launcher", "lightning"],
+          "rockets": 100,
+          "cells": 100,
+          "armor_value": 200,
+          "armor_type": 0.8,
+          "health": 100
+        }
       }
     }
   ]

@@ -54,10 +54,10 @@ RUN apt-get update \
 
 WORKDIR /workspace
 
-COPY src/docker/entrypoint.sh /usr/local/bin/quake-ai-trainer-entrypoint
-RUN chmod +x /usr/local/bin/quake-ai-trainer-entrypoint
+COPY src/docker/entrypoint.sh /usr/local/bin/qnn-trainer-entrypoint
+RUN chmod +x /usr/local/bin/qnn-trainer-entrypoint
 
 USER ${USERNAME}
 
-ENTRYPOINT ["quake-ai-trainer-entrypoint"]
+ENTRYPOINT ["qnn-trainer-entrypoint"]
 CMD ["bash"]

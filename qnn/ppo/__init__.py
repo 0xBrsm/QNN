@@ -1,1 +1,1 @@
-"""PPO training integration for Quake AI."""
+"""PPO training integration for QNN."""

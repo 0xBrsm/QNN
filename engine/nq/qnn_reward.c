@@ -1,5 +1,6 @@
 #include "qnn.h"
 #include "qnn_metrics.h"
+#include "qnn_store.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -176,9 +177,7 @@ static float QNN_RemapTracking(float cos_val, float fov_deg)
 {
 	float half_rad, boundary;
 
-	if (fov_deg >= 360.0f)
-		return cos_val;
-	half_rad = fov_deg * 0.5f * ((float)M_PI / 180.0f);
+	half_rad = fminf(fov_deg, 360.0f) * 0.5f * ((float)M_PI / 180.0f);
 	boundary = cosf(half_rad);
 	if (cos_val >= boundary)
 		return (cos_val - boundary) / fmaxf(1.0f - boundary, 1e-8f);
@@ -190,19 +189,25 @@ static float QNN_TrackingCosine(const qnn_snapshot_t *snapshot)
 {
 	float best_cos = 0.0f;
 	float best_dist_sq = 1e30f;
-	int i;
+	float now = (float)cl.mtime[0];
+	int entity_num;
 	vec3_t forward;
 
 	QNN_ForwardFromAngles(snapshot->player_view_angles, forward);
 
-	for (i = 0; i < snapshot->known_count; ++i)
+	/* Only actors whose primary observation channel is current this tick
+	   participate in tracking reward. Bodyque corpses have entity_num >
+	   cl.maxclients and are already excluded by the store classifier. */
+	for (entity_num = 1; entity_num <= cl.maxclients && entity_num < MAX_EDICTS; ++entity_num)
 	{
-		const qnn_known_entity_t *ent = &snapshot->known[i];
+		const qnn_entity_t *ent = &qnn_store[entity_num];
 		float dx, dy, dz, dist_sq, inv_dist, cos_val;
 
-		if (ent->entity_num == cl.viewentity || ent->entity_num <= 0)
+		if (entity_num == cl.viewentity)
 			continue;
-		if (ent->health <= 0)
+		if (ent->type != QNN_ENT_ACTOR)
+			continue;
+		if (!QNN_PrimaryObservationIsCurrent(ent, now))
 			continue;
 
 		dx = ent->origin[0] - snapshot->player_origin[0];

@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict
+import time as _time
 
 import numpy as np
 import torch
@@ -76,28 +77,28 @@ class BCConfig:
     train_eval_val_regression_threshold: float  # early trigger when val regresses beyond this
     train_eval_train_improve_threshold: float  # paired with val regression trigger
     # Performance tuning (sourced from machine.json by build_run_bc_config).
-    pin_memory: bool = True   # pinned host buffers + non-blocking h2d; ~5% faster on GPU
-    prefetch: bool = False    # ThreadPoolExecutor batch prefetch; net overhead in practice
+    pin_memory: bool           # pinned host buffers + non-blocking h2d
+    prefetch: int              # 0 = off, N = keep N batches staged ahead
+    microbatch_size: int       # forward-pass batch size for gradient accumulation (0 = batch_size)
+    snapshot_interval: int     # seconds between rolling mid-epoch state snapshots (0 = disabled)
+    dtype: str                 # "fp32" | "bf16" | "fp16" — autocast for forward+loss
+    step_report_interval_seconds: int = 60  # wall-clock cadence for step logging (0 = every callback)
 
 
-from qnn.bc.loop import PrecomputedEpisode as _PrecomputedEpisode, run_epoch as _run_precomputed_supervised
+from qnn.bc.loop import MidEpochState as _MidEpochState, PrecomputedEpisode as _PrecomputedEpisode, run_epoch as _run_precomputed_supervised
 
 
 def _selection_score(metrics: Mapping[str, float]) -> float:
-    """Composite selection metric: angular look error + move MAE + fire F1.
+    """Composite selection metric: angular look error + move MAE.
 
-    Lower is better.  Roughly equal contribution from each term at typical
-    model quality (~5-10 per term).
+    Lower is better. Fire and switch F1 are trained but kept out of the
+    selection score — their per-epoch noise masked slow look/move progress
+    and we can slice checkpoints on any metric retrospectively from the
+    per-epoch pt files anyway.
     """
     look_deg = float(metrics.get("mae_look_angle_deg", 0.0))
     move_mae = float(metrics.get("mae_move", 0.0))
-    tp = float(metrics.get("tp_fire", 0.0))
-    fp = float(metrics.get("fp_fire", 0.0))
-    fn = float(metrics.get("fn_fire", 0.0))
-    precision = tp / max(tp + fp, 1.0)
-    recall = tp / max(tp + fn, 1.0)
-    f1 = 2.0 * precision * recall / max(precision + recall, 1e-6)
-    return look_deg + 10.0 * move_mae + 10.0 * (1.0 - f1)
+    return look_deg + 10.0 * move_mae
 
 
 def _train_eval_schedule(
@@ -177,6 +178,20 @@ def _class_weights_from_counts(
 
 # --- Data loading ---
 
+def _madvise_sequential(arr: np.ndarray) -> None:
+    """Hint the kernel to read-ahead and drop pages behind the cursor.
+
+    Mmap'd training shards can be tens of GB.  Without this hint the
+    page cache fills with every page ever touched, competing with WSL2
+    VM memory.  MADV_SEQUENTIAL lets the kernel reclaim pages that the
+    training loop has already consumed.
+    """
+    import mmap as mmap_mod
+    mm = getattr(arr, '_mmap', None)
+    if mm is not None and hasattr(mm, 'madvise'):
+        mm.madvise(mmap_mod.MADV_SEQUENTIAL)
+
+
 def _load_precomputed(cache_dir: Path) -> list[_PrecomputedEpisode]:
     """Load precomputed episodes with real memory-mapped .npy arrays."""
     import json
@@ -192,6 +207,10 @@ def _load_precomputed(cache_dir: Path) -> list[_PrecomputedEpisode]:
                 head: np.load(cache_dir / fname, mmap_mode="r")
                 for head, fname in shard["actions"].items()
             }
+            for arr in obs_arrays.values():
+                _madvise_sequential(arr)
+            for arr in action_arrays.values():
+                _madvise_sequential(arr)
             start = 0
             for n_samples in shard.get("episode_lengths", []):
                 end = start + int(n_samples)
@@ -206,6 +225,10 @@ def _load_precomputed(cache_dir: Path) -> list[_PrecomputedEpisode]:
                for key, fname in entry["obs"].items()}
         actions = {head: np.load(cache_dir / fname, mmap_mode="r")
                    for head, fname in entry["actions"].items()}
+        for arr in obs.values():
+            _madvise_sequential(arr)
+        for arr in actions.values():
+            _madvise_sequential(arr)
         episodes.append(_PrecomputedEpisode(obs=obs, actions=actions, n_samples=entry["n_samples"]))
     return episodes
 
@@ -332,6 +355,10 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     if sample_counts["train"] <= 0:
         raise RuntimeError("No training samples available")
 
+    # Configure mixed-precision autocast via the env var that QNNPolicy reads.
+    os.environ["QNN_AUTOCAST_DTYPE"] = config.dtype
+    print(f"  [bc] dtype={config.dtype}")
+
     obs_dim = OBS_DIM
     if seed_checkpoint and Path(seed_checkpoint).exists():
         print(f"  [bc] Fine-tuning from seed: {seed_checkpoint}")
@@ -375,7 +402,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     best_val_loss = float("inf")
     best_epoch = -1
     epochs_without_improvement = 0
-    history: List[Dict[str, float]] = []
+    history: list[Dict[str, float]] = []
     start_epoch = 0
 
     # Regression-based stopping state.
@@ -403,6 +430,10 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     except Exception:
         _smb_available = False
         print("  [bc] NAS archive not available — skipping offsite backup")
+
+    # Mid-epoch state: rolling file for deterministic resume within an epoch.
+    mid_epoch_path = output / "snapshot.pt"
+    _MID_EPOCH_SAVE_INTERVAL = config.snapshot_interval
 
     # Resume from checkpoint if available.
     checkpoint_path = output / "bc_training_checkpoint.pt"
@@ -436,16 +467,46 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     else:
         _resume_optimizer_state = None
 
+    # Mid-epoch resume: if we have a mid-epoch state file, use it to
+    # resume within the current epoch instead of restarting it.
+    _mid_epoch_resume: _MidEpochState | None = None
+    if mid_epoch_path.exists():
+        import torch as _torch_mid
+        try:
+            _mid_ckpt = _torch_mid.load(mid_epoch_path, map_location=model.device, weights_only=False)
+            if _mid_ckpt.get("epoch") == start_epoch:
+                model.model.load_state_dict(_mid_ckpt["model_state_dict"])
+                _resume_optimizer_state = _mid_ckpt.get("optimizer_state_dict")
+                _mid_epoch_resume = _mid_ckpt["mid_epoch_state"]
+                rng.bit_generator.state = _mid_ckpt["rng_state"]
+                print(f"  [bc] Mid-epoch resume: epoch {start_epoch}, "
+                      f"step {_mid_epoch_resume.opt_steps}, "
+                      f"episode {_mid_epoch_resume.next_episode}")
+            else:
+                mid_epoch_path.unlink()
+        except Exception as exc:
+            print(f"  [bc] Mid-epoch state load failed: {exc}")
+            mid_epoch_path.unlink(missing_ok=True)
+
     # torch.compile: tested but net negative for this model size (189K params).
     # The fused kernels don't help when individual ops are already microseconds,
     # and the compile wrapper adds overhead (val: 100s → 120s per epoch).
     # Revisit if model size increases significantly.
 
-    # Per-step reporting: log every ~1024 samples (report_every optimizer steps).
+    # Per-step reporting: aggregate every ~1024 samples, then wall-clock gate
+    # actual logging/flushes so perf runs do not spend most of their time
+    # printing and rewriting the step log.
     _report_every = max(1, 1024 // max(config.batch_size, 1)) if config.batch_size > 0 else 0
-    _step_log: List[Dict[str, float]] = []
+    _step_log: list[Dict[str, float]] = []
+    _step_report_interval = max(int(config.step_report_interval_seconds), 0)
+    _last_step_report_time = _time.monotonic() - _step_report_interval
 
     def _on_step(step_metrics: Dict[str, float]) -> None:
+        nonlocal _last_step_report_time
+        _now = _time.monotonic()
+        if _step_report_interval > 0 and (_now - _last_step_report_time) < _step_report_interval:
+            return
+        _last_step_report_time = _now
         step_metrics["epoch"] = float(epoch)
         _step_log.append(step_metrics)
         mae_parts = [f"{k}={v:.4f}" for k, v in sorted(step_metrics.items()) if k.startswith("mae_")]
@@ -455,14 +516,39 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         # Flush step log to disk every report interval for live monitoring.
         write_json(output / "bc_step_log.json", {"steps": _step_log})
 
+    def _save_mid_epoch(state: _MidEpochState) -> None:
+        bc_opt = model._optimizers.get("bc")
+        mid_data = {
+            "epoch": epoch,
+            "model_state_dict": {
+                k.replace("_orig_mod.", ""): v
+                for k, v in model.model.state_dict().items()
+            },
+            "optimizer_state_dict": bc_opt.state_dict() if bc_opt else None,
+            "mid_epoch_state": state,
+            "rng_state": rng.bit_generator.state,
+        }
+        torch.save(mid_data, mid_epoch_path)
+
     _active_lr = config.lr
     _lr_override_path = output / "lr_override.json"
 
     import math as _math
-    import time as _time
     from datetime import datetime as _datetime, timezone as _tz
 
+    import gc as _gc
+
+    _prev_epoch_weights: Dict[str, torch.Tensor] | None = None
+
     for epoch in range(start_epoch, config.epochs):
+        # Reclaim Python + CUDA allocator pool at each epoch boundary.
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        # Snapshot weights at the start of this epoch so we can compute
+        # L2 drift from the end-of-last-epoch state as a "is the model still
+        # actively changing?" signal.
+        _epoch_start_weights = {k: v.detach().clone() for k, v in model.model.state_dict().items()}
         # Hot-reload LR: drop {"lr": 0.001, "lr_min": 0.0003} into lr_override.json.
         _lr = config.lr
         _lr_min = config.lr_min
@@ -511,9 +597,16 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             look_turn_alpha=config.look_turn_alpha,
             step_callback=_on_step,
             report_every=_report_every,
+            report_interval_seconds=float(_step_report_interval),
             pin_memory=config.pin_memory,
             prefetch=config.prefetch,
+            microbatch_size=config.microbatch_size,
+            save_state_callback=_save_mid_epoch,
+            snapshot_interval=_MID_EPOCH_SAVE_INTERVAL,
+            resume_state=_mid_epoch_resume,
         )
+        # Mid-epoch state consumed — don't reuse on next epoch.
+        _mid_epoch_resume = None
         _t_train_end = _time.monotonic()
         # Restore optimizer state on first epoch after resume.
         if _resume_optimizer_state is not None:
@@ -535,6 +628,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             look_turn_alpha=config.look_turn_alpha,
             pin_memory=config.pin_memory,
             prefetch=config.prefetch,
+            microbatch_size=config.microbatch_size,
         )
         _t_val_only_end = _time.monotonic()
         train_proxy_sum, train_proxy_gap, train_eval_reasons = _train_eval_schedule(
@@ -603,6 +697,18 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         selection_metric = val_selection_score
         improved = selection_metric < best_val_loss
 
+        # Weight drift: L2 of (weights now) - (weights at epoch start).
+        # Non-zero drift in a plateau = model still reorganizing; zero = stuck.
+        # Accumulate squared diffs on GPU, single host sync at the end.
+        _cur_state = model.model.state_dict()
+        _diffs = [((_cur_state[_k] - _start_v) ** 2).sum()
+                  for _k, _start_v in _epoch_start_weights.items()
+                  if _cur_state[_k].dtype.is_floating_point]
+        _weight_drift_l2 = torch.stack(_diffs).sum().sqrt().item() if _diffs else 0.0
+
+        _grad_mean = train_metrics.get("grad_norm_mean")
+        _grad_max = train_metrics.get("grad_norm_max")
+
         epoch_line = (
             f"  [bc] Epoch {epoch + 1}/{config.epochs}  "
             f"train_proxy={train_proxy_sum:.4f}  "
@@ -617,8 +723,14 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             )
         else:
             epoch_line += "train_eval=skipped  "
+        epoch_line += f"{'*' if improved else ''}  "
+        if _grad_mean is not None:
+            epoch_line += (
+                f"grad_mean={_grad_mean:.3f}  "
+                f"grad_max={_grad_max:.3f}  "
+            )
+        epoch_line += f"drift={_weight_drift_l2:.3f}  "
         epoch_line += (
-            f"{'*' if improved else ''}  "
             f"{mae_str}"
             f"{'  ' + _discrete_str if _discrete_str else ''}"
         )
@@ -637,6 +749,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             "train_eval_ran": train_eval_ran,
             "train_eval_reason": ",".join(train_eval_reasons),
         }
+        epoch_metrics["weight_drift_l2"] = _weight_drift_l2
+
         for key, value in train_metrics.items():
             if key == "_next_hidden":
                 continue
@@ -725,6 +839,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             "rng_state": rng.bit_generator.state,
         }
         torch.save(ckpt_data, checkpoint_path)
+        # Epoch completed cleanly — remove the rolling mid-epoch state.
+        mid_epoch_path.unlink(missing_ok=True)
         # Epoch-stamped copy so we can resume from any epoch.
         epoch_ckpt_dir = output / "checkpoints"
         epoch_ckpt_dir.mkdir(exist_ok=True)
@@ -756,6 +872,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         model.save(output / "bc_best_model.pth")
 
     final_model = QNNPolicy.load(output / "bc_best_model.pth", device=config.device)
+    final_model.look_cosine = bool(config.look_cosine)
 
     final_val_metrics = _run_precomputed_supervised(
         final_model,

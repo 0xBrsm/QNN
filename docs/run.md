@@ -115,7 +115,8 @@ PPO / PBT / Optuna trials:
 | `worker_num_splits` | Sample Factory worker splits |
 | `policy_workers_per_policy` | centralized inference workers per policy |
 | `batched_sampling` | Sample Factory batched sampling toggle |
-| `worker_inference` | per-worker inference toggle |
+| `worker_inference` | per-worker inference toggle (see [PPO worker inference](#ppo-worker-inference)) |
+| `worker_inference_device` | `cpu` (default) or `gpu` — device each rollout worker runs inference on when `worker_inference=true` |
 | `minibatch_size` | PPO minibatch size |
 | `eval_num_envs` | post-train eval env count |
 | `eval_num_episodes` | post-train eval episode count |
@@ -182,7 +183,8 @@ PPO / PBT / Optuna trials:
 | `fixed_tick_hz`, `max_steps_per_episode`, `seed` | run timing and seed |
 | `rollout_steps`, `total_steps` | PPO horizon |
 | `policy_lr`, `ppo_epochs`, `clip_ratio` | optimizer controls |
-| `entropy_coef`, `bc_kl_coef` | exploration and KL shaping |
+| `entropy_coef`, `bc_kl_coef`, `look_cosine`, `initial_stddev` | exploration, KL shaping, look-head action semantics, continuous action sampling width |
+| `head_loss_weights` | per-head PPO loss weighting (same JSON schema as BC); weight 0 zeros that head's log-prob/entropy/KL so no gradient flows to its parameters |
 | `gamma`, `gae_lambda`, `max_grad_norm`, `value_coef` | PPO objective weights |
 | `with_pbt`, `num_policies`, `pbt_*` | PBT controls |
 | `eval_seed` | post-train eval seed |
@@ -217,6 +219,30 @@ PPO / PBT / Optuna post-train eval pool.
 | `start_mode` | `holdout` or `randomized` |
 | `record_demos` | write demo files during eval |
 | `metric` | selection statistic across episodes (`median`, etc.) |
+
+## PPO worker inference
+
+Sample Factory's default rollout architecture sends every env's observation
+to a central inference worker that batches and forwards on GPU. For this
+project's small (~50k-param) policy on ROCm/WSL, the coordination tax of
+gathering 128 envs into one GPU batch dominates the GPU compute, and the
+`worker_inference=true` path (local inference inside each rollout worker)
+is substantially faster:
+
+| Config | Aggregate FPS | vs baseline |
+|---|---|---|
+| Central GPU inference (default) | ~1,900 | 1.0× |
+| `worker_inference=true`, GPU | ~2,800 | 1.5× |
+| `worker_inference=true`, `worker_inference_device=cpu` | ~4,570 | 2.4× |
+
+The CPU path wins because 32 rollout-worker processes get real per-core
+parallelism, while 32 processes all hitting one ROCm device serialize
+their kernel launches. The win flips back toward GPU once the policy
+grows (rebenchmark above a few hundred thousand params).
+
+With `worker_inference=true`, per-worker policy lag variance increases;
+`_record_summaries` in SF's learner is monkey-patched to guard against
+an empty minibatch.
 
 ## Derived Values
 

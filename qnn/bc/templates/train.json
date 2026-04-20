@@ -13,7 +13,7 @@
   "sparse_discrete": false,
   "look_deadzone": 0.0,
   "look_turn_alpha": 0.0,
-  "look_cosine": false,
+  "look_cosine": true,
   "warmup_epochs": 0,
   "class_weight_power": 0.6,
   "class_weight_min": 0.5,
@@ -25,5 +25,7 @@
   "train_eval_gap_threshold": 0.08,
   "train_eval_val_regression_threshold": 0.01,
   "train_eval_train_improve_threshold": 0.005,
+  "step_report_interval_seconds": 60,
+  "dtype": "bf16",
   "prometheus_pushgateway_url": ""
 }

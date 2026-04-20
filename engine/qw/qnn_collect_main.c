@@ -91,6 +91,12 @@ typedef struct
 	int	prev_fwd_sign;
 	int	prev_strafe_sign;
 	float	prev_move[3];
+	/* Previous valid weapon impulse (1-8) seen.  Used for edge-detection
+	 * on switch_slot — some QWD recorders write the held weapon every
+	 * frame instead of leaving impulse=0 between presses, so we only
+	 * emit switch when the weapon impulse value changes. */
+	int	prev_weapon_impulse;
+	qboolean has_prev_weapon_impulse;
 	FILE	*store_dump;
 	qnn_tick_emit_state_t tick_emit;
 	/* Frame filter counters. */
@@ -166,14 +172,32 @@ static void QNN_ExtractActionFromUsercmd(qnn_action_t *action)
 	/* Fire: BUTTON_ATTACK = bit 0 */
 	action->fire = (cmd->buttons & 1) ? 1 : 0;
 
-	/* Jump is now encoded in move[2] via QNN_SnapMove at emission time.
-	 * For QWD, upmove > 0 maps to move[2] = jump_speed / maxspeed. */
+	/* move[2]: jump (positive) and swim-down (negative).
+	 * Jump button or +moveup: positive jump speed.
+	 * +movedown (upmove < 0): negative, capturing swim down in water. */
 	if ((cmd->buttons & 2) || cmd->upmove > 0)
 		action->move[2] = QNN_SV_JUMP_SPEED / QNN_SV_MAXSPEED;
+	else if (cmd->upmove < 0)
+		action->move[2] = QNN_Clamp((float)cmd->upmove / QNN_SV_MAXSPEED, -1.0f, 0.0f);
 
-	/* Weapon switch: impulse 1-8 maps to weapon slots */
-	if (cmd->impulse >= 1 && cmd->impulse <= 8)
-		action->switch_slot = QNN_SwitchSlotFromWeaponId(cmd->impulse);
+	/* Weapon switch: impulse 1-8 maps to weapon slots, but only on the
+	 * EDGE between two different weapon impulses.  Some QWD recorders
+	 * write the held weapon into impulse every frame instead of just
+	 * on the press, so we'd emit switch every frame if we treated the
+	 * raw value as the event.  Tracking the previous *weapon* impulse
+	 * (ignoring zero / non-weapon impulses like 9, 10, 20) collapses
+	 * both the event-style and state-style files to the same semantics:
+	 * emit switch only when the player picks a different weapon. */
+	{
+		int imp = (int)cmd->impulse;
+		if (imp >= 1 && imp <= 8) {
+			if (qnn_runtime.has_prev_weapon_impulse
+				&& imp != qnn_runtime.prev_weapon_impulse)
+				action->switch_slot = QNN_SwitchSlotFromWeaponId(imp);
+			qnn_runtime.prev_weapon_impulse = imp;
+			qnn_runtime.has_prev_weapon_impulse = true;
+		}
+	}
 }
 
 /* ── View-relative look label ────────────────────────────────── */
@@ -466,7 +490,7 @@ static void QNN_RuntimeReset(void)
  * message like NQ's cl.mtime[0]), so we key off cls.netchan.incoming_sequence
  * which increments once per parsed server message. */
 #define QNN_DEMO_DETECT_PROBE_DT 0.001f
-#define QNN_DEMO_DETECT_MAX_FRAMES 8192
+#define QNN_DEMO_DETECT_MAX_FRAMES 2048
 #define QNN_DEMO_DETECT_SAMPLES    8
 
 static void QNN_DetectNativeTickHz(void)
@@ -576,24 +600,49 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, int seed, char *error
 		SZ_Clear(&cmd_text);
 	}
 
-	snprintf(command, sizeof(command), "playdemo %s\n", demo_path);
+	snprintf(command, sizeof(command), "playdemo \"%s\"\n", demo_path);
 	Cbuf_AddText(command);
 	Cbuf_Execute();
 
-	/* Pump frames until demo is loaded and active */
-	for (frame = 0; frame < 8192; ++frame)
+	/* Pump frames until demo is loaded and active.  A working demo
+	 * reaches ca_active within ~100 frames; if we haven't after 2048
+	 * something is wrong (missing BSP, corrupt demo, etc.). */
+	for (frame = 0; frame < 2048; ++frame)
 	{
 		Host_Frame(qnn_runtime.fixed_dt);
 		if (QNN_ClientReady())
 			break;
 		if (frame > 0 && !cls.demoplayback && cls.state == ca_disconnected)
 			break;
+		/* Fail fast on missing BSP: QW parses the modellist early in
+		 * signon, so cl.model_name[1] is set within a few frames. If
+		 * that's set but cl.worldmodel is still NULL 256 frames later,
+		 * Mod_ForName couldn't find the map file — no point pumping
+		 * another 1792 frames waiting for ca_active. */
+		if (frame >= 256 && cl.worldmodel == NULL && cl.model_name[1][0] != '\0')
+		{
+			fprintf(stderr, "[qw-demo] missing BSP: %s (worldmodel not loaded after %d frames)\n",
+				cl.model_name[1], frame);
+			snprintf(error, error_size, "Missing BSP %s for demo %s", cl.model_name[1], demo_path);
+			return false;
+		}
 	}
 	if (!QNN_ClientReady())
 	{
 		fprintf(stderr, "[qw-demo] playdemo failed: demoplayback=%d state=%d\n",
 			cls.demoplayback, cls.state);
-		snprintf(error, error_size, "Timed out waiting for QW demo playback on %s", demo_path);
+		/* Distinguish between "demo file exhausted during signon"
+		 * (permanent: QWD preamble is corrupt / non-standard) and
+		 * "engine got stuck" (possibly transient). Python uses the
+		 * prefix to decide whether to retry. */
+		if (!cls.demoplayback)
+			snprintf(error, error_size,
+				"demo_preamble_incompatible: %s (demoplayback ended during signon)",
+				demo_path);
+		else
+			snprintf(error, error_size,
+				"signon_timeout: %s (no ca_active after 2048 frames)",
+				demo_path);
 		return false;
 	}
 
@@ -689,14 +738,15 @@ static int QNN_HandleCollect(const char *line)
 	int seed;
 	int mvd_player_num;
 
+	int play_start, play_end;
+
 	memset(demo_path, 0, sizeof(demo_path));
 	memset(error, 0, sizeof(error));
 	seed = QNN_JsonExtractInt(line, "\"seed\"", -1);
 	mvd_player_num = QNN_JsonExtractInt(line, "\"player_num\"", -1);
-	{
-		int trim = QNN_JsonExtractInt(line, "\"trim_match\"", 0);
-		qnn_match_state = trim ? 0 : 1;
-	}
+	play_start = QNN_JsonExtractInt(line, "\"play_start\"", 0);
+	play_end = QNN_JsonExtractInt(line, "\"play_end\"", 999999999);
+	qnn_match_state = 1; /* always emit — boundaries are frame-gated */
 	if (!QNN_JsonExtractString(line, "\"demo_path\"", demo_path, sizeof(demo_path)))
 	{
 		QNN_WriteError("reset options must include demo_path");
@@ -756,7 +806,7 @@ static int QNN_HandleCollect(const char *line)
 		QNN_BuildAllRefs();
 
 		{
-			qboolean emitting = (qnn_match_state == 1);
+			qboolean emitting = false;
 
 		while (!qnn_runtime.done)
 		{
@@ -765,13 +815,11 @@ static int QNN_HandleCollect(const char *line)
 			qnn_runtime.steps += 1;
 
 			if (!cls.demoplayback || cls.state == ca_disconnected)
-			{
-				fprintf(stderr, "[qw-demo] loop exit: demoplayback=%d state=%d tick=%d match=%d emitting=%d\n",
-					cls.demoplayback, cls.state, qnn_runtime.tick, qnn_match_state, emitting);
 				qnn_runtime.done = true;
-			}
 
-			if (qnn_match_state == 2)
+			/* Frame-gated emission: play_start..play_end from the
+			 * offline analyzer.  Everything outside is skipped. */
+			if (qnn_runtime.tick > play_end)
 			{
 				snapshot.done = true;
 				qnn_runtime.done = true;
@@ -779,13 +827,14 @@ static int QNN_HandleCollect(const char *line)
 
 			QNN_CaptureSnapshotLocal(&snapshot, false);
 
-			if (!emitting && qnn_match_state == 1)
+			if (!emitting && qnn_runtime.tick >= play_start)
 			{
 				emitting = true;
 				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
 				QNN_ResampleInit(qnn_runtime.resample_hz);
 				QNN_SaveEmitAnchor(&snapshot);
-				fprintf(stderr, "[qw-demo] emitting from tick %d\n", qnn_runtime.tick);
+				fprintf(stderr, "[qw-demo] emitting from tick %d (play_start=%d play_end=%d)\n",
+					qnn_runtime.tick, play_start, play_end);
 				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
 				continue;
 			}
@@ -897,11 +946,12 @@ static int QNN_HandleCollect(const char *line)
 
 		if (!emitting)
 		{
+			/* Demo ended before play_start was reached — emit a
+			 * done marker so the reader doesn't block. */
 			snapshot.done = true;
 			QNN_WriteObsTick(&qnn_runtime.tick_emit, stdout,
 				&snapshot, qnn_runtime.tick,
 				qnn_runtime.steps, emit_hz, true);
-			fprintf(stderr, "[qw-demo] no match text found, emitted done marker only\n");
 		}
 		}
 	}

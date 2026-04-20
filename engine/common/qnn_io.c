@@ -486,6 +486,7 @@ static void QNN_CanonicalizeMap(char *out, size_t out_size, const char *requeste
 
 qboolean QNN_PrepareMap(const char *requested_map_id, char *error, size_t error_size)
 {
+	char saved_map_id[QNN_MAX_MAP_ID];
 	char map_name[QNN_MAX_MAP_ID];
 
 	if (!requested_map_id || !requested_map_id[0])
@@ -493,6 +494,15 @@ qboolean QNN_PrepareMap(const char *requested_map_id, char *error, size_t error_
 		snprintf(error, error_size, "map_id is required");
 		return false;
 	}
+
+	/* Defensive copy: the caller (e.g. QNN_HandleReset) may pass a pointer
+	   that aliases qnn_map_state.requested_map_id, which QNN_FreeMapState
+	   zeroes below. Without this copy, the subsequent strncpy in
+	   QNN_BuildMapState reads from zeroed memory and silently leaves
+	   qnn_map_state.requested_map_id empty, failing the next reset. */
+	strncpy(saved_map_id, requested_map_id, sizeof(saved_map_id) - 1);
+	saved_map_id[sizeof(saved_map_id) - 1] = '\0';
+	requested_map_id = saved_map_id;
 
 	QNN_CanonicalizeMap(map_name, sizeof(map_name), requested_map_id);
 

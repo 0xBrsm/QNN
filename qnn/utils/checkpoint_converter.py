@@ -176,10 +176,14 @@ def save_sf_format(
     if combined_b_parts:
         sf_style[f"{_SF_COMBINED_HEAD_KEY}.bias"] = torch.cat(combined_b_parts, dim=0).cpu()
 
-    # SF 2.1.1 ActorCriticSharedWeights expects obs_normalizer and
-    # returns_normalizer running stats.  Seed them at identity (mean=0,
-    # var=1, count=1) so the first training steps fill them in.
-    _add_sf_normalizer_buffers(sf_style)
+    # Seed returns_normalizer at identity (the actor-critic constructs this
+    # module regardless of cfg.normalize_input). We skip the obs_normalizer
+    # keys — `cfg.normalize_input=False` is the QNN default, so the model
+    # doesn't have an obs_normalizer module and these keys would be
+    # "Unexpected" on load.
+    sf_style["returns_normalizer.running_mean"] = torch.zeros([1], dtype=torch.float64)
+    sf_style["returns_normalizer.running_var"] = torch.ones([1], dtype=torch.float64)
+    sf_style["returns_normalizer.count"] = torch.ones([1], dtype=torch.float64)
 
     # Build a minimal Adam optimizer state dict.  SF creates a single flat
     # Adam over actor_critic.parameters(); load_state_dict validates that the

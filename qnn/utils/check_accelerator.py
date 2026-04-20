@@ -9,7 +9,7 @@ from qnn.utils.device import describe_torch_runtime
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Report the torch accelerator runtime visible to Quake AI")
+    parser = argparse.ArgumentParser(description="Report the torch accelerator runtime visible to QNN")
     parser.add_argument("--device", default="auto", help="Requested device override (auto, gpu, cpu, cuda, cuda:0, rocm, mps)")
     parser.add_argument(
         "--fail-on-error",

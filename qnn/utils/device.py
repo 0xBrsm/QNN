@@ -30,7 +30,7 @@ def _cuda_backend() -> str:
 
 
 def resolve_torch_device(requested: str | None = None) -> TorchDeviceSpec:
-    raw = (requested or os.environ.get("QUAKE_AI_DEVICE") or "auto").strip().lower()
+    raw = (requested or os.environ.get("QNN_DEVICE") or "auto").strip().lower()
     if not raw:
         raw = "auto"
 

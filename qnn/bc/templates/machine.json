@@ -3,6 +3,8 @@
   "asset_root": "assets",
   "bc_data_dir": "assets/collect/prod",
   "batch_size": 64,
+  "microbatch_size": 256,
   "pin_memory": true,
-  "prefetch": false
+  "prefetch": 2,
+  "snapshot_interval": 15
 }

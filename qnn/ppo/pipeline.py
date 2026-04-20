@@ -164,6 +164,7 @@ def run_training_job(
         lr=float(require_cfg_value(ppo_cfg, "policy_lr", "PPO config")),
         entropy_coef=float(require_cfg_value(ppo_cfg, "entropy_coef", "PPO config")),
         bc_kl_coef=float(require_cfg_value(ppo_cfg, "bc_kl_coef", "PPO config")),
+        look_cosine=bool(require_cfg_value(ppo_cfg, "look_cosine", "PPO config")),
         clip_ratio=float(require_cfg_value(ppo_cfg, "clip_ratio", "PPO config")),
         gamma=float(require_cfg_value(ppo_cfg, "gamma", "PPO config")),
         gae_lambda=float(require_cfg_value(ppo_cfg, "gae_lambda", "PPO config")),
@@ -180,7 +181,10 @@ def run_training_job(
         policy_workers_per_policy=int(require_cfg_value(ppo_cfg, "policy_workers_per_policy", "PPO config")),
         batched_sampling=bool(require_cfg_value(ppo_cfg, "batched_sampling", "PPO config")),
         worker_inference=bool(ppo_cfg.get("worker_inference", False)),
+        worker_inference_device=str(ppo_cfg.get("worker_inference_device", "cpu")),
         reward_json_path=require_cfg_string(ppo_cfg, "reward_json_path", "PPO config"),
+        head_loss_weights=str(ppo_cfg.get("head_loss_weights", "") or ""),
+        initial_stddev=float(require_cfg_value(ppo_cfg, "initial_stddev", "PPO config")),
     )
 
     ppo_result = run_ppo(cfg)
@@ -228,23 +232,24 @@ def run_pipeline(ctx: Any, *, post_train_eval: bool = True, write_report: bool =
 
     will_resume_ppo = prepare_ppo_run_outputs(ctx.run_cfg, resume=ctx.resume)
     ppo_cfg, eval_cfg = build_run_ppo_eval_config(ctx.run_cfg, ctx.device)
-    seed_ckpt = require_cfg_string(ctx.run_cfg, "checkpoint_path", "run config")
-    if not seed_ckpt:
-        raise RuntimeError("run.json.checkpoint_path must be non-empty when mode is 'ppo' or 'pbt'")
+    seed_ckpt = str(ctx.run_cfg.get("checkpoint_path", "") or "")
     ppo_cfg["resume"] = will_resume_ppo
-    if not will_resume_ppo and not Path(seed_ckpt).exists():
+    if seed_ckpt and not will_resume_ppo and not Path(seed_ckpt).exists():
         raise FileNotFoundError(f"Seed checkpoint from run.json does not exist: {seed_ckpt}")
     if will_resume_ppo:
         latest_ckpt = latest_ppo_checkpoint(ctx.run_cfg)
         if latest_ckpt is None:
             raise RuntimeError("PPO resume requested, but no latest checkpoint could be located")
         results["ppo_resume_from"] = str(latest_ckpt)
-    else:
+    elif seed_ckpt:
         ppo_cfg["init_ckpt"] = seed_ckpt
         results["ppo_init_ckpt"] = seed_ckpt
         if ctx.resume:
             results["ppo_resume_fallback"] = "No existing PPO checkpoint found; started from seed checkpoint."
         _validate_warm_start_arch(seed_ckpt, ppo_cfg)
+    else:
+        results["ppo_init_ckpt"] = ""
+        results["ppo_random_init"] = True
 
     validate_native_mod_assets(
         ctx.asset_root,

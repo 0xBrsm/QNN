@@ -25,11 +25,10 @@ extern FILE *qnn_sound_dump;
 static qboolean QNN_QualifyEntity(const qnn_entity_t *e, float now,
 	int *out_modality, float *out_age)
 {
-	/* For actors, "nearby" means visible (PVS + FOV).
-	   For everything else, PVS alone suffices. */
-	float near = (e->type == QNN_ENT_ACTOR) ? e->vis : e->pvs;
+	float near = QNN_PrimaryObservationTimestamp(e);
 	float newest = near;
-	int modality;
+	int modality = QNN_PrimaryObservationModalityId(e);
+	int primary_modality = modality;
 	float age, threshold;
 
 	if (e->snd > newest) newest = e->snd;
@@ -41,22 +40,20 @@ static qboolean QNN_QualifyEntity(const qnn_entity_t *e, float now,
 	   Always sets modality since newest > 0 implies at least one match. */
 	modality = QNN_MODALITY_MEMORY;
 	if (e->snd == newest) modality = QNN_MODALITY_SOUND;
-	if (near == newest)
-		modality = (e->type == QNN_ENT_ACTOR)
-			? QNN_MODALITY_SIGHT : QNN_MODALITY_PROXIMITY;
+	if (near == newest) modality = primary_modality;
 
 	/* Check age against modality threshold */
 	age = now - newest;
 	threshold = QNN_RecencyMaxForModality(modality);
 	if (age > threshold)
 	{
-		/* Actor fallback: stay in candidate pool for the full sight
-		   window if we've seen them recently, even if the most recent
-		   observation (sound/memory) has expired. */
-		if (e->type == QNN_ENT_ACTOR && e->vis > 0
-			&& (now - e->vis) <= QNN_RECENCY_MAX_SIGHT)
+		/* Fall back to the entity's primary observation channel if it is
+		   still within that channel's recency window. */
+		if (near > 0.0f
+			&& (now - near) <= QNN_RecencyMaxForModality(primary_modality))
 		{
-			age = now - e->vis;
+			modality = primary_modality;
+			age = now - near;
 		}
 		else
 			return false;
@@ -80,42 +77,35 @@ typedef struct {
 	int store_index;
 	float recency;
 	void *entry;
+	int pool;        /* 0 = projectile + actor (threats), 1 = item + mover */
+	int team;        /* 0 = enemy / unknown, 1 = teammate. Only meaningful for
+	                  * actors; projectiles default to enemy, items irrelevant. */
+	float sort_key;  /* lower = more important: distance × (1 - alpha·dot) for
+	                  * pool 0, distance for pool 1. Computed at collect time. */
 } qnn_candidate_t;
+
+/* Threat-axis weighting for pool 0. dot ∈ [-1, 1] of entity facing vs
+ * direction toward player. ALPHA bounds how much facing skews the
+ * distance-based ranking — distance still dominates within ~±40%. */
+#define QNN_THREAT_ALPHA 0.4f
 
 static int QNN_CandidateCompare(const void *a, const void *b)
 {
 	const qnn_candidate_t *ca = (const qnn_candidate_t *)a;
 	const qnn_candidate_t *cb = (const qnn_candidate_t *)b;
-	if (ca->type != cb->type)
-		return ca->type - cb->type;
+	/* Pool: projectile+actor first, then item+mover. */
+	if (ca->pool != cb->pool)
+		return ca->pool - cb->pool;
+	/* Recency: lower age value = more recently observed → emit first. */
 	if (ca->recency < cb->recency) return -1;
 	if (ca->recency > cb->recency) return 1;
+	/* Team: enemies (0) before teammates (1). */
+	if (ca->team != cb->team)
+		return ca->team - cb->team;
+	/* Threat (pool 0) or distance (pool 1) is the final tiebreaker. */
+	if (ca->sort_key < cb->sort_key) return -1;
+	if (ca->sort_key > cb->sort_key) return 1;
 	return 0;
-}
-
-/* ── Half extents from cl_entities model ──────────────────────── */
-
-static void QNN_LookupHalfExtents(int entity_num, float *out_half, vec3_t origin_adjust)
-{
-	entity_t *entity;
-	out_half[0] = out_half[1] = out_half[2] = 0.0f;
-	origin_adjust[0] = origin_adjust[1] = origin_adjust[2] = 0.0f;
-	if (entity_num <= 0 || entity_num >= MAX_EDICTS)
-		return;
-	entity = &cl_entities[entity_num];
-	if (entity->model == NULL)
-		return;
-	{
-		vec3_t bmins, bmaxs;
-		VectorCopy(entity->model->mins, bmins);
-		VectorCopy(entity->model->maxs, bmaxs);
-		origin_adjust[0] = (bmins[0] + bmaxs[0]) * 0.5f;
-		origin_adjust[1] = (bmins[1] + bmaxs[1]) * 0.5f;
-		origin_adjust[2] = (bmins[2] + bmaxs[2]) * 0.5f;
-		out_half[0] = (bmaxs[0] - bmins[0]) * 0.5f;
-		out_half[1] = (bmaxs[1] - bmins[1]) * 0.5f;
-		out_half[2] = (bmaxs[2] - bmins[2]) * 0.5f;
-	}
 }
 
 /* ── Fill events into token event array ───────────────────────── */
@@ -344,6 +334,60 @@ int QNN_OracleEmitTokens(
 			candidates[candidate_count].store_index = i;
 			candidates[candidate_count].recency = age;
 			candidates[candidate_count].entry = e;
+
+			/* Pool: projectiles + actors are threats (0); items + movers (1). */
+			candidates[candidate_count].pool =
+				(cand_type == QNN_CAND_PROJECTILE || cand_type == QNN_CAND_ACTOR) ? 0 : 1;
+
+			/* Team: only actors carry a team. Projectiles default to enemy
+			 * (we don't track the firer); items/movers are neutral so the
+			 * field never participates in their sort path. */
+			if (cand_type == QNN_CAND_ACTOR)
+				candidates[candidate_count].team = (QNN_IsSameTeam(e->entity_num) > 0.5f) ? 1 : 0;
+			else
+				candidates[candidate_count].team = 0;
+
+			/* Precompute sort_key (distance, optionally threat-modulated). */
+			{
+				vec3_t to_us;
+				float dist;
+				VectorSubtract(snapshot->player_origin, e->origin, to_us);
+				dist = QNN_VecLength(to_us);
+				if (candidates[candidate_count].pool == 0 && dist > 1e-3f)
+				{
+					vec3_t facing;
+					float dot;
+					if (cand_type == QNN_CAND_PROJECTILE)
+					{
+						/* Facing = velocity unit. Stationary projectile has no
+						 * threat axis → fall back to pure distance. */
+						float vlen = QNN_VecLength(e->velocity);
+						if (vlen > 1e-3f)
+						{
+							facing[0] = e->velocity[0] / vlen;
+							facing[1] = e->velocity[1] / vlen;
+							facing[2] = e->velocity[2] / vlen;
+						}
+						else
+						{
+							facing[0] = facing[1] = facing[2] = 0.0f;
+						}
+					}
+					else
+					{
+						/* Actor: forward vector from view angles. */
+						vec3_t right, up;
+						AngleVectors(e->angles, facing, right, up);
+					}
+					dot = (facing[0] * to_us[0] + facing[1] * to_us[1] + facing[2] * to_us[2]) / dist;
+					candidates[candidate_count].sort_key = dist * (1.0f - QNN_THREAT_ALPHA * dot);
+				}
+				else
+				{
+					candidates[candidate_count].sort_key = dist;
+				}
+			}
+
 			candidate_count++;
 		}
 	}
@@ -376,7 +420,7 @@ int QNN_OracleEmitTokens(
 	{
 		qnn_candidate_t *cand = &candidates[i];
 		qnn_entity_t *e = (qnn_entity_t *)cand->entry;
-		qnn_tagged_token_t *out = &out_tokens[token_count];
+		qnn_tagged_token_t *out;
 		vec3_t origin;
 		float half_ext[3];
 		vec3_t origin_adj;
@@ -390,10 +434,7 @@ int QNN_OracleEmitTokens(
 		/* Half extents + bbox center (not for projectiles) */
 		if (cand->type != QNN_CAND_PROJECTILE && entity_num > 0)
 		{
-			QNN_LookupHalfExtents(entity_num, half_ext, origin_adj);
-			origin[0] += origin_adj[0];
-			origin[1] += origin_adj[1];
-			origin[2] += origin_adj[2];
+			QNN_LookupEntityBounds(entity_num, half_ext, origin_adj);
 		}
 
 		/* Route */
@@ -416,6 +457,9 @@ int QNN_OracleEmitTokens(
 			float path_world[3] = {0, 0, 0};
 			float eta = 0.0f;
 			int used_path = 0;
+
+			/* Each path iteration emits to its own slot. */
+			out = &out_tokens[token_count];
 
 			if (cand->type != QNN_CAND_PROJECTILE && route && player_area_id >= 0 && obj_area_id >= 0)
 			{

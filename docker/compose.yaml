@@ -1,6 +1,6 @@
 services:
   trainer:
-    image: ${TRAINING_IMAGE_TAG:-quake-ai-trainer-amd:local}
+    image: ${TRAINING_IMAGE_TAG:-qnn-trainer-amd:local}
     build:
       context: ../..
       dockerfile: src/docker/Dockerfile
@@ -8,9 +8,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - QUAKE_BASEDIR=/workspace/assets
-      - QUAKE_AI_DEVICE=${QUAKE_AI_DEVICE:-gpu}
-      - QUAKE_AI_ARTIFACT_ROOT=/workspace/assets
-      - ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-0}
+      - QNN_DEVICE=${QNN_DEVICE:-gpu}
+      - QNN_ARTIFACT_ROOT=/workspace/assets
+      - ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-1}
+      - TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=${TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL:-1}
       - HSA_ENABLE_DXG_DETECTION=${HSA_ENABLE_DXG_DETECTION:-1}
       - HIP_VISIBLE_DEVICES
       - ROCR_VISIBLE_DEVICES
@@ -31,10 +32,10 @@ services:
         target: /usr/lib/librocdxg.so
         read_only: true
       - type: volume
-        source: quake-ai-pip-cache
+        source: qnn-pip-cache
         target: /home/trainer/.cache/pip
       - type: volume
-        source: quake-ai-miopen-cache
+        source: qnn-miopen-cache
         target: /home/trainer/.config/miopen
     devices:
       - /dev/dxg:/dev/dxg
@@ -53,5 +54,5 @@ services:
     tty: true
 
 volumes:
-  quake-ai-pip-cache:
-  quake-ai-miopen-cache:
+  qnn-pip-cache:
+  qnn-miopen-cache:

@@ -2,13 +2,14 @@
   "device": "gpu",
   "asset_root": "assets",
   "worker_binary": "assets/bin/ppo_worker",
-  "num_workers": 32,
+  "num_workers": 90,
   "num_envs_per_worker": 4,
-  "worker_num_splits": 2,
+  "worker_num_splits": 1,
   "policy_workers_per_policy": 1,
   "batched_sampling": false,
-  "worker_inference": false,
-  "minibatch_size": 8192,
+  "worker_inference": true,
+  "worker_inference_device": "cpu",
+  "minibatch_size": 23040,
   "eval_num_envs": 32,
   "eval_num_episodes": 32
 }

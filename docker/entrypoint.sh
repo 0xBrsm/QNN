@@ -3,14 +3,14 @@ set -euo pipefail
 
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="/workspace/src${PYTHONPATH:+:${PYTHONPATH}}"
-export QUAKE_AI_DEVICE="${QUAKE_AI_DEVICE:-gpu}"
-export QUAKE_AI_ARTIFACT_ROOT="${QUAKE_AI_ARTIFACT_ROOT:-/workspace/assets}"
+export QNN_DEVICE="${QNN_DEVICE:-gpu}"
+export QNN_ARTIFACT_ROOT="${QNN_ARTIFACT_ROOT:-/workspace/assets}"
 
 home_dir="${HOME:-/home/trainer}"
 cache_root="${home_dir}/.cache"
 config_root="${home_dir}/.config"
 if ! mkdir -p "${cache_root}" "${config_root}" 2>/dev/null || [ ! -w "${cache_root}" ] || [ ! -w "${config_root}" ]; then
-  export HOME=/tmp/quake-ai-home
+  export HOME=/tmp/qnn-home
   cache_root="${HOME}/.cache"
   config_root="${HOME}/.config"
   mkdir -p "${cache_root}" "${config_root}"
@@ -27,7 +27,7 @@ for _vol_dir in "${PIP_CACHE_DIR}" "${MIOPEN_USER_DB_PATH}"; do
   fi
 done
 
-mkdir -p "${QUAKE_AI_ARTIFACT_ROOT}/bin"
+mkdir -p "${QNN_ARTIFACT_ROOT}/bin"
 
 cd /workspace
 exec "$@"

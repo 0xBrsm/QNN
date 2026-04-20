@@ -72,6 +72,16 @@ static qboolean qnn_ephemeral_present[MAX_EDICTS];
 /* Track scoreboard for connect/disconnect */
 static qboolean qnn_player_present[MAX_EDICTS];
 
+/* Primary observation source by entity type. Keep this centralized so
+ * token qualification, metrics, and reward all key off the same source. */
+#define QNN_PRIMARY_OBS_ACTOR      QNN_PRIMARY_OBS_PVS
+#define QNN_PRIMARY_OBS_ITEM       QNN_PRIMARY_OBS_PVS
+#define QNN_PRIMARY_OBS_MOVER      QNN_PRIMARY_OBS_PVS
+#define QNN_PRIMARY_OBS_PROJECTILE QNN_PRIMARY_OBS_PVS
+#define QNN_PRIMARY_OBS_BACKPACK   QNN_PRIMARY_OBS_PVS
+#define QNN_PRIMARY_OBS_TELEPORTER QNN_PRIMARY_OBS_PVS
+#define QNN_PRIMARY_OBS_PUSH       QNN_PRIMARY_OBS_PVS
+
 /* ══════════════════════════════════════════════════════════════════
  * Helpers
  * ══════════════════════════════════════════════════════════════════ */
@@ -137,6 +147,86 @@ static const qnn_mover_init_t qnn_mover_init[] = {
 	{"func_button", 11, QNN_SUBJECT_BUTTON,    true},
 };
 static const int qnn_mover_init_count = sizeof(qnn_mover_init) / sizeof(qnn_mover_init[0]);
+
+int QNN_PrimaryObservationSourceForType(int entity_type)
+{
+	switch (entity_type)
+	{
+	case QNN_ENT_ACTOR:      return QNN_PRIMARY_OBS_ACTOR;
+	case QNN_ENT_ITEM:       return QNN_PRIMARY_OBS_ITEM;
+	case QNN_ENT_MOVER:      return QNN_PRIMARY_OBS_MOVER;
+	case QNN_ENT_PROJECTILE: return QNN_PRIMARY_OBS_PROJECTILE;
+	case QNN_ENT_BACKPACK:   return QNN_PRIMARY_OBS_BACKPACK;
+	case QNN_ENT_TELEPORTER: return QNN_PRIMARY_OBS_TELEPORTER;
+	case QNN_ENT_PUSH:       return QNN_PRIMARY_OBS_PUSH;
+	default:                 return QNN_PRIMARY_OBS_PVS;
+	}
+}
+
+float QNN_PrimaryObservationTimestamp(const qnn_entity_t *entity)
+{
+	if (entity == NULL)
+		return 0.0f;
+	return (QNN_PrimaryObservationSourceForType(entity->type) == QNN_PRIMARY_OBS_VIS)
+		? entity->vis
+		: entity->pvs;
+}
+
+int QNN_PrimaryObservationModalityId(const qnn_entity_t *entity)
+{
+	if (entity == NULL)
+		return QNN_MODALITY_PROXIMITY;
+	return (QNN_PrimaryObservationSourceForType(entity->type) == QNN_PRIMARY_OBS_VIS)
+		? QNN_MODALITY_SIGHT
+		: QNN_MODALITY_PROXIMITY;
+}
+
+qboolean QNN_PrimaryObservationIsCurrent(const qnn_entity_t *entity, float now)
+{
+	return (QNN_PrimaryObservationTimestamp(entity) == now) ? true : false;
+}
+
+void QNN_LookupEntityBounds(int entity_num, float *out_half, vec3_t out_center_adjust)
+{
+	entity_t *entity;
+
+	out_half[0] = out_half[1] = out_half[2] = 0.0f;
+	out_center_adjust[0] = out_center_adjust[1] = out_center_adjust[2] = 0.0f;
+	if (entity_num <= 0 || entity_num >= MAX_EDICTS)
+		return;
+	entity = &cl_entities[entity_num];
+	if (entity->model == NULL)
+		return;
+	{
+		vec3_t bmins, bmaxs;
+		VectorCopy(entity->model->mins, bmins);
+		VectorCopy(entity->model->maxs, bmaxs);
+		out_center_adjust[0] = (bmins[0] + bmaxs[0]) * 0.5f;
+		out_center_adjust[1] = (bmins[1] + bmaxs[1]) * 0.5f;
+		out_center_adjust[2] = (bmins[2] + bmaxs[2]) * 0.5f;
+		out_half[0] = (bmaxs[0] - bmins[0]) * 0.5f;
+		out_half[1] = (bmaxs[1] - bmins[1]) * 0.5f;
+		out_half[2] = (bmaxs[2] - bmins[2]) * 0.5f;
+	}
+}
+
+void QNN_EntityAnchorFromModel(int entity_num, const vec3_t raw_origin, vec3_t out_anchor, float *out_half)
+{
+	float local_half[3];
+	vec3_t center_adjust;
+
+	QNN_LookupEntityBounds(entity_num, local_half, center_adjust);
+	VectorCopy(raw_origin, out_anchor);
+	out_anchor[0] += center_adjust[0];
+	out_anchor[1] += center_adjust[1];
+	out_anchor[2] += center_adjust[2];
+	if (out_half != NULL)
+	{
+		out_half[0] = local_half[0];
+		out_half[1] = local_half[1];
+		out_half[2] = local_half[2];
+	}
+}
 
 /* Stamp PVS + visibility timestamps. */
 static void QNN_StampPvs(qnn_entity_t *e, float now, qboolean in_fov)
@@ -395,11 +485,13 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 		qnn_entity_t *e = &qnn_store[pvs_items[i].entity_num];
 		if (e->type == QNN_ENT_ITEM)
 		{
+			VectorCopy(pvs_items[i].origin, e->origin);
 			e->regen = 0.0f;
 			QNN_StampPvs(e, now, pvs_items[i].in_fov);
 		}
 		else if (e->type == QNN_ENT_MOVER)
 		{
+			VectorCopy(pvs_items[i].origin, e->origin);
 			QNN_StampPvs(e, now, pvs_items[i].in_fov);
 		}
 	}
@@ -445,7 +537,7 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 			e->entity_num = eu->entity_num;
 
 			QNN_ComputeStoreVelocity(e, cl_ent->msg_origins[0], emit_dt);
-			VectorCopy(cl_ent->msg_origins[0], e->origin);
+			VectorCopy(eu->origin, e->origin);
 			VectorCopy(eu->angles, e->angles);
 			QNN_StampPvs(e, now, eu->in_fov);
 
@@ -480,7 +572,7 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 			e->entity_num = eu->entity_num;
 
 			QNN_ComputeStoreVelocity(e, cl_ent->msg_origins[0], emit_dt);
-			VectorCopy(cl_ent->msg_origins[0], e->origin);
+			VectorCopy(eu->origin, e->origin);
 			QNN_StampPvs(e, now, eu->in_fov);
 
 			ephemeral_seen[eu->entity_num] = true;

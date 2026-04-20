@@ -10,6 +10,7 @@
 #include "qnn_object.h"
 #include "qnn_map.h"
 #include "qnn_io.h"
+#include "qnn_store.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -320,12 +321,6 @@ qboolean QNN_ClassifyByModel(const char *model_name, int skin, int *subject_id, 
 	}
 
 	return false;
-}
-
-/* Legacy wrapper — still used by qnn_object.h declaration */
-qboolean QNN_ClassifyKnownSubject(const qnn_known_entity_t *ent, int *subject_id, int *qualifier_id, float *magnitude)
-{
-	return QNN_ClassifyByModel(ent->model_name, ent->skin, subject_id, qualifier_id, magnitude);
 }
 
 int QNN_SubjectPickupCategory(int subject_id)
@@ -648,6 +643,8 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 		int subject_id, qualifier_id;
 		float magnitude;
 		qboolean is_item, in_fov, is_brush;
+		vec3_t anchor_origin;
+		float half_extents[3];
 
 		if (entity_num == cl.viewentity)
 			continue;
@@ -677,11 +674,12 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 			continue;
 
 		is_item = (!is_brush && QNN_SubjectIsItem(subject_id));
-		in_fov = QNN_InFov(snapshot->player_origin, snapshot->player_view_angles, entity->origin);
+		QNN_EntityAnchorFromModel(entity_num, entity->origin, anchor_origin, half_extents);
+		in_fov = QNN_InFov(snapshot->player_origin, snapshot->player_view_angles, anchor_origin);
 
 		/* QW MVD: cull entities outside the viewer's PVS. NQ demos
 		 * are already culled at record time, so this is a no-op for NQ. */
-		if (apply_pvs && !QNN_EntityInPvs(snapshot->player_origin, entity->origin))
+		if (apply_pvs && !QNN_EntityInPvs(snapshot->player_origin, anchor_origin))
 			continue;
 
 		/* Items and brush movers go into PVS list for timestamp stamping */
@@ -691,7 +689,7 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 			{
 				out_pvs[pvs_count].entity_num = entity_num;
 				out_pvs[pvs_count].subject_id = subject_id;
-				VectorCopy(entity->origin, out_pvs[pvs_count].origin);
+				VectorCopy(anchor_origin, out_pvs[pvs_count].origin);
 				out_pvs[pvs_count].magnitude = magnitude;
 				out_pvs[pvs_count].in_fov = in_fov;
 				pvs_count++;
@@ -716,7 +714,7 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 			eu->qualifier_id = qualifier_id;
 			eu->magnitude = magnitude;
 			eu->is_brush = is_brush;
-			VectorCopy(entity->origin, eu->origin);
+			VectorCopy(anchor_origin, eu->origin);
 
 			/* Velocity from message origin delta (client-side).
 			   Clamp large deltas (teleports, respawns) to zero —
@@ -734,21 +732,9 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 			VectorCopy(entity->angles, eu->angles);
 			eu->effects = entity->effects;
 
-			/* Bounds from model (client-side) */
-			{
-				vec3_t bmins = {0,0,0}, bmaxs = {0,0,0};
-				if (entity->model != NULL)
-				{
-					VectorCopy(entity->model->mins, bmins);
-					VectorCopy(entity->model->maxs, bmaxs);
-				}
-				eu->origin[0] += (bmins[0] + bmaxs[0]) * 0.5f;
-				eu->origin[1] += (bmins[1] + bmaxs[1]) * 0.5f;
-				eu->origin[2] += (bmins[2] + bmaxs[2]) * 0.5f;
-				eu->half_extents[0] = (bmaxs[0] - bmins[0]) * 0.5f;
-				eu->half_extents[1] = (bmaxs[1] - bmins[1]) * 0.5f;
-				eu->half_extents[2] = (bmaxs[2] - bmins[2]) * 0.5f;
-			}
+			eu->half_extents[0] = half_extents[0];
+			eu->half_extents[1] = half_extents[1];
+			eu->half_extents[2] = half_extents[2];
 
 			/* Frags from client scoreboard (client-side) */
 			eu->frags = 0;

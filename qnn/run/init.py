@@ -93,10 +93,9 @@ def main() -> None:
     manifest["git_commit"] = _git_commit_hash()
 
     checkpoint_path = manifest.get("checkpoint_path", "")
-    if args.mode in {"ppo", "pbt", "optuna"} and not checkpoint_path:
-        parser.error(
-            "--checkpoint-path is required for ppo, pbt, and optuna runs"
-        )
+    # Empty checkpoint_path on ppo/pbt/optuna means random init.
+    # init.py accepts it; config.py accepts it; warm-start in train.py
+    # no-ops when init_checkpoint is empty.
 
     # Resolve config files: CLI override or template default.
     # Each config key maps to its template filename.

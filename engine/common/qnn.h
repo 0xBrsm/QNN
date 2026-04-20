@@ -112,27 +112,6 @@ typedef struct
 
 typedef struct
 {
-	int	entity_key;
-	char	entity_id[32];
-	int	entity_num;
-	char	classname[QNN_MAX_CLASSNAME];
-	char	model_name[QNN_MAX_MODEL_NAME];
-	int	region_id;
-	vec3_t	origin;
-	vec3_t	velocity;
-	vec3_t	angles;
-	int	model_id;
-	int	frame;
-	int	effects;
-	int	skin;
-	int	health;
-	int	frags;
-	float	half_extents[3];
-	qboolean static_proxy;
-} qnn_known_entity_t;
-
-typedef struct
-{
 	char	event_type[32];
 	int	region_id;
 	int	has_delta;
@@ -163,8 +142,6 @@ typedef struct
 	qboolean grounded;
 	int	current_region_id;
 	qboolean done;
-	qnn_known_entity_t known[QNN_MAX_VISIBLE];
-	int	known_count;
 	qnn_event_t events[QNN_MAX_EVENTS];
 	int	event_count;
 	int	damage_dealt;

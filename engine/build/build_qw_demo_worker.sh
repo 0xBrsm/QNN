@@ -213,6 +213,18 @@ t = t.replace("#define\tMAX_MSGLEN\t\t1450", "#define\tMAX_MSGLEN\t\t65536")
 p.write_text(t, errors='surrogateescape')
 PY
 
+# 2b. Use ephemeral port for UDP socket so parallel workers don't clash.
+#     The headless worker only reads demos — it never connects to a real
+#     server — but QW's NET_Init still binds a UDP socket.  Changing
+#     PORT_CLIENT to PORT_ANY (0) lets the OS assign a unique port per
+#     process, enabling parallel collection with --workers 30.
+python3 - "${WORKTREE_DIR}/protocol.h" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+t = t.replace("#define\tPORT_CLIENT\t27001", "#define\tPORT_CLIENT\tPORT_ANY")
+p.write_text(t, errors='surrogateescape')
+PY
+
 # 3. Disable STRUCT_FROM_LINK pointer arithmetic warning (GCC/64-bit)
 python3 - "${WORKTREE_DIR}/common.h" <<'PY'
 from pathlib import Path; import sys
@@ -305,17 +317,40 @@ scoreboard_t qnn_scores_compat[MAX_CLIENTS];
 extern player_state_t qnn_mvd_latest_playerstate[MAX_CLIENTS];
 
 /* Called once at startup and after map load to populate cl_entities
- * from QW's cl_baselines[] array. */
+ * from QW's cl_baselines[] array.
+ *
+ * Also sets cl.num_entities — QW never writes this field (only NQ's
+ * CL_EntityNum bumps it), but shared QNN code uses it to bound the
+ * cl_entities[] iteration in QNN_MapBuildFromBaselines and
+ * QNN_EntityClassifyKnown. Without this, items and movers (which only
+ * enter qnn_store via the baseline path) are silently skipped. */
 void QNN_SyncBaselines(void)
 {
     int i;
+    int max_baseline = 0;
     for (i = 0; i < MAX_EDICTS; ++i)
     {
+        int mi = cl_baselines[i].modelindex;
         cl_entities[i].baseline = cl_baselines[i];
         VectorCopy(cl_baselines[i].origin, cl_entities[i].origin);
         VectorCopy(cl_baselines[i].origin, cl_entities[i].msg_origins[0]);
         VectorCopy(cl_baselines[i].origin, cl_entities[i].msg_origins[1]);
+        /* Also seed cl_entities[].model from the precached model. QW
+         * packetentities only carry entries for entities that move or
+         * change state, so stationary brush movers (closed doors,
+         * un-triggered plats) would otherwise leave model == NULL and
+         * get skipped by QNN_EntityClassifyKnown. */
+        if (mi > 0 && mi < MAX_MODELS)
+        {
+            cl_entities[i].model = cl.model_precache[mi];
+            max_baseline = i;
+        }
+        else
+        {
+            cl_entities[i].model = NULL;
+        }
     }
+    cl.num_entities = max_baseline + 1;
 }
 
 /* Called each frame to sync NQ-compat fields from QW state */
@@ -408,35 +443,23 @@ t = t.replace('#include "winquake.h"\n', '/* #include "winquake.h" — removed f
 p.write_text(t, errors='surrogateescape')
 PY
 
-# 6. Stub Host_WriteConfiguration (writes config.cfg — not needed for demo worker)
+# 6. Stub Host_WriteConfiguration (writes config.cfg — not needed for demo
+#    worker). A whitespace-tolerant regex replace: upstream has trailing tabs
+#    inside some blank lines, which a literal str.replace would miss silently.
+#    This was the primary cause of mass worker crashes under concurrent
+#    collect runs: every worker raced to write assets/<gamedir>/config.cfg.
 python3 - "${WORKTREE_DIR}/cl_main.c" <<'PY'
-from pathlib import Path; import sys
+from pathlib import Path; import sys, re
 p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-old = '''void Host_WriteConfiguration (void)
-{
-	FILE	*f;
-
-	if (host_initialized)
-	{
-		f = fopen (va("%s/config.cfg",com_gamedir), "w");
-		if (!f)
-		{
-			Con_Printf ("Couldn't write config.cfg.\\n");
-			return;
-		}
-
-		Key_WriteBindings (f);
-		Cvar_WriteVariables (f);
-
-		fclose (f);
-	}
-}'''
-new = '''void Host_WriteConfiguration (void)
-{
-	/* stubbed for headless demo worker */
-}'''
-t = t.replace(old, new)
+pat = re.compile(
+    r'void\s+Host_WriteConfiguration\s*\(\s*void\s*\)\s*\{.*?\n\}\n',
+    re.DOTALL,
+)
+new = 'void Host_WriteConfiguration (void)\n{\n\t/* stubbed for headless demo worker */\n}\n'
+t, n = pat.subn(new, t, count=1)
+assert n == 1, f"Host_WriteConfiguration stub patch did not match (n={n})"
 p.write_text(t, errors='surrogateescape')
+print("patch 6: Host_WriteConfiguration stubbed")
 PY
 
 # 7. Print Host_Error to stderr (same as NQ host.c.patch)
@@ -1349,9 +1372,15 @@ new_mdl = '''void Model_NextDownload (void)
 \t\t\tcl.model_precache[i] = Mod_ForName(cl.model_name[i], false);
 \t\t}
 \t\tcl.worldmodel = cl.model_precache[1];
+\t\tif (!cl.worldmodel)
+\t\t{
+\t\t\tfprintf(stderr, "[qw-demo] map BSP not found: %s\\n", cl.model_name[1]);
+\t\t\tCL_Disconnect();
+\t\t\treturn;
+\t\t}
 \t\t/* Request prespawn to continue init. */
 \t\tMSG_WriteByte (&cls.netchan.message, clc_stringcmd);
-\t\tMSG_WriteString (&cls.netchan.message, va("prespawn %i 0 %i", cl.servercount, cl.worldmodel ? cl.worldmodel->checksum2 : 0));
+\t\tMSG_WriteString (&cls.netchan.message, va("prespawn %i 0 %i", cl.servercount, cl.worldmodel->checksum2));
 \t\treturn;
 \t}'''
 if 'Demo playback: skip HTTP' not in t:

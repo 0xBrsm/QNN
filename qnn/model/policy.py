@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -23,10 +23,14 @@ from qnn.utils.device import configure_torch_runtime, resolve_torch_device
 from qnn.utils.io import trusted_torch_load
 
 HEAD_LOSS_WEIGHTS: Dict[str, float] = {
-    "move": 1.5,
-    "look": 1.25,
-    "fire": 2.0,
-    "switch": 1.0,
+    "move": 1.0,
+    "look": 1.0,
+    "fire": 1.0,
+    "switch": 0.0,
+    "recall_0": 0.0,
+    "recall_1": 0.0,
+    "recall_2": 0.0,
+    "recall_3": 0.0,
 }
 _CONTINUOUS_HEAD_STD_INIT = -1.0
 
@@ -102,46 +106,47 @@ def _continuous_head_metrics(
     head: str,
     pred: torch.Tensor,
     target: torch.Tensor,
-) -> Dict[str, float]:
-    """Compute L1 metrics for continuous heads entirely on GPU; single .item() per scalar."""
+) -> Dict[str, torch.Tensor]:
+    """Compute L1 metrics for continuous heads. Returns 0-d GPU tensors — caller
+    syncs once at report/epoch-end, not per step."""
     l1 = torch.abs(pred.detach() - target.detach())
     n = l1.shape[0]
+    device = l1.device
+    n_t = torch.tensor(float(n), device=device)
 
     if head == "move":
         s0, s1, s2, st = l1[:, 0].sum(), l1[:, 1].sum(), l1[:, 2].sum(), l1.sum()
         return {
-            "n_move": n,
-            "l1_sum_move_forward": s0.item(), "l1_sum_move_strafe": s1.item(),
-            "l1_sum_move_up": s2.item(), "l1_sum_move": st.item(),
-            "mae_move_forward": (s0 / n).item(), "mae_move_strafe": (s1 / n).item(),
-            "mae_move_up": (s2 / n).item(), "mae_move": (st / n).item(),
+            "n_move": n_t,
+            "l1_sum_move_forward": s0, "l1_sum_move_strafe": s1,
+            "l1_sum_move_up": s2, "l1_sum_move": st,
+            "mae_move_forward": s0 / n_t, "mae_move_strafe": s1 / n_t,
+            "mae_move_up": s2 / n_t, "mae_move": st / n_t,
         }
 
     if head == "look":
         p = pred.detach()
         t = target.detach()
         s0, s1, s2, st = l1[:, 0].sum(), l1[:, 1].sum(), l1[:, 2].sum(), l1.sum()
-        # Angular error (degrees) between pred and target unit vectors.
         cos_sim = F.cosine_similarity(p, t, dim=-1).clamp(-1.0, 1.0)
-        angle_rad = torch.acos(cos_sim)
-        angle_deg = angle_rad * (180.0 / torch.pi)
-        # Target turn magnitude in degrees (how much the player actually turned).
+        angle_deg = torch.acos(cos_sim) * (180.0 / torch.pi)
         turn_mag = torch.sqrt(t[:, 1] ** 2 + t[:, 2] ** 2).clamp(0.0, 1.0)
         target_turn_deg = torch.asin(turn_mag) * (180.0 / torch.pi)
-        result: Dict[str, float] = {
-            "n_look": n,
-            "l1_sum_look_x": s0.item(), "l1_sum_look_y": s1.item(), "l1_sum_look_z": s2.item(), "l1_sum_look": st.item(),
-            "mae_look_x": (s0 / n).item(), "mae_look_y": (s1 / n).item(), "mae_look_z": (s2 / n).item(), "mae_look": (st / n).item(),
-            "mae_look_angle_deg": float(angle_deg.mean().item()),
+        result: Dict[str, torch.Tensor] = {
+            "n_look": n_t,
+            "l1_sum_look_x": s0, "l1_sum_look_y": s1, "l1_sum_look_z": s2, "l1_sum_look": st,
+            "mae_look_x": s0 / n_t, "mae_look_y": s1 / n_t, "mae_look_z": s2 / n_t, "mae_look": st / n_t,
+            "mae_look_angle_deg": angle_deg.mean(),
         }
-        # Magnitude-binned metrics: 0-1°, 1-5°, 5-15°, 15°+
         _bins = [("0_1", 0.0, 1.0), ("1_5", 1.0, 5.0), ("5_15", 5.0, 15.0), ("15p", 15.0, 180.0)]
         for tag, lo, hi in _bins:
             mask = (target_turn_deg >= lo) & (target_turn_deg < hi)
-            cnt = int(mask.sum().item())
+            mask_f = mask.to(angle_deg.dtype)
+            cnt = mask_f.sum()
+            angle_sum = (angle_deg * mask_f).sum()
+            safe_cnt = torch.clamp(cnt, min=1.0)
             result[f"n_look_{tag}"] = cnt
-            if cnt > 0:
-                result[f"mae_look_{tag}_deg"] = float(angle_deg[mask].mean().item())
+            result[f"mae_look_{tag}_deg"] = angle_sum / safe_cnt
         return result
 
     raise ValueError(f"Unsupported continuous head for metrics: {head}")
@@ -329,7 +334,7 @@ class QNNPolicy:
         self.device = self.device_spec.device
         self._rocm_inference_pad_batch = 0
         if self.device_spec.backend == "rocm" and not self.use_gru:
-            raw_pad_batch = os.environ.get("QUAKE_AI_ROCM_INFERENCE_PAD_BATCH", "32").strip()
+            raw_pad_batch = os.environ.get("QNN_ROCM_INFERENCE_PAD_BATCH", "32").strip()
             try:
                 self._rocm_inference_pad_batch = max(int(raw_pad_batch), 0)
             except ValueError:
@@ -526,6 +531,17 @@ class QNNPolicy:
             raise ValueError(f"Expected continuous target shape {flat_shape} for {head}, got {target.shape}")
         return target
 
+    def _autocast(self):
+        """Mixed-precision context. Controlled by env var QNN_AUTOCAST_DTYPE
+        (one of: fp32, bf16, fp16). Defaults to fp32 (no autocast)."""
+        dtype_name = os.environ.get("QNN_AUTOCAST_DTYPE", "fp32").lower()
+        if dtype_name == "fp32" or self.device.type != "cuda":
+            return torch.amp.autocast(device_type=self.device.type, enabled=False)
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(dtype_name)
+        if dtype is None:
+            return torch.amp.autocast(device_type=self.device.type, enabled=False)
+        return torch.amp.autocast(device_type=self.device.type, dtype=dtype, enabled=True)
+
     def _class_weights_for_head(
         self,
         class_weights: Mapping[str, np.ndarray | torch.Tensor],
@@ -535,7 +551,20 @@ class QNNPolicy:
         source = class_weights.get(head)
         if source is None:
             return torch.ones((size,), dtype=torch.float32, device=self.device)
-        return self._tensor(source, dtype=torch.float32)
+        # Cache: source ndarrays are built once per run and passed unchanged
+        # every step. Keep a per-instance id→tensor map so we skip the
+        # numpy→GPU transfer on the hot path.
+        cache = getattr(self, "_class_weights_cache", None)
+        if cache is None:
+            cache = {}
+            self._class_weights_cache = cache
+        key = (head, id(source))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        tensor = self._tensor(source, dtype=torch.float32)
+        cache[key] = tensor
+        return tensor
 
     def _forward_tensors(
         self,
@@ -606,7 +635,7 @@ class QNNPolicy:
     def _optimizer(self, name: str, params: Iterable[nn.Parameter], lr: float) -> torch.optim.Optimizer:
         optimizer = self._optimizers.get(name)
         if optimizer is None:
-            optimizer = torch.optim.Adam(list(params), lr=lr)
+            optimizer = torch.optim.Adam(list(params), lr=lr, fused=True)
             self._optimizers[name] = optimizer
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -750,28 +779,30 @@ class QNNPolicy:
         sparse_discrete: bool = True,
         look_deadzone: float = 0.0,
         look_turn_alpha: float = 0.0,
-    ) -> tuple[list[torch.Tensor], Dict[str, float]]:
+        compute_metrics: bool = True,
+    ) -> tuple[list[torch.Tensor], list[bool], Dict[str, torch.Tensor | int | float]]:
         """Shared per-head loss + metrics for both train and eval.
 
-        Returns (losses_list, metrics_dict).  Discrete head raw counts are
-        batched into a single GPU tensor to minimise CPU syncs.
+        Returns (losses, loss_is_real_flags, metrics_dict).  Metrics values
+        stay as 0-d GPU tensors — caller accumulates on device and syncs only
+        at report/epoch boundaries.  loss_is_real_flags[i] is False for the
+        sparse-binary placeholder (no positive samples), True otherwise.  When
+        compute_metrics is False, metrics_dict only contains "loss" and
+        "accuracy" (required by callers); all MAE/stat computation is skipped.
         """
         weights_map = head_loss_weights or HEAD_LOSS_WEIGHTS
         losses: list[torch.Tensor] = []
-        accuracy_components: list[float] = []
-        metrics: Dict[str, float] = {}
-
-        # Accumulate discrete stats on GPU, sync once at the end.
-        discrete_stats: list[tuple[str, torch.Tensor]] = []
+        loss_is_real: list[bool] = []
+        accuracy_components: list[torch.Tensor] = []
+        metrics: Dict[str, torch.Tensor | int | float] = {}
 
         for head in ACTION_HEADS:
             head_logits = self._flatten_logits(logits[head])
+            is_real = True
             if head in CONTINUOUS_ACTION_HEADS:
                 pred = _continuous_mean(head, head_logits, look_cosine=self.look_cosine)
                 target = self._continuous_targets_for_head(actions, head, head_logits)
                 if head == "look" and self.look_cosine:
-                    # Look deadzone: zero out labels where turn magnitude is below
-                    # threshold.  Train on cleaned targets, evaluate against raw.
                     if look_deadzone > 0:
                         raw_target = target
                         turn_mag = torch.sqrt(target[:, 1] ** 2 + target[:, 2] ** 2)
@@ -781,72 +812,70 @@ class QNNPolicy:
                         target[mask, 1] = 0.0
                         target[mask, 2] = 0.0
                         head_loss = _look_cosine_loss(pred, target, look_turn_alpha)
-                        metrics.update(_continuous_head_metrics(head, pred, raw_target))
+                        if compute_metrics:
+                            metrics.update(_continuous_head_metrics(head, pred, raw_target))
                     else:
                         head_loss = _look_cosine_loss(pred, target, look_turn_alpha)
-                        metrics.update(_continuous_head_metrics(head, pred, target))
+                        if compute_metrics:
+                            metrics.update(_continuous_head_metrics(head, pred, target))
                 else:
                     head_loss = F.smooth_l1_loss(pred, target)
-                    metrics.update(_continuous_head_metrics(head, pred, target))
+                    if compute_metrics:
+                        metrics.update(_continuous_head_metrics(head, pred, target))
             else:
                 target = self._action_targets_for_head(actions, head, head_logits)
-                pred = torch.argmax(head_logits, dim=1)
-
-                # Sparse binary heads (fire, switch): skip true negatives.
-                # Only compute loss on ticks where demonstrator acted OR model
-                # predicted action — avoids rewarding trivial "always predict 0".
                 if sparse_discrete and head in _SPARSE_BINARY_HEADS:
+                    pred = torch.argmax(head_logits, dim=1)
                     sparse_mask = (target != 0) | (pred != 0)
                     if sparse_mask.any():
                         masked_logits = head_logits[sparse_mask]
                         masked_target = target[sparse_mask]
                         head_loss = F.cross_entropy(masked_logits, masked_target)
                     else:
-                        head_loss = torch.tensor(0.0, device=head_logits.device)
+                        head_loss = torch.zeros((), device=head_logits.device)
+                        is_real = False
                 else:
                     head_loss = _focal_cross_entropy(head_logits, target, focal_gamma, weight=(
                         self._class_weights_for_head(class_weights, head, ACTION_HEADS[head])
                         if class_weights is not None else None
                     ))
+                    pred = torch.argmax(head_logits, dim=1) if compute_metrics else None
 
-                match = pred == target
-                # Stack 7 scalars into one tensor: n, correct, tp, fp, fn, target_pos, pred_pos
-                n_t = torch.tensor(float(pred.shape[0]), device=pred.device)
-                correct = match.float().sum()
-                pos_pred = (pred != 0)
-                pos_target = (target != 0)
-                tp = (pos_pred & match).float().sum()
-                fp = (pos_pred & ~match).float().sum()
-                fn = (pos_target & ~match).float().sum()
-                target_pos = pos_target.float().sum()
-                pred_pos = pos_pred.float().sum()
-                discrete_stats.append((head, torch.stack([n_t, correct, tp, fp, fn, target_pos, pred_pos])))
-                accuracy_components.append(correct / n_t)
+                if compute_metrics:
+                    match = pred == target
+                    n_t = torch.tensor(float(pred.shape[0]), device=pred.device)
+                    correct = match.float().sum()
+                    pos_pred = (pred != 0)
+                    pos_target = (target != 0)
+                    tp = (pos_pred & match).float().sum()
+                    fp = (pos_pred & ~match).float().sum()
+                    fn = (pos_target & ~match).float().sum()
+                    target_pos = pos_target.float().sum()
+                    pred_pos = pos_pred.float().sum()
+                    safe_n = torch.clamp(n_t, min=1.0)
+                    metrics[f"n_{head}"] = n_t
+                    metrics[f"correct_{head}"] = correct
+                    metrics[f"acc_{head}"] = correct / safe_n
+                    metrics[f"tp_{head}"] = tp
+                    metrics[f"fp_{head}"] = fp
+                    metrics[f"fn_{head}"] = fn
+                    metrics[f"target_pos_{head}"] = target_pos
+                    metrics[f"pred_pos_{head}"] = pred_pos
+                    accuracy_components.append(correct / safe_n)
             head_loss = head_loss * weights_map.get(head, 1.0)
             losses.append(head_loss)
+            loss_is_real.append(is_real)
 
-        # Single GPU→CPU sync for all discrete heads.
-        if discrete_stats:
-            all_stats = torch.stack([s for _, s in discrete_stats]).cpu().numpy()
-            for i, (head, _) in enumerate(discrete_stats):
-                n, correct, tp, fp, fn, target_pos, pred_pos = all_stats[i]
-                metrics[f"n_{head}"] = int(n)
-                metrics[f"correct_{head}"] = float(correct)
-                metrics[f"acc_{head}"] = float(correct / max(n, 1))
-                metrics[f"tp_{head}"] = float(tp)
-                metrics[f"fp_{head}"] = float(fp)
-                metrics[f"fn_{head}"] = float(fn)
-                metrics[f"target_pos_{head}"] = float(target_pos)
-                metrics[f"pred_pos_{head}"] = float(pred_pos)
-
-        # Resolve accuracy_components (mix of tensors and floats).
-        if accuracy_components:
-            acc_tensor = torch.stack(accuracy_components) if isinstance(accuracy_components[0], torch.Tensor) else None
-            metrics["accuracy"] = float(acc_tensor.mean().item()) if acc_tensor is not None else float(np.mean([float(a) for a in accuracy_components]))
+        if compute_metrics:
+            if accuracy_components:
+                metrics["accuracy"] = torch.stack(accuracy_components).mean()
+            else:
+                metrics["accuracy"] = torch.zeros((), device=losses[0].device if losses else torch.device("cpu"))
         else:
-            metrics["accuracy"] = 0.0
+            # Placeholder so downstream code has a tensor to reference.
+            metrics["accuracy"] = torch.zeros((), device=losses[0].device if losses else torch.device("cpu"))
 
-        return losses, metrics
+        return losses, loss_is_real, metrics
 
     def supervised_step(
         self,
@@ -864,25 +893,27 @@ class QNNPolicy:
         look_deadzone: float = 0.0,
         look_turn_alpha: float = 0.0,
         loss_scale: float = 1.0,
-    ) -> Dict[str, float]:
+        compute_metrics: bool = True,
+    ) -> Dict[str, Any]:
         optimizer = self._optimizer("bc", self.model.parameters(), lr)
         if not accumulate_only:
             optimizer.zero_grad()
 
-        _, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
-        losses, metrics = self._compute_head_losses_and_metrics(
-            logits, actions, class_weights=class_weights, head_loss_weights=head_loss_weights,
-            focal_gamma=focal_gamma, sparse_discrete=sparse_discrete,
-            look_deadzone=look_deadzone, look_turn_alpha=look_turn_alpha,
-        )
-
-        nonzero = [l for l in losses if l.requires_grad or l.item() != 0.0]
-        loss = torch.stack(nonzero).mean() if nonzero else torch.tensor(0.0, device=losses[0].device)
+        with self._autocast():
+            _, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
+            losses, loss_is_real, metrics = self._compute_head_losses_and_metrics(
+                logits, actions, class_weights=class_weights, head_loss_weights=head_loss_weights,
+                focal_gamma=focal_gamma, sparse_discrete=sparse_discrete,
+                look_deadzone=look_deadzone, look_turn_alpha=look_turn_alpha,
+                compute_metrics=compute_metrics,
+            )
+            real = [l for l, r in zip(losses, loss_is_real) if r]
+            loss = torch.stack(real).mean() if real else torch.zeros((), device=losses[0].device)
         (loss * float(loss_scale)).backward()
         if not accumulate_only:
             optimizer.step()
 
-        metrics["loss"] = float(loss.item())
+        metrics["loss"] = loss.detach()
         metrics["_next_hidden"] = next_hidden.detach()
         return metrics
 
@@ -898,17 +929,20 @@ class QNNPolicy:
         sparse_discrete: bool = True,
         look_deadzone: float = 0.0,
         look_turn_alpha: float = 0.0,
-    ) -> Dict[str, float]:
-        with torch.inference_mode():
+        compute_metrics: bool = True,
+    ) -> Dict[str, Any]:
+        with torch.inference_mode(), self._autocast():
             _, logits, _, next_hidden = self._forward_tensors(obs, hidden=hidden, masks=masks)
-            losses, metrics = self._compute_head_losses_and_metrics(
+            losses, loss_is_real, metrics = self._compute_head_losses_and_metrics(
                 logits, actions, head_loss_weights=head_loss_weights,
                 focal_gamma=focal_gamma, sparse_discrete=sparse_discrete,
                 look_deadzone=look_deadzone, look_turn_alpha=look_turn_alpha,
+                compute_metrics=compute_metrics,
             )
 
-        nonzero_losses = [l.item() for l in losses if l.item() != 0.0]
-        metrics["loss"] = float(np.mean(nonzero_losses) if nonzero_losses else 0.0)
+        real = [l for l, r in zip(losses, loss_is_real) if r]
+        loss = torch.stack(real).mean() if real else torch.zeros((), device=losses[0].device if losses else torch.device("cpu"))
+        metrics["loss"] = loss
         metrics["_next_hidden"] = next_hidden.detach()
         return metrics
 

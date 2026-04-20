@@ -38,7 +38,9 @@ except ImportError as exc:
     raise ImportError("sample-factory is required: pip install sample-factory>=2.0.0") from exc
 
 import torch
+import torch.nn.functional as F
 
+from qnn.actions import ACTION_HEADS, CONTINUOUS_ACTION_HEADS, HEAD_ORDER
 from qnn.ppo.core import make_quake_core
 from qnn.ppo.encoder import QuakeTransformerEncoder, make_quake_encoder
 from qnn.ppo.env import make_quake_env
@@ -78,6 +80,194 @@ _allow_numpy_in_torch_load()
 def _patch_sample_factory_checkpoint_loading() -> None:
     """Ensure numpy globals are allowed for SF checkpoint loading."""
     _allow_numpy_in_torch_load()
+
+
+def _patch_action_distribution_weights() -> None:
+    """Teach SF's TupleActionDistribution to apply per-head loss weights.
+
+    Weights are stored as a class attribute `_qnn_head_weights` (tensor of
+    shape [n_heads], in action-space order — see qnn.actions.HEAD_ORDER).
+    When set, the three aggregation methods (_calc_log_probs, entropy,
+    kl_divergence) multiply each head's contribution before summing.
+
+    Effect of weight=0 for a head:
+      * log_prob sum excludes it → PPO ratio doesn't depend on that head
+      * entropy sum excludes it  → no entropy-bonus pressure on that head
+      * KL sum excludes it       → no reference-KL pressure on that head
+    ⇒ zero gradient flows to that head's parameters.
+    A weight of 0.5 gives a soft downweight, matching BC semantics.
+    """
+    try:
+        from sample_factory.algo.utils.action_distributions import TupleActionDistribution
+    except Exception:
+        return
+    if getattr(TupleActionDistribution, "_qnn_weighted", False):
+        return
+
+    def _weighted_per_head_values(values, weights):
+        # values: list of per-head [batch] tensors; weights: [n_heads] tensor or None
+        stacked = torch.cat([v.unsqueeze(dim=1) for v in values], dim=1)  # [batch, n_heads]
+        if weights is not None:
+            w = weights.to(stacked.device, stacked.dtype).unsqueeze(0)
+            stacked = stacked * w
+        return stacked.sum(dim=1)
+
+    def _calc_log_probs(self, list_of_action_batches):
+        log_probs = [d.log_prob(a) for d, a in zip(self.distributions, list_of_action_batches)]
+        return _weighted_per_head_values(log_probs, TupleActionDistribution._qnn_head_weights)
+
+    def entropy(self):
+        ents = [d.entropy() for d in self.distributions]
+        return _weighted_per_head_values(ents, TupleActionDistribution._qnn_head_weights)
+
+    def kl_divergence(self, other):
+        kls = [d.kl_divergence(o) for d, o in zip(self.distributions, other.distributions)]
+        return _weighted_per_head_values(kls, TupleActionDistribution._qnn_head_weights)
+
+    TupleActionDistribution._qnn_head_weights = None  # type: ignore[attr-defined]
+    TupleActionDistribution._calc_log_probs = _calc_log_probs  # type: ignore[assignment]
+    TupleActionDistribution.entropy = entropy  # type: ignore[assignment]
+    TupleActionDistribution.kl_divergence = kl_divergence  # type: ignore[assignment]
+    TupleActionDistribution._qnn_weighted = True  # type: ignore[attr-defined]
+
+
+def _continuous_mean_slices() -> dict[str, slice]:
+    slices: dict[str, slice] = {}
+    offset = 0
+    for head in HEAD_ORDER:
+        size = ACTION_HEADS[head]
+        if head in CONTINUOUS_ACTION_HEADS:
+            slices[head] = slice(offset, offset + size)
+            offset += 2 * size
+        else:
+            offset += size
+    return slices
+
+
+_CONTINUOUS_MEAN_SLICES = _continuous_mean_slices()
+
+
+def _patch_look_cosine_parameterization() -> None:
+    """Unit-normalize PPO look means when cfg.look_cosine is enabled."""
+    try:
+        from sample_factory.model.action_parameterization import (
+            ActionParameterizationContinuousNonAdaptiveStddev,
+            ActionParameterizationDefault,
+        )
+    except Exception:
+        return
+
+    look_slice = _CONTINUOUS_MEAN_SLICES.get("look")
+    if look_slice is None:
+        return
+
+    def _normalize_look_means(module: Any, params: torch.Tensor) -> torch.Tensor:
+        if not bool(getattr(module.cfg, "look_cosine", False)):
+            return params
+        if params.ndim != 2 or params.shape[1] < look_slice.stop:
+            return params
+        normalized = params.clone()
+        normalized[:, look_slice] = F.normalize(normalized[:, look_slice], dim=1)
+        return normalized
+
+    if not getattr(ActionParameterizationDefault, "_qnn_look_cosine_patched", False):
+        _orig_default_forward = ActionParameterizationDefault.forward
+
+        def _forward_default(self, actor_core_output):
+            action_distribution_params, action_distribution = _orig_default_forward(self, actor_core_output)
+            action_distribution_params = _normalize_look_means(self, action_distribution_params)
+            action_distribution = get_action_distribution(self.action_space, raw_logits=action_distribution_params)
+            return action_distribution_params, action_distribution
+
+        from sample_factory.model.action_parameterization import get_action_distribution
+
+        ActionParameterizationDefault.forward = _forward_default  # type: ignore[assignment]
+        ActionParameterizationDefault._qnn_look_cosine_patched = True  # type: ignore[attr-defined]
+
+    if not getattr(ActionParameterizationContinuousNonAdaptiveStddev, "_qnn_look_cosine_patched", False):
+        _orig_nonadaptive_forward = ActionParameterizationContinuousNonAdaptiveStddev.forward
+
+        def _forward_nonadaptive(self, actor_core_output):
+            action_distribution_params, action_distribution = _orig_nonadaptive_forward(self, actor_core_output)
+            action_distribution_params = _normalize_look_means(self, action_distribution_params)
+            action_distribution = get_action_distribution(self.action_space, raw_logits=action_distribution_params)
+            return action_distribution_params, action_distribution
+
+        from sample_factory.model.action_parameterization import get_action_distribution
+
+        ActionParameterizationContinuousNonAdaptiveStddev.forward = _forward_nonadaptive  # type: ignore[assignment]
+        ActionParameterizationContinuousNonAdaptiveStddev._qnn_look_cosine_patched = True  # type: ignore[attr-defined]
+
+
+def _patch_look_head_bias_init() -> None:
+    """Bias the look head's initial mean output to [1, 0, 0] (neutral no-turn).
+
+    The engine maps action.look to view-angle deltas via atan2(yaw, fwd) and
+    atan2(pitch, fwd) (qnn_input.c).  At the origin [0,0,0] atan2 is
+    singular: small random perturbations produce large, sign-random angle
+    changes, which makes random-init PPO explore through chaotic view
+    rotation rather than useful aim refinement.  Biasing the look-mean
+    layer so the network starts near [1, 0, 0] — the "look straight ahead"
+    point that also matches BC's no-turn label (qnn_collect_main.c) — moves
+    the starting point off the singularity so sample noise translates into
+    bounded angular perturbations (atan2(±0.2, 1.0) ≈ ±11°).
+    """
+    try:
+        from sample_factory.model.action_parameterization import (
+            ActionParameterizationContinuousNonAdaptiveStddev,
+            ActionParameterizationDefault,
+        )
+    except Exception:
+        return
+
+    look_slice = _CONTINUOUS_MEAN_SLICES.get("look")
+    if look_slice is None:
+        return
+
+    def _apply_look_bias(module: Any) -> None:
+        linear = getattr(module, "distribution_linear", None)
+        if linear is None or getattr(linear, "bias", None) is None:
+            return
+        if int(linear.bias.shape[0]) < look_slice.stop:
+            return
+        with torch.no_grad():
+            linear.bias[look_slice].copy_(torch.tensor([1.0, 0.0, 0.0]))
+
+    for cls in (ActionParameterizationDefault, ActionParameterizationContinuousNonAdaptiveStddev):
+        if getattr(cls, "_qnn_look_bias_init_patched", False):
+            continue
+        _orig_init = cls.__init__
+
+        def _make_patched_init(orig=_orig_init):
+            def _patched_init(self, cfg, core_out_size, action_space):
+                orig(self, cfg, core_out_size, action_space)
+                _apply_look_bias(self)
+            return _patched_init
+
+        cls.__init__ = _make_patched_init()  # type: ignore[assignment]
+        cls._qnn_look_bias_init_patched = True  # type: ignore[attr-defined]
+
+
+def _install_head_loss_weights(cfg: Any) -> None:
+    """Parse cfg.head_loss_weights JSON and plant it on TupleActionDistribution."""
+    raw = getattr(cfg, "head_loss_weights", "") or ""
+    if not raw.strip():
+        return
+    import json as _json
+    from qnn.actions import HEAD_ORDER
+    parsed = _json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"--head_loss_weights must be a JSON object, got {type(parsed).__name__}")
+    unknown = set(parsed) - set(HEAD_ORDER)
+    if unknown:
+        raise RuntimeError(f"--head_loss_weights has unknown heads: {sorted(unknown)}")
+    weights = torch.tensor(
+        [float(parsed.get(h, 1.0)) for h in HEAD_ORDER], dtype=torch.float32,
+    )
+    from sample_factory.algo.utils.action_distributions import TupleActionDistribution
+    TupleActionDistribution._qnn_head_weights = weights  # type: ignore[attr-defined]
+    print(f"[quake_ppo] head_loss_weights installed: "
+          f"{dict(zip(HEAD_ORDER, weights.tolist()))}")
 
 
 
@@ -322,36 +512,55 @@ def _warm_start_policy(
     policy_dir = exp_dir / f"checkpoint_p{pid}"
     policy_dir.mkdir(parents=True, exist_ok=True)
 
-    if ckpt.endswith(".pth"):
-        # Name the seed as checkpoint_*, never best_*.  SF reserves
-        # best_*.pth for its own save_best tracking — if the seed
-        # occupies that name, SF's new-best writes silently collide
-        # with the seed file and the checkpoint is lost.
-        from qnn.utils.checkpoint_converter import migrate_modality_embed
-        from qnn.utils.io import trusted_torch_load
+    # SF discovers checkpoints by scanning `checkpoint_<train_step>_<env_steps>.pth`
+    # in policy_dir. Any other filename is silently ignored and SF orthogonal-inits
+    # instead, so always land the seed under the canonical step-0 name.
+    #
+    # Two seed formats are handled here:
+    #   - QNN format (BC checkpoints, scripts/make_random_checkpoint.py output):
+    #     payload is {"state_dict": ..., "meta": ...}. SF's learner expects
+    #     {"train_step", "env_steps", "model", "optimizer", ...} and KeyErrors
+    #     without them, so these must go through save_sf_format() which builds
+    #     the matching structure (including a minimal Adam optimizer state).
+    #   - SF format (previously-trained PPO checkpoints): payload already has
+    #     {"model", "optimizer", "train_step", ...}. Raw-copy, with an optional
+    #     modality_embed migration if the layer shape changed since the seed
+    #     was saved.
+    from qnn.utils.checkpoint_converter import QNNPolicy, save_sf_format, migrate_modality_embed
+    from qnn.utils.io import trusted_torch_load
 
-        name = Path(ckpt).name.replace("best_", "checkpoint_")
-        dest = policy_dir / name
-        payload = trusted_torch_load(ckpt, map_location="cpu")
-        migrated = False
-        if "model" in payload:
-            if migrate_modality_embed(payload["model"], optimizer=payload.get("optimizer")):
-                print(f"[quake_ppo] Migrated modality_embed in {ckpt}")
-                migrated = True
+    dest = policy_dir / "checkpoint_000000000_0.pth"
+    payload = trusted_torch_load(ckpt, map_location="cpu")
+    is_qnn_format = isinstance(payload, dict) and "state_dict" in payload and "meta" in payload
+    is_sf_format = isinstance(payload, dict) and "model" in payload and "train_step" in payload
+
+    if is_qnn_format:
+        qnn_policy = QNNPolicy.load(ckpt, device="cpu")
+        sf_dest = save_sf_format(qnn_policy, policy_dir)
+        # save_sf_format names the file itself; rename to canonical step-0 form.
+        if sf_dest != dest:
+            shutil.move(str(sf_dest), str(dest))
+        print(f"[quake_ppo] Policy {pid} warm-start converted (QNN -> SF): {ckpt} -> {dest}")
+    elif is_sf_format:
+        migrated = bool(migrate_modality_embed(payload["model"], optimizer=payload.get("optimizer")))
         if migrated:
-            # Scrub numpy scalars so SF's weights_only=True torch.load works.
+            print(f"[quake_ppo] Migrated modality_embed in {ckpt}")
             _scrub_numpy(payload)
             torch.save(payload, dest)
         else:
             shutil.copy2(ckpt, dest)
-        print(f"[quake_ppo] Policy {pid} warm-start copied: {ckpt} → {dest}")
-        return dest
+        print(f"[quake_ppo] Policy {pid} warm-start copied (SF): {ckpt} -> {dest}")
     else:
-        from qnn.utils.checkpoint_converter import QNNPolicy, save_sf_format
-        bc_policy = QNNPolicy.load(ckpt, device="cpu")
-        dest = save_sf_format(bc_policy, policy_dir)
-        print(f"[quake_ppo] Policy {pid} warm-start converted: {ckpt} → {dest}")
-        return dest
+        raise RuntimeError(
+            f"Warm-start checkpoint {ckpt} is neither QNN format (state_dict+meta) "
+            f"nor SF format (model+train_step); keys={list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__}"
+        )
+
+    if not dest.exists():
+        raise RuntimeError(
+            f"Warm-start copy missing at {dest}; SF would silently orthogonal-init"
+        )
+    return dest
 
 
 def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
@@ -374,7 +583,8 @@ def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
         return None
 
     if not multi_ckpts and not single_ckpt:
-        raise RuntimeError("Fresh PPO runs require an explicit warm-start checkpoint")
+        print("[quake_ppo] No warm-start checkpoint provided; SF will initialize policies randomly")
+        return None
 
     cfg.load_checkpoint_kind = "latest"
     exp_dir = _experiment_dir(cfg)
@@ -421,6 +631,8 @@ def register_quake_components() -> None:
     """Register Quake env and encoder with Sample Factory (idempotent)."""
     _patch_save_best_keep()
     _patch_sample_factory_checkpoint_loading()
+    _patch_learner_record_summaries()
+    _patch_action_distribution_weights()
     register_env("quake_combat", make_quake_env)
     if _HAS_REGISTER_CUSTOM_ENCODER:
         # SF < 2.1: direct registration helper
@@ -487,6 +699,17 @@ def add_quake_cli_args(parser: Any) -> None:
                         help="Path to BC/PPO checkpoint for warm-start initialisation")
     parser.add_argument("--quake_bc_checkpoints", type=str, default=None,
                         help="Comma-separated BC/PPO checkpoints for multi-seed PBT warm-start")
+    # Per-head loss shaping (same JSON schema as BC's --head_loss_weights).
+    # Keys are action head names from qnn.actions.HEAD_ORDER; missing heads
+    # default to 1.0.  Weight 0.0 on a head zeros its contribution to PPO
+    # log-prob sum, entropy, and KL — so no gradient flows to that head.
+    parser.add_argument("--head_loss_weights", type=str, default="",
+                        help='JSON object of per-head weights, e.g. '
+                             '\'{"move":0.0,"fire":0.0,"switch":0.0,"recall_0":0.0,'
+                             '"recall_1":0.0,"recall_2":0.0,"recall_3":0.0}\' '
+                             'to isolate the look head.')
+    parser.add_argument("--look_cosine", type=str, default=None,
+                        help="true = L2-normalize look means before building PPO action distributions")
 
 
 def _validate_quake_cfg(cfg: Any) -> None:
@@ -510,6 +733,7 @@ def _validate_quake_cfg(cfg: Any) -> None:
         "quake_attn_dropout",
         "quake_action_history_tokens",
         "reward_json_path",
+        "look_cosine",
     )
     missing = [name for name in required_attrs if getattr(cfg, name, None) is None]
     if missing:
@@ -561,6 +785,7 @@ def build_ppo_cfg(
     lr: float,
     entropy_coef: float,
     bc_kl_coef: float,
+    look_cosine: bool,
     clip_ratio: float,
     gamma: float,
     gae_lambda: float,
@@ -570,6 +795,7 @@ def build_ppo_cfg(
     policy_workers_per_policy: int,
     batched_sampling: bool,
     worker_inference: bool = False,
+    worker_inference_device: str = "cpu",
     max_policy_lag: int = 30,
     with_wandb: bool = False,
     # Population-Based Training
@@ -584,6 +810,8 @@ def build_ppo_cfg(
     init_checkpoint: str = "",
     init_checkpoints: Optional[List[str]] = None,
     resume: bool = False,
+    head_loss_weights: str = "",
+    initial_stddev: float = 0.2,
     extra_argv: Optional[List[str]] = None,
 ) -> Any:
     """Build a PPO cfg namespace without command-line parsing.
@@ -619,9 +847,10 @@ def build_ppo_cfg(
         f"--value_loss_coeff={value_coef}",
         f"--exploration_loss_coeff={entropy_coef}",
         f"--kl_loss_coeff={bc_kl_coef}",
+        f"--look_cosine={'True' if look_cosine else 'False'}",
         "--adaptive_stddev=False",
         "--continuous_tanh_scale=1.0",
-        "--initial_stddev=0.2",
+        f"--initial_stddev={initial_stddev}",
         f"--policy_workers_per_policy={policy_workers_per_policy}",
         f"--batched_sampling={'True' if batched_sampling else 'False'}",
         f"--max_policy_lag={max_policy_lag}",
@@ -675,6 +904,9 @@ def build_ppo_cfg(
     elif init_checkpoint:
         argv.append(f"--quake_bc_checkpoint={init_checkpoint}")
 
+    if head_loss_weights:
+        argv.append(f"--head_loss_weights={head_loss_weights}")
+
     if extra_argv:
         argv.extend(extra_argv)
 
@@ -683,6 +915,11 @@ def build_ppo_cfg(
     cfg = parse_full_cfg(parser, argv=argv)
     cfg.quake_resume = bool(resume)
     cfg.worker_inference = bool(worker_inference)
+    cfg.worker_inference_device = str(worker_inference_device).lower()
+    cfg.look_cosine = str(getattr(cfg, "look_cosine", "")).lower() == "true"
+    # Our encoder already pre-scales scalar fields and passes categoricals through
+    # embeddings; SF's RunningMeanStd is redundant. Disable it.
+    cfg.normalize_input = False
     _validate_quake_cfg(cfg)
     return cfg
 
@@ -718,12 +955,41 @@ def _set_ppo_report_interval(seconds: float = 60.0) -> None:
         pass
 
 
+def _patch_learner_record_summaries() -> None:
+    """Skip a summary cycle instead of crashing when a minibatch has zero
+    valid samples (valid_ratios.min() errors on empty tensor).
+
+    Hit under worker_inference=True when per-worker policy lag pushes some
+    minibatches past max_policy_lag so all samples are filtered as invalid.
+    """
+    try:
+        from sample_factory.algo.learning.learner import Learner
+        _orig_record = Learner._record_summaries
+
+        def _safe_record(self, summary_vars, *args, **kwargs):
+            try:
+                return _orig_record(self, summary_vars, *args, **kwargs)
+            except RuntimeError as exc:
+                if "numel()" in str(exc) or "reduction dim" in str(exc):
+                    return None
+                raise
+
+        if not getattr(_safe_record, "_quake_patched", False):
+            _safe_record._quake_patched = True  # type: ignore[attr-defined]
+            Learner._record_summaries = _safe_record
+    except Exception:
+        pass
+
+
 def run_ppo(cfg: Any) -> Dict[str, Any]:
     """Launch PPO training and retain a compact summary artifact."""
     from sample_factory.algo.utils.misc import ExperimentStatus
     from qnn.ppo.observer import BestCheckpointArchiver
 
     register_quake_components()
+    _install_head_loss_weights(cfg)
+    _patch_look_cosine_parameterization()
+    _patch_look_head_bias_init()
     _set_ppo_report_interval(60.0)
     _ensure_warm_start_checkpoint(cfg)
 

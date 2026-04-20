@@ -8,6 +8,7 @@
 
 #include "qnn.h"
 #include "qnn_metrics.h"
+#include "qnn_store.h"
 
 #include <math.h>
 #include <string.h>
@@ -17,19 +18,22 @@
 void QNN_ComputeTracking(qnn_metrics_t *out, const qnn_snapshot_t *snapshot)
 {
 	vec3_t forward;
-	int i;
+	float now = (float)cl.mtime[0];
+	int entity_num;
 
 	QNN_ForwardFromAngles(snapshot->player_view_angles, forward);
 
-	for (i = 0; i < snapshot->known_count; ++i)
+	for (entity_num = 1; entity_num <= cl.maxclients && entity_num < MAX_EDICTS; ++entity_num)
 	{
-		const qnn_known_entity_t *ent = &snapshot->known[i];
+		const qnn_entity_t *ent = &qnn_store[entity_num];
 		float dx, dy, dz, dist_sq, inv_dist, cos_val;
 		int slot, j;
 
-		if (ent->entity_num == cl.viewentity || ent->entity_num <= 0)
+		if (entity_num == cl.viewentity)
 			continue;
-		if (ent->health <= 0)
+		if (ent->type != QNN_ENT_ACTOR)
+			continue;
+		if (!QNN_PrimaryObservationIsCurrent(ent, now))
 			continue;
 
 		dx = ent->origin[0] - snapshot->player_origin[0];
@@ -46,7 +50,7 @@ void QNN_ComputeTracking(qnn_metrics_t *out, const qnn_snapshot_t *snapshot)
 		slot = -1;
 		for (j = 0; j < out->entity_count; ++j)
 		{
-			if (out->entities[j].entity_num == ent->entity_num)
+			if (out->entities[j].entity_num == entity_num)
 			{
 				slot = j;
 				break;
@@ -56,7 +60,7 @@ void QNN_ComputeTracking(qnn_metrics_t *out, const qnn_snapshot_t *snapshot)
 		{
 			slot = out->entity_count++;
 			memset(&out->entities[slot], 0, sizeof(out->entities[slot]));
-			out->entities[slot].entity_num = ent->entity_num;
+			out->entities[slot].entity_num = entity_num;
 		}
 		if (slot >= 0)
 			out->entities[slot].tracking_cos = cos_val;
