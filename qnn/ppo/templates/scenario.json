@@ -7,7 +7,7 @@
   ],
   "options": {
     "maxplayers": 7,
-    "skill": 0,
+    "skill": 3,
     "deathmatch": 1,
     "coop": 0,
     "teamplay": 0,

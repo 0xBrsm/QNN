@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.18.0
+
+### Added
+
+- `qnn.diag` package for trained-policy analysis: ablation, attention, convergence, gradients, linear_probe, participation, pruning, rank, report — driven by the `/diag` skill
+- `qnn.probes.target_head_probe` standalone causal TCN slot probe + GBT variants for offline target-head analysis
+- `qw_classifier` C binary replaces the Python QWD classifier end-to-end
+- `nq_client` binary + `qnn.eval.live` — canonical live-play entry point against real NQ servers
+- Per-head F1 headline metrics with per-class weapon/move visibility; `head_loss_weights` for per-head loss gating; `jump_pos_weight` with linear decay
+- Collection-identity fingerprint sidecar verified at train time; sub-episode splitting on filter-mask drops; `segment_mask` / `token_mask` config knobs
+- Native-rate labeler LOBS stream with per-tick `target_valid_mask`; engine-side sticky engagement gated on PVS modality
+
+### Changed
+
+- BC training loop split: chunked `supervised_loop.py` extracted from `loop.py`; class-weight derivation, token-mask filter, filter DSL each in their own modules
+- Engine collect modularized: monolithic `qnn_collect_main` split into `qnn_mvd_collect`, `qnn_qwd_collect`, `qnn_labeler_collect`; common runtime via `qnn_collect_helpers`, `qnn_fault`, `qnn_watchdog`, `qnn_tick`
+- MVD fire/jump labels: ping-driven walk-back with per-record demotime back-shift; sound + velocity-sign jump detection at native tick rate
+- QW worker hardening: per-demo SIGALRM, bounds-checked baselines, protocols 24-27 accepted, graceful post-signon `svc_disconnect`, 4× statics cap, per-demo worker restart
+- Checkpoint converter trimmed to v17 + v20 era with `drop_action_history` and `drop_fire_align_scalar` migrations
+- BC templates: 8 epochs, flat LR, bf16, `head_loss_weights` default; PPO scenario skill 0 → 3
+
+### Removed
+
+- `microbench`, `attn_dump`, tactics head + labeler, `length_bucket_window`, regression-stop, loss-shape ablation knobs, `MODEL_VERSION` tag, legacy precomputed manifest path
+
+### Fixed
+
+- QWD other-player entities now register for actor-token emission; spectator demos filtered via `svc_serverdata` bit
+- Five mid-demo crash classes in the QW worker (cross-demo `tick_emit` jitter reset, unknown `svc` codes, missing actor-store creation, etc.)
+- BC sub-episodes split on filter drops so the target labeler never reads across dropped intervals
+
+## 0.17.0
+
+### Added
+
+- TargetPointer head: pointer distribution over actor slots; `target_feat = probs @ actor_tokens` conditions move/look/fire/weapon. Target is supervised internally, not a sampled action
+- Supervised target labels via `qnn.bc.target_labeler`: cone-anchored + Schmitt-trigger release + sticky-by-PID engagement; on-disk `actions["target"]` is (T,) int64 with -100 ignore
+- 8-class weapon head emits a direct Quake impulse byte (1-8); engine action-byte 28 renamed `switch` → `weapon`
+- Per-weapon one-hot ownership in `self_scalars` — SG/SSG/NG/SNG each get their own bit instead of the paired 0/0.5/1.0 floats
+
+### Changed
+
+- Token spec v9 → v11; entity vocab 42 → 44 with SHOTGUN/SUPER_SHOTGUN and NAILGUN/SUPER_NAILGUN as distinct rows, weapons renumbered into Quake impulse order (ids 3-10) so SG/SSG and NG/SNG embed rows sit adjacent
+- `self_scalars` 14 → 16; `entity_stream` offset shifts back to byte 564 (action_history wire region removed); max obs ~2389B
+- `move` action: continuous float[3] → 3 categorical axes (fb/lr/ud) × 3 classes {neg, none, pos}. Engine still receives float[3] in {-1, 0, +1}; on-disk corpus stores 6-bit packed uint8
+- Trunk returns a tuple `(self_readout, target_feat, target_logits, target_query)` instead of a single tensor; downstream heads consume `target_feat` directly. GRU input remains `self_readout` (the in-branch `linear(cat(self_readout, mean(actors)))` experiment lost to `gru_input_self_only=True` and was baked out)
+- Corpus on-disk action format: packed `move` uint8, fp16 `look`, raw engine `weapon` byte (no-weapon frames carry 0 and are masked from CE)
+
+### Removed
+
+- `recall_0..3` heads and recall wire bytes; `qnn_store[].mem` kept dormant as a revival hook
+- `action_history` ripped from wire, schema, and Tokenizer end-to-end; checkpoint converter keeps `migrate_drop_action_history` to strip pre-rip-out weights
+- 5-slot `switch` head end-to-end (replaced by direct-impulse `weapon`)
+
 ## 0.16.0
 
 ### Added

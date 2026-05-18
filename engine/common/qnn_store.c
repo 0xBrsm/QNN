@@ -38,9 +38,9 @@ const qnn_item_def_t qnn_item_defs[] = {
 	{"item_rockets",   0, 0, QNN_SUBJECT_ROCKETS,            5,  30.0f},
 	{"item_cells",     1, 1, QNN_SUBJECT_CELLS,             12,  30.0f},
 	{"item_cells",     0, 0, QNN_SUBJECT_CELLS,              6,  30.0f},
-	{"weapon_supershotgun",    0, 0, QNN_SUBJECT_SHOTGUN,           5, 30.0f},
+	{"weapon_supershotgun",    0, 0, QNN_SUBJECT_SUPER_SHOTGUN,     5, 30.0f},
 	{"weapon_nailgun",         0, 0, QNN_SUBJECT_NAILGUN,          30, 30.0f},
-	{"weapon_supernailgun",    0, 0, QNN_SUBJECT_NAILGUN,          30, 30.0f},
+	{"weapon_supernailgun",    0, 0, QNN_SUBJECT_SUPER_NAILGUN,    30, 30.0f},
 	{"weapon_grenadelauncher", 0, 0, QNN_SUBJECT_GRENADE_LAUNCHER,  5, 30.0f},
 	{"weapon_rocketlauncher",  0, 0, QNN_SUBJECT_ROCKET_LAUNCHER,   5, 30.0f},
 	{"weapon_lightning",       0, 0, QNN_SUBJECT_THUNDERBOLT,       15, 30.0f},
@@ -74,7 +74,7 @@ static qboolean qnn_player_present[MAX_EDICTS];
 
 /* Primary observation source by entity type. Keep this centralized so
  * token qualification, metrics, and reward all key off the same source. */
-#define QNN_PRIMARY_OBS_ACTOR      QNN_PRIMARY_OBS_PVS
+#define QNN_PRIMARY_OBS_ACTOR      QNN_PRIMARY_OBS_VIS
 #define QNN_PRIMARY_OBS_ITEM       QNN_PRIMARY_OBS_PVS
 #define QNN_PRIMARY_OBS_MOVER      QNN_PRIMARY_OBS_PVS
 #define QNN_PRIMARY_OBS_PROJECTILE QNN_PRIMARY_OBS_PVS
@@ -455,15 +455,18 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 		emit_dt = 1.0f / 20.0f;
 	memset(ephemeral_seen, 0, sizeof(ephemeral_seen));
 
-	/* ---- Scoreboard connect/disconnect cleanup ---- */
+	/* ---- Scoreboard connect/disconnect cleanup ----
+	 * A name-bearing scoreboard slot is necessary but not sufficient to
+	 * promote the slot to an ACTOR entity: spectators (QW) and non-player
+	 * edicts (NQ) also have names.  Defer to the per-game predicate. */
 	if (cl.scores != NULL)
 	{
 		for (i = 1; i <= cl.maxclients && i < MAX_EDICTS; ++i)
 		{
-			qboolean has_name = (cl.scores[i - 1].name[0] != '\0');
-			if (qnn_player_present[i] && !has_name)
+			qboolean is_live_player = QNN_IsLivePlayerSlot(i);
+			if (qnn_player_present[i] && !is_live_player)
 				memset(&qnn_store[i], 0, sizeof(qnn_store[i]));
-			else if (!qnn_player_present[i] && has_name)
+			else if (!qnn_player_present[i] && is_live_player)
 			{
 				memset(&qnn_store[i], 0, sizeof(qnn_store[i]));
 				qnn_store[i].type = QNN_ENT_ACTOR;
@@ -471,7 +474,7 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 				qnn_store[i].entity_num = i;
 				qnn_store[i].colormap = cl.scores[i - 1].colors;
 			}
-			qnn_player_present[i] = has_name;
+			qnn_player_present[i] = is_live_player;
 		}
 	}
 
@@ -524,7 +527,6 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 		/* Players */
 		if (eu->subject_id == QNN_SUBJECT_PLAYER)
 		{
-			entity_t *cl_ent = &cl_entities[eu->entity_num];
 			if (eu->entity_num > cl.maxclients)
 				continue; /* bodyque */
 			if (eu->entity_num == cl.viewentity)
@@ -536,7 +538,10 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 			e->qualifier_id = eu->qualifier_id;
 			e->entity_num = eu->entity_num;
 
-			QNN_ComputeStoreVelocity(e, cl_ent->msg_origins[0], emit_dt);
+			if (e->pvs > 0.0f || e->snd > 0.0f || e->mem > 0.0f)
+				QNN_ComputeStoreVelocity(e, eu->origin, emit_dt);
+			else
+				VectorCopy(eu->velocity, e->velocity);
 			VectorCopy(eu->origin, e->origin);
 			VectorCopy(eu->angles, e->angles);
 			QNN_StampPvs(e, now, eu->in_fov);

@@ -1,4 +1,5 @@
 #include "qnn.h"
+#include "qnn_object.h"
 #include "qnn_route.h"
 
 #include <ctype.h>
@@ -16,7 +17,6 @@
 /* ── shared globals ──────────────────────────────────────────────── */
 
 qnn_map_state_t qnn_map_state;
-qnn_resample_state_t qnn_resample;
 char qnn_basedir_storage[MAX_OSPATH] = ".";
 
 qboolean isDedicated;
@@ -206,5 +206,30 @@ const char *QNN_ProgString(string_t value)
 	if (!value)
 		return "";
 	return pr_strings + value;
+}
+
+/* QNN_TraceLine (NQ) — forwards to upstream's SV_RecursiveHullCheck from
+ * world.c.  Shared declaration in qnn_object.h. */
+void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
+{
+	if (trace == NULL)
+		return;
+	if (cl.worldmodel == NULL)
+	{
+		memset(trace, 0, sizeof(*trace));
+		trace->fraction = 1.0f;
+		VectorCopy(end, trace->endpos);
+		return;
+	}
+	memset(trace, 0, sizeof(*trace));
+	/* Upstream NQ convention: caller sets fraction=1 before recursion.
+	 * SV_RecursiveHullCheck only WRITES fraction when an obstruction is
+	 * found — on a clear line it leaves whatever value was there.  Without
+	 * this seed, a memset-zeroed trace returns fraction=0 ("blocked") on
+	 * every unobstructed call, which silently broke VIS-gated actor obs
+	 * after 536c99b5 flipped QNN_PRIMARY_OBS_ACTOR from PVS to VIS. */
+	trace->fraction = 1.0f;
+	SV_RecursiveHullCheck(cl.worldmodel->hulls, 0, 0, 1,
+		(float *)start, (float *)end, trace);
 }
 

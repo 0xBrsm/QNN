@@ -101,6 +101,7 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin,
 	snd->entity_num = entnum;
 	strncpy(snd->name, name, sizeof(snd->name) - 1);
 	snd->name[sizeof(snd->name) - 1] = '\0';
+	snd->native_time = (float)cl.mtime[0];
 	qnn_sound_count += 1;
 }
 

@@ -148,7 +148,7 @@ _CONTINUOUS_MEAN_SLICES = _continuous_mean_slices()
 
 
 def _patch_look_cosine_parameterization() -> None:
-    """Unit-normalize PPO look means when cfg.look_cosine is enabled."""
+    """Unit-normalize PPO look means at the action parameterization layer."""
     try:
         from sample_factory.model.action_parameterization import (
             ActionParameterizationContinuousNonAdaptiveStddev,
@@ -161,9 +161,7 @@ def _patch_look_cosine_parameterization() -> None:
     if look_slice is None:
         return
 
-    def _normalize_look_means(module: Any, params: torch.Tensor) -> torch.Tensor:
-        if not bool(getattr(module.cfg, "look_cosine", False)):
-            return params
+    def _normalize_look_means(params: torch.Tensor) -> torch.Tensor:
         if params.ndim != 2 or params.shape[1] < look_slice.stop:
             return params
         normalized = params.clone()
@@ -175,7 +173,7 @@ def _patch_look_cosine_parameterization() -> None:
 
         def _forward_default(self, actor_core_output):
             action_distribution_params, action_distribution = _orig_default_forward(self, actor_core_output)
-            action_distribution_params = _normalize_look_means(self, action_distribution_params)
+            action_distribution_params = _normalize_look_means(action_distribution_params)
             action_distribution = get_action_distribution(self.action_space, raw_logits=action_distribution_params)
             return action_distribution_params, action_distribution
 
@@ -189,7 +187,7 @@ def _patch_look_cosine_parameterization() -> None:
 
         def _forward_nonadaptive(self, actor_core_output):
             action_distribution_params, action_distribution = _orig_nonadaptive_forward(self, actor_core_output)
-            action_distribution_params = _normalize_look_means(self, action_distribution_params)
+            action_distribution_params = _normalize_look_means(action_distribution_params)
             action_distribution = get_action_distribution(self.action_space, raw_logits=action_distribution_params)
             return action_distribution_params, action_distribution
 
@@ -523,10 +521,10 @@ def _warm_start_policy(
     #     without them, so these must go through save_sf_format() which builds
     #     the matching structure (including a minimal Adam optimizer state).
     #   - SF format (previously-trained PPO checkpoints): payload already has
-    #     {"model", "optimizer", "train_step", ...}. Raw-copy, with an optional
-    #     modality_embed migration if the layer shape changed since the seed
-    #     was saved.
-    from qnn.utils.checkpoint_converter import QNNPolicy, save_sf_format, migrate_modality_embed
+    #     {"model", "optimizer", "train_step", ...}. Raw-copy, with optional
+    #     v17→v20 entity-vocab + self-scalar migrations if the seed predates
+    #     the v21 wire-format split.
+    from qnn.utils.checkpoint_converter import QNNPolicy, save_sf_format, migrate_entity_embed, migrate_self_scalars
     from qnn.utils.io import trusted_torch_load
 
     dest = policy_dir / "checkpoint_000000000_0.pth"
@@ -542,9 +540,10 @@ def _warm_start_policy(
             shutil.move(str(sf_dest), str(dest))
         print(f"[quake_ppo] Policy {pid} warm-start converted (QNN -> SF): {ckpt} -> {dest}")
     elif is_sf_format:
-        migrated = bool(migrate_modality_embed(payload["model"], optimizer=payload.get("optimizer")))
+        migrated = bool(migrate_entity_embed(payload["model"], optimizer=payload.get("optimizer")))
+        migrated = bool(migrate_self_scalars(payload["model"], optimizer=payload.get("optimizer"))) or migrated
         if migrated:
-            print(f"[quake_ppo] Migrated modality_embed in {ckpt}")
+            print(f"[quake_ppo] Migrated warm-start checkpoint tensors in {ckpt}")
             _scrub_numpy(payload)
             torch.save(payload, dest)
         else:
@@ -684,16 +683,12 @@ def add_quake_cli_args(parser: Any) -> None:
                         help="Transformer token dimension (transformer only)")
     parser.add_argument("--quake_n_heads", type=int, default=None,
                         help="Number of attention heads (transformer only)")
-    parser.add_argument("--quake_readout", type=str, default=None,
-                        help="Transformer readout token: cls or self")
     parser.add_argument("--quake_n_layers", type=int, default=None,
                         help="Number of transformer blocks (transformer only)")
     parser.add_argument("--quake_ffn_dim", type=int, default=None,
                         help="FFN inner dimension (transformer only)")
     parser.add_argument("--quake_attn_dropout", type=float, default=None,
                         help="Attention dropout rate (transformer only)")
-    parser.add_argument("--quake_action_history_tokens", type=int, default=None,
-                        help="Number of action history tokens fed to transformer")
     # BC warm-start
     parser.add_argument("--quake_bc_checkpoint", type=str, default=None,
                         help="Path to BC/PPO checkpoint for warm-start initialisation")
@@ -705,11 +700,8 @@ def add_quake_cli_args(parser: Any) -> None:
     # log-prob sum, entropy, and KL — so no gradient flows to that head.
     parser.add_argument("--head_loss_weights", type=str, default="",
                         help='JSON object of per-head weights, e.g. '
-                             '\'{"move":0.0,"fire":0.0,"switch":0.0,"recall_0":0.0,'
-                             '"recall_1":0.0,"recall_2":0.0,"recall_3":0.0}\' '
+                             '\'{"move":0.0,"fire":0.0,"weapon":0.0}\' '
                              'to isolate the look head.')
-    parser.add_argument("--look_cosine", type=str, default=None,
-                        help="true = L2-normalize look means before building PPO action distributions")
 
 
 def _validate_quake_cfg(cfg: Any) -> None:
@@ -727,13 +719,10 @@ def _validate_quake_cfg(cfg: Any) -> None:
         "quake_scenario_config_json",
         "quake_d_model",
         "quake_n_heads",
-        "quake_readout",
         "quake_n_layers",
         "quake_ffn_dim",
         "quake_attn_dropout",
-        "quake_action_history_tokens",
         "reward_json_path",
-        "look_cosine",
     )
     missing = [name for name in required_attrs if getattr(cfg, name, None) is None]
     if missing:
@@ -776,16 +765,13 @@ def build_ppo_cfg(
     use_gru: bool,
     d_model: int,
     n_heads: int,
-    readout: str,
     n_layers: int,
     ffn_dim: int,
-    action_history_tokens: int,
     attn_dropout: float,
     ppo_epochs: int,
     lr: float,
     entropy_coef: float,
     bc_kl_coef: float,
-    look_cosine: bool,
     clip_ratio: float,
     gamma: float,
     gae_lambda: float,
@@ -847,7 +833,6 @@ def build_ppo_cfg(
         f"--value_loss_coeff={value_coef}",
         f"--exploration_loss_coeff={entropy_coef}",
         f"--kl_loss_coeff={bc_kl_coef}",
-        f"--look_cosine={'True' if look_cosine else 'False'}",
         "--adaptive_stddev=False",
         "--continuous_tanh_scale=1.0",
         f"--initial_stddev={initial_stddev}",
@@ -873,11 +858,9 @@ def build_ppo_cfg(
         f"--quake_native_args_json={native_args_json}",
         f"--quake_d_model={d_model}",
         f"--quake_n_heads={n_heads}",
-        f"--quake_readout={readout}",
         f"--quake_n_layers={n_layers}",
         f"--quake_ffn_dim={ffn_dim}",
         f"--quake_attn_dropout={attn_dropout}",
-        f"--quake_action_history_tokens={action_history_tokens}",
     ]
 
     argv.append(f"--quake_options_json={options_json}")
@@ -916,7 +899,6 @@ def build_ppo_cfg(
     cfg.quake_resume = bool(resume)
     cfg.worker_inference = bool(worker_inference)
     cfg.worker_inference_device = str(worker_inference_device).lower()
-    cfg.look_cosine = str(getattr(cfg, "look_cosine", "")).lower() == "true"
     # Our encoder already pre-scales scalar fields and passes categoricals through
     # embeddings; SF's RunningMeanStd is redundant. Disable it.
     cfg.normalize_input = False

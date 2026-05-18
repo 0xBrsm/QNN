@@ -29,14 +29,13 @@ import torch
 
 from qnn.actions import ACTION_HEADS, CONTINUOUS_ACTION_HEADS, HEAD_ORDER
 from qnn.schema import (
-    ACTION_HISTORY_DIM,
-    ACTION_HISTORY_LEN,
     SELF_SCALAR_DIM,
     SPATIAL_SCALAR_DIM,
     SPATIAL_TOKEN_COUNT,
 )
 from qnn.model.policy import QNNPolicy
 from qnn.utils.io import trusted_torch_load
+from qnn.vocab import ENTITY_IDS
 
 _HEAD_ORDER = HEAD_ORDER
 _HEAD_SIZES: list[int] = list(ACTION_HEADS.values())
@@ -81,9 +80,7 @@ def sf_to_qnn(
     n_heads: int,
     n_layers: int,
     ffn_dim: int,
-    action_history_tokens: int,
     attn_dropout: float,
-    readout: str,
     device: str = "cpu",
 ) -> QNNPolicy:
     """Load an SF checkpoint and return an QNNPolicy with copied weights."""
@@ -106,9 +103,7 @@ def sf_to_qnn(
         n_heads=n_heads,
         n_layers=n_layers,
         ffn_dim=ffn_dim,
-        action_history_tokens=action_history_tokens,
         attn_dropout=attn_dropout,
-        readout=readout,
     )
     bc_state = bc_policy.model.state_dict()
 
@@ -224,9 +219,7 @@ def save_sf_format(
         "n_heads": bc_policy.n_heads,
         "n_layers": bc_policy.n_layers,
         "ffn_dim": bc_policy.ffn_dim,
-        "action_history_tokens": bc_policy.action_history_tokens,
         "attn_dropout": bc_policy.attn_dropout,
-        "readout": bc_policy.readout,
         "source": "bc_to_sf_converter",
     }
     ckpt_path = output / "checkpoint_000000000_0.pth"
@@ -247,45 +240,260 @@ from qnn.schema import OBS_SCHEMA
 _OBS_SHAPES = OBS_SCHEMA
 
 
-def migrate_modality_embed(state: Dict[str, torch.Tensor], expected_rows: int = 4,
-                           optimizer: Dict[str, Any] | None = None) -> bool:
-    """Shrink modality_embed from old 5-row layout to current 4-row layout.
+def migrate_v17_move_heads(state: Dict[str, torch.Tensor]) -> bool:
+    """Fold v17's split move_fb_head + move_lr_head into the v20 unified move_head.
 
-    Old layout had NONE=0, SIGHT=1, PROXIMITY=2, SOUND=3, MEMORY=4 (5 rows
-    total, but row 0 was a sentinel that the oracle never emitted, so it
-    was never trained).  Current layout packs SIGHT=0, PROXIMITY=1, SOUND=2,
-    MEMORY=3 (4 rows, all trained).  Migration drops row 0 and shifts the
-    rest down.
+    v17 trained two 3-class Linear heads (fb, lr) and never modeled the
+    ud (jump) axis.  v20 uses a single Linear(head_in, 9) reshaped to
+    (3 axes × 3 classes).  Layout: rows 0-2 = fb, 3-5 = lr, 6-8 = ud.
 
-    Works on both SF state dicts (key contains ``encoder.trunk.tokenizer.modality_embed.weight``)
-    and BC state dicts (``trunk.tokenizer.modality_embed.weight``).
+    Migration packs the v17 weights into rows 0-5 of the unified head and
+    bias-locks the ud axis to class 1 ("none") so v17 inference produces
+    deterministic no-jump decisions instead of random ud logits.  The
+    split-head tensors are then deleted from the state dict so they don't
+    show up as unexpected keys at load time.
 
-    If ``optimizer`` is provided, also shifts matching Adam momentum buffers
-    so the optimizer state stays consistent with the model.
+    Operates on BC state dicts (top-level ``move_fb_head.*`` /
+    ``move_lr_head.*`` keys).  Returns True iff a migration ran.
+    """
+    fb_w = state.get("move_fb_head.weight")
+    fb_b = state.get("move_fb_head.bias")
+    lr_w = state.get("move_lr_head.weight")
+    lr_b = state.get("move_lr_head.bias")
+    if fb_w is None or fb_b is None or lr_w is None or lr_b is None:
+        return False
 
-    Returns True if any tensor was migrated.
+    # Sanity-check shapes: (3, head_in) and (3,) for each axis.
+    if fb_w.shape != lr_w.shape or fb_w.shape[0] != 3:
+        return False
+
+    head_in = fb_w.shape[1]
+    unified_w = torch.zeros((9, head_in), dtype=fb_w.dtype)
+    unified_w[0:3] = fb_w
+    unified_w[3:6] = lr_w
+    # ud rows stay zero — bias-only decision.
+
+    unified_b = torch.zeros((9,), dtype=fb_b.dtype)
+    unified_b[0:3] = fb_b
+    unified_b[3:6] = lr_b
+    # Lock ud softmax to class 1 (none) regardless of features.
+    unified_b[6:9] = torch.tensor([-100.0, 100.0, -100.0], dtype=fb_b.dtype)
+
+    state["move_head.weight"] = unified_w
+    state["move_head.bias"] = unified_b
+    for key in ("move_fb_head.weight", "move_fb_head.bias",
+                "move_lr_head.weight", "move_lr_head.bias"):
+        state.pop(key, None)
+    return True
+
+
+def migrate_drop_fire_align_scalar(state: Dict[str, torch.Tensor]) -> bool:
+    """Strip the trailing alignment-scalar column from pre-v21 fire heads.
+
+    Pre-v21 fire heads were Linear(fire_in + 1, …) — the +1 was the
+    cosine of pred_look against the target-anchored base_look,
+    concatenated as the last feature dim.  Settled-null in ablation
+    and removed from the architecture; v17/v20-era checkpoints still
+    carry the 129-wide first-layer weight (128 fused features + 1
+    alignment scalar) even though their training treated the scalar
+    as essentially dead weight.
+
+    Migration drops the last input column from the fire head's first
+    Linear so it matches the current 128-wide architecture.  Covers
+    both single-Linear (`fire_head.weight`) and bottlenecked
+    (`fire_head.0.weight`) layouts.  Bias is per-output, unaffected.
+    Returns True iff a migration ran.
+
+    Detection is by shape, not by meta flag: v17 doesn't record a
+    `fire_use_align_scalar` field even though it trained with the
+    scalar wired in.  An odd `in_dim` is the unambiguous tell — the
+    even base_features_dim makes that impossible without the +1.
     """
     migrated = False
-    param_keys = [k for k in state
-                  if not k.startswith("obs_normalizer.") and not k.startswith("returns_normalizer.")]
-
-    for idx, key in enumerate(param_keys):
-        if not key.endswith("modality_embed.weight"):
+    for key in ("fire_head.weight", "fire_head.0.weight"):
+        w = state.get(key)
+        if w is None or w.ndim != 2:
             continue
-        tensor = state[key]
-        if tensor.shape[0] > expected_rows:
-            # Drop the dead NONE row at index 0; keep rows 1..N.
-            state[key] = tensor[1:1 + expected_rows].clone()
+        in_dim = w.shape[1]
+        if in_dim % 2 != 1:
+            continue  # already even — no trailing align column to drop
+        state[key] = w[:, :-1].contiguous()
+        migrated = True
+    return migrated
+
+
+def migrate_drop_action_history(state: Dict[str, torch.Tensor]) -> bool:
+    """Strip the action_history tokenizer pieces from pre-rip-out checkpoints.
+
+    Pre-rip-out tokenizers carried:
+      - trunk.tokenizer.action_proj.{weight,bias}: Linear(8, d_model)
+      - trunk.tokenizer.action_pos_embed.weight:   Embedding(8, d_model)
+      - trunk.tokenizer.kind_embed.weight:         Embedding(4, d_model)
+        — kinds 0..3 = self / entity / spatial / action.
+
+    The new tokenizer drops the action-history branch entirely and sizes
+    kind_embed at (3, d_model), keeping the same row order for the first
+    three kinds.  This migration deletes the dead action_proj / pos_embed
+    keys and truncates kind_embed to its first three rows so load_state_dict
+    can apply the v17/v20-era checkpoint without shape mismatches on the
+    kind embedding.  Returns True iff any change was made.
+    """
+    migrated = False
+    for key in (
+        "trunk.tokenizer.action_proj.weight",
+        "trunk.tokenizer.action_proj.bias",
+        "trunk.tokenizer.action_pos_embed.weight",
+    ):
+        if key in state:
+            del state[key]
             migrated = True
+
+    kind_key = "trunk.tokenizer.kind_embed.weight"
+    kind_w = state.get(kind_key)
+    if kind_w is not None and kind_w.shape[0] == 4:
+        state[kind_key] = kind_w[:3].clone()
+        migrated = True
+
+    return migrated
+
+
+def _expanded_self_scalar_weight(tensor: torch.Tensor) -> torch.Tensor:
+    """Expand self-proj columns from 14 old scalars to 16 v21 scalars."""
+    old_sg = tensor[:, 2:3]
+    old_ng = tensor[:, 3:4]
+    return torch.cat(
+        [
+            tensor[:, 0:2],
+            old_sg * 0.5,
+            old_sg,
+            old_ng * 0.5,
+            old_ng,
+            tensor[:, 4:],
+        ],
+        dim=1,
+    )
+
+
+def _expanded_self_scalar_vector(tensor: torch.Tensor) -> torch.Tensor:
+    """Expand normalizer vectors from the old 14-scalar self layout."""
+    return torch.cat(
+        [
+            tensor[0:2],
+            tensor[2:3],
+            tensor[2:3],
+            tensor[3:4],
+            tensor[3:4],
+            tensor[4:],
+        ],
+        dim=0,
+    )
+
+
+def migrate_self_scalars(state: Dict[str, torch.Tensor], optimizer: Dict[str, Any] | None = None) -> bool:
+    """Migrate pre-v21 self scalar layout to 7 binary inventory flags."""
+    migrated = False
+    param_keys = [
+        key for key in state
+        if not key.startswith("obs_normalizer.") and not key.startswith("returns_normalizer.")
+    ]
+    for idx, key in enumerate(param_keys):
+        tensor = state[key]
+        if not (key.endswith("self_proj.weight") and tensor.ndim == 2 and tensor.shape[1] == 14):
+            continue
+        state[key] = _expanded_self_scalar_weight(tensor)
+        migrated = True
 
         if optimizer is not None and idx in optimizer.get("state", {}):
             opt_entry = optimizer["state"][idx]
             for buf_key in ("exp_avg", "exp_avg_sq"):
                 if buf_key in opt_entry and hasattr(opt_entry[buf_key], "shape"):
-                    if opt_entry[buf_key].shape[0] > expected_rows:
-                        opt_entry[buf_key] = opt_entry[buf_key][1:1 + expected_rows].clone()
+                    buf = opt_entry[buf_key]
+                    if buf.ndim == 2 and buf.shape[1] == 14:
+                        opt_entry[buf_key] = _expanded_self_scalar_weight(buf)
                         migrated = True
 
+    for key, tensor in list(state.items()):
+        if ".self_scalars." in key and hasattr(tensor, "shape") and tensor.shape == torch.Size([14]):
+            state[key] = _expanded_self_scalar_vector(tensor)
+            migrated = True
+
+    return migrated
+
+
+def _permute_entity_rows_to_impulse(old: torch.Tensor) -> torch.Tensor | None:
+    """Map a pre-impulse-order entity embed tensor to the v22 layout.
+
+    Pre-impulse layouts (rows 0-2 = NONE/PLAYER/WEAPON, rows 3..N-1 follow):
+      v17 (42 rows): no SUPER_SHOTGUN, no SUPER_NAILGUN.
+        AXE=3, SG=4, NG=5, GL=6, RL=7, LG=8, AMMO=9 .. TRAIN=41.
+      v20 (43 rows): SUPER_SHOTGUN appended at the tail (=42).
+      pre-recollect 44 (interim): SUPER_NAILGUN appended at 43.
+
+    v22 layout (this commit): weapons in Quake impulse order, contiguous.
+      AXE=3, SG=4, SSG=5, NG=6, SNG=7, GL=8, RL=9, LG=10, AMMO=11 .. TRAIN=43.
+
+    Returns the permuted (44, D) tensor.  If the old tail rows for SSG /
+    SNG don't exist, those slots are seeded from the family parent
+    (SHOTGUN / NAILGUN).
+    """
+    n_old = old.shape[0]
+    if n_old not in (42, 43, 44):
+        return None
+    new = torch.zeros((44, *old.shape[1:]), dtype=old.dtype)
+    # NONE..SHOTGUN (slots 0-4) carry over unchanged.
+    new[0:5] = old[0:5]
+    # SUPER_SHOTGUN: from old slot 42 if present, else seed from SHOTGUN.
+    new[5] = old[42] if n_old >= 43 else old[4]
+    # NAILGUN: old slot 5 → new slot 6.
+    new[6] = old[5]
+    # SUPER_NAILGUN: from old slot 43 if present, else seed from NAILGUN.
+    new[7] = old[43] if n_old >= 44 else old[5]
+    # GL, RL, LG: old slots 6..8 → new slots 8..10.
+    new[8:11] = old[6:9]
+    # AMMO..TRAIN: old slots 9..41 → new slots 11..43.
+    new[11:44] = old[9:42]
+    return new
+
+
+def migrate_entity_embed(state: Dict[str, torch.Tensor], optimizer: Dict[str, Any] | None = None) -> bool:
+    """Permute pre-impulse-order entity_embed rows into the v22 layout.
+
+    Detection is by row count: 42- or 43-row tensors are v17 / v20 with
+    SSG-only; both need permutation.  44-row tensors are assumed to
+    already be in the new impulse-ordered layout (no shipped checkpoint
+    has the brief interim 44-row old layout from commit 2fa6432b).
+    """
+    migrated = False
+    target_rows = len(ENTITY_IDS)  # 44
+
+    param_keys = [
+        key for key in state
+        if not key.startswith("obs_normalizer.") and not key.startswith("returns_normalizer.")
+    ]
+    for idx, key in enumerate(param_keys):
+        if not key.endswith("entity_embed.weight"):
+            continue
+        tensor = state[key]
+        if tensor.shape[0] == target_rows:
+            continue
+        permuted = _permute_entity_rows_to_impulse(tensor)
+        if permuted is None:
+            continue
+        state[key] = permuted
+        migrated = True
+
+        if optimizer is not None and idx in optimizer.get("state", {}):
+            opt_entry = optimizer["state"][idx]
+            for buf_key in ("exp_avg", "exp_avg_sq"):
+                buf = opt_entry.get(buf_key)
+                if buf is None or not hasattr(buf, "shape"):
+                    continue
+                if buf.shape[0] == target_rows:
+                    continue
+                permuted_buf = _permute_entity_rows_to_impulse(buf)
+                if permuted_buf is not None:
+                    opt_entry[buf_key] = permuted_buf
+                    migrated = True
     return migrated
 
 
@@ -460,7 +668,6 @@ def main() -> None:
     to_qnn.add_argument("--ffn-dim", type=int, required=True)
     to_qnn.add_argument("--action-history-tokens", type=int, required=True)
     to_qnn.add_argument("--attn-dropout", type=float, required=True)
-    to_qnn.add_argument("--readout", required=True)
     to_qnn.add_argument("--device", default="cpu")
 
     args = parser.parse_args()
@@ -482,9 +689,7 @@ def main() -> None:
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             ffn_dim=args.ffn_dim,
-            action_history_tokens=args.action_history_tokens,
             attn_dropout=args.attn_dropout,
-            readout=args.readout,
         )
         policy.save(args.output_path)
         print(f"Saved QNNPolicy checkpoint: {args.output_path}")
@@ -533,8 +738,7 @@ def load_sf_checkpoint_as_qnn(
 
     required_keys = (
         "obs_dim", "trunk_hidden", "gru_hidden", "use_gru",
-        "d_model", "n_heads", "n_layers", "ffn_dim",
-        "action_history_tokens", "attn_dropout", "readout",
+        "d_model", "n_heads", "n_layers", "ffn_dim", "attn_dropout",
     )
     missing = [key for key in required_keys if key not in meta]
     if missing:
@@ -553,9 +757,7 @@ def load_sf_checkpoint_as_qnn(
         n_heads=int(meta["n_heads"]),
         n_layers=int(meta["n_layers"]),
         ffn_dim=int(meta["ffn_dim"]),
-        action_history_tokens=int(meta["action_history_tokens"]),
         attn_dropout=float(meta["attn_dropout"]),
-        readout=str(meta["readout"]),
     )
 
 

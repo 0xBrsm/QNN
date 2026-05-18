@@ -4,10 +4,11 @@ Shared ID tables used by the C worker (`qnn_vocab.h`) and Python model
 (`vocab.py`). One entity table, one action table, one modality table. All
 embedding lookups index into these.
 
-## Entity IDs (42)
+## Entity IDs (44)
 
 Unified subject/source table. Every entity token, event subject, and event
-source indexes into this single vocabulary.
+source indexes into this single vocabulary. Weapons occupy ids 3-10 in
+Quake impulse order so SG/SSG and NG/SNG embed rows sit adjacent.
 
 | ID | Name | Category |
 |----|------|----------|
@@ -16,43 +17,45 @@ source indexes into this single vocabulary.
 | 2 | WEAPON | source (generic pickup) |
 | 3 | AXE | weapon |
 | 4 | SHOTGUN | weapon |
-| 5 | NAILGUN | weapon |
-| 6 | GRENADE_LAUNCHER | weapon |
-| 7 | ROCKET_LAUNCHER | weapon |
-| 8 | THUNDERBOLT | weapon |
-| 9 | AMMO | source (generic pickup) |
-| 10 | SHELLS | ammo |
-| 11 | NAILS | ammo |
-| 12 | ROCKETS | ammo |
-| 13 | CELLS | ammo |
-| 14 | BACKPACK | ammo (dynamic drop) |
-| 15 | ARMOR | source (generic pickup) |
-| 16 | ARMOR_GREEN | armor |
-| 17 | ARMOR_YELLOW | armor |
-| 18 | ARMOR_RED | armor |
-| 19 | HEALTH | health |
-| 20 | MEGAHEALTH | health |
-| 21 | POWERUP | source (generic) |
-| 22 | QUAD | powerup |
-| 23 | PENT | powerup |
-| 24 | RING | powerup |
-| 25 | SUIT | powerup |
-| 26 | PROJECTILE_NAIL | projectile |
-| 27 | PROJECTILE_GRENADE | projectile |
-| 28 | PROJECTILE_ROCKET | projectile |
-| 29 | LIGHTNING_BEAM | projectile |
-| 30 | GROUND | environment |
-| 31 | WATER | environment |
-| 32 | SLIME | environment |
-| 33 | LAVA | environment |
-| 34 | GIB | source (death type) |
-| 35 | BUTTON | mover |
-| 36 | PLATFORM | mover |
-| 37 | TELEPORTER | mover |
-| 38 | DOOR | mover |
-| 39 | KEYED | source (locked door) |
-| 40 | SECRET | source (secret door) |
-| 41 | TRAIN | mover |
+| 5 | SUPER_SHOTGUN | weapon |
+| 6 | NAILGUN | weapon |
+| 7 | SUPER_NAILGUN | weapon |
+| 8 | GRENADE_LAUNCHER | weapon |
+| 9 | ROCKET_LAUNCHER | weapon |
+| 10 | THUNDERBOLT | weapon |
+| 11 | AMMO | source (generic pickup) |
+| 12 | SHELLS | ammo |
+| 13 | NAILS | ammo |
+| 14 | ROCKETS | ammo |
+| 15 | CELLS | ammo |
+| 16 | BACKPACK | ammo (dynamic drop) |
+| 17 | ARMOR | source (generic pickup) |
+| 18 | ARMOR_GREEN | armor |
+| 19 | ARMOR_YELLOW | armor |
+| 20 | ARMOR_RED | armor |
+| 21 | HEALTH | health |
+| 22 | MEGAHEALTH | health |
+| 23 | POWERUP | source (generic) |
+| 24 | QUAD | powerup |
+| 25 | PENT | powerup |
+| 26 | RING | powerup |
+| 27 | SUIT | powerup |
+| 28 | PROJECTILE_NAIL | projectile |
+| 29 | PROJECTILE_GRENADE | projectile |
+| 30 | PROJECTILE_ROCKET | projectile |
+| 31 | LIGHTNING_BEAM | projectile |
+| 32 | GROUND | environment |
+| 33 | WATER | environment |
+| 34 | SLIME | environment |
+| 35 | LAVA | environment |
+| 36 | GIB | source (death type) |
+| 37 | BUTTON | mover |
+| 38 | PLATFORM | mover |
+| 39 | TELEPORTER | mover |
+| 40 | DOOR | mover |
+| 41 | KEYED | source (locked door) |
+| 42 | SECRET | source (secret door) |
+| 43 | TRAIN | mover |
 
 ## Action IDs (20)
 
@@ -151,9 +154,9 @@ source) triple using the IDs above.
 |-------|--------|--------|
 | weapons/ax1.wav | FIRE | AXE |
 | weapons/guncock.wav | FIRE | SHOTGUN |
-| weapons/shotgn2.wav | FIRE | SHOTGUN |
+| weapons/shotgn2.wav | FIRE | SUPER_SHOTGUN |
 | weapons/rocket1i.wav | FIRE | NAILGUN |
-| weapons/spike2.wav | FIRE | NAILGUN |
+| weapons/spike2.wav | FIRE | SUPER_NAILGUN |
 | weapons/grenade.wav | FIRE | GRENADE_LAUNCHER |
 | weapons/sgun1.wav | FIRE | ROCKET_LAUNCHER |
 | weapons/lstart.wav | FIRE | THUNDERBOLT |

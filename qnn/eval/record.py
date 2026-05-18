@@ -64,8 +64,10 @@ def _run_episode(
             value = result.actions[head][0]
             if head in CONTINUOUS_ACTION_HEADS:
                 action[head] = value.astype(np.float32).tolist()
-            else:
+            elif np.ndim(value) == 0:
                 action[head] = int(value)
+            else:
+                action[head] = value.astype(np.int64).tolist()
 
         obs, reward, done, info = env.step(action)
         total_reward += float(reward)
@@ -168,7 +170,7 @@ def main() -> None:
     print(f"Demo:       {demo_path}")
 
     policy = _load_policy(str(checkpoint), device=args.device)
-    print(f"  arch: d_model={policy.d_model} gru={policy.use_gru} layers={policy.n_layers} ah={policy.action_history_tokens}")
+    print(f"  arch: d_model={policy.d_model} gru={policy.use_gru} layers={policy.n_layers}")
 
     env = NativeWorldEnv(
         executable=str(worker),

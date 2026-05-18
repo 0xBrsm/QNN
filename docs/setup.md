@@ -57,7 +57,7 @@ assets/
 
 ## Building
 
-Three binaries and one QuakeC progs.dat:
+Five binaries and one QuakeC progs.dat:
 
 ```bash
 # All at once (inside container):
@@ -66,14 +66,18 @@ scripts/build-mod.sh
 # Or individually:
 bash engine/build/build_ppo_worker.sh assets/bin/ppo_worker
 bash engine/build/build_nq_demo_worker.sh assets/bin/nq_demo_worker
+bash engine/build/build_nq_client.sh assets/bin/nq_client
 bash engine/build/build_qw_demo_worker.sh assets/bin/qw_demo_worker
+bash engine/build/build_qw_classifier.sh assets/bin/qw_classifier
 ```
 
 | Binary | Purpose |
 |--------|---------|
 | `ppo_worker` | Live training worker (PPO, interactive) — runs the full engine with bots |
 | `nq_demo_worker` | NetQuake demo collection — replays `.dem` files, emits obs/action pairs |
-| `qw_demo_worker` | QuakeWorld demo collection — replays `.mvd`/`.qwd` files, same output format |
+| `nq_client` | NetQuake client wired to `qnn.eval.live` — drives a trained policy against a live NQ server |
+| `qw_demo_worker` | QuakeWorld demo collection — replays `.mvd`/`.qwd` files, same QOBS output format |
+| `qw_classifier` | Standalone QWD parser used by `qnn.demo.classify` — replaces the old Python parser end-to-end |
 
 The build scripts fetch upstream id Software Quake source, apply headless
 patches, and compile with the QNN C modules from `engine/`.
@@ -166,14 +170,13 @@ caches — it never touches demos directly.
 
 ```bash
 python -m qnn.bc.collect \
-    --demo-dir assets/corpus/dem \
-    --output assets/collect/prod \
+    --demo-dir artifacts/corpus/qwd \
     --workers 30
 ```
 
 The collector starts a persistent demo worker process per worker, feeds it
 demos sequentially, and writes sharded `.npy` files plus a train/val split
-manifest into `assets/collect/prod/`. Resume is supported via an append-only
+manifest into `artifacts/collect/<demo-type>/`. Resume is supported via an append-only
 done log. God-mode frames, dead-time, and frozen-alive periods are filtered
 at the C emission layer before reaching Python.
 
@@ -239,6 +242,21 @@ python scripts/make_random_checkpoint.py \
 ```
 
 The checkpoint has the same architecture/sidecar layout as a BC `bc_best_model.pth`, so `qnn.run.init --mode ppo --checkpoint-path ...` accepts it directly.
+
+### Live Play
+
+Drive a trained checkpoint against a real NQ server via the `nq_client`
+binary:
+
+```bash
+python -m qnn.eval.live \
+    --checkpoint runs/bc/bc_v1/checkpoints/bc_best_model.pth \
+    --server <host>:<port>
+```
+
+`qnn.eval.live` co-locates the policy with `nq_client`; NAT breaks NetQuake's
+port-switching handshake, so run the client on the same network segment as
+the server.
 
 ### Microbenchmark
 

@@ -5,14 +5,15 @@ a full production-shape obs dict for the described scene, and trains the look
 head via REINFORCE — no engine, no SF, no docker.
 
 Each tick:
-  1. Model emits look action (move/fire/switch/recall held at no-op).
+  1. Model emits look action (move/fire/switch held at no-op).
   2. Action → pitch/yaw deltas via atan2 (mirrors src/engine/nq/qnn_input.c).
   3. Every kind="entity" token's rel/dist is recomputed in the new view frame,
      keeping the world position frozen.
   4. Reward = cos(view_forward, unit_rel_to_target), matching QNN_TrackingCosine.
   5. REINFORCE policy-gradient update.
 
-Target defaults to the nearest actor-type entity (same rule as QNN_TrackingCosine).
+Target defaults to the nearest actor-type entity (same rule as QNN_TrackingCosine),
+or you can mark one actor token with ``"target": true`` in the scene JSON.
 
 Usage:
     python -m qnn.env.sim --tokens path/to/tokens.json --episodes 3000
@@ -31,7 +32,7 @@ import torch
 import torch.nn.functional as F
 
 from qnn.model.policy import QNNPolicy
-from qnn.schema import ACTION_HISTORY_LEN, OBS_SCHEMA, SPATIAL_TOKEN_COUNT
+from qnn.schema import OBS_SCHEMA, SPATIAL_TOKEN_COUNT
 from qnn.vocab import (
     ACTION_IDS, ENTITY_IDS, MAX_TOKEN_OBJECTS,
     MODALITY_IDS, SPATIAL_SECTOR_IDS,
@@ -98,9 +99,10 @@ _ENTITY_LAYOUTS = {
 
 _SELF_SCALAR_LAYOUT: Dict[str, int] = {
     "health": 0, "armor": 1,
-    "weapon_sg": 2, "weapon_ng": 3, "weapon_gl": 4, "weapon_rl": 5, "weapon_lg": 6,
-    "ammo_shells": 7, "ammo_nails": 8, "ammo_rockets": 9, "ammo_cells": 10,
-    # "vel" handled separately — maps to indices 11, 12, 13.
+    "weapon_sg": 2, "weapon_ssg": 3, "weapon_ng": 4, "weapon_sng": 5,
+    "weapon_gl": 6, "weapon_rl": 7, "weapon_lg": 8,
+    "ammo_shells": 9, "ammo_nails": 10, "ammo_rockets": 11, "ammo_cells": 12,
+    # "vel" handled separately — maps to indices 13, 14, 15.
 }
 _SPATIAL_LAYOUT: Dict[str, Tuple[int, int]] = {
     "dir":          (0, 3),
@@ -114,12 +116,6 @@ _SPATIAL_LAYOUT: Dict[str, Tuple[int, int]] = {
     "water_frac":   (10, 1),
     "slime_frac":   (11, 1),
     "lava_frac":    (12, 1),
-}
-_ACTION_HISTORY_LAYOUT: Dict[str, Tuple[int, int]] = {
-    "move":        (0, 3),
-    "look":        (3, 3),
-    "fire":        (6, 1),
-    "switch_norm": (7, 1),
 }
 
 
@@ -195,7 +191,7 @@ def _write_self_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any]) -> None:
         vel = np.asarray(tok["vel"], dtype=np.float32)
         if vel.size != 3:
             raise ValueError(f"self.vel must have 3 values, got {vel.size}")
-        obs["self_scalars"][11:14] = vel
+        obs["self_scalars"][13:16] = vel
     if "weapon_id" in tok:
         obs["self_weapon_id"][0] = _lookup_vocab(tok["weapon_id"], ENTITY_IDS, "self.weapon_id")
     if "armor_type_id" in tok:
@@ -232,25 +228,8 @@ def _write_spatial_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index:
             _write_scalar_field(dest, tok[field], off, length, f"spatial.{field}")
 
 
-def _write_action_history_token(
-    obs: Dict[str, np.ndarray], tok: Dict[str, Any],
-) -> None:
-    if "tick_back" not in tok:
-        raise ValueError("action_history token missing 'tick_back'")
-    tb = int(tok["tick_back"])
-    slot = ACTION_HISTORY_LEN - tb
-    if not 0 <= slot < ACTION_HISTORY_LEN:
-        raise ValueError(
-            f"action_history tick_back={tb} out of range [1, {ACTION_HISTORY_LEN}]"
-        )
-    dest = obs["action_history"][slot]
-    for field, (off, length) in _ACTION_HISTORY_LAYOUT.items():
-        if field in tok:
-            _write_scalar_field(dest, tok[field], off, length, f"action_history.{field}")
-
-
 def _write_entity_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: int) -> int:
-    slot = index - (1 + SPATIAL_TOKEN_COUNT + 2)  # 12..27 → 0..15 (assumes 2 AH slots)
+    slot = index - (1 + SPATIAL_TOKEN_COUNT)  # 10..25 → 0..15
     if not 0 <= slot < MAX_TOKEN_OBJECTS:
         raise ValueError(
             f"entity token index {index} out of range [12, {12 + MAX_TOKEN_OBJECTS - 1}]"
@@ -290,8 +269,11 @@ def _write_entity_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: 
 
 def load_scene(
     path: Path,
-) -> Tuple[Dict[str, np.ndarray], List[Tuple[int, int, np.ndarray]], np.ndarray]:
-    """Parse a tokens.json.  Returns (zero-view obs, [(slot, tok_type, world_pos)], target_world_pos)."""
+) -> Tuple[Dict[str, np.ndarray], List[Tuple[int, int, np.ndarray]], np.ndarray, int]:
+    """Parse a tokens.json.
+
+    Returns ``(zero_view_obs, [(slot, tok_type, world_pos)], target_world_pos, target_slot)``.
+    """
     payload = json.loads(Path(path).read_text())
     tokens = payload.get("tokens", [])
     if not isinstance(tokens, list):
@@ -299,6 +281,8 @@ def load_scene(
 
     obs = _zero_obs()
     entity_worlds: List[Tuple[int, int, np.ndarray]] = []
+    designated_target_slot: int | None = None
+    designated_target_world: np.ndarray | None = None
 
     for tok in tokens:
         if not isinstance(tok, dict):
@@ -314,8 +298,6 @@ def load_scene(
             _write_self_token(obs, tok)
         elif kind == "spatial":
             _write_spatial_token(obs, tok, index)
-        elif kind == "action_history":
-            _write_action_history_token(obs, tok)
         elif kind == "entity":
             slot = _write_entity_token(obs, tok, index)
             tok_type = int(obs["entity_types"][slot])
@@ -323,8 +305,16 @@ def load_scene(
             rel_off, _ = layout["rel"]
             world_pos = obs["entity_scalars_raw"][slot, rel_off:rel_off + 3].copy()
             entity_worlds.append((slot, tok_type, world_pos))
+            if bool(tok.get("target", False)):
+                if tok_type != TOKEN_ACTOR:
+                    raise ValueError(f"{path}: target=true is only valid for actor tokens")
+                designated_target_slot = slot
+                designated_target_world = world_pos.copy()
         else:
-            raise ValueError(f"Unknown kind {kind!r} at index {index}. Valid: self/spatial/action_history/entity")
+            raise ValueError(f"Unknown kind {kind!r} at index {index}. Valid: self/spatial/entity")
+
+    if designated_target_slot is not None and designated_target_world is not None:
+        return obs, entity_worlds, designated_target_world, designated_target_slot
 
     # Target = nearest actor (matches QNN_TrackingCosine).
     actors = [(s, t, wp) for (s, t, wp) in entity_worlds if t == TOKEN_ACTOR and np.linalg.norm(wp) > 1e-6]
@@ -333,8 +323,64 @@ def load_scene(
             f"{path}: no actor-type entity with non-zero rel; can't pick a tracking target"
         )
     actors.sort(key=lambda e: float(np.linalg.norm(e[2])))
+    target_slot = int(actors[0][0])
     target_world = actors[0][2].copy()
-    return obs, entity_worlds, target_world
+    return obs, entity_worlds, target_world, target_slot
+
+
+def _active_actor_slots(
+    obs_template: Dict[str, np.ndarray],
+    entity_worlds: List[Tuple[int, int, np.ndarray]],
+) -> List[int]:
+    actor_slots: List[int] = []
+    for slot, tok_type, world_pos in entity_worlds:
+        if tok_type != TOKEN_ACTOR:
+            continue
+        if np.linalg.norm(world_pos) <= 1e-6:
+            continue
+        if int(obs_template["entity_ids"][slot, 2]) <= 0:
+            continue
+        actor_slots.append(int(slot))
+    return actor_slots
+
+
+def _shuffle_actor_slots(
+    obs_template: Dict[str, np.ndarray],
+    entity_worlds: List[Tuple[int, int, np.ndarray]],
+    target_slot: int,
+    rng: np.random.Generator,
+) -> Tuple[Dict[str, np.ndarray], List[Tuple[int, int, np.ndarray]], int]:
+    actor_slots = _active_actor_slots(obs_template, entity_worlds)
+    if len(actor_slots) <= 1:
+        return obs_template, entity_worlds, target_slot
+
+    permuted_sources = list(rng.permutation(actor_slots))
+    if permuted_sources == actor_slots:
+        permuted_sources = actor_slots[1:] + actor_slots[:1]
+
+    shuffled = {key: value.copy() for key, value in obs_template.items()}
+    world_by_slot = {int(slot): (int(tok_type), world_pos.copy()) for slot, tok_type, world_pos in entity_worlds}
+    src_to_dest: Dict[int, int] = {}
+
+    for dest_slot, src_slot in zip(actor_slots, permuted_sources):
+        shuffled["entity_types"][dest_slot] = obs_template["entity_types"][src_slot]
+        shuffled["entity_ids"][dest_slot] = obs_template["entity_ids"][src_slot]
+        shuffled["entity_scalars_raw"][dest_slot] = obs_template["entity_scalars_raw"][src_slot]
+        shuffled["entity_event_actions"][dest_slot] = obs_template["entity_event_actions"][src_slot]
+        shuffled["entity_event_sources"][dest_slot] = obs_template["entity_event_sources"][src_slot]
+        shuffled["entity_event_counts"][dest_slot] = obs_template["entity_event_counts"][src_slot]
+        src_to_dest[int(src_slot)] = int(dest_slot)
+
+    shuffled_worlds: List[Tuple[int, int, np.ndarray]] = []
+    for slot, tok_type, world_pos in entity_worlds:
+        new_slot = src_to_dest.get(int(slot), int(slot))
+        if int(tok_type) == TOKEN_ACTOR and int(slot) in world_by_slot:
+            _, mapped_world = world_by_slot[int(slot)]
+            shuffled_worlds.append((new_slot, int(tok_type), mapped_world.copy()))
+        else:
+            shuffled_worlds.append((new_slot, int(tok_type), world_pos.copy()))
+
+    return shuffled, shuffled_worlds, src_to_dest.get(int(target_slot), int(target_slot))
 
 
 # ── Sim dynamics ─────────────────────────────────────────────────────
@@ -388,12 +434,22 @@ def _to_tensor_batch(frames: List[Dict[str, np.ndarray]], device: torch.device) 
 def _sample_look(
     policy: QNNPolicy, obs_batch: Dict[str, torch.Tensor], stddev: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    _, logits, _, _ = policy._forward_tensors(obs_batch)
+    _, logits, _, _, _ = policy._forward_tensors(obs_batch)
     mean = F.normalize(logits["look"], dim=-1)  # look_cosine semantics
     dist = torch.distributions.Normal(mean, stddev)
     sampled = dist.sample()  # detached → gradient flows through mean in log_prob
     log_prob = dist.log_prob(sampled).sum(dim=-1)
     return sampled, log_prob
+
+
+def _target_probe_step(
+    policy: QNNPolicy,
+    obs_batch: Dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    _, _, _, _, target_logits = policy._forward_tensors(obs_batch)
+    probs = F.softmax(target_logits, dim=-1)
+    pred_slot = int(torch.argmax(probs, dim=-1)[0].item())
+    return target_logits[0], probs[0], pred_slot
 
 
 # ── Training loop ────────────────────────────────────────────────────
@@ -414,7 +470,7 @@ def _run_episode(
     for _ in range(steps):
         obs_frame = _apply_view(obs_template, entity_worlds, tuple(view_angles))
         obs_batch = _to_tensor_batch([obs_frame], device)
-        _, logits_dict, values_t, _ = policy._forward_tensors(obs_batch)
+        _, logits_dict, values_t, _, _ = policy._forward_tensors(obs_batch)
         mean = F.normalize(logits_dict["look"], dim=-1)  # look_cosine
         dist = torch.distributions.Normal(mean, stddev)
         sampled = dist.sample()  # detached — gradient via mean in log_prob
@@ -437,6 +493,138 @@ def _run_episode(
     )
 
 
+def _target_topk_summary(
+    obs_frame: Dict[str, np.ndarray],
+    probs: torch.Tensor,
+    *,
+    topk: int,
+) -> str:
+    probs_np = probs.detach().cpu().numpy()
+    order = np.argsort(-probs_np)[:topk]
+    parts: List[str] = []
+    for slot in order:
+        prob = float(probs_np[slot])
+        pid = int(obs_frame["entity_ids"][slot, 2])
+        rel = obs_frame["entity_scalars_raw"][slot, _ACTOR_LAYOUT["rel"][0]:_ACTOR_LAYOUT["rel"][0] + 3]
+        parts.append(f"s{int(slot)}:p{pid}@{prob:.3f} rel={np.round(rel, 3).tolist()}")
+    return " | ".join(parts)
+
+
+def run_target_probe(
+    policy: QNNPolicy,
+    obs_template: Dict[str, np.ndarray],
+    entity_worlds: List[Tuple[int, int, np.ndarray]],
+    target_world: np.ndarray,
+    target_slot: int,
+    *,
+    steps: int,
+    log_every: int,
+    device: torch.device,
+    driver: str = "oracle",
+    shuffle_actors: bool = False,
+    rng: np.random.Generator | None = None,
+    topk: int = 3,
+) -> None:
+    """Inspect TargetPointer predictions over a short rollout."""
+    if shuffle_actors:
+        if rng is None:
+            rng = np.random.default_rng(0)
+        obs_template, entity_worlds, target_slot = _shuffle_actor_slots(
+            obs_template, entity_worlds, target_slot, rng,
+        )
+
+    view_angles = [0.0, 0.0]
+    correct = 0
+    for step in range(steps):
+        obs_frame = _apply_view(obs_template, entity_worlds, tuple(view_angles))
+        obs_batch = _to_tensor_batch([obs_frame], device)
+        _target_logits, probs, pred_slot = _target_probe_step(policy, obs_batch)
+        target_prob = float(probs[target_slot].item())
+        pred_prob = float(probs[pred_slot].item())
+        is_correct = pred_slot == target_slot
+        correct += int(is_correct)
+
+        if step % log_every == 0 or step == steps - 1:
+            target_pid = int(obs_frame["entity_ids"][target_slot, 2])
+            pred_pid = int(obs_frame["entity_ids"][pred_slot, 2])
+            topk_summary = _target_topk_summary(obs_frame, probs, topk=topk)
+            print(
+                f"step {step:3d}  target_slot={target_slot} pid={target_pid}  "
+                f"pred_slot={pred_slot} pid={pred_pid}  "
+                f"target_p={target_prob:.3f} pred_p={pred_prob:.3f}  "
+                f"correct={is_correct}  {topk_summary}",
+                flush=True,
+            )
+
+        if driver == "oracle":
+            basis = _angle_basis(view_angles[0], view_angles[1])
+            rel_view = basis @ target_world
+            rel_norm = float(np.linalg.norm(rel_view))
+            if rel_norm < 1e-6:
+                continue
+            look_np = rel_view / rel_norm
+        else:
+            _, logits, _, _, _ = policy._forward_tensors(obs_batch)
+            look_np = F.normalize(logits["look"], dim=-1)[0].detach().cpu().numpy()
+        pitch_d, yaw_d = _action_to_angle_delta(look_np)
+        view_angles[1] = (view_angles[1] - yaw_d) % 360.0
+        view_angles[0] = max(-70.0, min(80.0, view_angles[0] + pitch_d))
+
+    print(
+        f"target probe summary: acc={correct / max(steps, 1):.3f} "
+        f"({correct}/{steps})",
+        flush=True,
+    )
+
+
+def train_target_sl(
+    policy: QNNPolicy,
+    obs_template: Dict[str, np.ndarray],
+    entity_worlds: List[Tuple[int, int, np.ndarray]],
+    target_world: np.ndarray,
+    target_slot: int,
+    *,
+    steps: int,
+    lr: float,
+    log_every: int,
+    device: torch.device,
+    shuffle_actors: bool = False,
+    rng: np.random.Generator | None = None,
+) -> None:
+    """Supervised CE training on TargetPointer logits with optional actor-slot shuffling."""
+    policy.model.train()
+    optimizer = torch.optim.Adam(policy.model.parameters(), lr=lr)
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    for step in range(steps):
+        step_obs = obs_template
+        step_worlds = entity_worlds
+        step_target_slot = target_slot
+        if shuffle_actors:
+            step_obs, step_worlds, step_target_slot = _shuffle_actor_slots(
+                obs_template, entity_worlds, target_slot, rng,
+            )
+        obs_frame = _apply_view(step_obs, step_worlds, (0.0, 0.0))
+        obs_batch = _to_tensor_batch([obs_frame], device)
+        target_logits, probs, pred_slot = _target_probe_step(policy, obs_batch)
+        target_tensor = torch.tensor([step_target_slot], dtype=torch.long, device=device)
+        loss = F.cross_entropy(target_logits.unsqueeze(0), target_tensor)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if step % log_every == 0 or step == steps - 1:
+            target_prob = float(probs[step_target_slot].item())
+            print(
+                f"step {step:6d}  loss={loss.item():+.4f}  "
+                f"target_slot={step_target_slot} pred_slot={pred_slot}  "
+                f"target_p={target_prob:.3f} correct={pred_slot == step_target_slot}",
+                flush=True,
+            )
+
+
 def train_sl(
     policy: QNNPolicy,
     obs_template: Dict[str, np.ndarray],
@@ -451,7 +639,6 @@ def train_sl(
     the target (which equals the target's world_pos / |world_pos| since the
     obs is captured at view_angles=(0, 0)).
     """
-    policy.look_cosine = True
     policy.model.train()
     optimizer = torch.optim.Adam(policy.model.parameters(), lr=lr)
 
@@ -463,7 +650,7 @@ def train_sl(
     obs_batch = _to_tensor_batch([obs_template], device)
 
     for step in range(steps):
-        _, logits, _, _ = policy._forward_tensors(obs_batch)
+        _, logits, _, _, _ = policy._forward_tensors(obs_batch)
         pred = F.normalize(logits["look"], dim=-1)[0]
         cos = torch.dot(pred, target_unit)
         loss = 1.0 - cos
@@ -531,7 +718,6 @@ def train_sl_episodic(
     normalized) output is applied via atan2 to update the view for the next tick —
     so the obs distribution is on-policy, but supervision is oracle.
     """
-    policy.look_cosine = True
     policy.model.train()
     optimizer = torch.optim.Adam(policy.model.parameters(), lr=lr)
 
@@ -544,7 +730,7 @@ def train_sl_episodic(
         for _ in range(steps_per_episode):
             obs_frame = _apply_view(obs_template, entity_worlds, tuple(view_angles))
             obs_batch = _to_tensor_batch([obs_frame], device)
-            _, logits, _, _ = policy._forward_tensors(obs_batch)
+            _, logits, _, _, _ = policy._forward_tensors(obs_batch)
             raw = logits["look"][0]               # 3-dim, unnormalized
             pred = F.normalize(raw, dim=-1)        # unit vector for env / cos metric
 
@@ -610,7 +796,6 @@ def train_rl(
     * Advantage normalization is OFF by default — it was the main cause of
       sign-flipping updates in the earlier REINFORCE attempts on this scene.
     """
-    policy.look_cosine = True
     policy.model.train()
     optimizer = torch.optim.Adam(policy.model.parameters(), lr=lr)
 
@@ -675,9 +860,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Offline training sim for a static token scene.")
     ap.add_argument("--tokens", type=Path, required=True, help="Path to tokens.json.")
     ap.add_argument(
-        "--mode", choices=["oracle", "sl", "sl-episodic", "rl"], default="rl",
+        "--mode", choices=["oracle", "sl", "sl-episodic", "target-probe", "target-sl", "rl"], default="rl",
         help="oracle      = no model, apply ideal look each tick (sanity-check the sim math). "
              "sl          = static supervised cosine regression (same obs every step). "
+             "target-probe= inspect TargetPointer predictions on a static scene. "
+             "target-sl   = supervised CE training on TargetPointer logits. "
              "sl-episodic = on-policy SL: model drives view each tick, oracle supervises. "
              "rl          = REINFORCE with atan2 action → viewangle dynamics.",
     )
@@ -709,6 +896,9 @@ def main() -> int:
     ap.add_argument("--entropy-coef", type=float, default=0.01, help="RL mode only.")
     ap.add_argument("--normalize-adv", action="store_true", default=False, help="RL mode only.")
     ap.add_argument("--log-every", type=int, default=2)
+    ap.add_argument("--topk", type=int, default=3, help="target-probe only: how many slots to print per step.")
+    ap.add_argument("--shuffle-actors", action="store_true", default=False,
+                    help="target-probe / target-sl: permute active actor slots so the target is not tied to a fixed token position.")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "gpu"])
     # Architecture knobs — defaults match runs/ppo/ppo_look_sanity/config/model.json.
     ap.add_argument("--d-model", type=int, default=64)
@@ -720,25 +910,25 @@ def main() -> int:
     ap.add_argument("--n-heads", type=int, default=2)
     ap.add_argument("--n-layers", type=int, default=2)
     ap.add_argument("--ffn-dim", type=int, default=256)
-    ap.add_argument("--readout", default="self")
-    ap.add_argument("--action-history-tokens", type=int, default=2)
     ap.add_argument("--seed", type=int, default=17)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    obs_template, entity_worlds, target_world = load_scene(args.tokens)
+    obs_template, entity_worlds, target_world, target_slot = load_scene(args.tokens)
     print(f"scene: {args.tokens}")
     print(f"  entity tokens loaded: {len(entity_worlds)}")
-    print(f"  target world_pos: {target_world}  |target|={np.linalg.norm(target_world):.3f}")
+    print(
+        f"  target slot: {target_slot}  world_pos: {target_world}  "
+        f"|target|={np.linalg.norm(target_world):.3f}"
+    )
 
     policy = QNNPolicy(
         obs_dim=0, trunk_hidden=args.d_model, gru_hidden=args.gru_hidden,
         use_gru=args.use_gru, seed=args.seed, device=args.device,
         d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
-        ffn_dim=args.ffn_dim, attn_dropout=0.0, readout=args.readout,
-        action_history_tokens=args.action_history_tokens,
+        ffn_dim=args.ffn_dim, attn_dropout=0.0,
     )
     print(
         f"policy: d_model={policy.d_model} gru={policy.use_gru} "
@@ -756,6 +946,34 @@ def main() -> int:
         train_sl(
             policy, obs_template, target_world,
             steps=args.steps, lr=args.lr, log_every=args.log_every,
+        )
+    elif args.mode == "target-probe":
+        print(
+            f"mode=target-probe steps={args.steps} driver={args.driver} "
+            f"shuffle_actors={args.shuffle_actors}"
+        )
+        run_target_probe(
+            policy, obs_template, entity_worlds, target_world, target_slot,
+            steps=args.steps, log_every=args.log_every, device=policy.device,
+            driver=args.driver, shuffle_actors=args.shuffle_actors,
+            rng=np.random.default_rng(args.seed), topk=args.topk,
+        )
+    elif args.mode == "target-sl":
+        print(
+            f"training: mode=target-sl steps={args.steps} lr={args.lr} "
+            f"shuffle_actors={args.shuffle_actors}"
+        )
+        train_target_sl(
+            policy, obs_template, entity_worlds, target_world, target_slot,
+            steps=args.steps, lr=args.lr, log_every=args.log_every,
+            device=policy.device, shuffle_actors=args.shuffle_actors,
+            rng=np.random.default_rng(args.seed),
+        )
+        run_target_probe(
+            policy, obs_template, entity_worlds, target_world, target_slot,
+            steps=min(args.steps_per_episode, 8), log_every=1, device=policy.device,
+            driver="oracle", shuffle_actors=args.shuffle_actors,
+            rng=np.random.default_rng(args.seed + 1), topk=args.topk,
         )
     elif args.mode == "sl-episodic":
         print(

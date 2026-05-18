@@ -51,9 +51,9 @@ static const qnn_model_classify_t qnn_model_table[] = {
 	{"maps/b_rock1.bsp",    QNN_SUBJECT_ROCKETS,            0,      10,  QNN_MAX_ROCKETS},
 	{"maps/b_batt0.bsp",    QNN_SUBJECT_CELLS,              0,      6,   QNN_MAX_CELLS},
 	{"maps/b_batt1.bsp",    QNN_SUBJECT_CELLS,              0,      12,  QNN_MAX_CELLS},
-	{"progs/g_shot.mdl",    QNN_SUBJECT_SHOTGUN,            0,      0, 0},
+	{"progs/g_shot.mdl",    QNN_SUBJECT_SUPER_SHOTGUN,      0,      0, 0},
 	{"progs/g_nail.mdl",    QNN_SUBJECT_NAILGUN,            0,      0, 0},
-	{"progs/g_nail2.mdl",   QNN_SUBJECT_NAILGUN,            0,      0, 0},
+	{"progs/g_nail2.mdl",   QNN_SUBJECT_SUPER_NAILGUN,      0,      0, 0},
 	{"progs/g_rock.mdl",    QNN_SUBJECT_GRENADE_LAUNCHER,   0,      0, 0},
 	{"progs/g_rock2.mdl",   QNN_SUBJECT_ROCKET_LAUNCHER,    0,      0, 0},
 	{"progs/g_light.mdl",   QNN_SUBJECT_THUNDERBOLT,        0,      0, 0},
@@ -178,7 +178,7 @@ static qboolean QNN_ClassifyItemSubject(const char *classname, int spawnflags, i
 	}
 	if (!strcasecmp(classname, "weapon_supershotgun"))
 	{
-		*subject_id = QNN_SUBJECT_SHOTGUN;
+		*subject_id = QNN_SUBJECT_SUPER_SHOTGUN;
 		*magnitude = 0.0f;
 		return true;
 	}
@@ -190,7 +190,7 @@ static qboolean QNN_ClassifyItemSubject(const char *classname, int spawnflags, i
 	}
 	if (!strcasecmp(classname, "weapon_supernailgun"))
 	{
-		*subject_id = QNN_SUBJECT_NAILGUN;
+		*subject_id = QNN_SUBJECT_SUPER_NAILGUN;
 		*magnitude = 0.0f;
 		return true;
 	}
@@ -331,7 +331,7 @@ int QNN_SubjectPickupCategory(int subject_id)
 		return 2;
 	if (subject_id == QNN_SUBJECT_ARMOR_GREEN || subject_id == QNN_SUBJECT_ARMOR_YELLOW || subject_id == QNN_SUBJECT_ARMOR_RED)
 		return 3;
-	if (subject_id == QNN_SUBJECT_SHOTGUN || subject_id == QNN_SUBJECT_NAILGUN || subject_id == QNN_SUBJECT_GRENADE_LAUNCHER || subject_id == QNN_SUBJECT_ROCKET_LAUNCHER || subject_id == QNN_SUBJECT_THUNDERBOLT)
+	if (subject_id == QNN_SUBJECT_SHOTGUN || subject_id == QNN_SUBJECT_SUPER_SHOTGUN || subject_id == QNN_SUBJECT_NAILGUN || subject_id == QNN_SUBJECT_SUPER_NAILGUN || subject_id == QNN_SUBJECT_GRENADE_LAUNCHER || subject_id == QNN_SUBJECT_ROCKET_LAUNCHER || subject_id == QNN_SUBJECT_THUNDERBOLT)
 		return 4;
 	if (subject_id == QNN_SUBJECT_SHELLS || subject_id == QNN_SUBJECT_NAILS || subject_id == QNN_SUBJECT_ROCKETS || subject_id == QNN_SUBJECT_CELLS)
 		return 5;
@@ -370,58 +370,17 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 	VectorCopy(player_origin, eye);
 	eye[2] += QNN_VIEW_OFS_Z;
 	memset(&trace, 0, sizeof(trace));
-	SV_RecursiveHullCheck(cl.worldmodel->hulls, 0, 0, 1, (float *)eye, (float *)target, &trace);
+	QNN_TraceLine(eye, target, &trace);
 	return trace.fraction >= 1.0f;
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * Team detection and frag helpers
+ * Frag helper (shared)
+ *
+ * Team detection (QNN_IsSameTeam, QNN_PlayersResetTeamCache) lives in
+ * the per-game qnn_players.c — pants-color for NQ (engine team field),
+ * userinfo "team" + cl.teamplay for QW.
  * ══════════════════════════════════════════════════════════════════ */
-
-/* Team detection: same pants color (bottom 4 bits of colors) = same team.
-   Works for teamplay (teammates share pants color) and FFA (all different = all enemies).
-   Matches engine logic: ent->v.team = (colors & 15) + 1  (host_cmd.c). */
-/* Cached pants colors for all players.  Latched once when cl.scores first
-   has nonzero entries, so that mid-demo level transitions (which zero
-   cl.scores via CL_ClearState) don't flip the team signal. */
-#define QNN_MAX_CACHED_PLAYERS 32
-static int qnn_cached_pants[QNN_MAX_CACHED_PLAYERS];
-static int qnn_cached_pants_count = 0;
-static int qnn_self_pants_cached = -1;
-
-static void QNN_LatchTeamColors(void)
-{
-	int i, self_slot;
-
-	if (cl.scores == NULL || cl.viewentity <= 0)
-		return;
-	self_slot = cl.viewentity - 1;
-	if (self_slot < 0 || self_slot >= cl.maxclients)
-		return;
-	/* Wait until the self slot has a nonzero color — scores allocated
-	   but not yet populated means all zeros (indistinguishable). */
-	if (cl.scores[self_slot].colors == 0)
-		return;
-	qnn_self_pants_cached = cl.scores[self_slot].colors & 15;
-	qnn_cached_pants_count = cl.maxclients < QNN_MAX_CACHED_PLAYERS ? cl.maxclients : QNN_MAX_CACHED_PLAYERS;
-	for (i = 0; i < qnn_cached_pants_count; ++i)
-		qnn_cached_pants[i] = cl.scores[i].colors & 15;
-}
-
-float QNN_IsSameTeam(int entity_num)
-{
-	int other_slot;
-
-	if (qnn_self_pants_cached < 0)
-		QNN_LatchTeamColors();
-	if (qnn_self_pants_cached < 0)
-		return 0.0f;
-
-	other_slot = entity_num - 1;
-	if (other_slot < 0 || other_slot >= qnn_cached_pants_count)
-		return 0.0f;
-	return (qnn_self_pants_cached == qnn_cached_pants[other_slot]) ? 1.0f : 0.0f;
-}
 
 float QNN_FragFraction(int entity_frags)
 {
@@ -437,12 +396,6 @@ float QNN_FragFraction(int entity_frags)
 		}
 	}
 	return QNN_Clamp((float)entity_frags / (float)max_frags, 0.0f, 1.0f);
-}
-
-void QNN_EntityResetTeamCache(void)
-{
-	qnn_self_pants_cached = -1;
-	qnn_cached_pants_count = 0;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -590,7 +543,7 @@ int QNN_EntityClassifyStatic(const qnn_raw_entity_t *raw, int raw_count,
  *
  * Uses a 32-byte cluster bitmap from the viewer's leaf and tests the
  * entity's center leaf against it. */
-static qboolean QNN_EntityInPvs(const vec3_t viewer, const vec3_t target)
+qboolean QNN_EntityInPvs(const vec3_t viewer, const vec3_t target)
 {
 	mleaf_t *vleaf, *tleaf;
 	byte *vis;
@@ -668,9 +621,11 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 		else if (!QNN_ClassifyByModel(model_name, entity->skinnum, &subject_id, &qualifier_id, &magnitude))
 			continue;
 
-		/* Bodyque corpses use progs/player.mdl but are allocated above
-		   the client range.  Skip them — they're static decoration. */
-		if (subject_id == QNN_SUBJECT_PLAYER && entity_num > cl.maxclients)
+		/* Runtime players are engine-specific transport.  NQ materializes
+		 * them in cl_entities[]; QW carries them in playerstate[].  Let the
+		 * engine-local player scanner own all actor updates so QW baseline
+		 * shims cannot become live-player tokens by accident. */
+		if (subject_id == QNN_SUBJECT_PLAYER)
 			continue;
 
 		is_item = (!is_brush && QNN_SubjectIsItem(subject_id));
@@ -709,6 +664,7 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 			qnn_entity_update_t *eu = &out_entities[entity_count];
 			vec3_t delta;
 
+			memset(eu, 0, sizeof(*eu));
 			eu->entity_num = entity_num;
 			eu->subject_id = subject_id;
 			eu->qualifier_id = qualifier_id;
@@ -748,6 +704,9 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 			entity_count++;
 		}
 	}
+
+	entity_count = QNN_AppendPlayerEntityUpdates(snapshot,
+		out_entities, entity_count, max_entities);
 
 	*out_pvs_count = pvs_count;
 	return entity_count;

@@ -1,15 +1,23 @@
-# common.c — COM_FileBase undefined behavior
+# common.c — COM_FileBase UB + bounded path concat in COM_FindFile + dual-case pak loader
 #
-# The original COM_FileBase() walks a pointer backward through the input string
-# looking for a '/' separator, but the loop condition (*s2 && *s2 != '/') tests
-# for null while decrementing — it can walk before the start of the string,
-# producing undefined behavior or a crash. There is also an off-by-one in the
-# strncpy length calculation. The fix replaces the hand-rolled pointer
-# arithmetic with strrchr() calls and adds a null/empty input guard.
+# 1. COM_FileBase: walks a pointer backward through the input string looking
+#    for a '/' separator, but the loop condition (*s2 && *s2 != '/') tests for
+#    null while decrementing — it can walk before the start of the string,
+#    producing undefined behavior or a crash. There is also an off-by-one in
+#    the strncpy length calculation. The fix replaces the hand-rolled pointer
+#    arithmetic with strrchr() calls and adds a null/empty input guard.
+#
+# 2. COM_FindFile: the four sprintf calls building netpath / cachepath are
+#    unbounded. Replace with snprintf(MAX_OSPATH).
+#
+# 3. COM_AddGameDirectory: the pak loader probes only lowercase pak0.pak,
+#    pak1.pak, ... On case-sensitive filesystems this misses valid uppercase
+#    PAK0.PAK / PAK1.PAK files (and both forms can coexist with different
+#    contents). Load both variants for each pak index before stopping.
 #
 --- common.c
 +++ common.c
-@@ -855,22 +855,29 @@
+@@ -855,27 +855,32 @@
  */
  void COM_FileBase (char *in, char *out)
  {
@@ -25,6 +33,7 @@
 -	
 -	if (s-s2 < 2)
 -		strcpy (out,"?model?");
+-	else
 +	char		*slash;
 +	char		*dot;
 +	char		*start;
@@ -32,25 +41,94 @@
 +	size_t		len;
 +
 +	if (!in || !*in)
-+	{
+ 	{
+-		s--;
+-		strncpy (out,s2+1, s-s2);
+-		out[s-s2] = 0;
 +		strcpy (out, "?model?");
 +		return;
-+	}
-+
+ 	}
+-}
+ 
 +	slash = strrchr(in, '/');
 +	start = slash ? (slash + 1) : in;
 +	dot = strrchr(start, '.');
 +	end = dot ? dot : (in + strlen(in));
 +	len = (size_t)(end - start);
-+
+ 
 +	if (len < 2)
 +		strcpy (out, "?model?");
- 	else
- 	{
--		s--;
--		strncpy (out,s2+1, s-s2);
--		out[s-s2] = 0;
++	else
++	{
 +		memcpy (out, start, len);
 +		out[len] = 0;
++	}
++}
+ /*
+ ==================
+ COM_DefaultExtension
+@@ -1421,7 +1426,7 @@
+ 					continue;
+ 			}
+ 			
+-			sprintf (netpath, "%s/%s",search->filename, filename);
++			snprintf (netpath, MAX_OSPATH, "%s/%s",search->filename, filename);
+ 			
+ 			findtime = Sys_FileTime (netpath);
+ 			if (findtime == -1)
+@@ -1434,11 +1439,11 @@
+ 			{	
+ #if defined(_WIN32)
+ 				if ((strlen(netpath) < 2) || (netpath[1] != ':'))
+-					sprintf (cachepath,"%s%s", com_cachedir, netpath);
++					snprintf (cachepath, MAX_OSPATH, "%s%s", com_cachedir, netpath);
+ 				else
+-					sprintf (cachepath,"%s%s", com_cachedir, netpath+2);
++					snprintf (cachepath, MAX_OSPATH, "%s%s", com_cachedir, netpath+2);
+ #else
+-				sprintf (cachepath,"%s%s", com_cachedir, netpath);
++				snprintf (cachepath, MAX_OSPATH, "%s%s", com_cachedir, netpath);
+ #endif
+ 
+ 				cachetime = Sys_FileTime (cachepath);
+@@ -1708,16 +1713,34 @@
+ //
+ 	for (i=0 ; ; i++)
+ 	{
++		qboolean	loaded;
++
++		loaded = false;
+ 		sprintf (pakfile, "%s/pak%i.pak", dir, i);
+ 		pak = COM_LoadPackFile (pakfile);
+-		if (!pak)
++		if (pak)
++		{
++			search = Hunk_Alloc (sizeof(searchpath_t));
++			search->pack = pak;
++			search->next = com_searchpaths;
++			com_searchpaths = search;
++			loaded = true;
++		}
++
++		sprintf (pakfile, "%s/PAK%i.PAK", dir, i);
++		pak = COM_LoadPackFile (pakfile);
++		if (pak)
++		{
++			search = Hunk_Alloc (sizeof(searchpath_t));
++			search->pack = pak;
++			search->next = com_searchpaths;
++			com_searchpaths = search;
++			loaded = true;
++		}
++
++		if (!loaded)
+ 			break;
+-		search = Hunk_Alloc (sizeof(searchpath_t));
+-		search->pack = pak;
+-		search->next = com_searchpaths;
+-		com_searchpaths = search;               
  	}
- }
+-
+ //
+ // add the contents of the parms.txt file to the end of the command line
+ //

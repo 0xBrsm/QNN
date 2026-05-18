@@ -11,7 +11,6 @@
   "clip_ratio": 0.2,
   "entropy_coef": 0.02,
   "bc_kl_coef": 0.02,
-  "look_cosine": true,
   "initial_stddev": 0.2,
   "gamma": 0.99,
   "gae_lambda": 0.95,

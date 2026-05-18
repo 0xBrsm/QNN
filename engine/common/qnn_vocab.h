@@ -18,49 +18,54 @@
 #define QNN_MODALITY_VOCAB_SIZE 4
 
 /* ── Subject IDs ───────────────────────────────────────────────── */
+/* Weapons occupy 3..10 in Quake impulse order so the embed rows for
+ * shotgun/SSG and nailgun/SNG sit next to each other; everything else
+ * follows in original order with a +2 shift to make room. */
 
 #define QNN_SUBJECT_NONE               0
 #define QNN_SUBJECT_PLAYER             1
 #define QNN_SOURCE_WEAPON              2
 #define QNN_SUBJECT_AXE                3
 #define QNN_SUBJECT_SHOTGUN            4
-#define QNN_SUBJECT_NAILGUN            5
-#define QNN_SUBJECT_GRENADE_LAUNCHER   6
-#define QNN_SUBJECT_ROCKET_LAUNCHER    7
-#define QNN_SUBJECT_THUNDERBOLT        8
-#define QNN_SOURCE_AMMO                9
-#define QNN_SUBJECT_SHELLS            10
-#define QNN_SUBJECT_NAILS             11
-#define QNN_SUBJECT_ROCKETS           12
-#define QNN_SUBJECT_CELLS             13
-#define QNN_SUBJECT_BACKPACK          14
-#define QNN_SOURCE_ARMOR              15
-#define QNN_SUBJECT_ARMOR_GREEN       16
-#define QNN_SUBJECT_ARMOR_YELLOW      17
-#define QNN_SUBJECT_ARMOR_RED         18
-#define QNN_SUBJECT_HEALTH            19
-#define QNN_SUBJECT_MEGAHEALTH        20
-#define QNN_SUBJECT_POWERUP           21
-#define QNN_SUBJECT_QUAD              22
-#define QNN_SUBJECT_PENT              23
-#define QNN_SUBJECT_RING              24
-#define QNN_SUBJECT_SUIT              25
-#define QNN_SUBJECT_PROJECTILE_NAIL   26
-#define QNN_SUBJECT_PROJECTILE_GRENADE 27
-#define QNN_SUBJECT_PROJECTILE_ROCKET 28
-#define QNN_SUBJECT_LIGHTNING_BEAM    29
-#define QNN_SOURCE_GROUND             30
-#define QNN_SOURCE_WATER              31
-#define QNN_SOURCE_SLIME              32
-#define QNN_SOURCE_LAVA               33
-#define QNN_SOURCE_GIB                34
-#define QNN_SUBJECT_BUTTON            35
-#define QNN_SUBJECT_PLATFORM          36
-#define QNN_SUBJECT_TELEPORTER        37
-#define QNN_SUBJECT_DOOR              38
-#define QNN_SOURCE_KEYED              39
-#define QNN_SOURCE_SECRET             40
-#define QNN_SUBJECT_TRAIN             41
+#define QNN_SUBJECT_SUPER_SHOTGUN      5
+#define QNN_SUBJECT_NAILGUN            6
+#define QNN_SUBJECT_SUPER_NAILGUN      7
+#define QNN_SUBJECT_GRENADE_LAUNCHER   8
+#define QNN_SUBJECT_ROCKET_LAUNCHER    9
+#define QNN_SUBJECT_THUNDERBOLT       10
+#define QNN_SOURCE_AMMO               11
+#define QNN_SUBJECT_SHELLS            12
+#define QNN_SUBJECT_NAILS             13
+#define QNN_SUBJECT_ROCKETS           14
+#define QNN_SUBJECT_CELLS             15
+#define QNN_SUBJECT_BACKPACK          16
+#define QNN_SOURCE_ARMOR              17
+#define QNN_SUBJECT_ARMOR_GREEN       18
+#define QNN_SUBJECT_ARMOR_YELLOW      19
+#define QNN_SUBJECT_ARMOR_RED         20
+#define QNN_SUBJECT_HEALTH            21
+#define QNN_SUBJECT_MEGAHEALTH        22
+#define QNN_SUBJECT_POWERUP           23
+#define QNN_SUBJECT_QUAD              24
+#define QNN_SUBJECT_PENT              25
+#define QNN_SUBJECT_RING              26
+#define QNN_SUBJECT_SUIT              27
+#define QNN_SUBJECT_PROJECTILE_NAIL   28
+#define QNN_SUBJECT_PROJECTILE_GRENADE 29
+#define QNN_SUBJECT_PROJECTILE_ROCKET 30
+#define QNN_SUBJECT_LIGHTNING_BEAM    31
+#define QNN_SOURCE_GROUND             32
+#define QNN_SOURCE_WATER              33
+#define QNN_SOURCE_SLIME              34
+#define QNN_SOURCE_LAVA               35
+#define QNN_SOURCE_GIB                36
+#define QNN_SUBJECT_BUTTON            37
+#define QNN_SUBJECT_PLATFORM          38
+#define QNN_SUBJECT_TELEPORTER        39
+#define QNN_SUBJECT_DOOR              40
+#define QNN_SOURCE_KEYED              41
+#define QNN_SOURCE_SECRET             42
+#define QNN_SUBJECT_TRAIN             43
 
 /* ── Action IDs ────────────────────────────────────────────────── */
 
@@ -87,7 +92,7 @@
 #define QNN_ACTION_COUNT       20
 
 #define QNN_SOURCE_NONE    0  /* alias for QNN_SUBJECT_NONE */
-#define QNN_ENTITY_VOCAB_SIZE 42  /* total entries in shared subject/source table */
+#define QNN_ENTITY_VOCAB_SIZE 44  /* total entries in shared subject/source table */
 
 /* ── Spatial sector IDs ────────────────────────────────────────── */
 
@@ -149,8 +154,9 @@ static inline float QNN_RecencyMaxForModality(int modality)
 
 static inline int QNN_SubjectIsItem(int subject_id)
 {
-	/* Ammo (9-12), armor (13-15), health (16-17), powerups (18-21).
-	   Backpack (2) is a dynamic drop, not a static item. */
+	/* Static map items: ammo, armor, health, powerups — the contiguous
+	 * SHELLS..SUIT block.  Backpacks (dynamic drops) are intentionally
+	 * excluded. */
 	return subject_id >= QNN_SUBJECT_SHELLS && subject_id <= QNN_SUBJECT_SUIT;
 }
 

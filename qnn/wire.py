@@ -4,10 +4,10 @@ Single source of truth for the obs buffer wire format in Python.
 Must match qnn_io.h on the C side.
 
 Wire layout (all offsets fixed, little-endian):
-  0..87    self section (scalars + embed IDs)
-  88..555  spatial tokens (9 × 13 float32)
-  556..811 action history (8 × 8 float32)
-  812..    entity stream (variable-length, type-tagged tokens)
+  0..95    self section (scalars + embed IDs)
+  96..563  spatial tokens (9 × 13 float32)
+  564..819 action history (8 × 8 float32)
+  820..    entity stream (variable-length, type-tagged tokens)
 
 See OBS_SCHEMA in qnn/schema.py for the canonical
 model-facing dict shape contract.
@@ -29,7 +29,7 @@ MAX_ENTITY_SCALAR_DIM = ACTOR_SCALAR_DIM  # largest per-type scalar count
 MAX_ENTITY_ID_DIM = ACTOR_ID_DIM          # largest per-type ID count
 
 OBS_BUFFER_SIZE = 4096
-ACTION_SIZE = 48  # sizeof(qnn_action_t) — move[3] + look[3] + fire + switch + recall[4]
+ACTION_SIZE = 32  # sizeof(qnn_action_t) — move[3] + look[3] + fire + switch
 
 # Per-tick header emitted by demo worker collect mode.
 TICK_HEADER_SIZE = 16
@@ -39,25 +39,27 @@ TICK_MAGIC_SIZE = 4
 FLAG_RESET = 0x01
 FLAG_DONE = 0x02
 
+# LOBS — labeler-mode slim per-native-tick frame.  See qnn.h
+# QNN_EmitLabelerTick docstring for the authoritative layout.
+LABELER_MAGIC = b"LOBS"
+LABELER_FRAME_SIZE = 33  # 4 magic + 10 header + 19 payload
+
 # Self token: fixed layout at offset 0 (96 bytes)
-SELF_SCALAR_DIM = 14
+SELF_SCALAR_DIM = 16
 SPATIAL_TOKEN_COUNT = 9
 SPATIAL_SCALAR_DIM = 13  # dir[3] + 10 measurement scalars
-ACTION_HISTORY_LEN = 8
-ACTION_HISTORY_DIM = 8  # move[3] + look[3] + fire + switch
 
 SELF_FIELDS = {
-    "self_scalars":     (0,  np.float32, (14,)),
-    "self_weapon_id":   (56, np.int32,   (1,)),
-    "self_armor_type_id": (60, np.int32, (1,)),
-    "self_powerup_ids": (64, np.int32,   (5,)),
-    "self_movement_id": (84, np.int32,   (1,)),
+    "self_scalars":     (0,  np.float32, (16,)),
+    "self_weapon_id":   (64, np.int32,   (1,)),
+    "self_armor_type_id": (68, np.int32, (1,)),
+    "self_powerup_ids": (72, np.int32,   (5,)),
+    "self_movement_id": (92, np.int32,   (1,)),
 }
 
-SPATIAL_OFFSET = 88
+SPATIAL_OFFSET = 96
 SPATIAL_STRIDE = 52  # 13 float32
-ACTION_HISTORY_OFFSET = 556
-ENTITY_STREAM_OFFSET = 812
+ENTITY_STREAM_OFFSET = 564
 
 # Per-type wire layout: (n_ids, n_scalars)
 TOKEN_LAYOUT = {
@@ -127,21 +129,6 @@ def unpack_spatial(raw: bytes, offset: int) -> Tuple[np.ndarray, int]:
         SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM
     )
     return scalars.copy(), offset + count * 4
-
-
-def unpack_action_history(raw: bytes, offset: int, count: int) -> Tuple[np.ndarray, int]:
-    """Parse action history (up to 8 × 8 floats)."""
-    total = ACTION_HISTORY_LEN * ACTION_HISTORY_DIM
-    history = np.frombuffer(raw, dtype=np.float32, offset=offset, count=total).reshape(
-        ACTION_HISTORY_LEN, ACTION_HISTORY_DIM
-    )
-    if count >= ACTION_HISTORY_LEN:
-        return history.copy(), offset + total * 4
-    result = np.zeros((ACTION_HISTORY_LEN, ACTION_HISTORY_DIM), dtype=np.float32)
-    keep = max(0, min(count, ACTION_HISTORY_LEN))
-    if keep:
-        result[:keep] = history[:keep]
-    return result, offset + total * 4
 
 
 def unpack_entity_stream_dense(raw: bytes, offset: int) -> Tuple[dict[str, np.ndarray], int]:
@@ -250,13 +237,58 @@ def densify_entity_tokens(tokens: list[dict]) -> dict[str, np.ndarray]:
     }
 
 
+def unpack_labeler_buffer(raw: bytes) -> dict[str, np.ndarray]:
+    """Unpack an 18-byte LOBS payload (everything after the 4-byte magic
+    and 10-byte header) into a model-facing dict.
+
+    Layout (matches C-side QNN_EmitLabelerTick in qnn_collect_helpers.c):
+        pos_delta_vel[3]     fp16   offset 0,  6 bytes (body-frame, normalized)
+        movement_id          u8     offset 6,  1 byte
+        view_delta[3]        fp16   offset 7,  6 bytes
+        c_rule_fire          u8     offset 13, 1 byte (engine-side sound+ammo)
+        c_rule_jump          u8     offset 14, 1 byte
+        move_packed          u8     offset 15, 1 byte (fb | lr<<2 | ud<<4, target)
+        target_valid_mask    u8     offset 16, 1 byte (bit0=fb, bit1=lr,
+                                                       bit2=ud, bit3=fire,
+                                                       bit4=weapon; bits5..7
+                                                       reserved)
+        usercmd_fire         u8     offset 17, 1 byte (press truth: usercmd
+                                                       fire button OR'd
+                                                       across the cmd window)
+        weapon_id            u8     offset 18, 1 byte (held weapon 1..8,
+                                                       0 = none)
+    """
+    if len(raw) < 19:
+        raise ValueError(f"labeler payload too short: {len(raw)} bytes")
+    pos_delta_vel = np.frombuffer(raw, dtype=np.float16, offset=0,  count=3).astype(np.float32)
+    movement_id   = int(raw[6])
+    view_delta    = np.frombuffer(raw, dtype=np.float16, offset=7,  count=3).astype(np.float32)
+    c_rule_fire   = int(raw[13])
+    c_rule_jump   = int(raw[14])
+    move_packed   = int(raw[15])
+    target_valid_mask = int(raw[16])
+    usercmd_fire  = int(raw[17])
+    weapon_id     = int(raw[18])
+    return {
+        "pos_delta_vel": pos_delta_vel,
+        "movement_id":   movement_id,
+        "view_delta":    view_delta,
+        "c_rule_fire":   c_rule_fire,
+        "c_rule_jump":   c_rule_jump,
+        "move_packed":   move_packed,
+        "target_valid_mask": target_valid_mask,
+        "usercmd_fire":  usercmd_fire,
+        "weapon_id":     weapon_id,
+    }
+
+
 def unpack_obs_buffer(raw: bytes) -> dict[str, np.ndarray]:
     """Unpack a v9 obs buffer into a model-facing dict.
 
     Returns dict with:
         self_scalars, self_weapon_id, etc. (fixed fields)
         entity_types, entity_scalars_raw, entity_ids, entity_event_* (dense)
-        spatial_scalars, action_history
+        spatial_scalars
     """
     obs: dict[str, np.ndarray] = {}
 
@@ -270,10 +302,6 @@ def unpack_obs_buffer(raw: bytes) -> dict[str, np.ndarray]:
     spatial_scalars, _ = unpack_spatial(raw, SPATIAL_OFFSET)
     obs["spatial_scalars"] = spatial_scalars
 
-    # Action history (fixed offset)
-    action_history, _ = unpack_action_history(raw, ACTION_HISTORY_OFFSET, ACTION_HISTORY_LEN)
-    obs["action_history"] = action_history
-
     # Entity stream → dense arrays
     dense_entities, _ = unpack_entity_stream_dense(raw, ENTITY_STREAM_OFFSET)
     obs.update(dense_entities)
@@ -281,15 +309,17 @@ def unpack_obs_buffer(raw: bytes) -> dict[str, np.ndarray]:
     return obs
 
 
-# ---- Action struct: move[3] + look[3] + fire + switch + recall[4] = 48 bytes ----
+# ---- Action struct: move[3] + look[3] + fire + weapon = 32 bytes ----
+#
+# The 4-byte int32 at offset 28 carries the raw engine weapon byte
+# (action->switch_slot on the C side — still named for historical
+# reasons; the field carries an impulse-form weapon id 0..8, where 0
+# means no weapon held).  The Python-side key here is the new
+# canonical name and what bc/collect writes to disk.
 
 ACTION_FIELDS = {
     "move":     (0,  np.float32, (3,)),
     "look":     (12, np.float32, (3,)),
     "fire":     (24, np.int32,   ()),
-    "switch":   (28, np.int32,   ()),
-    "recall_0": (32, np.int32,   ()),
-    "recall_1": (36, np.int32,   ()),
-    "recall_2": (40, np.int32,   ()),
-    "recall_3": (44, np.int32,   ()),
+    "weapon":   (28, np.int32,   ()),
 }

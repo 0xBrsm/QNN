@@ -1,12 +1,21 @@
 {
   "trunk_hidden": 64,
   "gru_hidden": 64,
-  "n_heads": 1,
+  "n_heads": 2,
   "n_layers": 2,
   "ffn_dim": 256,
   "d_model": 64,
-  "readout": "self",
-  "action_history_tokens": 2,
   "attn_dropout": 0.0,
-  "use_gru": true
+  "use_gru": true,
+  "use_weapon_head": true,
+  "weapon_switch_confidence": 0.65,
+  "weapon_switch_margin": 0.15,
+  "weapon_use_gru": true,
+  "weapon_context_from_obs": true,
+  "gru_target_query": false,
+  "hard_target_feat": false,
+  "weapon_in_target_query": false,
+  "linear_slot_prior": false,
+  "head_bottleneck_dim": 192,
+  "head_use_relu": true
 }

@@ -205,9 +205,7 @@ def prepare_eval_checkpoint(checkpoint_path: str, output_dir: str) -> str:
         "n_heads",
         "n_layers",
         "ffn_dim",
-        "action_history_tokens",
         "attn_dropout",
-        "readout",
     )
     missing = [key for key in required_keys if key not in meta]
     if missing:
@@ -231,9 +229,7 @@ def prepare_eval_checkpoint(checkpoint_path: str, output_dir: str) -> str:
             n_heads=int(meta["n_heads"]),
             n_layers=int(meta["n_layers"]),
             ffn_dim=int(meta["ffn_dim"]),
-            action_history_tokens=int(meta["action_history_tokens"]),
             attn_dropout=float(meta["attn_dropout"]),
-            readout=str(meta["readout"]),
         )
         policy.save(converted_path)
         converted_sidecar_path.write_text(

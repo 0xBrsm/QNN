@@ -96,19 +96,26 @@ QW_CUSTOM_SOURCES=(
   "${ENGINE_DIR}/qw/qnn_sys.c"
   "${ENGINE_DIR}/common/qnn_sys_common.c"
   "${ENGINE_DIR}/qw/qnn_collect_main.c"
-  "${ENGINE_DIR}/common/qnn_match.c"
   "${ENGINE_DIR}/common/qnn_collect_helpers.c"
+  "${ENGINE_DIR}/common/qnn_mvd_collect.c"
+  "${ENGINE_DIR}/qw/qnn_qwd_collect.c"
+  "${ENGINE_DIR}/common/qnn_labeler_collect.c"
   "${ENGINE_DIR}/qw/qnn_self.c"
+  "${ENGINE_DIR}/common/qnn_self_common.c"
   "${ENGINE_DIR}/qw/qnn_input.c"
   "${ENGINE_DIR}/common/qnn_event.c"
   "${ENGINE_DIR}/common/qnn_sound.c"
   "${ENGINE_DIR}/common/qnn_map.c"
   "${ENGINE_DIR}/common/qnn_entity.c"
+  "${ENGINE_DIR}/qw/qnn_players.c"
   "${ENGINE_DIR}/common/qnn_oracle.c"
   "${ENGINE_DIR}/common/qnn_spatial.c"
   "${ENGINE_DIR}/common/qnn_io.c"
   "${ENGINE_DIR}/common/qnn_metrics.c"
+  "${ENGINE_DIR}/common/qnn_fault.c"
+  "${ENGINE_DIR}/common/qnn_watchdog.c"
   "${ENGINE_DIR}/common/qnn_store.c"
+  "${ENGINE_DIR}/common/qnn_tick.c"
   "${ENGINE_DIR}/qw/qnn_phys.c"
   "${ENGINE_DIR}/qw/qnn_stubs.c"
 )
@@ -179,6 +186,37 @@ git -C "${UPSTREAM_DIR}" checkout -q --detach FETCH_HEAD
 
 cp -R "${UPSTREAM_DIR}/QW/client" "${WORKTREE_DIR}"
 
+# ── Patch helper ─────────────────────────────────────────────────
+#
+# Most patches replace a single literal string in one upstream file.
+# `apply_subst <file> [guard]` reads OLD on its caller's stdin up to a
+# separator line "===NEW===", then NEW until EOF, and substitutes once.
+# Pass `guard` to skip when a marker string is already present in the
+# target (idempotent rebuilds).  Errors out if OLD doesn't match exactly
+# once, so silent upstream drift surfaces as a hard build failure.
+APPLY_SUBST_PY='
+import sys
+from pathlib import Path
+path, guard = Path(sys.argv[1]), sys.argv[2]
+data = sys.stdin.read()
+sep = "\n===NEW===\n"
+if sep not in data:
+    sys.exit(f"apply_subst: missing ===NEW=== separator (file={path.name})")
+old, new = data.split(sep, 1)
+if new.endswith("\n"):
+    new = new[:-1]
+text = path.read_text(errors="surrogateescape")
+if guard and guard in text:
+    sys.exit(0)
+n = text.count(old)
+if n != 1:
+    sys.exit(f"apply_subst: {path.name}: expected 1 match for old text, got {n}")
+path.write_text(text.replace(old, new, 1), errors="surrogateescape")
+'
+apply_subst() {
+	python3 -c "$APPLY_SUBST_PY" "${WORKTREE_DIR}/$1" "${2-}"
+}
+
 # ── Inline patches for headless QW operation ─────────────────────
 
 # 1. Make qboolean C++-safe
@@ -213,26 +251,32 @@ t = t.replace("#define\tMAX_MSGLEN\t\t1450", "#define\tMAX_MSGLEN\t\t65536")
 p.write_text(t, errors='surrogateescape')
 PY
 
+# 2a. Increase the small Z_Malloc zone. The default QW zone is only
+#     128 KiB and long-lived demo workers can exhaust it on aliases,
+#     cvars, and search-path bookkeeping across sequential demos.
+apply_subst zone.c <<'EOF'
+#define	DYNAMIC_SIZE	0x20000
+===NEW===
+#define	DYNAMIC_SIZE	0x800000
+EOF
+
 # 2b. Use ephemeral port for UDP socket so parallel workers don't clash.
 #     The headless worker only reads demos — it never connects to a real
 #     server — but QW's NET_Init still binds a UDP socket.  Changing
 #     PORT_CLIENT to PORT_ANY (0) lets the OS assign a unique port per
 #     process, enabling parallel collection with --workers 30.
-python3 - "${WORKTREE_DIR}/protocol.h" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-t = t.replace("#define\tPORT_CLIENT\t27001", "#define\tPORT_CLIENT\tPORT_ANY")
-p.write_text(t, errors='surrogateescape')
-PY
+apply_subst protocol.h <<'EOF'
+#define	PORT_CLIENT	27001
+===NEW===
+#define	PORT_CLIENT	PORT_ANY
+EOF
 
 # 3. Disable STRUCT_FROM_LINK pointer arithmetic warning (GCC/64-bit)
-python3 - "${WORKTREE_DIR}/common.h" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-old = '#define\tSTRUCT_FROM_LINK(l,t,m) ((t *)((byte *)l - (int)&(((t *)0)->m)))'
-new = '#define\tSTRUCT_FROM_LINK(l,t,m) ((t *)((byte *)l - (size_t)&(((t *)0)->m)))'
-p.write_text(t.replace(old, new))
-PY
+apply_subst common.h <<'EOF'
+#define	STRUCT_FROM_LINK(l,t,m) ((t *)((byte *)l - (int)&(((t *)0)->m)))
+===NEW===
+#define	STRUCT_FROM_LINK(l,t,m) ((t *)((byte *)l - (size_t)&(((t *)0)->m)))
+EOF
 
 # 4. Add NQ-compatible fields to QW client_state_t so shared worker
 #    code (qnn_entity.c, qnn_store.c, qnn_oracle.c, etc.) compiles.
@@ -265,7 +309,7 @@ new_end = '''// all player information
 
 /* ── NQ-compatible fields for shared QNN worker code ──────────── */
 \tint\t\t\tviewentity;\t\t/* = playernum + 1, set by QW worker */
-\tint\t\t\tmaxclients;\t\t/* = MAX_CLIENTS */
+\tint\t\t\tmaxclients;\t\t/* parsed from cl.serverinfo "maxclients", clamped to MAX_CLIENTS */
 \tscoreboard_t\t*scores;\t/* points to qnn_scores_compat[] */
 \tint\t\t\titems;\t\t\t/* = stats[STAT_ITEMS] */
 \tvec3_t\t\tvelocity;\t\t/* = simvel */
@@ -359,11 +403,24 @@ void QNN_SyncEngineCompat(void)
     int i;
 
     cl.viewentity = cl.playernum + 1;
-    cl.maxclients = MAX_CLIENTS;
+    {
+        int parsed = atoi(Info_ValueForKey(cl.serverinfo, "maxclients"));
+        if (parsed <= 0 || parsed > MAX_CLIENTS)
+            parsed = MAX_CLIENTS;
+        cl.maxclients = parsed;
+    }
     cl.items = cl.stats[STAT_ITEMS];
     VectorCopy(cl.simvel, cl.velocity);
-    cl.mtime[0] = cl.time;
-    cl.mtime[1] = cl.time - host_frametime;
+    /* Do NOT overwrite cl.mtime[0] / cl.mtime[1] here.  Vanilla QW
+     * sets cl.mtime[0] from svc_time during cl_parse — this is the
+     * server's wall clock when the packet was sent, which we need
+     * at sub-emit-frame resolution for the MVD per-event fire
+     * back-shift to compute each sound's phase within the emit
+     * window.  An earlier version of this patch synced them to
+     * cl.time for NQ-compat downstream code, but that clobbered the
+     * per-svc-time advance and pinned cl.mtime[0] to the emit
+     * boundary.  If downstream NQ code relies on cl.mtime[0] for
+     * state interpolation, audit those call sites instead. */
 
     /* Sync scoreboard from player_info_t */
     for (i = 0; i < MAX_CLIENTS; ++i)
@@ -397,51 +454,47 @@ void QNN_SyncEngineCompat(void)
 }
 COMPAT
 
-# 4c. Add qnn_engine_compat.c to upstream sources list
+# 4f. Add qnn_engine_compat.c to upstream sources list
 # (This is handled in the source list below)
 
 # 4d. Add msg_origins and baseline to QW entity_t (NQ has them, QW doesn't)
-python3 - "${WORKTREE_DIR}/render.h" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-# Add msg_origins and baseline after origin in entity_t
-old = '\tvec3_t\t\t\t\t\torigin;\n\tvec3_t\t\t\t\t\tangles;'
-new = ('\tvec3_t\t\t\t\t\torigin;\n'
-       '\tvec3_t\t\t\t\t\tmsg_origins[2];\t/* NQ compat */\n'
-       '\tvec3_t\t\t\t\t\tangles;\n'
-       '\tentity_state_t\t\t\tbaseline;\t\t/* NQ compat */\n'
-       '\tdouble\t\t\t\t\tmsgtime;\t\t/* NQ compat */')
-t = t.replace(old, new)
-p.write_text(t, errors='surrogateescape')
-PY
+apply_subst render.h <<'EOF'
+	vec3_t					origin;
+	vec3_t					angles;
+===NEW===
+	vec3_t					origin;
+	vec3_t					msg_origins[2];	/* NQ compat */
+	vec3_t					angles;
+	entity_state_t			baseline;		/* NQ compat */
+	double					msgtime;		/* NQ compat */
+EOF
 
-# 4e. Add NQ-compatible fields to QW common.h that shared worker code needs
-python3 - "${WORKTREE_DIR}/bothdefs.h" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-# Add STAT_FRAGS if not defined (QW comments it out)
-if 'STAT_FRAGS' not in t or '//define\tSTAT_FRAGS' in t:
-    t = t.replace('//define\tSTAT_FRAGS\t\t\t1', '#define\tSTAT_FRAGS\t\t\t1')
-p.write_text(t, errors='surrogateescape')
-PY
+# 4e. Uncomment STAT_FRAGS (QW ships it commented out; NQ-shared code needs it).
+apply_subst bothdefs.h '#define	STAT_FRAGS			1' <<'EOF'
+//define	STAT_FRAGS			1
+===NEW===
+#define	STAT_FRAGS			1
+EOF
 
-# 5. Remove #include "winquake.h" from cl_main.c (not available on Linux)
-python3 - "${WORKTREE_DIR}/cl_main.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-t = t.replace('#include "winquake.h"\n', '/* #include "winquake.h" — removed for headless build */\n')
-# Also stub out the Windows-specific SetWindowText calls
-t = t.replace('SetWindowText (mainwindow, "QuakeWorld: disconnected");', '/* SetWindowText removed for headless */')
-p.write_text(t, errors='surrogateescape')
-PY
+# 5a. Remove #include "winquake.h" from cl_main.c (not available on Linux)
+#     and stub the Windows-specific SetWindowText call.
+apply_subst cl_main.c <<'EOF'
+#include "winquake.h"
+===NEW===
+/* #include "winquake.h" — removed for headless build */
+EOF
+apply_subst cl_main.c <<'EOF'
+SetWindowText (mainwindow, "QuakeWorld: disconnected");
+===NEW===
+/* SetWindowText removed for headless */
+EOF
 
-# 5. Remove #include "winquake.h" from cl_cam.c
-python3 - "${WORKTREE_DIR}/cl_cam.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-t = t.replace('#include "winquake.h"\n', '/* #include "winquake.h" — removed for headless build */\n')
-p.write_text(t, errors='surrogateescape')
-PY
+# 5b. Remove #include "winquake.h" from cl_cam.c
+apply_subst cl_cam.c <<'EOF'
+#include "winquake.h"
+===NEW===
+/* #include "winquake.h" — removed for headless build */
+EOF
 
 # 6. Stub Host_WriteConfiguration (writes config.cfg — not needed for demo
 #    worker). A whitespace-tolerant regex replace: upstream has trailing tabs
@@ -463,47 +516,75 @@ print("patch 6: Host_WriteConfiguration stubbed")
 PY
 
 # 7. Print Host_Error to stderr (same as NQ host.c.patch)
-python3 - "${WORKTREE_DIR}/cl_main.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-old = '\tCon_Printf ("Host_Error: %s\\n",string);'
-new = '\tCon_Printf ("Host_Error: %s\\n",string);\n\tfprintf(stderr, "Host_Error: %s\\n", string);'
-t = t.replace(old, new)
-p.write_text(t, errors='surrogateescape')
-PY
+apply_subst cl_main.c <<'EOF'
+	Con_Printf ("Host_Error: %s\n",string);
+===NEW===
+	Con_Printf ("Host_Error: %s\n",string);
+	fprintf(stderr, "Host_Error: %s\n", string);
+EOF
 
-# 8. Non-fatal model precache failures in cl_parse.c
-python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-# QW's model precache uses NULL checks differently
-old = '''		if (!cl.model_precache[nummodels])
-			Host_Error ("Model %s not found", cl.model_name[nummodels]);'''
-new = '''		if (!cl.model_precache[nummodels])
-			Con_Printf ("Model %s not found (non-fatal)\\n", cl.model_name[nummodels]);'''
-t = t.replace(old, new)
-p.write_text(t, errors='surrogateescape')
-PY
+# 7b. Centralize the Host_Frame rate gate.  Replaces the cl_maxfps
+#     30/72 floor/ceiling clamp with a single call into qnn_tick.c so
+#     a single cvar (qnn_tick_hz) controls the engine tick rate across
+#     QW demo collect, NQ demo collect, NQ trainer, and NQ live client.
+#     When qnn_tick_hz is 0 (unset), the legacy clamped behavior is
+#     preserved verbatim by passing it as the native cap.
+apply_subst cl_main.c <<'EOF'
+	realtime += time;
+	if (oldrealtime > realtime)
+		oldrealtime = 0;
+
+	if (cl_maxfps.value)
+		fps = max(30.0, min(cl_maxfps.value, 72.0));
+	else
+		fps = max(30.0, min(rate.value/80.0, 72.0));
+
+	if (!cls.timedemo && realtime - oldrealtime < 1.0/fps)
+		return;			// framerate is too high
+===NEW===
+	{
+		extern qboolean QNN_TickGate(qboolean is_timedemo,
+			float incoming_time, float native_cap_hz,
+			double *p_realtime, double *p_oldrealtime);
+		float native_cap;
+		if (cl_maxfps.value)
+			native_cap = max(30.0, min(cl_maxfps.value, 72.0));
+		else
+			native_cap = max(30.0, min(rate.value/80.0, 72.0));
+		if (!QNN_TickGate(cls.timedemo, time, native_cap,
+				&realtime, &oldrealtime))
+			return;
+	}
+EOF
+
+# 7c. Remove the now-unused `float fps;` local in Host_Frame.
+apply_subst cl_main.c <<'EOF'
+	int			pass1, pass2, pass3;
+	float fps;
+	if (setjmp (host_abort) )
+===NEW===
+	int			pass1, pass2, pass3;
+	if (setjmp (host_abort) )
+EOF
 
 # 9. Guard R_AddEfrags against NULL worldmodel
-python3 - "${WORKTREE_DIR}/r_efrag.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-t = t.replace(
-    'if (!ent->model)\n\t\treturn;',
-    'if (!ent->model)\n\t\treturn;\n\n\tif (!cl.worldmodel || !cl.worldmodel->nodes)\n\t\treturn;')
-p.write_text(t, errors='surrogateescape')
-PY
+apply_subst r_efrag.c <<'EOF'
+if (!ent->model)
+		return;
+===NEW===
+if (!ent->model)
+		return;
+
+	if (!cl.worldmodel || !cl.worldmodel->nodes)
+		return;
+EOF
 
 # 10. snprintf for safe path concatenation in common.c
-python3 - "${WORKTREE_DIR}/common.c" <<'PY'
-from pathlib import Path; import sys
-path = Path(sys.argv[1]); text = path.read_text(errors='surrogateescape')
-text = text.replace(
-    'sprintf (netpath, "%s/%s",search->filename, filename);',
-    'snprintf (netpath, MAX_OSPATH, "%s/%s",search->filename, filename);')
-path.write_text(text, errors='surrogateescape')
-PY
+apply_subst common.c <<'EOF'
+sprintf (netpath, "%s/%s",search->filename, filename);
+===NEW===
+snprintf (netpath, MAX_OSPATH, "%s/%s",search->filename, filename);
+EOF
 
 # 11. Patch Host_Init to skip VID/Draw/SCR/R/CDAudio/Sbar init for headless
 #     We replace the platform-specific init block with just CL_Init.
@@ -551,61 +632,33 @@ t = t.replace(old, new)
 p.write_text(t, errors='surrogateescape')
 PY
 
-# 12. Stub CL_StopUpload (referenced in CL_Disconnect)
-python3 - "${WORKTREE_DIR}/cl_main.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-# Add a stub if not already defined
-if 'void CL_StopUpload' not in t:
-    # It's declared in cl_parse.c, just add a stub declaration
-    pass
-p.write_text(t, errors='surrogateescape')
-PY
-
-# 13. Stub SCR_UpdateScreen and related rendering calls in Host_Frame
-python3 - "${WORKTREE_DIR}/cl_main.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-# Replace SCR_UpdateScreen call
-t = t.replace('SCR_UpdateScreen ();', '/* SCR_UpdateScreen (); — headless */')
-# Replace S_Update calls
-t = t.replace(
-    '''	if (cls.state == ca_active)
-	{
-		S_Update (r_origin, vpn, vright, vup);
-		CL_DecayLights ();
-	}
-	else
-		S_Update (vec3_origin, vec3_origin, vec3_origin, vec3_origin);
-
-	CDAudio_Update();''',
-    '''	if (cls.state == ca_active)
-		CL_DecayLights ();
-	/* S_Update, CDAudio_Update — headless */''')
-p.write_text(t, errors='surrogateescape')
-PY
+# 13. Stub SCR_UpdateScreen call in Host_Frame.  S_Update / CDAudio_Update
+#     no-op without sound init (skipped in patch 11), so we leave them.
+apply_subst cl_main.c <<'EOF'
+SCR_UpdateScreen ();
+===NEW===
+/* SCR_UpdateScreen (); — headless */
+EOF
 
 # 14. Fix M_Menu_Quit_f reference in CL_Quit_f
-python3 - "${WORKTREE_DIR}/cl_main.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-t = t.replace(
-    '''	if (1 /* key_dest != key_console */ /* && cls.state != ca_dedicated */)
+apply_subst cl_main.c <<'EOF'
+	if (1 /* key_dest != key_console */ /* && cls.state != ca_dedicated */)
 	{
 		M_Menu_Quit_f ();
 		return;
-	}''',
-    '''	/* M_Menu_Quit_f removed for headless */''')
-p.write_text(t, errors='surrogateescape')
-PY
+	}
+===NEW===
+	/* M_Menu_Quit_f removed for headless */
+EOF
 
 # 15. Remove Windows-specific CL_Windows_f
-python3 - "${WORKTREE_DIR}/cl_main.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-t = t.replace('#ifdef _WINDOWS\n#include <windows.h>', '/* Windows section removed for headless */\n#if 0')
-p.write_text(t, errors='surrogateescape')
-PY
+apply_subst cl_main.c <<'EOF'
+#ifdef _WINDOWS
+#include <windows.h>
+===NEW===
+/* Windows section removed for headless */
+#if 0
+EOF
 
 # 16. Provide an empty winquake.h so any residual includes don't fail
 cat > "${WORKTREE_DIR}/winquake.h" <<'EOF'
@@ -799,11 +852,30 @@ new_play = '''\t{
 if 'cls.mvdplayback = false' not in t:
     t = t.replace(old_play, new_play)
 
-# 21d. Reset MVD state in CL_StopPlayback
-old_stop = 'cls.demoplayback = false;'
-new_stop = 'cls.demoplayback = false;\n\tcls.mvdplayback = false;'
+# 21d. Reset MVD state in CL_StopPlayback (upstream source uses `= 0;`,
+# not `= false;` — the earlier needle silently no-op'd).
+old_stop = 'cls.demoplayback = 0;'
+new_stop = 'cls.demoplayback = 0;\n\tcls.mvdplayback = false;'
 if 'cls.mvdplayback = false' not in t:
     t = t.replace(old_stop, new_stop, 1)
+
+# 21d-mtime.  Set cl.mtime[0]/cl.mtime[1] from each record's demotime in
+# CL_GetDemoMessage.  QW has no svc_time message (the opcode is reserved
+# but commented out in protocol.h), so the QW client never natively
+# populates cl.mtime[0].  The shared NQ-compat fields were previously
+# kept = cl.time via the QNN_SyncEngineCompat sync, but that pinned the
+# value to the emit boundary and threw away the per-record sub-emit
+# timing we need for the MVD per-event fire back-shift.  This patch
+# threads demotime through each record so sounds parsed during one
+# record's dem_read get cl.mtime[0] == the record's actual demotime,
+# not the emit-window start.
+old_after_gate = 'if (cls.state < ca_demostart)\n\t\tHost_Error ("CL_GetDemoMessage: cls.state != ca_active");'
+new_after_gate = ('cl.mtime[1] = cl.mtime[0];\n'
+                  '\tcl.mtime[0] = demotime;\n'
+                  '\tif (cls.state < ca_demostart)\n'
+                  '\t\tHost_Error ("CL_GetDemoMessage: cls.state != ca_active");')
+if 'cl.mtime[0] = demotime;' not in t:
+    t = t.replace(old_after_gate, new_after_gate, 1)
 
 # 21e. Append CL_GetMVDMessage function at end of file
 mvd_reader = r'''
@@ -1041,23 +1113,19 @@ if 'CL_ParsePlayerinfo_MVD' not in t or 'void CL_ParsePlayerinfo_MVD (void)\n{' 
 p.write_text(t, errors='surrogateescape')
 PY
 
-# 23. Route dem_stats to correct player in cl_parse.c
-python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-# Find CL_SetStat and add MVD player filtering at the start
-old_setstat = 'void CL_SetStat (int stat, int value)\n{'
-new_setstat = '''void CL_SetStat (int stat, int value)
+# 23. Route dem_stats to correct player in cl_parse.c (MVD-only).
+apply_subst cl_parse.c 'mvd_lasttype == dem_stats' <<'EOF'
+void CL_SetStat (int stat, int value)
 {
-\t/* MVD: dem_stats targets a specific player. Only apply to
-\t * cl.stats[] if it targets our tracked player. */
-\tif (cls.mvdplayback && cls.mvd_lasttype == dem_stats
-\t\t&& cls.mvd_lastto != cl.playernum)
-\t\treturn;'''
-if 'mvd_lasttype == dem_stats' not in t:
-    t = t.replace(old_setstat, new_setstat)
-p.write_text(t, errors='surrogateescape')
-PY
+===NEW===
+void CL_SetStat (int stat, int value)
+{
+	/* MVD: dem_stats targets a specific player. Only apply to
+	 * cl.stats[] if it targets our tracked player. */
+	if (cls.mvdplayback && cls.mvd_lasttype == dem_stats
+		&& cls.mvd_lastto != cl.playernum)
+		return;
+EOF
 
 # 24. MVD view angle sync in qnn_engine_compat.c
 #     When MVD, copy tracked player's angles to cl.viewangles
@@ -1114,52 +1182,8 @@ new_netchan = """\t\tif (cls.demoplayback)
 \t\t\tif (!Netchan_Process(&cls.netchan))
 \t\t\t\tcontinue;\t\t// wasn't accepted for some reason
 \t\t}"""
-count = t.count(old_netchan)
-print(f'patch 25: netchan match count = {count}', file=sys.stderr)
-if count == 0:
-    idx = t.find('Netchan_Process')
-    if idx >= 0:
-        print(f'patch 25: context around Netchan_Process: {repr(t[idx-40:idx+80])}', file=sys.stderr)
 if 'QWD dem_read: strip' not in t and 'MVD: no netchan header' not in t:
     t = t.replace(old_netchan, new_netchan, 1)
-p.write_text(t, errors='surrogateescape')
-PY
-
-# 25a. Hook svc_print and svc_centerprint in cl_parse.c to forward
-#      match text to QNN_MatchCheckPrint (same approach as NQ's
-#      cl_parse.c.patch).  QW's svc_print reads a print-level byte
-#      before the text string; NQ's does not.
-python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
-
-# svc_print: capture the MSG_ReadString result
-old_print = '\t\t\tCon_Printf ("%s", MSG_ReadString ());\n\t\t\tcon_ormask = 0;'
-new_print = """\t\t\t{
-\t\t\t\tchar *_qnn_print_text = MSG_ReadString ();
-\t\t\t\textern void QNN_MatchCheckPrint(const char *);
-\t\t\t\tCon_Printf ("%s", _qnn_print_text);
-\t\t\t\tQNN_MatchCheckPrint(_qnn_print_text);
-\t\t\t}
-\t\t\tcon_ormask = 0;"""
-
-# svc_centerprint: same pattern
-old_center = '\t\tcase svc_centerprint:\n\t\t\tSCR_CenterPrint (MSG_ReadString ());'
-new_center = """\t\tcase svc_centerprint:
-\t\t{
-\t\t\tchar *_qnn_cp_text = MSG_ReadString ();
-\t\t\textern void QNN_MatchCheckPrint(const char *);
-\t\t\tSCR_CenterPrint (_qnn_cp_text);
-\t\t\tQNN_MatchCheckPrint(_qnn_cp_text);
-\t\t}"""
-
-count_p = t.count(old_print)
-count_c = t.count(old_center)
-print(f'patch 25a: svc_print match={count_p}, svc_centerprint match={count_c}', file=sys.stderr)
-if '_qnn_print_text' not in t:
-    t = t.replace(old_print, new_print, 1)
-if '_qnn_cp_text' not in t:
-    t = t.replace(old_center, new_center, 1)
 p.write_text(t, errors='surrogateescape')
 PY
 
@@ -1185,8 +1209,6 @@ new = '''\t// -game <dir>: add a custom game directory to the search path.
 \t// any set gamedirs will be freed up to here
 \tcom_base_searchpaths = com_searchpaths;'''
 
-count = t.count(old)
-print(f'patch 25b: -game handler match count = {count}', file=sys.stderr)
 if 'COM_CheckParm ("-game")' not in t:
     t = t.replace(old, new, 1)
 p.write_text(t, errors='surrogateescape')
@@ -1218,8 +1240,8 @@ new_protover = '''\t/* FTE extension markers: MVDSV 0.31+ prepends extension bit
 \t\t\t\tfte_ext2 = (unsigned int)MSG_ReadLong();
 \t\t\telse if (protover == 0x3144564D) /* "MVD1" */
 \t\t\t\tmvd_ext = (unsigned int)MSG_ReadLong();
-\t\t\telse if (cls.demoplayback && (protover == 26 || protover == 27))
-\t\t\t\tbreak; /* old demo compat */
+\t\t\telse if (cls.demoplayback && protover >= 24 && protover <= 27)
+\t\t\t\tbreak; /* old demo compat: protocols 24-27 from pre-2.30 clients */
 \t\t\telse
 \t\t\t{
 \t\t\t\tHost_EndGame("Server returned version %i, not %i", protover, PROTOCOL_VERSION);
@@ -1231,8 +1253,6 @@ new_protover = '''\t/* FTE extension markers: MVDSV 0.31+ prepends extension bit
 \t}'''
 
 if 'fte_ext' not in t:
-    count = t.count(old_protover)
-    print(f'patch 26a: protover match count = {count}', file=sys.stderr)
     t = t.replace(old_protover, new_protover, 1)
 
 # 26b. Replace playernum + spectator block for MVD support.
@@ -1265,8 +1285,6 @@ new_playernum = '''\t// parse player slot, high bit means spectator
 \t\t}
 \t}'''
 if 'mvd_start' not in t:
-    count = t.count(old_playernum)
-    print(f'patch 26b: playernum match count = {count}', file=sys.stderr)
     t = t.replace(old_playernum, new_playernum, 1)
 
 p.write_text(t, errors='surrogateescape')
@@ -1290,7 +1308,6 @@ float MSG_ReadCoord (void)
 \tif (qnn_fte_floatcoords)
 \t\treturn MSG_ReadFloat();
 \treturn MSG_ReadShort() * (1.0/8);'''
-    c1 = t.count(old_rc); print(f'patch 28: ReadCoord count = {c1}', file=sys.stderr)
     t = t.replace(old_rc, new_rc, 1)
 
     # Override MSG_ReadAngle for float coords
@@ -1300,7 +1317,6 @@ float MSG_ReadCoord (void)
 \tif (qnn_fte_floatcoords)
 \t\treturn MSG_ReadShort() * (360.0/65536);
 \treturn MSG_ReadChar() * (360.0/256);'''
-    c2 = t.count(old_ra); print(f'patch 28: ReadAngle count = {c2}', file=sys.stderr)
     t = t.replace(old_ra, new_ra, 1)
 
     # MSG_ReadAngle16 stays as short — MVDSV writes angle16 as shorts
@@ -1401,16 +1417,304 @@ if 'MAX_PACKET_ENTITIES\t256' not in t:
 p.write_text(t, errors='surrogateescape')
 PY
 
-# 30b. Treat svc_bad (0) as end-of-message during MVD playback.
-#      MVD messages can have trailing zero padding after the last real svc.
+
+# 30a2. Bump MAX_STATIC_ENTITIES from 128 to 512 (same value ezQuake uses).
+#       Long multi-map demos can accumulate well past 128 per-map statics
+#       even after CL_ClearState runs each map change — QW's vanilla 128
+#       cap was chosen for single-level play.  At 128, dgvsgq1-style
+#       15-map demo series Host_EndGame mid-replay.
+python3 - "${WORKTREE_DIR}/client.h" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old = '#define\tMAX_STATIC_ENTITIES\t128'
+new = '#define\tMAX_STATIC_ENTITIES\t512'
+if 'MAX_STATIC_ENTITIES\t512' not in t:
+    t = t.replace(old, new, 1)
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30b. Skip packet entities whose model index is invalid or missing.
+#      Some demos reference models that were not precached successfully in
+#      headless playback. Vanilla CL_LinkPacketEntities dereferences
+#      cl.model_precache[s1->modelindex] unconditionally; for data collection
+#      this visual entity can be dropped instead of crashing the worker.
+python3 - "${WORKTREE_DIR}/cl_ents.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old = '''\t\t// if set to invisible, skip
+\t\tif (!s1->modelindex)
+\t\t\tcontinue;
+
+\t\t// create a new entity'''
+new = '''\t\t// if set to invisible, skip
+\t\tif (!s1->modelindex)
+\t\t\tcontinue;
+
+\t\t// QNN headless collect: demos can reference absent or out-of-range
+\t\t// precache entries. Skip the visual entity rather than dereferencing
+\t\t// a NULL/garbage model pointer in the renderer path.
+\t\tif (s1->modelindex >= MAX_MODELS || cl.model_precache[s1->modelindex] == NULL)
+\t\t\tcontinue;
+
+\t\t// create a new entity'''
+if 'QNN headless collect: demos can reference absent' not in t:
+    if old not in t:
+        raise SystemExit("failed to patch CL_LinkPacketEntities model guard")
+    t = t.replace(old, new, 1)
+
+# 30b2. CL_ParsePlayerinfo: vanilla QW uses `num > MAX_CLIENTS` with a Sys_Error.
+#       1) `>` should be `>=` — num is an index into [0..MAX_CLIENTS-1].  The
+#          stricter compare catches the off-by-one silently corrupting slot
+#          MAX_CLIENTS. 2) We replace the fatal Sys_Error with a swallow +
+#          return so one malformed playerinfo doesn't kill the replay.
+old_ppi = '''\tnum = MSG_ReadByte ();
+\tif (num > MAX_CLIENTS)
+\t\tSys_Error ("CL_ParsePlayerinfo: bad num");'''
+new_ppi = '''\tnum = MSG_ReadByte ();
+\tif (num >= MAX_CLIENTS)
+\t{
+\t\tfprintf(stderr, "[qw-demo] CL_ParsePlayerinfo: bad num %d — skipping\\n", num);
+\t\treturn;
+\t}'''
+if '[qw-demo] CL_ParsePlayerinfo: bad num' not in t:
+    if old_ppi not in t:
+        raise SystemExit("failed to patch CL_ParsePlayerinfo bad-num guard")
+    t = t.replace(old_ppi, new_ppi, 1)
+
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30b2c. svc_spawnbaseline: vanilla QW indexes cl_baselines[i] without any
+#        bounds check on the i = MSG_ReadShort() it just read.  Malformed
+#        demos (or our own parser desyncing on something we tolerated
+#        earlier in the stream) hand i values like 2048 or -16384 here,
+#        which segfaults inside CL_ParseBaseline on the first write.
+#        Skip out-of-range entries while still draining the payload so
+#        we stay aligned with the rest of the message.
+python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old_sb = '''\t\tcase svc_spawnbaseline:
+\t\t\ti = MSG_ReadShort ();
+\t\t\tCL_ParseBaseline (&cl_baselines[i]);
+\t\t\tbreak;'''
+new_sb = '''\t\tcase svc_spawnbaseline:
+\t\t{
+\t\t\tentity_state_t qnn_baseline_junk;
+\t\t\ti = MSG_ReadShort ();
+\t\t\tif (i < 0 || i >= MAX_EDICTS)
+\t\t\t{
+\t\t\t\tfprintf(stderr, "[qw-demo] svc_spawnbaseline: bad entnum %d — skipping\\n", i);
+\t\t\t\tCL_ParseBaseline (&qnn_baseline_junk);
+\t\t\t\tbreak;
+\t\t\t}
+\t\t\tCL_ParseBaseline (&cl_baselines[i]);
+\t\t\tbreak;
+\t\t}'''
+if '[qw-demo] svc_spawnbaseline:' not in t:
+    if old_sb not in t:
+        raise SystemExit("failed to patch svc_spawnbaseline bounds guard")
+    t = t.replace(old_sb, new_sb, 1)
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30b3. CL_SetStat: `stat < 0 || stat >= MAX_CL_STATS` → Sys_Error.  MVDSV
+#       / ezQuake extended stats occasionally push indices above MAX_CL_STATS
+#       (32 in vanilla, 96 in ezQuake).  Raising the cap is risky (affects
+#       cl.stats[] indexing everywhere), so just skip out-of-range stats.
+python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old = '\tif (stat < 0 || stat >= MAX_CL_STATS)\n\t\tSys_Error ("CL_SetStat: %i is invalid", stat);'
+new = ('\tif (stat < 0 || stat >= MAX_CL_STATS)\n'
+       '\t{\n'
+       '\t\tfprintf(stderr, "[qw-demo] CL_SetStat: %i is invalid — skipping\\n", stat);\n'
+       '\t\treturn;\n'
+       '\t}')
+if '[qw-demo] CL_SetStat:' not in t:
+    if old not in t:
+        raise SystemExit('failed to patch CL_SetStat bad-stat guard')
+    t = t.replace(old, new, 1)
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30b5b. CL_SetSolidEntities: zero physents[] before rebuild so stale model
+#        pointers from a previous frame can't leak into pmove.  Without this
+#        a freed-model pointer (e.g. after a mid-demo map change whose
+#        svc_modellist got swallowed by our tolerance patches) sits in
+#        physents past the numphysent cap and slips through if anything
+#        iterates beyond that cap.  Zeroing is cheap (one array × sizeof).
+python3 - "${WORKTREE_DIR}/cl_ents.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old = '\tpmove.physents[0].model = cl.worldmodel;\n\tVectorCopy (vec3_origin, pmove.physents[0].origin);\n\tpmove.physents[0].info = 0;\n\tpmove.numphysent = 1;'
+new = ('\tmemset(pmove.physents, 0, sizeof(pmove.physents));\n'
+       '\tpmove.physents[0].model = cl.worldmodel;\n'
+       '\tVectorCopy (vec3_origin, pmove.physents[0].origin);\n'
+       '\tpmove.physents[0].info = 0;\n'
+       '\tpmove.numphysent = 1;')
+if 'memset(pmove.physents, 0, sizeof(pmove.physents))' not in t:
+    if old not in t:
+        raise SystemExit('failed to patch CL_SetSolidEntities physents memset')
+    t = t.replace(old, new, 1)
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30b5a. Disable other-player prediction.  CL_LinkPlayers runs client-side
+#        pmove prediction for every visible player every frame; the result
+#        is only used to nudge the rendered entity's origin.  Two MVD demos
+#        SIGSEGV inside PM_TestPlayerPosition via this path (stale model
+#        pointer in pmove.physents after mid-demo map change).  The worker
+#        never renders, so we don't need the predicted origin — use the
+#        raw state origin and skip the predict entirely.  Matches vanilla
+#        QW behaviour when cl_predict_players=0.
+python3 - "${WORKTREE_DIR}/cl_main.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old1 = 'cvar_t\tcl_predict_players = {"cl_predict_players", "1"};'
+new1 = 'cvar_t\tcl_predict_players = {"cl_predict_players", "0"};'
+if new1 not in t:
+    t = t.replace(old1, new1, 1)
+old2 = 'cvar_t\tcl_predict_players2 = {"cl_predict_players2", "1"};'
+new2 = 'cvar_t\tcl_predict_players2 = {"cl_predict_players2", "0"};'
+if new2 not in t and old2 in t:
+    t = t.replace(old2, new2, 1)
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30b5. PM_TestPlayerPosition: guard against stale model pointers in physents.
+#       Two MVD demos SIGSEGV via CL_LinkPlayers → CL_PredictUsercmd →
+#       PlayerMove → NudgePosition → PM_TestPlayerPosition, dereffing
+#       `&physents[i].model->hulls[1]` with a non-NULL but invalid pointer
+#       (likely stale after a map change eats a partial svc sequence).
+#       Skip any physent whose model->hulls[1] looks unusable for collision,
+#       same spirit as the CL_LinkPacketEntities modelindex guard.
+python3 - "${WORKTREE_DIR}/pmovetst.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old = '''\tfor (i=0 ; i< pmove.numphysent ; i++)
+\t{
+\t\tpe = &pmove.physents[i];
+\t// get the clipping hull
+\t\tif (pe->model)
+\t\t\thull = &pmove.physents[i].model->hulls[1];
+\t\telse
+\t\t{'''
+new = '''\tfor (i=0 ; i< pmove.numphysent ; i++)
+\t{
+\t\tpe = &pmove.physents[i];
+\t// get the clipping hull
+\t\tif (pe->model)
+\t\t{
+\t\t\t/* QNN headless collect: svc-tolerance can leave model_precache
+\t\t\t * entries stale after a skipped-message sequence.  Reject any
+\t\t\t * physent whose BSP hulls aren't actually populated so we don't
+\t\t\t * chase a freed hull pointer into SIGSEGV-land. */
+\t\t\thull = &pmove.physents[i].model->hulls[1];
+\t\t\tif (hull == NULL || hull->firstclipnode == 0)
+\t\t\t\tcontinue;
+\t\t}
+\t\telse
+\t\t{'''
+if 'QNN headless collect: svc-tolerance' not in t:
+    if old not in t:
+        raise SystemExit('failed to patch PM_TestPlayerPosition stale-model guard')
+    t = t.replace(old, new, 1)
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30b4. CL_ParseTEnt: unknown temp-entity type → Sys_Error.  ezQuake servers
+#       emit TE types beyond the vanilla set (chat bubbles, blood spikes,
+#       etc.).  For data collection we don't render, so swallow and skip.
+python3 - "${WORKTREE_DIR}/cl_tent.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old = '\tdefault:\n\t\tSys_Error ("CL_ParseTEnt: bad type");'
+new = ('\tdefault:\n'
+       '\t\tfprintf(stderr, "[qw-demo] CL_ParseTEnt: bad type %d — skipping\\n", type);\n'
+       '\t\treturn;')
+if '[qw-demo] CL_ParseTEnt: bad type' not in t:
+    if old not in t:
+        raise SystemExit('failed to patch CL_ParseTEnt bad-type guard')
+    t = t.replace(old, new, 1)
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30c. Tolerate unknown svc codes instead of terminating the demo.
+#      Many QWD demos from FTE/ezQuake-era servers contain extension svc
+#      codes (0x53 voicechat, 0x8d extended-entities, etc.) that vanilla
+#      QW's parser doesn't recognize.  The default case originally called
+#      Host_EndGame, wiping the entire replay.  For data-collection we
+#      instead break out of the per-message switch: the current net_message
+#      is abandoned but demo playback continues with the next one.  Trailing
+#      zero padding on MVD messages (svc_bad) is also treated as end-of-
+#      message for the same reason.
 python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
 from pathlib import Path; import sys
 p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
 old = 'Host_EndGame ("CL_ParseServerMessage: Illegible server message");'
 new = '''if (cls.mvdplayback && cmd == svc_bad)
 \t\t\t\tbreak; /* MVD trailing zeros — end of message */
-\t\t\tHost_EndGame ("CL_ParseServerMessage: Illegible svc 0x%02x at offset %d of %d", cmd, msg_readcount, net_message.cursize);'''
-if 'MVD trailing zeros' not in t:
+\t\t\t/* Extended server protocols (FTE, ezQuake) use svc codes the
+\t\t\t   vanilla QW parser doesn't know.  For data collection we'd
+\t\t\t   rather abandon this one network message than terminate the
+\t\t\t   entire demo — we can't know the extension's payload length,
+\t\t\t   so the rest of this packet is lost, but subsequent demo
+\t\t\t   packets are independent framing and remain parseable. */
+\t\t\treturn;'''
+if 'Extended server protocols' not in t:
+    t = t.replace(old, new, 1)
+p.write_text(t, errors='surrogateescape')
+PY
+
+# 30d. Treat mid-demo svc_disconnect (after successful signon) as a no-op
+#      instead of fatal Host_EndGame, so multi-session recordings don't
+#      truncate at the first inter-session boundary.  Tournament demos are
+#      commonly recorded across multiple sessions (warmup → disconnect →
+#      match → disconnect → next-map) and the demo file contains a fresh
+#      svc_serverdata after each disconnect.  The upstream client's chain
+#      (svc_disconnect → Host_EndGame → CL_Disconnect → CL_StopPlayback)
+#      closes the demofile and ends playback, which is GUI-client
+#      behavior — wrong for data collection.
+#
+#      Approach: when state == ca_active (signon completed), simply
+#      `return` from the message handler — don't change cls.state or
+#      touch the demo file.  CL_GetDemoMessage requires state >=
+#      ca_demostart so we can't drop to ca_disconnected, and CL_ClearState
+#      would free the hunk (Mod_ClearAll / Hunk_FreeToLowMark) and
+#      invalidate cl_entities / qnn_store references.  The follow-up
+#      svc_serverdata calls CL_ClearState itself when it arrives.
+#
+#      Pre-signon disconnects (state in ca_demostart / ca_connected) fall
+#      through to upstream Host_EndGame so signon failures still terminate
+#      cleanly — running the engine with a partially-initialised cl can
+#      SIGSEGV on subsequent svc messages.
+python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
+from pathlib import Path; import sys
+p = Path(sys.argv[1]); t = p.read_text(errors='surrogateescape')
+old = '''		case svc_disconnect:
+			if (cls.state == ca_connected)
+				Host_EndGame ("Server disconnected\\n"
+					"Server version may not be compatible");
+			else
+				Host_EndGame ("Server disconnected");
+			break;'''
+new = '''		case svc_disconnect:
+			/* Multi-session demo recording: the file contains a
+			   fresh svc_serverdata after each disconnect.  Reset
+			   client state but keep the demofile open so playback
+			   transitions cleanly into the next session.  Live
+			   non-demo connections still hit the upstream
+			   Host_EndGame path. */
+			if (cls.demoplayback && cls.state == ca_active)
+				return;
+			if (cls.state == ca_connected)
+				Host_EndGame ("Server disconnected\\n"
+					"Server version may not be compatible");
+			else
+				Host_EndGame ("Server disconnected");
+			break;'''
+if 'Multi-session demo recording' not in t:
     t = t.replace(old, new, 1)
 p.write_text(t, errors='surrogateescape')
 PY
@@ -1432,6 +1736,28 @@ compile_c() {
     -O2 \
     -fcommon \
     -w \
+    -DQNN_QW_BUILD \
+    -I"${WORKTREE_DIR}" \
+    -I"${ENGINE_DIR}/common" \
+    -I"${ENGINE_DIR}/qw" \
+    -c "${src}" \
+    -o "${obj}"
+  OBJECTS+=("${obj}")
+}
+
+# Same as compile_c but with implicit-function-declaration promoted to an
+# error.  Used for QNN-owned sources only — upstream Quake code predates
+# clean prototypes and needs -w to compile at all.  Catches the kind of
+# missing-prototype bug that silently broke SV_RecursiveHullCheck.
+compile_c_strict() {
+  local src="$1"
+  local obj="${OBJ_DIR}/$(basename "${src}").o"
+  cc \
+    -std=gnu89 \
+    -O2 \
+    -fcommon \
+    -w \
+    -Werror=implicit-function-declaration \
     -DQNN_QW_BUILD \
     -I"${WORKTREE_DIR}" \
     -I"${ENGINE_DIR}/common" \
@@ -1466,7 +1792,7 @@ done
 
 # Compile QW worker sources
 for source in "${QW_CUSTOM_SOURCES[@]}"; do
-  compile_c "${source}"
+  compile_c_strict "${source}"
 done
 
 # Compile shared C++ nav sources
@@ -1477,10 +1803,13 @@ for source in "${NAV_CXX_SOURCES[@]}"; do
   compile_cxx "${source}"
 done
 
-# Link
+# Link.  -rdynamic exports symbols into the dynamic table so
+# backtrace_symbols_fd() in qnn_fault.c can print function names rather
+# than raw addresses when a worker crashes.
 c++ \
   -O2 \
   -w \
+  -rdynamic \
   -o "${OUTPUT_PATH}" \
   "${OBJECTS[@]}" \
   -lm

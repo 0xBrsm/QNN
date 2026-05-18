@@ -4,3 +4,13 @@
  	Con_Printf ("Host_Error: %s\n",string);
 +	fprintf(stderr, "Host_Error: %s\n", string);
 
+@@ -503,4 +503,5 @@
+-	realtime += time;
+-
+-	if (!cls.timedemo && realtime - oldrealtime < 1.0/72.0)
+-		return false;		// framerate is too high
++	{
++		extern qboolean QNN_TickGate(qboolean, float, float, double *, double *);
++		if (!QNN_TickGate(cls.timedemo, time, 72.0, &realtime, &oldrealtime))
++			return false;
++	}

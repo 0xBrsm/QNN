@@ -53,7 +53,6 @@ class NativeProcessBase:
         executable: str | Path,
         map_id: str,
         fixed_tick_hz: int = 20,
-        resample_hz: int = 0,
         movement_threshold: float = 0.0,
         workdir: str | Path | None = None,
         env: Mapping[str, str] | None = None,
@@ -63,7 +62,6 @@ class NativeProcessBase:
         self.executable = str(executable)
         self.map_id = str(map_id)
         self.fixed_tick_hz = int(fixed_tick_hz)
-        self.resample_hz = int(resample_hz)
         self.movement_threshold = float(movement_threshold)
         self.workdir = None if workdir is None else str(workdir)
         self.env = dict(env or {})
@@ -84,8 +82,6 @@ class NativeProcessBase:
             "step_format": self._step_format,
             "training_format": self.training_format,
         }
-        if self.resample_hz > 0:
-            hello_payload["resample_hz"] = self.resample_hz
         if self.movement_threshold > 0:
             hello_payload["movement_threshold"] = int(self.movement_threshold)
         self._hello_request = self._serialize_request(hello_payload)
@@ -156,10 +152,10 @@ class NativeProcessBase:
 
     # -- Action helpers ------------------------------------------------------
 
-    # Binary step protocol: 1-byte opcode + packed action struct (48 bytes).
-    # Matches qnn_action_t layout: move[3] look[3] fire switch recall[4].
+    # Binary step protocol: 1-byte opcode + packed action struct (32 bytes).
+    # Matches qnn_action_t layout: move[3] look[3] fire switch.
     _BINARY_OP_STEP = b"\x01"
-    _ACTION_PACK_FORMAT = "<3f3f6i"  # 6 floats + 6 ints = 48 bytes
+    _ACTION_PACK_FORMAT = "<3f3f2i"  # 6 floats + 2 ints = 32 bytes
 
     def _binary_step_request(self, action: Mapping[str, object]) -> bytes:
         labels = ActionLabels.from_dict(action)
@@ -167,9 +163,7 @@ class NativeProcessBase:
             self._ACTION_PACK_FORMAT,
             float(labels.move[0]), float(labels.move[1]), float(labels.move[2]),
             float(labels.look[0]), float(labels.look[1]), float(labels.look[2]),
-            int(labels.fire), int(labels.switch),
-            int(labels.recall_0), int(labels.recall_1),
-            int(labels.recall_2), int(labels.recall_3),
+            int(labels.fire), int(labels.weapon),
         )
 
     def _action_request(self, action: Mapping[str, object], op: str = "step") -> bytes:
@@ -430,3 +424,123 @@ class NativeObsBufferAdapter:
 
     def close(self) -> None:
         self.process.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# NativeClientProcess — live network client (qnn_client_main.c)
+# ---------------------------------------------------------------------------
+
+
+class NativeClientProcess:
+    """Subprocess bridge for the live NQ client binary.
+
+    Unlike NativeObsBufferProcess (trainer/collect), the client takes the
+    server address as a positional CLI arg, connects on startup, and speaks
+    only the binary step protocol — no hello/reset/shutdown JSON.  After
+    a successful signon the worker emits one initial obs immediately so
+    the caller can run a forward pass before sending its first action;
+    subsequent obs are emitted in response to each step.
+    """
+
+    _BINARY_OP_STEP = b"\x01"
+    _ACTION_PACK_FORMAT = "<3f3f2i"
+
+    def __init__(
+        self,
+        executable: str | Path,
+        server_addr: str,
+        *,
+        env: Mapping[str, str] | None = None,
+        workdir: str | Path | None = None,
+        extra_args: Sequence[str] | None = None,
+    ) -> None:
+        self.executable = str(executable)
+        self.server_addr = str(server_addr)
+        self.env = dict(env or {})
+        self.workdir = None if workdir is None else str(workdir)
+        self.extra_args = tuple(str(a) for a in (extra_args or ()))
+        self.proc: subprocess.Popen[bytes] | None = None
+
+    def _ensure_running(self) -> subprocess.Popen[bytes]:
+        if self.proc is None or self.proc.stdin is None or self.proc.stdout is None:
+            raise NativeEngineError("Native client process is not running")
+        return self.proc
+
+    def _stderr_tail(self) -> str:
+        if self.proc is None or self.proc.stderr is None:
+            return ""
+        try:
+            return self.proc.stderr.read().decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def _read_exact(self, size: int) -> bytes:
+        proc = self._ensure_running()
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = proc.stdout.read(size - len(chunks))
+            if not chunk:
+                stderr = self._stderr_tail().strip()
+                raise NativeEngineError(
+                    f"Native client terminated: {stderr or 'incomplete obs response'}"
+                )
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def start(self) -> Dict[str, np.ndarray]:
+        """Spawn the client, wait for connect+signon, return the initial obs."""
+        if self.proc is not None:
+            raise NativeEngineError("Native client process is already running")
+
+        env = os.environ.copy()
+        env.update(self.env)
+        self.proc = subprocess.Popen(
+            [self.executable, self.server_addr, *self.extra_args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.workdir,
+            env=env,
+        )
+        raw = self._read_exact(OBS_BUFFER_SIZE)
+        return _unpack_obs_buffer(raw)
+
+    def step(self, action: Mapping[str, object]) -> Dict[str, np.ndarray]:
+        """Send one action, return the resulting obs."""
+        proc = self._ensure_running()
+        labels = ActionLabels.from_dict(action)
+        payload = self._BINARY_OP_STEP + struct.pack(
+            self._ACTION_PACK_FORMAT,
+            float(labels.move[0]), float(labels.move[1]), float(labels.move[2]),
+            float(labels.look[0]), float(labels.look[1]), float(labels.look[2]),
+            int(labels.fire), int(labels.weapon),
+        )
+        proc.stdin.write(payload)
+        proc.stdin.flush()
+        raw = self._read_exact(OBS_BUFFER_SIZE)
+        return _unpack_obs_buffer(raw)
+
+    def close(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            if self.proc.stdin is not None:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        if self.proc.stdout is not None:
+            self.proc.stdout.close()
+        if self.proc.stderr is not None:
+            self.proc.stderr.close()
+        self.proc = None
+
+    def __enter__(self) -> "NativeClientProcess":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

@@ -1,0 +1,41 @@
+# common.h — STRUCT_FROM_LINK pointer-width-safe offset + C++-safe qboolean
+#
+# 1. STRUCT_FROM_LINK: original macro subtracts an offset cast to int. That
+#    truncates on 64-bit and corrupts entity/link traversal in world collision
+#    code. Replaced with offsetof().
+#
+# 2. qboolean: the `enum {false, true}` typedef collides with C++ `bool` in the
+#    nav/oracle worker sources (compiled as C++). Use plain `int` for C++.
+#
+--- common.h
++++ common.h
+@@ -18,6 +18,8 @@
+ 
+ */
+ // comndef.h  -- general definitions
++
++#include <stddef.h>
+ 
+ #if !defined BYTE_DEFINED
+ typedef unsigned char 		byte;
+@@ -27,7 +29,11 @@
+ #undef true
+ #undef false
+
+-typedef enum {false, true}	qboolean;
++#ifdef __cplusplus
++typedef int qboolean;
++#else
++typedef enum {false, true}		qboolean;
++#endif
+
+ //============================================================================
+
+@@ -63,7 +69,7 @@
+ // (type *)STRUCT_FROM_LINK(link_t *link, type, member)
+ // ent = STRUCT_FROM_LINK(link,entity_t,order)
+ // FIXME: remove this mess!
+-#define	STRUCT_FROM_LINK(l,t,m) ((t *)((byte *)l - (int)&(((t *)0)->m)))
++#define	STRUCT_FROM_LINK(l,t,m) ((t *)((byte *)l - offsetof(t, m)))
+
+ //============================================================================

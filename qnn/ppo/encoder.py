@@ -31,8 +31,6 @@ class QuakeTransformerEncoder(Encoder):
         n_layers: int = int(getattr(cfg, "quake_n_layers", 2))
         ffn_dim: int = int(getattr(cfg, "quake_ffn_dim", 256))
         dropout: float = float(getattr(cfg, "quake_attn_dropout", 0.0))
-        readout: str = str(getattr(cfg, "quake_readout", "self") or "self")
-        action_history_tokens: int = int(getattr(cfg, "quake_action_history_tokens", 0))
 
         self.trunk = TransformerTrunk(
             obs_dim=0,
@@ -41,13 +39,18 @@ class QuakeTransformerEncoder(Encoder):
             n_layers=n_layers,
             ffn_dim=ffn_dim,
             dropout=dropout,
-            readout=readout,
-            action_history_tokens=action_history_tokens,
         )
-        self.encoder_out_size: int = d_model
+        self.use_rnn: bool = bool(getattr(cfg, "use_rnn", False))
+        self.d_model: int = d_model
+        self.encoder_out_size: int = 2 * d_model
 
     def forward(self, obs_dict):
-        return self.trunk(obs_dict)
+        import torch as _torch
+        # PPO does not use target_logits (no labels during rollout); the
+        # TargetPointer still runs inside the trunk so gradient can flow via
+        # target_feat.  Discard target_logits here.
+        self_readout, target_feat, _target_logits, _target_query = self.trunk(obs_dict)
+        return _torch.cat([self_readout, target_feat], dim=-1)
 
     def get_out_size(self) -> int:
         return self.encoder_out_size

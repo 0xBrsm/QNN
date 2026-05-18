@@ -1,5 +1,7 @@
 #include "qnn.h"
+#include "qnn_fault.h"
 #include "qnn_io.h"
+#include "qnn_tick.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -43,8 +45,6 @@ typedef struct
 	int	weapon_shots_fired[9];
 	int	prev_entity_health[MAX_EDICTS];
 	qboolean prev_entity_active[MAX_EDICTS];
-	qnn_action_t history[QNN_ACTION_HISTORY];
-	int	history_count;
 	char	episode_id[QNN_WORKER_MAX_EPISODE_ID];
 	int	training_output_mode;
 	int	step_output_mode;
@@ -72,14 +72,12 @@ static qnn_reset_options_t qnn_reset_options;
    a string name which QNN_TrainModeFromName() maps to one of these values. */
 #define QNN_TRAIN_OFF    0
 #define QNN_TRAIN_ARENA  1  /* bots get full loadout via CheatCommand */
-#define QNN_TRAIN_TARGET 2  /* bots spawn frozen so the model can practice aim */
 static cvar_t qnn_train_cvar = {"qnn_train", "0", false, false};
 
 static int QNN_TrainModeFromName(const char *name)
 {
 	if (name == NULL || name[0] == 0) return QNN_TRAIN_OFF;
 	if (!strcmp(name, "arena"))       return QNN_TRAIN_ARENA;
-	if (!strcmp(name, "target"))      return QNN_TRAIN_TARGET;
 	return QNN_TRAIN_OFF;
 }
 /* Inventory cvars: set by C worker from scenario.json, read by QuakeC PlayerPreThink. */
@@ -92,6 +90,7 @@ static cvar_t qnn_inv_armor_cvar      = {"qnn_inv_armor",      "0", false, false
 static cvar_t qnn_inv_armor_type_cvar = {"qnn_inv_armor_type", "0", false, false};
 static cvar_t qnn_inv_health_cvar     = {"qnn_inv_health",     "0", false, false};
 static cvar_t qnn_inv_powerups_cvar   = {"qnn_inv_powerups",   "0", false, false};
+static cvar_t qnn_inv_selected_cvar   = {"qnn_inv_selected",   "0", false, false};
 
 static qboolean QNN_ClientReady(void)
 {
@@ -178,6 +177,7 @@ static void QNN_ParseInventory(const char *line)
 	QNN_CvarSetFloat("qnn_inv_armor_type", 0.0f);
 	QNN_CvarSetInt("qnn_inv_health", 0);
 	QNN_CvarSetInt("qnn_inv_powerups", 0);
+	QNN_CvarSetInt("qnn_inv_selected", 0);
 
 	if (strstr(line, "\"inventory\"") == NULL)
 		return;
@@ -225,6 +225,14 @@ static void QNN_ParseInventory(const char *line)
 		}
 	}
 	QNN_CvarSetInt("qnn_inv_powerups", powerups);
+
+	/* Selected weapon: which IT_* bit the model wields at every spawn.
+	   Read by QC PutClientInServer's inv_weapons branch on every respawn. */
+	{
+		char selected[32] = {0};
+		if (QNN_JsonExtractString(line, "\"selected_weapon\"", selected, sizeof(selected)))
+			QNN_CvarSetInt("qnn_inv_selected", QNN_WeaponBit(selected));
+	}
 }
 
 static void QNN_ParseResetOptions(const char *line, qnn_reset_options_t *options)
@@ -250,6 +258,7 @@ static void QNN_ParseResetOptions(const char *line, qnn_reset_options_t *options
 
 	/* Parse inventory section and set qnn_inv_* cvars for QuakeC. */
 	QNN_ParseInventory(line);
+
 }
 
 static void QNN_AppendCommand(char *buffer, size_t buffer_size, const char *command_text)
@@ -328,18 +337,6 @@ static void QNN_RuntimeReset(void)
 	qnn_runtime.fixed_dt = 1.0f / 20.0f;
 	qnn_runtime.training_output_mode = QNN_TRAIN_OUTPUT_NONE;
 	QNN_ResetOptionsDefaults(&qnn_reset_options);
-}
-
-static void QNN_PushHistory(const qnn_action_t *action)
-{
-	if (qnn_runtime.history_count < QNN_ACTION_HISTORY)
-	{
-		qnn_runtime.history[qnn_runtime.history_count] = *action;
-		qnn_runtime.history_count += 1;
-		return;
-	}
-	qnn_runtime.history[0] = qnn_runtime.history[1];
-	qnn_runtime.history[1] = *action;
 }
 
 static void QNN_AddEvent(
@@ -545,8 +542,6 @@ static void QNN_CommitSnapshot(const qnn_snapshot_t *snapshot, const qnn_action_
 	if (snapshot->damage_weapon_id > 0)
 		qnn_runtime.last_fire_weapon_id = snapshot->damage_weapon_id;
 	QNN_CacheEntityState();
-	if (!reset_flag)
-		QNN_PushHistory(current_action);
 }
 
 static qboolean QNN_ResetWorldLocal(int seed, char *error, size_t error_size)
@@ -649,7 +644,6 @@ static qboolean QNN_ResetWorldLocal(int seed, char *error, size_t error_size)
 
 	qnn_runtime.tick = 0;
 	qnn_runtime.steps = 0;
-	qnn_runtime.history_count = 0;
 	qnn_runtime.recent_fire_steps = 0;
 	qnn_runtime.last_fire_weapon_id = 0;
 	qnn_runtime.total_damage_dealt = 0;
@@ -701,7 +695,6 @@ static void QNN_WriteObsToStdout(const qnn_snapshot_t *snapshot)
 	qnn_tick_result_t result;
 	QNN_IOEmit(snapshot, &result);
 	QNN_IOPackObsBuffer(obs, &result);
-	QNN_IOPushAction(&snapshot->action_label);
 	fwrite(obs, 1, QNN_OBS_BUFFER_SIZE, stdout);
 	fflush(stdout);
 }
@@ -763,8 +756,7 @@ static int QNN_HandleHello(const char *line)
 	if (qnn_runtime.fixed_tick_hz <= 0)
 		qnn_runtime.fixed_tick_hz = 20;
 	qnn_runtime.fixed_dt = 1.0f / (float)qnn_runtime.fixed_tick_hz;
-
-	QNN_ResampleInit(QNN_JsonExtractInt(line, "\"resample_hz\"", 0));
+	Cvar_SetValue("qnn_tick_hz", (float)qnn_runtime.fixed_tick_hz);
 
 	if (!QNN_PrepareMap(map_id, error, sizeof(error)))
 	{
@@ -802,6 +794,10 @@ static int QNN_HandleReset(const char *line)
 		return 0;
 	}
 
+	/* Tag subsequent crashes with the map name so parallel-worker
+	 * stack traces can be grouped by scenario. */
+	QNN_FaultSetContext(qnn_map_state.requested_map_id);
+
 	QNN_CaptureSnapshotLocal(&snapshot, &action, true);
 	snapshot.action_label = action;
 	QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
@@ -825,35 +821,15 @@ static int QNN_HandleStep(const char *line)
 	QNN_JsonExtractVec3(line, "\"move\"", action.move);
 	QNN_JsonExtractVec3(line, "\"look\"", action.look);
 	action.fire = QNN_JsonExtractInt(line, "\"fire\"", 0);
-	action.switch_slot = QNN_JsonExtractInt(line, "\"switch\"", 0);
-	action.recall[0] = QNN_JsonExtractInt(line, "\"recall_0\"", 0);
-	action.recall[1] = QNN_JsonExtractInt(line, "\"recall_1\"", 0);
-	action.recall[2] = QNN_JsonExtractInt(line, "\"recall_2\"", 0);
-	action.recall[3] = QNN_JsonExtractInt(line, "\"recall_3\"", 0);
+	action.weapon = QNN_JsonExtractInt(line, "\"weapon\"", 0);
 	qnn_pending_action = action;
 	QNN_TrainingResetTick();
 
 	if (!qnn_runtime.done)
 	{
-		if (qnn_resample.target_hz > 0 && qnn_resample.target_hz < qnn_runtime.fixed_tick_hz)
-		{
-			/* Run multiple engine frames per step to reach the resample interval.
-			 * The pending action is held constant across all sub-frames. */
-			int sub_frames = qnn_runtime.fixed_tick_hz / qnn_resample.target_hz;
-			int i;
-			for (i = 0; i < sub_frames && !qnn_runtime.done; i++)
-			{
-				Host_Frame(qnn_runtime.fixed_dt);
-				qnn_runtime.tick += 1;
-				qnn_runtime.steps += 1;
-			}
-		}
-		else
-		{
-			Host_Frame(qnn_runtime.fixed_dt);
-			qnn_runtime.tick += 1;
-			qnn_runtime.steps += 1;
-		}
+		Host_Frame(qnn_runtime.fixed_dt);
+		qnn_runtime.tick += 1;
+		qnn_runtime.steps += 1;
 	}
 
 	QNN_CaptureSnapshotLocal(&snapshot, &action, false);
@@ -870,6 +846,7 @@ int main(int argc, char **argv)
 	quakeparms_t parms;
 	char line[QNN_WORKER_MAX_LINE];
 
+	QNN_FaultInit("ppo_worker");
 	QNN_ResolveBasedir(qnn_basedir_storage, sizeof(qnn_basedir_storage));
 	QNN_RuntimeReset();
 	QNN_ClearAction(&qnn_pending_action);
@@ -881,6 +858,7 @@ int main(int argc, char **argv)
 	parms.membase = malloc(parms.memsize);
 	parms.basedir = basedir;
 	Host_Init(&parms);
+	QNN_TickRegister();
 	Cvar_RegisterVariable(&qnn_train_cvar);
 	Cvar_RegisterVariable(&qnn_inv_weapons_cvar);
 	Cvar_RegisterVariable(&qnn_inv_shells_cvar);
@@ -891,6 +869,7 @@ int main(int argc, char **argv)
 	Cvar_RegisterVariable(&qnn_inv_armor_type_cvar);
 	Cvar_RegisterVariable(&qnn_inv_health_cvar);
 	Cvar_RegisterVariable(&qnn_inv_powerups_cvar);
+	Cvar_RegisterVariable(&qnn_inv_selected_cvar);
 	cls.demonum = -1;
 
 	for (;;)
@@ -917,23 +896,9 @@ int main(int argc, char **argv)
 			}
 			if (!qnn_runtime.done)
 			{
-				if (qnn_resample.target_hz > 0 && qnn_resample.target_hz < qnn_runtime.fixed_tick_hz)
-				{
-					int sub_frames = qnn_runtime.fixed_tick_hz / qnn_resample.target_hz;
-					int i;
-					for (i = 0; i < sub_frames && !qnn_runtime.done; i++)
-					{
-						Host_Frame(qnn_runtime.fixed_dt);
-						qnn_runtime.tick += 1;
-						qnn_runtime.steps += 1;
-					}
-				}
-				else
-				{
-					Host_Frame(qnn_runtime.fixed_dt);
-					qnn_runtime.tick += 1;
-					qnn_runtime.steps += 1;
-				}
+				Host_Frame(qnn_runtime.fixed_dt);
+				qnn_runtime.tick += 1;
+				qnn_runtime.steps += 1;
 			}
 			{
 				qnn_snapshot_t snapshot;

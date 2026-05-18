@@ -104,6 +104,8 @@ void IN_Move(usercmd_t *cmd)
 	else if (cl.stats[STAT_HEALTH] > 0)
 		in_jump.state = 0;
 
-	if (qnn_pending_action.switch_slot > 0)
-		in_impulse = QNN_SwitchImpulseFromSlot(qnn_pending_action.switch_slot, cl.items);
+	/* weapon byte 1..8 is a Quake impulse directly (axe..lightning);
+	 * the server's QC rejects impulses for unowned weapons. */
+	if (qnn_pending_action.weapon > 0)
+		in_impulse = qnn_pending_action.weapon;
 }

@@ -7,6 +7,7 @@
  */
 
 #include "qnn_io.h"
+#include "qnn_object.h"
 
 #include <math.h>
 #include <string.h>
@@ -37,7 +38,7 @@ static float QNN_TraceLineDistance(const vec3_t start, const vec3_t end, vec3_t 
 		return QNN_VecLength(delta);
 	}
 	memset(&trace, 0, sizeof(trace));
-	SV_RecursiveHullCheck(cl.worldmodel->hulls, 0, 0, 1, (float *)start, (float *)end, &trace);
+	QNN_TraceLine(start, end, &trace);
 	VectorCopy(trace.endpos, impact);
 	VectorSubtract(trace.endpos, start, delta);
 	return QNN_VecLength(delta);

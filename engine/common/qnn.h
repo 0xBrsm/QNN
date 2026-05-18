@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "qnn_navmesh.h"
+#include "qnn_vocab.h"
 #include "quakedef.h"
 
 #ifndef QNN_ROUTE_RUNTIME_FWD
@@ -12,7 +13,6 @@
 typedef struct qnn_route_runtime_s qnn_route_runtime_t;
 #endif
 
-#define QNN_ACTION_HISTORY 2
 #define QNN_OBS_BUFFER_SIZE 4096
 #define QNN_MAX_PROPERTY_KEY 64
 #define QNN_MAX_PROPERTY_VALUE 256
@@ -42,6 +42,13 @@ typedef struct
 	float	attenuation;
 	int	entity_num;
 	char	name[QNN_MAX_SOUND_NAME];
+	/* cl.mtime[0] captured at S_StartSound — the native-frame
+	 * (~13 ms at QW 77 Hz server tick) timestamp of when the sound
+	 * multicast was sent by the server (svc_time embedded in the
+	 * containing packet).  Used by the MVD per-event fire back-shift
+	 * to compute press_phase within the current emit window and
+	 * route the fire label to the right ring slot. */
+	float	native_time;
 } qnn_sound_event_t;
 
 typedef struct
@@ -106,8 +113,9 @@ typedef struct
 	float	move[3];	/* view-relative direction: (forward, right, up) */
 	float	look[3];
 	int	fire;
-	int	switch_slot;
-	int	recall[4];
+	int	weapon;		/* raw engine weapon byte: 0 = no switch this
+				 * frame, 1..8 = Quake weapon id (axe..lightning)
+				 * consumed as an impulse by the runtime engine. */
 } qnn_action_t;
 
 typedef struct
@@ -160,29 +168,6 @@ extern qnn_action_t qnn_pending_action;
 #define QNN_BINARY_OP_STEP 0x01
 #define QNN_BINARY_ACTION_SIZE ((int)sizeof(qnn_action_t))
 
-/* ── Tick resampling gate ─────────────────────────────────────────
- * Accumulates engine frames and emits at a fixed target Hz.
- * Call QNN_ResampleInit() once, then QNN_ResampleShouldEmit()
- * every frame.  When it returns true, emit the token tick.
- * Action labels are merged across the window: fire uses OR,
- * move is a continuous wishdir inferred per emission, and
- * look/switch remain emission-to-emission labels computed by the
- * collector.
- */
-typedef struct
-{
-	int	target_hz;		/* 0 = disabled (emit every frame) */
-	float	target_dt;		/* 1.0 / target_hz */
-	float	accumulated_dt;		/* time since last emission */
-	int	fire_any;		/* OR accumulator for fire */
-} qnn_resample_state_t;
-
-extern qnn_resample_state_t qnn_resample;
-
-void QNN_ResampleInit(int target_hz);
-void QNN_ResampleAccumulate(const qnn_action_t *action, float frame_dt);
-qboolean QNN_ResampleShouldEmit(void);
-void QNN_ResampleApplyActionMerge(qnn_action_t *action);
 extern qnn_sound_event_t qnn_sound_buffer[QNN_MAX_SOUNDS];
 extern int qnn_sound_count;
 
@@ -201,8 +186,6 @@ qboolean QNN_JsonExtractVec2(const char *line, const char *key, float out[2]);
 qboolean QNN_JsonExtractVec3(const char *line, const char *key, vec3_t out);
 float QNN_LookAxisFromMouseCount(int mouse_count);
 int QNN_MouseCountFromLookAxis(float axis);
-int QNN_SwitchSlotFromWeaponId(int weapon_id);
-int QNN_SwitchImpulseFromSlot(int switch_slot, int weapons_owned);
 void QNN_WriteJsonString(FILE *out, const char *text);
 void QNN_WriteError(const char *message);
 int QNN_HandleNavQuery(const char *line);
@@ -246,6 +229,11 @@ void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot);
 void QNN_DrainSounds(qnn_snapshot_t *snapshot);
 qboolean QNN_SnapshotHasSelfWeaponFireSound(const qnn_snapshot_t *snapshot);
 qboolean QNN_SnapshotHasSelfJumpSound(const qnn_snapshot_t *snapshot);
+/* Per-sound check used by the per-event MVD fire back-shift.  See
+ * qnn_event.c — same rules as QNN_SnapshotHasSelfWeaponFireSound
+ * but on one sound so the caller can route per native_time. */
+qboolean QNN_IsSelfWeaponFireSound(const qnn_sound_event_t *sound);
+qboolean QNN_IsSelfJumpSound(const qnn_sound_event_t *sound);
 
 /* IO (qnn_io.c) — see qnn_io.h for full typed token API */
 
@@ -284,10 +272,72 @@ qboolean QNN_ActionIsFrozen(const qnn_action_t *a);
 void QNN_EmitTick(FILE *out, const uint8_t *obs, const qnn_action_t *action,
 	int tick, int steps, int tick_hz, uint16_t flags);
 
+/* LOBS (Labeler OBS): slim per-native-tick stream for labeler training /
+ * apply.  32-byte fixed-size frame, no obs buffer overhead.  Used only
+ * when qnn_runtime.labeler_mode is set; the worker writes LOBS instead
+ * of QOBS so the labeler reader is decoupled from the BC obs schema.
+ *
+ * Wire layout (little-endian, all fields contiguous):
+ *   "LOBS"            4 bytes magic
+ *   tick              u32        4
+ *   tick_hz           u32        4
+ *   flags             u16        2  (reserved, currently 0)
+ *   pos_delta_vel[3]  fp16       6  (body-frame, normalized by QNN_VELOCITY_SCALE)
+ *   movement_id       u8         1
+ *   view_delta[3]     fp16       6  (per-tick cur_forward dot anchor_basis)
+ *   c_rule_fire       u8         1  (engine-side sound+ammo fire detection)
+ *   c_rule_jump       u8         1
+ *   move_packed       u8         1  (fb | lr<<2 | ud<<4, target)
+ *   target_valid_mask u8         1  (per-axis engine-effective bits;
+ *                                    bit0=fb, bit1=lr, bit2=ud,
+ *                                    bit3=fire, bit4=weapon (held);
+ *                                    bits5..7 reserved.  See
+ *                                    src/demo/sanitize.py for the
+ *                                    rule definitions this mirrors.)
+ *   usercmd_fire      u8         1  (true press signal: cmd-window-OR'd
+ *                                    action_label.fire on QWD,
+ *                                    MVD-inferred fire on real MVD)
+ *   weapon_id         u8         1  (held-weapon byte 1..8 = axe..LG, 0
+ *                                    if no weapon held — observable
+ *                                    every alive frame from server-side
+ *                                    STAT_ACTIVEWEAPON)
+ *                              ---
+ *                              33 bytes/tick
+ */
+void QNN_EmitLabelerTick(FILE *out,
+	int tick, int tick_hz, uint16_t flags,
+	const float pos_delta_vel[3],     /* body-frame, pre-normalized */
+	int movement_id,
+	const float view_delta[3],
+	int c_rule_fire,
+	int c_rule_jump,
+	uint8_t move_packed,
+	uint8_t target_valid_mask,
+	uint8_t usercmd_fire,
+	uint8_t weapon_id);
+
 /* Shared tick-emission state for collect workers (NQ + QW).
- * Handles the two-level buffer (obs delay + jitter filter) and pushes
- * the filtered action into action history at emit time so the next
- * frame's obs has the correct T-1 action. */
+ * Handles the two-level buffer (obs delay + 3-frame jitter filter on
+ * move).  `has_prev_emitted` is a sentinel set on the first successful
+ * emit so the demo-end fallback can decide whether to inject a done-
+ * tick when the play gate skipped every frame. */
+typedef struct
+{
+	int		source_tick;
+	int		dest_tick;
+	int		sound_index;
+	int		weapon_id;
+	float		native_time;
+	float		emit_start_native;
+	float		ping_sec;
+	float		phase;
+	float		press_offset;
+	int		deterministic_offset;
+	int		route_offset;
+} qnn_fire_route_event_t;
+
+#define QNN_MAX_FIRE_ROUTE_EVENTS 32
+
 typedef struct
 {
 	uint8_t		buffered_obs[QNN_OBS_BUFFER_SIZE];
@@ -300,16 +350,40 @@ typedef struct
 	uint16_t	jitter_flags;
 	FILE		*jitter_out;
 	qboolean	has_jitter_buf;
+	qnn_fire_route_event_t jitter_fire_routes[QNN_MAX_FIRE_ROUTE_EVENTS];
+	int		jitter_fire_route_count;
 	float		prev_prev_move[3];
 	qboolean	has_prev_prev_move;
-	qnn_action_t	prev_emitted_action;
 	qboolean	has_prev_emitted;
+	int		emitted_rows;
 } qnn_tick_emit_state_t;
 
 void QNN_TickEmitReset(qnn_tick_emit_state_t *st);
 void QNN_WriteObsTick(qnn_tick_emit_state_t *st, FILE *out,
 	const qnn_snapshot_t *snapshot, int tick, int steps, int tick_hz,
 	qboolean reset_flag);
+
+/* Pack obs bytes from a snapshot without writing — exposes the
+ * QNN_IOEmit + QNN_IOPackObsBuffer combo used internally by
+ * QNN_WriteObsTick.  Callers that need to defer the emit (MVD
+ * back-shift ring buffer) pack at capture time and store bytes. */
+void QNN_PackSnapshotObs(const qnn_snapshot_t *snapshot, uint8_t *obs_out);
+
+/* Push a pre-packed obs+action through the obs/jitter pipeline.
+ * Same buffer semantics as QNN_WriteObsTick, but accepts already-
+ * packed obs bytes (so the caller can defer the call after capture
+ * without losing access to global state read by QNN_IOEmit). */
+void QNN_WriteObsTickPrepacked(qnn_tick_emit_state_t *st, FILE *out,
+	const uint8_t *obs_bytes, const qnn_action_t *action,
+	qboolean done, int tick, int steps, int tick_hz,
+	qboolean reset_flag);
+
+void QNN_WriteObsTickPrepackedWithFireRoutes(qnn_tick_emit_state_t *st,
+	FILE *out, const uint8_t *obs_bytes, const qnn_action_t *action,
+	qboolean done, int tick, int steps, int tick_hz,
+	qboolean reset_flag, const qnn_fire_route_event_t *routes,
+	int route_count);
+
 void QNN_FlushTickEmit(qnn_tick_emit_state_t *st);
 
 /* Tolerance on |look - identity| below which a look label counts as
@@ -466,12 +540,15 @@ static inline int qnn_weapon_subject_from_id(int weapon_id)
 {
 	switch (weapon_id)
 	{
-	case 1: case 2: return 4;   /* SG, SSG → SHOTGUN */
-	case 3: case 4: return 5;   /* NG, SNG → NAILGUN */
-	case 5: return 6;           /* GL → GRENADE_LAUNCHER */
-	case 6: return 7;           /* RL → ROCKET_LAUNCHER */
-	case 7: return 8;           /* LG → THUNDERBOLT */
-	default: return 0;          /* Axe → NONE */
+	case 1: return QNN_SUBJECT_AXE;
+	case 2: return QNN_SUBJECT_SHOTGUN;
+	case 3: return QNN_SUBJECT_SUPER_SHOTGUN;
+	case 4: return QNN_SUBJECT_NAILGUN;
+	case 5: return QNN_SUBJECT_SUPER_NAILGUN;
+	case 6: return QNN_SUBJECT_GRENADE_LAUNCHER;
+	case 7: return QNN_SUBJECT_ROCKET_LAUNCHER;
+	case 8: return QNN_SUBJECT_THUNDERBOLT;
+	default: return QNN_SUBJECT_NONE;
 	}
 }
 

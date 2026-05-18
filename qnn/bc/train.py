@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -12,13 +13,15 @@ import time as _time
 import numpy as np
 import torch
 
-from qnn.actions import ACTION_HEADS, DISCRETE_ACTION_HEADS
+from qnn import filter_dsl
+from qnn.bc.class_weights import fire_class_weights
 from qnn.schema import OBS_DIM
-from qnn.model.policy import QNNPolicy
+from qnn.model.policy import (
+    HEAD_LOSS_WEIGHTS,
+    QNNPolicy,
+)
 from qnn.utils.io import write_json
 from qnn.utils.repro import set_global_seed, write_experiment_manifest
-
-_DISCRETE_HEAD_NAMES = [head for head in ACTION_HEADS if head in DISCRETE_ACTION_HEADS]
 
 
 @dataclass(slots=True)
@@ -26,9 +29,9 @@ class BCConfig:
     """Behavior cloning configuration.
 
     Architecture defaults (trunk_hidden, gru_hidden, n_heads, n_layers,
-    ffn_dim, readout, action_history_tokens) must stay in sync with
-    the frozen run's ``config/model.json`` — ``build_run_bc_config()`` injects
-    those values from the run directory before training starts.
+    ffn_dim) must stay in sync with the frozen run's
+    ``config/model.json`` — ``build_run_bc_config()`` injects those
+    values from the run directory before training starts.
     """
     output_dir: str
     bc_data_dir: str
@@ -37,14 +40,10 @@ class BCConfig:
     sequence_length: int  # 0 = full episode (no chunking)
     epochs: int
     lr: float
-    patience: int
     use_gru: bool
     # --- Architecture params (authoritative source: frozen run config/model.json) ---
     gru_hidden: int
     trunk_hidden: int
-    class_weight_power: float
-    class_weight_min: float
-    class_weight_max: float
     # look smoothing is now applied during bc_collect.py, not at training time
     max_grad_norm: float  # gradient clipping for BPTT stability
     tbptt_limit: int  # max ticks before detaching gradient graph (0 = no limit)
@@ -53,20 +52,11 @@ class BCConfig:
     ffn_dim: int  # feedforward hidden dim in transformer layers (typically 4 * d_model)
     d_model: int
     attn_dropout: float
-    action_history_tokens: int  # number of recent action ticks as transformer tokens (0 = disabled)
-    readout: str  # "cls" or "self"
     # --- End architecture params ---
     fixed_tick_hz: int
     device: str
     # Per-head loss weights.  Heads not listed default to 1.0.
-    # Set recall_0..3 to 0.0 to exclude them from gradient budget.
-    head_loss_weights: str  # JSON string, e.g. '{"move":1.5,"recall_0":0.0}'
-    focal_gamma: float  # 0.0 = standard CE, >0 = focal loss for discrete heads
-    sparse_discrete: bool  # true = sparse masking for fire/jump/switch, false = use focal/CE on all ticks
-    look_deadzone: float  # >0 zeros look labels where turn magnitude < threshold; 0.0 = disabled
-    look_turn_alpha: float  # >0 upweights turning frames in look cosine loss; 0.0 = uniform
-    look_cosine: bool  # true = L2 normalize + cosine loss for look head; false = tanh + smooth L1
-    regression_stop: bool  # use regression-based stopping instead of patience
+    head_loss_weights: str  # JSON string, e.g. '{"move":1.5,"weapon":0.0}'
     regression_threshold: float  # max acceptable regression from per-head best
     regression_patience: int  # consecutive epochs above threshold before stopping
     lr_min: float  # >0 enables cosine decay from lr to lr_min over all epochs
@@ -83,22 +73,75 @@ class BCConfig:
     snapshot_interval: int     # seconds between rolling mid-epoch state snapshots (0 = disabled)
     dtype: str                 # "fp32" | "bf16" | "fp16" — autocast for forward+loss
     step_report_interval_seconds: int = 60  # wall-clock cadence for step logging (0 = every callback)
+    use_weapon_head: bool = False  # v21 dense desired-weapon selector + action-head weapon context
+    weapon_switch_confidence: float = 0.65  # live switch gate: top weapon probability threshold
+    weapon_switch_margin: float = 0.15  # live switch gate: top1-top2 probability margin
+    fire_pos_weight_override: float = 0.0  # >0 overrides the auto-computed pos_weight (neg/pos) for fire BCE loss
+    jump_pos_weight: float = 1.0  # >1.0 upweights the POS class on the move ud-axis CE
+    jump_pos_weight_end: float = -1.0  # >0 enables linear decay of jump_pos_weight from this start value to the end value across all epochs (epoch 0 = start, last epoch = end). -1.0 disables decay and holds at start.
+    target_focal_gamma: float = 0.0  # >0 applies focal modulation (1-p_t)^gamma to the target-slot CE; concentrates gradient on hard (exception) frames where slot != 0
+
+    weapon_use_gru: bool = True       # weapon_selector includes gru_flat (decisive: dropping cost f1_weapon -0.07)
+    weapon_context_from_obs: bool = True  # motor heads condition on currently-held weapon from obs (self_weapon_id) instead of softmax(weapon_logits); decouples weapon intent from motor actuation so the 1-2 frame switch lag at inference doesn't corrupt fire/look/move
+    gru_target_query: bool = False    # route GRU output (instead of self_readout) into the target attention query; planned follow-up for target commitment/hysteresis
+    hard_target_feat: bool = False    # target_feat is the entity vector at a single chosen slot (BC GT during training, argmax at eval) instead of a soft attention pool. Decouples target-head loss tuning from motor-head training distribution
+    weapon_in_target_query: bool = False  # additive currently-held weapon embed on the target attention query so target choice can condition on weapon (RL pulls distant, shotgun pulls close); independent of hard_target_feat
+    linear_slot_prior: bool = False    # additive logit prior linear in slot index on the target pointer; encodes the slot ordering (slot 0 most likely) directly so the residual only has to override when a non-slot-0 target is better
+    head_bottleneck_dim: "int | dict" = 192
+    head_use_relu: bool = True         # ReLU is the operative ingredient (confirmed via disentangle); capacity reduction alone hurts
+    head_activation: "str | None" = None  # "none" | "relu" | "gelu"; if None, derived from head_use_relu
+    # Per-frame predicate (MongoDB DSL, qnn.filter_dsl) over the
+    # stored action/obs arrays.  Each loaded episode is masked by the
+    # predicate at load time; contiguous surviving runs become discrete
+    # segments keyed by (demo_idx, episode_idx, segment_idx) so GRU
+    # state resets at each boundary.  None / empty = no masking.
+    # Example: {"act.target": {"$ne": -100}} = combat-only training.
+    segment_mask: "dict | None" = None
+    # Per-slot predicate (same MongoDB DSL) over entity token fields.
+    # Slots where the predicate evaluates to False have their entity
+    # arrays zeroed (entity_types set to -1, scalars/ids/event arrays to
+    # 0); slot positions are preserved so target labels remain valid.
+    # Target rows pointing into a zeroed slot are flipped to -100 so CE
+    # skips them.  Field paths: ``type``, ``modality``, ``pid``,
+    # ``route_idx``.  None / empty = no masking.  Equivalent to the
+    # deprecated ``--entity-filter pvs_actors`` collect flag:
+    #   {"type": 1, "pid": {"$gt": 0}, "modality": 0}
+    # (Actors never get modality 1 = PROXIMITY; SIGHT is the only
+    # PVS-visible modality for actors.)
+    token_mask: "dict | None" = None
+    # Expected collection identity (qnn.collection_fingerprint).  When
+    # non-empty, the trainer verifies the data dir's fingerprint
+    # matches before loading.  Empty = log-only mode.  See
+    # ``qnn.collection_fingerprint`` for the override env var.
+    collection_fingerprint: str = ""
 
 
 from qnn.bc.loop import MidEpochState as _MidEpochState, PrecomputedEpisode as _PrecomputedEpisode, run_epoch as _run_precomputed_supervised
 
 
 def _selection_score(metrics: Mapping[str, float]) -> float:
-    """Composite selection metric: angular look error + move MAE.
+    """Composite selection metric for combat-objective BC.
 
-    Lower is better. Fire and switch F1 are trained but kept out of the
-    selection score — their per-epoch noise masked slow look/move progress
-    and we can slice checkpoints on any metric retrospectively from the
-    per-epoch pt files anyway.
+    Lower is better. Each head contributes additively; missing metrics default
+    to a neutral value so runs with subsets of heads still produce monotonic
+    improvement signals.
     """
-    look_deg = float(metrics.get("mae_look_angle_deg", 0.0))
-    move_mae = float(metrics.get("mae_move", 0.0))
-    return look_deg + 10.0 * move_mae
+    target_error = 1.0 - float(metrics.get("acc_target", 1.0))
+    # Move: 3-axis macro-F1 (each axis macro-averages the 3 classes
+    # neg/none/pos).  Scaled by 3 to match the magnitude of the historical
+    # axis-sum-of-error form so selection scores line up with prior runs.
+    move_err = 3.0 * (1.0 - float(metrics.get("f1_move", 1.0)))
+    # Look: cos_sim ranges in [-1, 1]; convert to a "1 - cos" error in [0, 2].
+    look_err = 1.0 - float(metrics.get("cos_sim_look", 1.0))
+    # Fire: F1 ranges in [0, 1]; convert to a "1 - f1" error in [0, 1].
+    fire_f1 = float(metrics.get("f1_fire_global", metrics.get("f1_fire", 1.0)))
+    fire_err = 1.0 - fire_f1
+    # Weapon: macro-F1 across 8 classes — equal weight regardless of
+    # frequency so rare-weapon failures don't disappear into the dominant
+    # rocket-launcher class.
+    weapon_f1 = float(metrics.get("f1_weapon_global", metrics.get("f1_weapon", 1.0)))
+    weapon_err = 1.0 - weapon_f1
+    return target_error + move_err + look_err + fire_err + weapon_err
 
 
 def _train_eval_schedule(
@@ -128,10 +171,10 @@ def _train_eval_schedule(
         prev_train_proxy_sum = float(
             prev.get(
                 "train_proxy_sum",
-                float(prev.get("train_mae_move", 0.0)) + float(prev.get("train_mae_look", 0.0)),
+                1.0 - float(prev.get("train_acc_target", 0.0)),
             )
         )
-        prev_val_sum = float(prev.get("val_mae_move", 0.0)) + float(prev.get("val_mae_look", 0.0))
+        prev_val_sum = 1.0 - float(prev.get("val_acc_target", 0.0))
         val_regression = val_sum - prev_val_sum
         train_delta = train_proxy_sum - prev_train_proxy_sum
         if (
@@ -146,37 +189,24 @@ def _train_eval_schedule(
 
 
 
-# --- Action class counting ---
-
-def _init_action_counts() -> dict[str, np.ndarray]:
-    return {head: np.ones(ACTION_HEADS[head], dtype=np.float32) for head in _DISCRETE_HEAD_NAMES}
-
-
-def _accumulate_action_counts(
-    ep: _PrecomputedEpisode,
-    action_counts: dict[str, np.ndarray],
-) -> None:
-    for head in _DISCRETE_HEAD_NAMES:
-        np.add.at(action_counts[head], ep.actions[head], 1.0)
-
-
-def _class_weights_from_counts(
-    counts: Mapping[str, np.ndarray],
-    *,
-    power: float,
-    min_weight: float,
-    max_weight: float,
-) -> dict[str, np.ndarray]:
-    weights: dict[str, np.ndarray] = {}
-    for head, values in counts.items():
-        scaled = np.power(values.astype(np.float32, copy=False), -float(power)).astype(np.float32, copy=False)
-        scaled = scaled / max(float(np.mean(scaled)), 1e-8)
-        scaled = np.clip(scaled, float(min_weight), float(max_weight))
-        weights[head] = scaled.astype(np.float32, copy=False)
-    return weights
-
-
 # --- Data loading ---
+
+def _unpack_move_axes(packed: np.ndarray) -> np.ndarray:
+    """Expand the on-disk packed move byte to (T, 3) uint8 axis class indices.
+
+    The collector packs three 3-class axis indices (each in {0=neg, 1=none,
+    2=pos}) into bits 0-1 (fb), 2-3 (lr), 4-5 (ud) of a single uint8.
+    Materializes a fresh array (no longer mmap-backed) — fine because action
+    labels are tiny relative to obs.
+    """
+    arr = np.asarray(packed, dtype=np.uint8)
+    if arr.ndim != 1:
+        raise ValueError(f"expected (T,) packed move, got shape {arr.shape}")
+    fb = (arr      ) & 0x3
+    lr = (arr >> 2 ) & 0x3
+    ud = (arr >> 4 ) & 0x3
+    return np.ascontiguousarray(np.stack([fb, lr, ud], axis=-1))
+
 
 def _madvise_sequential(arr: np.ndarray) -> None:
     """Hint the kernel to read-ahead and drop pages behind the cursor.
@@ -192,45 +222,164 @@ def _madvise_sequential(arr: np.ndarray) -> None:
         mm.madvise(mmap_mod.MADV_SEQUENTIAL)
 
 
-def _load_precomputed(cache_dir: Path) -> list[_PrecomputedEpisode]:
-    """Load precomputed episodes with real memory-mapped .npy arrays."""
-    import json
-    manifest = json.loads((cache_dir / "manifest.json").read_text())
-    episodes: list[_PrecomputedEpisode] = []
-    if isinstance(manifest, dict) and manifest.get("format") == "sharded_v1":
-        for shard in manifest.get("shards", []):
-            obs_arrays = {
-                key: np.load(cache_dir / fname, mmap_mode="r")
-                for key, fname in shard["obs"].items()
-            }
-            action_arrays = {
-                head: np.load(cache_dir / fname, mmap_mode="r")
-                for head, fname in shard["actions"].items()
-            }
-            for arr in obs_arrays.values():
-                _madvise_sequential(arr)
-            for arr in action_arrays.values():
-                _madvise_sequential(arr)
-            start = 0
-            for n_samples in shard.get("episode_lengths", []):
-                end = start + int(n_samples)
-                obs = {key: values[start:end] for key, values in obs_arrays.items()}
-                actions = {head: values[start:end] for head, values in action_arrays.items()}
-                episodes.append(_PrecomputedEpisode(obs=obs, actions=actions, n_samples=int(n_samples)))
-                start = end
-        return episodes
+def _effective_head_loss_weights(raw: str) -> Dict[str, float]:
+    weights = dict(HEAD_LOSS_WEIGHTS)
+    if not raw:
+        return weights
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"head_loss_weights must be a JSON object, got {type(parsed).__name__}")
+    for head, value in parsed.items():
+        weights[str(head)] = float(value)
+    return weights
 
-    for entry in manifest:
-        obs = {key: np.load(cache_dir / fname, mmap_mode="r")
-               for key, fname in entry["obs"].items()}
-        actions = {head: np.load(cache_dir / fname, mmap_mode="r")
-                   for head, fname in entry["actions"].items()}
-        for arr in obs.values():
+
+def _require_action_files(
+    action_files: Mapping[str, str],
+    required_actions: frozenset[str],
+    *,
+    cache_dir: Path,
+) -> None:
+    missing = sorted(required_actions.difference(action_files))
+    if not missing:
+        return
+    raise RuntimeError(
+        f"{cache_dir} is missing required action arrays {missing}. "
+        "Recollect BC data on this branch before training."
+    )
+
+
+def _flatten_episode_arrays(obs: dict, actions: dict) -> dict[str, Any]:
+    """Build a flat ``field_path -> np.ndarray`` view of an episode for
+    qnn.filter_dsl predicate evaluation.
+
+    Paths mirror the on-disk layout:
+        act.<head>   →  action_arrays[head]
+        obs.<chan>   →  obs_arrays[chan]
+    """
+    flat: dict[str, Any] = {}
+    for head, arr in actions.items():
+        flat[f"act.{head}"] = arr
+    for chan, arr in obs.items():
+        flat[f"obs.{chan}"] = arr
+    return flat
+
+
+def _split_episode_on_mask(obs: dict, actions: dict,
+                            mask: np.ndarray) -> list[tuple[dict, dict, int]]:
+    """Split an episode into one ``(obs, actions, n_samples)`` tuple per
+    surviving run in ``mask``.  Runs are emitted in source-frame order
+    so the i-th run gets segment_idx = i deterministically. """
+    from qnn.bc.collect import _runs_from_mask  # local import: shared helper
+    runs = _runs_from_mask(mask)
+    out: list[tuple[dict, dict, int]] = []
+    for s, e in runs:
+        sub_obs = {k: v[s:e] for k, v in obs.items()}
+        sub_act = {k: v[s:e] for k, v in actions.items()}
+        out.append((sub_obs, sub_act, int(e - s)))
+    return out
+
+
+def _load_precomputed(
+    cache_dir: Path,
+    *,
+    required_actions: frozenset[str] = frozenset(),
+    segment_mask: dict | None = None,
+    token_mask: dict | None = None,
+) -> list[_PrecomputedEpisode]:
+    """Load precomputed episodes with real memory-mapped .npy arrays.
+
+    Episodes are returned sorted globally by ``(demo_idx, episode_idx,
+    segment_idx)``.  ``demo_idx`` is the position of each demo in the
+    collector's canonical sorted demo list; ``episode_idx`` is the
+    0-based ordinal of each surviving run when the collector segmented
+    the demo on the filter config's ``drop_tick_labels`` mask;
+    ``segment_idx`` is the 0-based ordinal of each surviving run inside
+    that episode after applying the train-time ``segment_mask``
+    predicate (or 0 if no mask is set).  This makes training-time
+    shuffle a pure function of the seed, the dataset, and the mask —
+    independent of which worker finished first during collection.
+
+    Shards without ``demo_idxs`` fall back to load order; shards
+    without ``episode_idxs`` default to a single episode_idx=0 per
+    episode.  No ``segment_mask`` keeps each episode as one
+    ``segment_idx=0`` trajectory (today's behavior). """
+    manifest = json.loads((cache_dir / "manifest.json").read_text())
+    if not isinstance(manifest, dict) or manifest.get("format") != "sharded_v1":
+        raise RuntimeError(
+            f"{cache_dir}/manifest.json: expected sharded_v1 format. "
+            "Recollect BC data with the current collector."
+        )
+
+    indexed: list[tuple[tuple[int, int, int], _PrecomputedEpisode]] = []
+    fallback_idx = 0
+    for shard in manifest.get("shards", []):
+        _require_action_files(shard["actions"], required_actions, cache_dir=cache_dir)
+        obs_arrays = {
+            key: np.load(cache_dir / fname, mmap_mode="r")
+            for key, fname in shard["obs"].items()
+        }
+        action_arrays = {
+            head: np.load(cache_dir / fname, mmap_mode="r")
+            for head, fname in shard["actions"].items()
+        }
+        # Unpack the bit-packed move byte to (T, 6) once per shard so
+        # per-episode slices below produce (n_samples, 6) views directly.
+        if "move" in action_arrays:
+            action_arrays["move"] = _unpack_move_axes(action_arrays["move"])
+        for arr in obs_arrays.values():
             _madvise_sequential(arr)
-        for arr in actions.values():
-            _madvise_sequential(arr)
-        episodes.append(_PrecomputedEpisode(obs=obs, actions=actions, n_samples=entry["n_samples"]))
-    return episodes
+        for arr in action_arrays.values():
+            if isinstance(arr, np.memmap):
+                _madvise_sequential(arr)
+        episode_lengths = shard.get("episode_lengths", [])
+        demo_idxs = shard.get("demo_idxs")
+        if demo_idxs is None or len(demo_idxs) != len(episode_lengths):
+            demo_idxs = list(range(fallback_idx, fallback_idx + len(episode_lengths)))
+        fallback_idx += len(episode_lengths)
+        episode_idxs = shard.get("episode_idxs")
+        if episode_idxs is None or len(episode_idxs) != len(episode_lengths):
+            episode_idxs = [0] * len(episode_lengths)
+        start = 0
+        for n_samples, demo_idx, episode_idx in zip(
+                episode_lengths, demo_idxs, episode_idxs):
+            end = start + int(n_samples)
+            obs = {key: values[start:end] for key, values in obs_arrays.items()}
+            actions = {head: values[start:end] for head, values in action_arrays.items()}
+            if token_mask:
+                from qnn.bc.token_filter import apply_token_mask, clear_targets_on_masked_slots
+                obs = apply_token_mask(obs, token_mask)
+                if "target" in actions:
+                    actions["target"] = clear_targets_on_masked_slots(
+                        actions["target"], obs,
+                    )
+            if segment_mask:
+                flat = _flatten_episode_arrays(obs, actions)
+                mask = np.asarray(filter_dsl.eval_filter(flat, segment_mask), dtype=bool)
+                runs = _split_episode_on_mask(obs, actions, mask)
+                for segment_idx, (sub_obs, sub_act, n) in enumerate(runs):
+                    indexed.append((
+                        (int(demo_idx), int(episode_idx), int(segment_idx)),
+                        _PrecomputedEpisode(
+                            obs=sub_obs,
+                            actions=sub_act,
+                            n_samples=n,
+                            sort_key=(int(demo_idx), int(episode_idx), int(segment_idx)),
+                        ),
+                    ))
+            else:
+                indexed.append((
+                    (int(demo_idx), int(episode_idx), 0),
+                    _PrecomputedEpisode(
+                        obs=obs,
+                        actions=actions,
+                        n_samples=int(n_samples),
+                        sort_key=(int(demo_idx), int(episode_idx), 0),
+                    ),
+                ))
+            start = end
+    indexed.sort(key=lambda item: item[0])
+    return [ep for _, ep in indexed]
 
 
 
@@ -239,9 +388,9 @@ def _load_precomputed(cache_dir: Path) -> list[_PrecomputedEpisode]:
 # ---------------------------------------------------------------------------
 
 _PROM_METRICS_TO_PUSH = (
-    "val_mae_move", "val_mae_look", "val_mae_move_forward", "val_mae_move_strafe",
-    "val_mae_look_yaw", "val_mae_look_pitch", "train_loss", "val_loss",
-    "train_mae_move", "train_mae_look",
+    "val_acc_target",
+    "train_acc_target",
+    "train_loss", "val_loss",
 )
 
 
@@ -329,28 +478,49 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     if not train_cache.exists():
         raise RuntimeError(f"BC training data not found at {train_cache}. Run python -m qnn.bc.collect first.")
 
+    # Verify the dataset identity matches what the run expects.  When
+    # config.collection_fingerprint is set the check is strict (raises
+    # FingerprintMismatch); otherwise the current fingerprint is just
+    # logged + stamped into bc_summary for audit.
+    from qnn import collection_fingerprint
+    expected_fp = config.collection_fingerprint or None
+    actual_fp = collection_fingerprint.verify(
+        expected_fingerprint=expected_fp,
+        data_dir=bc_data_dir,
+    )
+    if actual_fp is not None:
+        print(f"  [bc] collection fingerprint: {actual_fp['fingerprint']}")
+    elif expected_fp is None:
+        print(f"  [bc] collection fingerprint: (absent — pre-fingerprint collection)")
+
+    head_loss_weights = _effective_head_loss_weights(config.head_loss_weights)
+    required_actions_set: set[str] = set()
+    if head_loss_weights.get("target", 1.0) > 0.0:
+        required_actions_set.add("target")
+    if config.use_weapon_head and head_loss_weights.get("weapon", 1.0) > 0.0:
+        required_actions_set.add("weapon")
+    required_actions = frozenset(required_actions_set)
+
     print(f"  [bc] Loading training data: {train_cache}")
-    train_episodes = _load_precomputed(train_cache)
-    val_episodes = _load_precomputed(val_cache) if val_cache.exists() else []
+    if config.segment_mask:
+        print(f"  [bc] segment_mask: {config.segment_mask}")
+    if config.token_mask:
+        print(f"  [bc] token_mask: {config.token_mask}")
+    train_episodes = _load_precomputed(
+        train_cache, required_actions=required_actions,
+        segment_mask=config.segment_mask,
+        token_mask=config.token_mask,
+    )
+    val_episodes = _load_precomputed(
+        val_cache, required_actions=required_actions,
+        segment_mask=config.segment_mask,
+        token_mask=config.token_mask,
+    ) if val_cache.exists() else []
 
     sample_counts = {
         "train": sum(ep.n_samples for ep in train_episodes),
         "val": sum(ep.n_samples for ep in val_episodes),
     }
-
-    # Accumulate action class counts
-    import json as _json_counts
-    counts_cache = train_cache / "class_counts.json"
-    if counts_cache.exists():
-        print(f"  [bc] Loading cached class counts: {counts_cache}")
-        _raw = _json_counts.loads(counts_cache.read_text())
-        class_counts = {h: np.array(v, dtype=np.float32) for h, v in _raw.items()}
-    else:
-        class_counts = _init_action_counts()
-        for ep in train_episodes:
-            _accumulate_action_counts(ep, class_counts)
-        counts_cache.write_text(_json_counts.dumps({h: v.tolist() for h, v in class_counts.items()}))
-        print(f"  [bc] Cached class counts: {counts_cache}")
 
     if sample_counts["train"] <= 0:
         raise RuntimeError("No training samples available")
@@ -376,32 +546,36 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             n_layers=config.n_layers,
             ffn_dim=config.ffn_dim,
             attn_dropout=config.attn_dropout,
-            action_history_tokens=config.action_history_tokens,
-            readout=config.readout,
+            use_weapon_head=config.use_weapon_head,
+            weapon_switch_confidence=config.weapon_switch_confidence,
+            weapon_switch_margin=config.weapon_switch_margin,
+            jump_pos_weight=config.jump_pos_weight,
+            target_focal_gamma=config.target_focal_gamma,
+            weapon_use_gru=config.weapon_use_gru,
+            weapon_context_from_obs=config.weapon_context_from_obs,
+            gru_target_query=config.gru_target_query,
+            hard_target_feat=config.hard_target_feat,
+            weapon_in_target_query=config.weapon_in_target_query,
+            linear_slot_prior=config.linear_slot_prior,
+            head_bottleneck_dim=config.head_bottleneck_dim,
+            head_use_relu=config.head_use_relu,
+            head_activation=config.head_activation,
         )
-    # look_cosine is a training behavior, not an architecture param.
-    # Always honor the run config, not the checkpoint metadata.
-    model.look_cosine = bool(config.look_cosine)
 
-    weights = {
-        head: torch.as_tensor(values, dtype=torch.float32, device=model.device)
-        for head, values in _class_weights_from_counts(
-            class_counts,
-            power=config.class_weight_power,
-            min_weight=config.class_weight_min,
-            max_weight=config.class_weight_max,
-        ).items()
-    }
+    weights = fire_class_weights(
+        train_episodes,
+        head_loss_weights=head_loss_weights,
+        override=float(config.fire_pos_weight_override),
+        device=model.device,
+    )
 
     # Parse per-head loss weights from JSON string if provided.
-    import json as _json
     hlw: Dict[str, float] | None = None
     if config.head_loss_weights:
-        hlw = _json.loads(config.head_loss_weights)
+        hlw = dict(head_loss_weights)
 
     best_val_loss = float("inf")
     best_epoch = -1
-    epochs_without_improvement = 0
     history: list[Dict[str, float]] = []
     start_epoch = 0
 
@@ -439,16 +613,19 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
     checkpoint_path = output / "bc_training_checkpoint.pt"
     if checkpoint_path.exists():
         import torch as _torch_resume
-        from qnn.utils.checkpoint_converter import migrate_modality_embed
+        from qnn.utils.checkpoint_converter import migrate_entity_embed, migrate_self_scalars
         ckpt = _torch_resume.load(checkpoint_path, map_location=model.device, weights_only=False)
-        migrate_modality_embed(
+        migrate_entity_embed(
+            ckpt["model_state_dict"],
+            optimizer=ckpt.get("optimizer_state_dict"),
+        )
+        migrate_self_scalars(
             ckpt["model_state_dict"],
             optimizer=ckpt.get("optimizer_state_dict"),
         )
         model.model.load_state_dict(ckpt["model_state_dict"])
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         best_epoch = ckpt.get("best_epoch", -1)
-        epochs_without_improvement = ckpt.get("epochs_without_improvement", 0)
         history = ckpt.get("history", [])
         start_epoch = ckpt.get("epoch", 0) + 1
         _best_move = ckpt.get("_best_move", float("inf"))
@@ -481,7 +658,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
                 rng.bit_generator.state = _mid_ckpt["rng_state"]
                 print(f"  [bc] Mid-epoch resume: epoch {start_epoch}, "
                       f"step {_mid_epoch_resume.opt_steps}, "
-                      f"episode {_mid_epoch_resume.next_episode}")
+                      f"chunk {_mid_epoch_resume.next_episode}")
             else:
                 mid_epoch_path.unlink()
         except Exception as exc:
@@ -545,6 +722,16 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         _gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # Optional linear decay of the ud-axis pos_weight across epochs.
+        # Lets us start with high pos_weight (push recall hard while the head
+        # is randomly initialized) and end with low pos_weight (let precision
+        # recover as the head calibrates).  -1.0 sentinel disables decay.
+        if config.jump_pos_weight_end > 0 and config.epochs > 1:
+            alpha = float(epoch) / float(config.epochs - 1)
+            current_pw = (1.0 - alpha) * float(config.jump_pos_weight) + alpha * float(config.jump_pos_weight_end)
+            model.jump_pos_weight = current_pw
+            print(f"  [bc] jump_pos_weight (decay): epoch {epoch}/{config.epochs - 1}  alpha={alpha:.3f}  pw={current_pw:.3f}")
         # Snapshot weights at the start of this epoch so we can compute
         # L2 drift from the end-of-last-epoch state as a "is the model still
         # actively changing?" signal.
@@ -591,10 +778,6 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             max_grad_norm=config.max_grad_norm,
             tbptt_limit=config.tbptt_limit,
             head_loss_weights=hlw,
-            focal_gamma=config.focal_gamma,
-            sparse_discrete=config.sparse_discrete,
-            look_deadzone=config.look_deadzone,
-            look_turn_alpha=config.look_turn_alpha,
             step_callback=_on_step,
             report_every=_report_every,
             report_interval_seconds=float(_step_report_interval),
@@ -622,10 +805,6 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             sequence_length=config.sequence_length,
             tbptt_limit=config.tbptt_limit,
             head_loss_weights=hlw,
-            focal_gamma=config.focal_gamma,
-            sparse_discrete=config.sparse_discrete,
-            look_deadzone=config.look_deadzone,
-            look_turn_alpha=config.look_turn_alpha,
             pin_memory=config.pin_memory,
             prefetch=config.prefetch,
             microbatch_size=config.microbatch_size,
@@ -656,10 +835,6 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
                 sequence_length=config.sequence_length,
                 tbptt_limit=config.tbptt_limit,
                 head_loss_weights=hlw,
-                focal_gamma=config.focal_gamma,
-                sparse_discrete=config.sparse_discrete,
-                look_deadzone=config.look_deadzone,
-                look_turn_alpha=config.look_turn_alpha,
                 pin_memory=config.pin_memory,
                 prefetch=config.prefetch,
             )
@@ -669,6 +844,12 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         _train_secs = _t_train_end - _t_train_start
         _val_only_secs = _t_val_only_end - _t_val_start
         _val_secs = _t_val_end - _t_val_start
+        train_rows = float(train_metrics.get("n_rows", sample_counts["train"]))
+        val_rows = float(val_metrics.get("n_rows", sample_counts["val"]))
+        train_eval_rows = float(train_eval_metrics.get("n_rows", 0.0)) if train_eval_ran else 0.0
+        train_rows_per_sec = train_rows / _train_secs if _train_secs > 0 else 0.0
+        val_rows_per_sec = val_rows / _val_only_secs if _val_only_secs > 0 else 0.0
+        train_eval_rows_per_sec = train_eval_rows / _train_eval_secs if _train_eval_secs > 0 else 0.0
         _wall_clock = _datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         if train_eval_ran:
             print(
@@ -677,22 +858,22 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             )
         else:
             print(f"  [bc] timing: train={_train_secs:.1f}s  val={_val_only_secs:.1f}s  total={_train_secs + _val_secs:.1f}s  [{_wall_clock}]")
+        # Headline per-head summary: one number per head (F1 where the
+        # class imbalance makes accuracy misleading), plus per-axis move F1
+        # so axis-specific regressions surface in the log.
+        _headline_keys = (
+            "acc_target",
+            "f1_move", "f1_move_fb", "f1_move_lr", "f1_move_ud",
+            "cos_sim_look",
+            "f1_fire",
+            "f1_weapon",
+        )
         mae_str = "  ".join(
-            f"{k}={v:.4f}" for k, v in sorted(val_metrics.items()) if k.startswith("mae_")
+            f"{k}={float(val_metrics[k]):.4f}"
+            for k in _headline_keys if k in val_metrics
         )
 
-        # Surface discrete head tp/fp/fn in the epoch log line.
-        _discrete_parts = []
-        for _dh in _DISCRETE_HEAD_NAMES:
-            _tp = float(val_metrics.get(f"tp_{_dh}", 0))
-            _fp = float(val_metrics.get(f"fp_{_dh}", 0))
-            _fn = float(val_metrics.get(f"fn_{_dh}", 0))
-            _hlw_val = hlw.get(_dh, 1.0) if hlw else 1.0
-            if _hlw_val > 0 and (_tp + _fp + _fn) > 0:
-                _discrete_parts.append(f"{_dh}:tp={_tp:.0f}/fp={_fp:.0f}/fn={_fn:.0f}")
-        _discrete_str = "  ".join(_discrete_parts)
-
-        # Composite selection: angular look + move MAE + fire F1.
+        # Composite selection: target acc + move/fire/weapon macro-F1 + look cos.
         val_selection_score = _selection_score(val_metrics)
         selection_metric = val_selection_score
         improved = selection_metric < best_val_loss
@@ -730,10 +911,8 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
                 f"grad_max={_grad_max:.3f}  "
             )
         epoch_line += f"drift={_weight_drift_l2:.3f}  "
-        epoch_line += (
-            f"{mae_str}"
-            f"{'  ' + _discrete_str if _discrete_str else ''}"
-        )
+        epoch_line += f"train_rps={train_rows_per_sec:.1f}  val_rps={val_rows_per_sec:.1f}  "
+        epoch_line += mae_str
         print(epoch_line)
 
         # Assemble and record per-epoch metrics.
@@ -748,6 +927,12 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             "train_proxy_gap": train_proxy_gap,
             "train_eval_ran": train_eval_ran,
             "train_eval_reason": ",".join(train_eval_reasons),
+            "train_rows": train_rows,
+            "val_rows": val_rows,
+            "train_eval_rows": train_eval_rows,
+            "effective_train_rows_per_sec": train_rows_per_sec,
+            "effective_val_rows_per_sec": val_rows_per_sec,
+            "effective_train_eval_rows_per_sec": train_eval_rows_per_sec,
         }
         epoch_metrics["weight_drift_l2"] = _weight_drift_l2
 
@@ -773,7 +958,7 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         # Epoch sentinel: external watchers can poll this file to detect
         # epoch completion across any training mode (BC, PPO, etc.).
         (output / "epoch_done").write_text(
-            _json.dumps({"epoch": epoch, "wall_clock": _wall_clock, "mode": "bc"}) + "\n"
+            json.dumps({"epoch": epoch, "wall_clock": _wall_clock, "mode": "bc"}) + "\n"
         )
 
         # Push metrics to Prometheus pushgateway (no-op when URL is empty).
@@ -786,37 +971,28 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
                 config=config,
             )
 
-        if config.regression_stop:
-            # Regression-based stopping: track per-head bests and regression.
-            val_move = val_metrics.get("mae_move", float("inf"))
-            val_look = val_metrics.get("mae_look", float("inf"))
-            _best_move = min(_best_move, val_move)
-            _best_look = min(_best_look, val_look)
-            move_reg = val_move - _best_move
-            look_reg = val_look - _best_look
+        # Regression-based stopping: track per-head bests and regression.
+        val_move = val_metrics.get("mae_move", float("inf"))
+        val_look = val_metrics.get("mae_look", float("inf"))
+        _best_move = min(_best_move, val_move)
+        _best_look = min(_best_look, val_look)
+        move_reg = val_move - _best_move
+        look_reg = val_look - _best_look
 
-            # Checkpoint selection: best val MAE sum (same as non-regression mode).
-            # Regression gate is purely for stopping, not model selection.
-            if selection_metric < best_val_loss:
-                best_val_loss = selection_metric
-                best_epoch = epoch
-                model.save(output / "bc_best_model.pth")
+        # Checkpoint selection: best val MAE sum.  Regression gate is purely
+        # for stopping, not model selection.
+        if selection_metric < best_val_loss:
+            best_val_loss = selection_metric
+            best_epoch = epoch
+            model.save(output / "bc_best_model.pth")
 
-            if move_reg > config.regression_threshold or look_reg > config.regression_threshold:
-                _reg_violations += 1
-            else:
-                _reg_violations = 0
-
-            print(f"  [bc]   regression: move={move_reg:+.4f} look={look_reg:+.4f} "
-                  f"violations={_reg_violations}/{config.regression_patience}")
+        if move_reg > config.regression_threshold or look_reg > config.regression_threshold:
+            _reg_violations += 1
         else:
-            if improved:
-                best_val_loss = selection_metric
-                best_epoch = epoch
-                epochs_without_improvement = 0
-                model.save(output / "bc_best_model.pth")
-            else:
-                epochs_without_improvement += 1
+            _reg_violations = 0
+
+        print(f"  [bc]   regression: move={move_reg:+.4f} look={look_reg:+.4f} "
+              f"violations={_reg_violations}/{config.regression_patience}")
 
         # Save resumable checkpoint every epoch (latest + epoch-stamped).
         bc_opt = model._optimizers.get("bc")
@@ -829,7 +1005,6 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             "optimizer_state_dict": bc_opt.state_dict() if bc_opt else None,
             "best_val_loss": best_val_loss,
             "best_epoch": best_epoch,
-            "epochs_without_improvement": epochs_without_improvement,
             "history": history,
             "_best_move": _best_move,
             "_best_look": _best_look,
@@ -860,19 +1035,15 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
             except Exception as exc:
                 print(f"  [bc] NAS archive failed: {exc}")
 
-        if config.regression_stop:
-            if _reg_violations >= config.regression_patience:
-                print(f"  [bc] Regression stop: {config.regression_patience} consecutive epochs "
-                      f"above threshold {config.regression_threshold}. Best epoch: {best_epoch + 1}")
-                break
-        elif epochs_without_improvement >= config.patience:
+        if _reg_violations >= config.regression_patience:
+            print(f"  [bc] Regression stop: {config.regression_patience} consecutive epochs "
+                  f"above threshold {config.regression_threshold}. Best epoch: {best_epoch + 1}")
             break
 
     if best_epoch < 0:
         model.save(output / "bc_best_model.pth")
 
     final_model = QNNPolicy.load(output / "bc_best_model.pth", device=config.device)
-    final_model.look_cosine = bool(config.look_cosine)
 
     final_val_metrics = _run_precomputed_supervised(
         final_model,
@@ -880,8 +1051,6 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         batch_size=config.batch_size,
         sequence_length=config.sequence_length,
         tbptt_limit=config.tbptt_limit,
-        focal_gamma=config.focal_gamma,
-        sparse_discrete=config.sparse_discrete,
         pin_memory=config.pin_memory,
         prefetch=config.prefetch,
     ) if val_episodes else {"loss": 0.0}
@@ -894,6 +1063,20 @@ def run_behavior_cloning(config: BCConfig, seed_checkpoint: str = "") -> Dict[st
         "num_val_samples": int(sample_counts["val"]),
         "epochs_ran": len(history),
     }
+    if history:
+        last = history[-1]
+        for key in (
+            "effective_train_rows_per_sec",
+            "effective_val_rows_per_sec",
+            "effective_train_eval_rows_per_sec",
+            "train_rows",
+            "val_rows",
+            "train_eval_rows",
+        ):
+            if key in last:
+                summary[f"final_{key}"] = float(last[key])
+    if actual_fp is not None:
+        summary["collection_fingerprint"] = actual_fp["fingerprint"]
     for key, value in final_val_metrics.items():
         if key == "_next_hidden":
             continue
@@ -933,8 +1116,72 @@ def run(ctx: "RunnerContext") -> dict[str, object]:
     seed_checkpoint = str(ctx.run_cfg.get("checkpoint_path", ""))
     started = _time.monotonic()
     valid_keys = {f.name for f in _dc.fields(BCConfig)}
-    filtered_cfg = {k: v for k, v in bc_cfg.items() if k in valid_keys}
-    results["bc"] = run_behavior_cloning(BCConfig(**filtered_cfg), seed_checkpoint=seed_checkpoint)
+    unknown = sorted(set(bc_cfg) - valid_keys)
+    if unknown:
+        raise RuntimeError(
+            f"BC config has {len(unknown)} unknown key(s) (typo or removed feature): {unknown}. "
+            "Either remove them from the run's train.json/model.json or add them to BCConfig."
+        )
+    results["bc"] = run_behavior_cloning(BCConfig(**bc_cfg), seed_checkpoint=seed_checkpoint)
     stage_timings["bc"] = _time.monotonic() - started
     results["stage_timings"] = stage_timings
     return finalize_results(ctx, results, stage_timings)
+
+
+# ── Standalone eval entry point ────────────────────────────────────────────────
+# python -m qnn.bc.train --eval-only --run-dir runs/bc/<name> [--data-dir ...]
+
+def _eval_only(run_dir: Path, data_dir: Path | None, device: str, batch_size: int) -> None:
+    import json as _json
+    checkpoint = run_dir / "checkpoints" / "bc_best_model.pth"
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"No best-model checkpoint at {checkpoint}")
+
+    if data_dir is None:
+        machine_cfg = _json.loads((run_dir / "config" / "machine.json").read_text())
+        data_dir = Path(machine_cfg["bc_data_dir"])
+
+    val_cache = data_dir / "precomputed_val"
+    if not val_cache.exists():
+        raise FileNotFoundError(f"Val cache not found: {val_cache}")
+
+    train_cfg = _json.loads((run_dir / "config" / "train.json").read_text())
+    tbptt = int(train_cfg.get("tbptt_limit", 256))
+
+    print(f"  checkpoint : {checkpoint}")
+    print(f"  val data   : {val_cache}")
+    print(f"  device     : {device}  batch_size: {batch_size}  tbptt: {tbptt}")
+
+    model = QNNPolicy.load(str(checkpoint), device=device)
+    model.model.eval()
+
+    val_episodes = _load_precomputed(val_cache)
+    print(f"  val episodes: {len(val_episodes)}")
+
+    metrics = _run_precomputed_supervised(
+        model,
+        val_episodes,
+        batch_size=batch_size,
+        sequence_length=0,
+        tbptt_limit=tbptt,
+        pin_memory=False,
+        prefetch=0,
+    )
+
+    print("\n--- val metrics ---")
+    for k, v in sorted(metrics.items()):
+        if k == "_next_hidden":
+            continue
+        print(f"  {k:<30s}  {v:.6f}")
+
+
+if __name__ == "__main__":
+    import argparse as _argparse
+    _ap = _argparse.ArgumentParser(description="Evaluate a BC best-model checkpoint on the val set.")
+    _ap.add_argument("--eval-only", action="store_true", required=True)
+    _ap.add_argument("--run-dir", type=Path, required=True, help="Run directory (contains config/ and checkpoints/)")
+    _ap.add_argument("--data-dir", type=Path, default=None, help="Override bc_data_dir from machine.json")
+    _ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    _ap.add_argument("--batch-size", type=int, default=256)
+    _args = _ap.parse_args()
+    _eval_only(_args.run_dir, _args.data_dir, _args.device, _args.batch_size)

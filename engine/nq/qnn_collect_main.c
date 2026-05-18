@@ -1,81 +1,16 @@
 #include "qnn.h"
+#include "qnn_collect_helpers.h"
+#include "qnn_fault.h"
 #include "qnn_io.h"
 #include "qnn_store.h"
 #include "qnn_metrics.h"
+#include "qnn_watchdog.h"
+#include "qnn_tick.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-#define QNN_WORKER_PROTOCOL "v6"
 #define QNN_WORKER_SERVER_NAME "quake-demo-worker"
-#define QNN_WORKER_UPSTREAM_COMMIT "bf4ac424ce754894ac8f1dae6a3981954bc9852d"
-#define QNN_WORKER_MAX_LINE 8192
-#define QNN_WORKER_MAX_COMMAND_TEXT 1024
-
-/* ── Match state — defined in common/qnn_match.c ───────────────── */
-extern int qnn_match_state;
-extern const char *qnn_match_log_tag;
-
-/* Per-native-frame buffers for entity interaction (movers, players). */
-#define QNN_MAX_NATIVE_FRAMES 16
-
-/* trigger_push: max tracked push triggers. */
-#define QNN_MAX_PUSH_TRIGGERS 8
-
-/* Emission-level frame filters. */
-#define QNN_GOD_MODE_HEALTH     250
-#define QNN_DEAD_MAX_EMIT       20   /* 1 s at 20 Hz */
-#define QNN_FROZEN_MAX_EMIT     40   /* 2 s at 20 Hz */
-
-typedef struct
-{
-	int	fixed_tick_hz;
-	float	fixed_dt;
-	int	resample_hz;	/* requested resample target; 0 = use detected rate */
-	int	tick;
-	int	steps;
-	qboolean has_reset;
-	qboolean done;
-	vec3_t	prev_origin;
-	vec3_t	prev_velocity;	/* reconstructed from position deltas */
-	int	prev_ammo;
-	qboolean has_prev;
-	vec3_t	emit_view_angles;
-	vec3_t	emit_origin;
-	vec3_t	emit_velocity;
-	qboolean emit_grounded;
-	int	emit_waterlevel;
-	int	emit_weapon_id;
-	qboolean has_emit_anchor;
-	int	native_frame_count;
-	qboolean phys_grounded;
-	/* Mover tracking for per-frame entity interaction. */
-	int	mover_entity_nums[QNN_MAX_PHYS_MOVERS];
-	int	mover_model_indices[QNN_MAX_PHYS_MOVERS];
-	int	mover_count;
-	vec3_t	mover_emit_origins[QNN_MAX_PHYS_MOVERS];
-	vec3_t	mover_origins[QNN_MAX_NATIVE_FRAMES][QNN_MAX_PHYS_MOVERS];
-	/* Other player positions per native frame for body-block collision. */
-	vec3_t	player_origins[QNN_MAX_NATIVE_FRAMES][QNN_MAX_PHYS_PLAYERS];
-	int	player_entity_nums[QNN_MAX_PHYS_PLAYERS];
-	int	player_count;
-	/* trigger_push tracking. */
-	int	push_model_indices[QNN_MAX_PUSH_TRIGGERS];
-	vec3_t	push_velocities[QNN_MAX_PUSH_TRIGGERS]; /* speed * direction */
-	int	push_count;
-	float	prev_move[3];	/* last inferred move — carried forward for zero-frame emissions */
-	int	prev_fwd_sign;	/* last candidate forward sign for continuity bias */
-	int	prev_strafe_sign;
-	FILE	*store_dump;	/* NULL = no dump, set from QNN_STORE_DUMP env var */
-	/* Buffered obs for one-tick delay: we emit obs(t) paired with
-	   the action computed at t+1 (the transition FROM state t). */
-	qnn_tick_emit_state_t tick_emit;
-	/* Frame filter counters (emission-rate) */
-	int	dead_emit_count;
-	int	frozen_emit_count;
-} qnn_runtime_t;
-
-static qnn_runtime_t qnn_runtime;
 
 /* Build mover/push/player refs into the runtime via shared scanners
  * in common/qnn_collect_helpers.c. */
@@ -134,21 +69,24 @@ static void QNN_InferEmitAction(qnn_action_t *action, const qnn_snapshot_t *snap
 		action->look[2] = DotProduct(cur_forward, up);
 	}
 
-	if (snapshot->weapon_id != qnn_runtime.emit_weapon_id && snapshot->weapon_id > 0)
-		action->switch_slot = QNN_SwitchSlotFromWeaponId(snapshot->weapon_id);
+	if (snapshot->weapon_id > 0)
+		action->weapon = snapshot->weapon_id;
+	action->fire = qnn_runtime.native_fire_this_window ? 1 : 0;
 }
 
-/* Per-native-frame: infer fire from sound/ammo cues. */
+/* Per-native-frame: infer fire from sound/ammo cues.  Shared with the
+ * QW MVD path via qnn_collect_helpers — see QNN_DetectFireEvent.
+ * Jump is set per-emit from QNN_SnapshotHasSelfJumpSound in QNN_SnapMove
+ * below, not aggregated here. */
 static void QNN_InferNativeAction(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot)
 {
 	QNN_ClearAction(action);
-
-	if (!qnn_runtime.has_prev)
-		return;
-
-	action->fire = (QNN_SnapshotHasSelfWeaponFireSound(snapshot)
-		|| snapshot->ammo < qnn_runtime.prev_ammo) ? 1 : 0;
+	if (QNN_DetectFireEvent(snapshot))
+	{
+		action->fire = 1;
+		qnn_runtime.native_fire_this_window = true;
+	}
 }
 
 /* Per-emission: determine the player's input by simulating all 9 key
@@ -259,28 +197,8 @@ snap:
 }
 
 /* QNN_EmitTick, QNN_JitterFilter, QNN_ActionIsFrozen, QNN_WriteObsTick,
- * QNN_FlushTickEmit — shared in common/qnn_collect_helpers.c. */
-
-static void QNN_SavePrev(const qnn_snapshot_t *snapshot, float dt)
-{
-	/* Reconstruct velocity from position delta before overwriting prev_origin. */
-	if (qnn_runtime.has_prev && dt > 0.0f)
-	{
-		int i;
-		for (i = 0; i < 3; i++)
-			qnn_runtime.prev_velocity[i] =
-				(snapshot->player_origin[i] - qnn_runtime.prev_origin[i]) / dt;
-	}
-	else
-	{
-		qnn_runtime.prev_velocity[0] = 0.0f;
-		qnn_runtime.prev_velocity[1] = 0.0f;
-		qnn_runtime.prev_velocity[2] = 0.0f;
-	}
-	VectorCopy(snapshot->player_origin, qnn_runtime.prev_origin);
-	qnn_runtime.prev_ammo = snapshot->ammo;
-	qnn_runtime.has_prev = true;
-}
+ * QNN_FlushTickEmit, QNN_SavePrev, QNN_EmitFilter — shared in
+ * common/qnn_collect_helpers.c. */
 
 static void QNN_SaveEmitAnchor(const qnn_snapshot_t *snapshot)
 {
@@ -301,6 +219,7 @@ static void QNN_SaveEmitAnchor(const qnn_snapshot_t *snapshot)
 	qnn_runtime.emit_weapon_id = snapshot->weapon_id;
 	qnn_runtime.has_emit_anchor = true;
 	qnn_runtime.native_frame_count = 0;
+	qnn_runtime.native_fire_this_window = false;
 
 	/* Snapshot mover origins at the emission anchor. */
 	{
@@ -314,61 +233,10 @@ static void QNN_SaveEmitAnchor(const qnn_snapshot_t *snapshot)
 }
 
 
-/* Apply emission-level frame filters.  Returns the FILE* to pass to
- * QNN_WriteObsTick: stdout to emit, NULL to buffer-only (skip). */
-static FILE *QNN_EmitFilter(qnn_snapshot_t *snapshot)
-{
-	int health = snapshot->health;
-
-	/* Always emit the done marker. */
-	if (snapshot->done)
-	{
-		qnn_runtime.dead_emit_count = 0;
-		qnn_runtime.frozen_emit_count = 0;
-		return stdout;
-	}
-
-	/* God-mode: skip entirely. */
-	if (health > QNN_GOD_MODE_HEALTH)
-		return NULL;
-
-	/* Dead: keep first QNN_DEAD_MAX_EMIT frames, inject fire=1,
-	 * zero move (corpse physics ≠ player input, sim diverges
-	 * because it runs alive friction+accel vs dead velocity decay). */
-	if (health <= 0)
-	{
-		qnn_runtime.frozen_emit_count = 0;
-		qnn_runtime.dead_emit_count++;
-		if (qnn_runtime.dead_emit_count > QNN_DEAD_MAX_EMIT)
-			return NULL;
-		snapshot->action_label.fire = 1;
-		snapshot->action_label.move[0] = 0.0f;
-		snapshot->action_label.move[1] = 0.0f;
-		snapshot->action_label.move[2] = 0.0f;
-		return stdout;
-	}
-
-	/* Alive — reset dead counter. */
-	qnn_runtime.dead_emit_count = 0;
-
-	/* Frozen-alive: keep first QNN_FROZEN_MAX_EMIT frames. */
-	if (QNN_ActionIsFrozen(&snapshot->action_label))
-	{
-		qnn_runtime.frozen_emit_count++;
-		if (qnn_runtime.frozen_emit_count > QNN_FROZEN_MAX_EMIT)
-			return NULL;
-		return stdout;
-	}
-
-	/* Active gameplay — reset frozen counter. */
-	qnn_runtime.frozen_emit_count = 0;
-	return stdout;
-}
-
 static void QNN_RuntimeReset(void)
 {
 	memset(&qnn_runtime, 0, sizeof(qnn_runtime));
-	qnn_runtime.fixed_tick_hz = 20;
+	qnn_runtime.fixed_tick_hz = 20;  /* default emit rate; overridden by hello.tick_hz */
 	qnn_runtime.fixed_dt = 1.0f / 20.0f;
 	qnn_runtime.store_dump = NULL;
 	{
@@ -432,10 +300,9 @@ static void QNN_DetectNativeTickHz(void)
 	if (detected_hz < 5 || detected_hz > 200)
 		return; /* out of sane range */
 
-	qnn_runtime.fixed_tick_hz = detected_hz;
-	qnn_runtime.fixed_dt = 1.0f / (float)detected_hz;
-	fprintf(stderr, "[demo] detected native tick rate: %d Hz (dt=%.4fs)\n",
-		detected_hz, qnn_runtime.fixed_dt);
+	qnn_runtime.native_hz_detected = detected_hz;
+	fprintf(stderr, "[demo] detected native tick rate: %d Hz (dt=%.4fs) — engine tick = %d Hz\n",
+		detected_hz, native_dt, qnn_runtime.fixed_tick_hz);
 }
 
 static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, qboolean reset_flag)
@@ -471,18 +338,23 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, char *error, size_t e
 	{
 		int saved_tick_hz = qnn_runtime.fixed_tick_hz;
 		float saved_dt = qnn_runtime.fixed_dt;
-		int saved_resample = qnn_runtime.resample_hz;
 		FILE *saved_store_dump = qnn_runtime.store_dump;
 		memset(&qnn_runtime, 0, sizeof(qnn_runtime));
 		qnn_runtime.fixed_tick_hz = saved_tick_hz;
 		qnn_runtime.fixed_dt = saved_dt;
-		qnn_runtime.resample_hz = saved_resample;
 		qnn_runtime.store_dump = saved_store_dump;
 	}
 
 	qnn_sound_count = 0;
 	cls.demonum = -1;
 	cls.timedemo = false;
+
+	/* Clear per-demo entity / event / action state up front so that a
+	 * mid-signon failure below can't leave stale qnn_store entries
+	 * visible to the next demo on this worker.  The success path below
+	 * re-runs QNN_IOInit to rebuild baselines from the newly-loaded
+	 * demo. */
+	QNN_IOInit(&qnn_map_state);
 
 	/* Disconnect directly from C to avoid command buffer ordering issues */
 	CL_Disconnect();
@@ -554,6 +426,7 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, char *error, size_t e
 	qnn_runtime.steps = 0;
 	qnn_runtime.has_reset = true;
 	qnn_runtime.done = false;
+	QNN_TickEmitReset(&qnn_runtime.tick_emit);
 	QNN_IOInit(&qnn_map_state);
 	QNN_PhysInit();
 	return true;
@@ -575,6 +448,8 @@ static void QNN_WriteHelloResponse(void)
 	fflush(stdout);
 }
 
+/* QNN_OpIs — shared in common/qnn_collect_helpers.c. */
+
 static int QNN_HandleHello(const char *line)
 {
 	char map_id[QNN_MAX_MAP_ID];
@@ -585,9 +460,13 @@ static int QNN_HandleHello(const char *line)
 	if (!QNN_JsonExtractString(line, "\"map_id\"", map_id, sizeof(map_id)))
 		snprintf(map_id, sizeof(map_id), "E1M1");
 
-	/* Resample target Hz: >0 = downsample to target, 0 = emit at native rate. */
-	qnn_runtime.resample_hz = QNN_JsonExtractInt(line, "\"resample_hz\"", 0);
-
+	{
+		int tick_hz = QNN_JsonExtractInt(line, "\"tick_hz\"", 20);
+		if (tick_hz <= 0) tick_hz = 20;
+		qnn_runtime.fixed_tick_hz = tick_hz;
+		qnn_runtime.fixed_dt = 1.0f / (float)tick_hz;
+		Cvar_SetValue("qnn_tick_hz", (float)tick_hz);
+	}
 
 	if (!QNN_PrepareMap(map_id, error, sizeof(error)))
 	{
@@ -611,28 +490,39 @@ static int QNN_HandleCollect(const char *line)
 	memset(error, 0, sizeof(error));
 	play_start = QNN_JsonExtractInt(line, "\"play_start\"", 0);
 	play_end = QNN_JsonExtractInt(line, "\"play_end\"", 999999999);
-	qnn_match_state = 1; /* always emit — boundaries are frame-gated */
 	if (!QNN_JsonExtractString(line, "\"demo_path\"", demo_path, sizeof(demo_path)))
 	{
 		QNN_WriteError("reset options must include demo_path");
 		return 0;
 	}
+	QNN_FaultSetContext(demo_path);
 	if (!QNN_ResetWorldLocal(demo_path, error, sizeof(error)))
 	{
 		QNN_WriteError(error);
+		QNN_FaultSetContext(NULL);
 		return 0;
 	}
 
-	/* Init resampler. resample_hz=0 means pass-through (emit every frame
-	 * at native recording FPS). resample_hz>0 means downsample to target. */
-	QNN_ResampleInit(qnn_runtime.resample_hz);
-	if (qnn_runtime.resample_hz > 0)
-		fprintf(stderr, "[demo] resample target: %d Hz (source: %d Hz)\n",
-			qnn_runtime.resample_hz, qnn_runtime.fixed_tick_hz);
+	/* Engine tick = emit tick.  fixed_dt set from hello.tick_hz. */
+
+	/* play_start / play_end arrive as native-frame indices from the
+	 * classifier.  qnn_runtime.tick increments per emit at fixed_tick_hz,
+	 * so we convert once now using the engine-detected native rate.
+	 * Fallback: NQ default 72 Hz when detection failed. */
+	{
+		int native_hz = qnn_runtime.native_hz_detected > 0
+			? qnn_runtime.native_hz_detected
+			: 72;
+		if (play_start > 0)
+			play_start = (int)(((long long)play_start * qnn_runtime.fixed_tick_hz) / native_hz);
+		if (play_end < 999999999)
+			play_end = (int)(((long long)play_end * qnn_runtime.fixed_tick_hz) / native_hz);
+		fprintf(stderr, "[demo] play gate (native→emit @ %d Hz / %d Hz): play_start=%d play_end=%d\n",
+			native_hz, qnn_runtime.fixed_tick_hz, play_start, play_end);
+	}
 
 	{
-		int emit_hz = qnn_resample.target_hz > 0
-			? qnn_resample.target_hz : qnn_runtime.fixed_tick_hz;
+		int emit_hz = qnn_runtime.fixed_tick_hz;
 
 		QNN_CaptureSnapshotLocal(&snapshot, true);
 		QNN_SavePrev(&snapshot, 0.0f);  /* first tick, no dt */
@@ -644,9 +534,12 @@ static int QNN_HandleCollect(const char *line)
 		{
 			qboolean emitting = false;
 
+		QNN_WatchdogBegin(10);
 		while (!qnn_runtime.done)
 		{
+			qnn_runtime.emit_start_native = (float)cl.time;
 			Host_Frame(qnn_runtime.fixed_dt);
+			QNN_WatchdogTick();
 			qnn_runtime.tick += 1;
 			qnn_runtime.steps += 1;
 			if (!cls.demoplayback || cls.state == ca_disconnected)
@@ -666,7 +559,6 @@ static int QNN_HandleCollect(const char *line)
 			{
 				emitting = true;
 				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
-				QNN_ResampleInit(qnn_runtime.resample_hz);
 				QNN_SaveEmitAnchor(&snapshot);
 				fprintf(stderr, "[demo] emitting from tick %d (play_start=%d play_end=%d)\n",
 					qnn_runtime.tick, play_start, play_end);
@@ -716,51 +608,45 @@ static int QNN_HandleCollect(const char *line)
 			else
 				QNN_ClearAction(&native_action);
 
-			QNN_ResampleAccumulate(&native_action, qnn_runtime.fixed_dt);
-			while (QNN_ResampleShouldEmit() || qnn_runtime.done)
+			if (!snapshot.done)
 			{
-				if (!snapshot.done)
+				QNN_InferEmitAction(&snapshot.action_label, &snapshot);
+				if (qnn_runtime.native_frame_count > 0)
 				{
-					QNN_InferEmitAction(&snapshot.action_label, &snapshot);
-					if (qnn_runtime.native_frame_count > 0)
-					{
-						float phys_dt = qnn_runtime.native_frame_count * qnn_runtime.fixed_dt;
-						QNN_InferEmitMove(&snapshot.action_label,
-							&snapshot, phys_dt);
-						VectorCopy(snapshot.action_label.move, qnn_runtime.prev_move);
-					}
-					else
-					{
-						VectorCopy(qnn_runtime.prev_move, snapshot.action_label.move);
-					}
+					float phys_dt = qnn_runtime.native_frame_count * qnn_runtime.fixed_dt;
+					QNN_InferEmitMove(&snapshot.action_label,
+						&snapshot, phys_dt);
+					VectorCopy(snapshot.action_label.move, qnn_runtime.prev_move);
 				}
 				else
-					QNN_ClearAction(&snapshot.action_label);
-				QNN_ResampleApplyActionMerge(&snapshot.action_label);
-				QNN_WriteObsTick(&qnn_runtime.tick_emit,
-					QNN_EmitFilter(&snapshot),
-					&snapshot, qnn_runtime.tick,
-					qnn_runtime.steps, emit_hz, false);
-				if (!snapshot.done)
-					QNN_SaveEmitAnchor(&snapshot);
-				if (qnn_resample.target_hz <= 0 || qnn_runtime.done)
-					break;
+				{
+					VectorCopy(qnn_runtime.prev_move, snapshot.action_label.move);
+				}
 			}
+			else
+				QNN_ClearAction(&snapshot.action_label);
+			QNN_WriteObsTick(&qnn_runtime.tick_emit,
+				QNN_EmitFilter(&snapshot),
+				&snapshot, qnn_runtime.tick,
+				qnn_runtime.steps, emit_hz, false);
+			if (!snapshot.done)
+				QNN_SaveEmitAnchor(&snapshot);
 
 			QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
 		}
+		QNN_WatchdogEnd();
 
-		/* If no match text was ever seen, emit a done tick so the
-		   reader doesn't block. The Python side will see 0 real
-		   ticks for trimmed spectator demos, or collect untrimmed
-		   via a second pass for demos without match text. */
-		if (!emitting)
+		/* Emit a done-tick if the replay produced no usable frames —
+		   reached play_end before play_start (degenerate range),
+		   aborted during signon, spectator demo trimmed to empty,
+		   or no match text found.  Without this the Python reader
+		   blocks forever waiting for FLAG_DONE. */
+		if (!qnn_runtime.tick_emit.has_prev_emitted)
 		{
 			snapshot.done = true;
 			QNN_WriteObsTick(&qnn_runtime.tick_emit, stdout,
 				&snapshot, qnn_runtime.tick,
 				qnn_runtime.steps, emit_hz, true);
-			/* Demo ended before play_start — no data emitted. */
 		}
 		}
 	}
@@ -771,6 +657,7 @@ static int QNN_HandleCollect(const char *line)
 		fclose(qnn_runtime.store_dump);
 		qnn_runtime.store_dump = NULL;
 	}
+	QNN_FaultSetContext(NULL);
 	return 0;
 }
 
@@ -779,6 +666,7 @@ int main(int argc, char **argv)
 	quakeparms_t parms;
 	char line[QNN_WORKER_MAX_LINE];
 
+	QNN_FaultInit("nq_demo_worker");
 	QNN_ResolveBasedir(qnn_basedir_storage, sizeof(qnn_basedir_storage));
 	QNN_RuntimeReset();
 	QNN_ClearAction(&qnn_pending_action);
@@ -790,6 +678,7 @@ int main(int argc, char **argv)
 	parms.membase = malloc(parms.memsize);
 	parms.basedir = basedir;
 	Host_Init(&parms);
+	QNN_TickRegister();
 	/* Flush startdemos from quake.rc and tear down any auto-demo */
 	Cbuf_Execute();
 	cls.demonum = -1;
@@ -798,22 +687,25 @@ int main(int argc, char **argv)
 
 	while (fgets(line, sizeof(line), stdin) != NULL)
 	{
-		if (strstr(line, "\"op\"") != NULL && strstr(line, "hello") != NULL)
+		/* Match the "op" key precisely — substring search on the raw
+		 * line collides with demo filenames that happen to contain
+		 * the keyword (e.g. _vs_hello_kitty_).  See QNN_OpIs below. */
+		if (QNN_OpIs(line, "hello"))
 		{
 			QNN_HandleHello(line);
 			continue;
 		}
-		if (strstr(line, "\"op\"") != NULL && strstr(line, "nav_query") != NULL)
+		if (QNN_OpIs(line, "nav_query"))
 		{
 			QNN_HandleNavQuery(line);
 			continue;
 		}
-		if (strstr(line, "\"op\"") != NULL && strstr(line, "collect") != NULL)
+		if (QNN_OpIs(line, "collect"))
 		{
 			QNN_HandleCollect(line);
 			continue;
 		}
-		if (strstr(line, "\"op\"") != NULL && strstr(line, "shutdown") != NULL)
+		if (QNN_OpIs(line, "shutdown"))
 		{
 			fprintf(stdout, "{\"ok\":true}\n");
 			fflush(stdout);

@@ -116,20 +116,21 @@ NAV_CXX_SOURCES=(
 # ── Shared patches ─────────────────────────────────────────────────
 
 COMMON_PATCHES=(
-  "${ENGINE_DIR}/patches/common.c.patch"
-  "${ENGINE_DIR}/patches/common-pak-case.patch"
+  "${ENGINE_DIR}/patches/cl_parse.c.patch"
   "${ENGINE_DIR}/patches/com_parse.c.patch"
-  "${ENGINE_DIR}/patches/common.h-offsetof.patch"
-  "${ENGINE_DIR}/patches/world.h.patch"
+  "${ENGINE_DIR}/patches/common.c.patch"
+  "${ENGINE_DIR}/patches/common.h.patch"
   "${ENGINE_DIR}/patches/host_cmd.c.patch"
   "${ENGINE_DIR}/patches/net.h.patch"
   "${ENGINE_DIR}/patches/net_dgrm.c.patch"
   "${ENGINE_DIR}/patches/net_udp.c.patch"
   "${ENGINE_DIR}/patches/pr_edict.c.patch"
+  "${ENGINE_DIR}/patches/quakedef.h.patch"
+  "${ENGINE_DIR}/patches/r_efrag.c.patch"
   "${ENGINE_DIR}/patches/sv_main.c.patch"
-  "${ENGINE_DIR}/patches/cl_parse.c.patch"
-  "${ENGINE_DIR}/patches/64bit/pr_cmds.c.patch"
+  "${ENGINE_DIR}/patches/world.h.patch"
   "${ENGINE_DIR}/patches/64bit/host_cmd.c.patch"
+  "${ENGINE_DIR}/patches/64bit/pr_cmds.c.patch"
   "${ENGINE_DIR}/patches/64bit/sv_main.c.patch"
 )
 
@@ -176,84 +177,6 @@ prepare_upstream() {
   for patch_path in "${patches[@]}"; do
     patch -d "${WORKTREE_DIR}" -p0 < "${patch_path}"
   done
-
-  # Shared inline patches applied to all worker builds:
-
-  # 1. Make upstream qboolean C++-safe for the nav/oracle worker sources.
-  python3 - "${WORKTREE_DIR}/common.h" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text()
-pattern = r'typedef enum \{false, true\}\s+qboolean;'
-replacement = (
-    '#ifdef __cplusplus\n'
-    'typedef int qboolean;\n'
-    '#else\n'
-    'typedef enum {false, true}\t\tqboolean;\n'
-    '#endif'
-)
-text, count = re.subn(pattern, replacement, text, count=1)
-if count != 1:
-    raise SystemExit("failed to patch qboolean definition in common.h")
-path.write_text(text)
-PY
-
-  # 2. Increase MAX_OSPATH from 128 to 512 (long demo filenames)
-  python3 - "${WORKTREE_DIR}/quakedef.h" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text()
-p.write_text(t.replace("#define\tMAX_OSPATH\t\t128", "#define\tMAX_OSPATH\t\t512"))
-PY
-
-  # 3. snprintf in COM_FindFile (bounded path concatenation)
-  python3 - "${WORKTREE_DIR}/common.c" <<'PY'
-from pathlib import Path; import sys
-path = Path(sys.argv[1]); text = path.read_text()
-text = text.replace(
-    'sprintf (netpath, "%s/%s",search->filename, filename);',
-    'snprintf (netpath, MAX_OSPATH, "%s/%s",search->filename, filename);')
-text = text.replace(
-    'sprintf (cachepath,"%s%s", com_cachedir, netpath);',
-    'snprintf (cachepath, MAX_OSPATH, "%s%s", com_cachedir, netpath);')
-text = text.replace(
-    'sprintf (cachepath,"%s%s", com_cachedir, netpath+2);',
-    'snprintf (cachepath, MAX_OSPATH, "%s%s", com_cachedir, netpath+2);')
-path.write_text(text)
-PY
-
-  # 4. Guard R_AddEfrags against NULL worldmodel (headless demo playback)
-  python3 - "${WORKTREE_DIR}/r_efrag.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text()
-t = t.replace(
-    'if (!ent->model)\n\t\treturn;',
-    'if (!ent->model)\n\t\treturn;\n\n\tif (!cl.worldmodel || !cl.worldmodel->nodes)\n\t\treturn;')
-p.write_text(t)
-PY
-
-  # 5. Non-fatal model precache failures (headless doesn't need all models)
-  #    Without this, demos on maps like e4m3 fail because progs/star.mdl
-  #    isn't in our PAK files — the engine returns early and worldmodel is NULL.
-  python3 - "${WORKTREE_DIR}/cl_parse.c" <<'PY'
-from pathlib import Path; import sys
-p = Path(sys.argv[1]); t = p.read_text()
-old = '''		cl.model_precache[i] = Mod_ForName (model_precache[i], false);
-		if (cl.model_precache[i] == NULL)
-		{
-			Con_Printf("Model %s not found\\n", model_precache[i]);
-			return;
-		}'''
-new = '''		cl.model_precache[i] = Mod_ForName (model_precache[i], false);
-		if (cl.model_precache[i] == NULL)
-		{
-			Con_Printf("Model %s not found (non-fatal)\\n", model_precache[i]);
-		}'''
-t = t.replace(old, new)
-p.write_text(t)
-PY
 }
 
 # ── Compile helpers ────────────────────────────────────────────────
@@ -268,6 +191,27 @@ compile_c() {
     -O2 \
     -fcommon \
     -w \
+    -I"${WORKTREE_DIR}" \
+    -I"${ENGINE_DIR}/common" \
+    -I"${ENGINE_DIR}/nq" \
+    -c "${src}" \
+    -o "${obj}"
+  OBJECTS+=("${obj}")
+}
+
+# Same as compile_c but with implicit-function-declaration promoted to an
+# error.  Used for QNN-owned sources only — upstream Quake code predates
+# clean prototypes and needs -w to compile at all.  Catches the kind of
+# missing-prototype bug that silently broke SV_RecursiveHullCheck on QW.
+compile_c_strict() {
+  local src="$1"
+  local obj="${OBJ_DIR}/$(basename "${src}").o"
+  cc \
+    -std=gnu89 \
+    -O2 \
+    -fcommon \
+    -w \
+    -Werror=implicit-function-declaration \
     -I"${WORKTREE_DIR}" \
     -I"${ENGINE_DIR}/common" \
     -I"${ENGINE_DIR}/nq" \
@@ -310,7 +254,7 @@ build_worker() {
     compile_c "${WORKTREE_DIR}/${source}"
   done
   for source in "${custom_sources[@]}"; do
-    compile_c "${source}"
+    compile_c_strict "${source}"
   done
   for source in "${CUSTOM_CXX_SOURCES[@]}"; do
     compile_cxx "${source}"
@@ -319,9 +263,13 @@ build_worker() {
     compile_cxx "${source}"
   done
 
+  # -rdynamic exports symbols into the dynamic table so
+  # backtrace_symbols_fd() in qnn_fault.c can print function names
+  # rather than raw addresses when a worker crashes.
   c++ \
     -O2 \
     -w \
+    -rdynamic \
     -o "${output_path}" \
     "${OBJECTS[@]}" \
     -lm

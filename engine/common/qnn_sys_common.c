@@ -19,12 +19,27 @@
 
 /* ── JSON extraction utilities ───────────────────────────────────── */
 
+static const char *QNN_JsonFindKey(const char *line, const char *key)
+{
+	const char *match;
+	const char *next;
+
+	match = NULL;
+	next = line;
+	while ((next = strstr(next, key)) != NULL)
+	{
+		match = next;
+		next += 1;
+	}
+	return match;
+}
+
 int QNN_JsonExtractInt(const char *line, const char *key, int fallback)
 {
 	const char *match;
 	const char *colon;
 
-	match = strstr(line, key);
+	match = QNN_JsonFindKey(line, key);
 	if (match == NULL)
 		return fallback;
 	colon = strchr(match, ':');
@@ -38,7 +53,7 @@ float QNN_JsonExtractFloat(const char *line, const char *key, float fallback)
 	const char *match;
 	const char *colon;
 
-	match = strstr(line, key);
+	match = QNN_JsonFindKey(line, key);
 	if (match == NULL)
 		return fallback;
 	colon = strchr(match, ':');
@@ -53,7 +68,7 @@ qboolean QNN_JsonExtractBool(const char *line, const char *key, qboolean fallbac
 	const char *colon;
 	const char *val;
 
-	match = strstr(line, key);
+	match = QNN_JsonFindKey(line, key);
 	if (match == NULL)
 		return fallback;
 	colon = strchr(match, ':');
@@ -77,7 +92,7 @@ qboolean QNN_JsonExtractString(const char *line, const char *key, char *out, siz
 	const char *cursor;
 	size_t index;
 
-	match = strstr(line, key);
+	match = QNN_JsonFindKey(line, key);
 	if (match == NULL)
 		return false;
 	colon = strchr(match, ':');
@@ -281,45 +296,26 @@ float QNN_LookAxisFromMouseCount(int mouse_count)
 	return sign * QNN_ClampUnit(axis);
 }
 
-int QNN_SwitchSlotFromWeaponId(int weapon_id)
+/* Map weapon-select impulse (1-8) → IT_* bit-flag.  Game-agnostic per
+ * QC convention: impulse 1 is always axe, 8 always lightning, etc. */
+int QNN_ItemFlagFromImpulse(int impulse)
 {
-	if (weapon_id <= 0)
-		return 0;
-	if (weapon_id == 2 || weapon_id == 3)
-		return 1;
-	if (weapon_id == 4 || weapon_id == 5)
-		return 2;
-	if (weapon_id == 6)
-		return 3;
-	if (weapon_id == 7)
-		return 4;
-	if (weapon_id == 8)
-		return 5;
-	return 0;
-}
-
-int QNN_SwitchImpulseFromSlot(int switch_slot, int weapons_owned)
-{
-	switch (switch_slot)
+	switch (impulse)
 	{
-	case 1:
-		if (weapons_owned & IT_SUPER_SHOTGUN) return 3;
-		if (weapons_owned & IT_SHOTGUN) return 2;
-		return 0;
-	case 2:
-		if (weapons_owned & IT_SUPER_NAILGUN) return 5;
-		if (weapons_owned & IT_NAILGUN) return 4;
-		return 0;
-	case 3:
-		return (weapons_owned & IT_GRENADE_LAUNCHER) ? 6 : 0;
-	case 4:
-		return (weapons_owned & IT_ROCKET_LAUNCHER) ? 7 : 0;
-	case 5:
-		return (weapons_owned & IT_LIGHTNING) ? 8 : 0;
-	default:
-		return 0;
+		case 1: return IT_AXE;
+		case 2: return IT_SHOTGUN;
+		case 3: return IT_SUPER_SHOTGUN;
+		case 4: return IT_NAILGUN;
+		case 5: return IT_SUPER_NAILGUN;
+		case 6: return IT_GRENADE_LAUNCHER;
+		case 7: return IT_ROCKET_LAUNCHER;
+		case 8: return IT_LIGHTNING;
+		default: return 0;
 	}
 }
+
+/* QNN_NextWeaponId lives in per-game qnn_self.c — items source
+ * differs between NQ (cl.items) and QW (cl.stats[STAT_ITEMS]). */
 
 /* map preparation moved to qnn_io.c */
 
@@ -526,54 +522,6 @@ int QNN_HandleNavQuery(const char *line)
 	return 0;
 }
 
-/* ── Tick resampling gate ─────────────────────────────────────────── */
-
-void QNN_ResampleInit(int target_hz)
-{
-	memset(&qnn_resample, 0, sizeof(qnn_resample));
-	if (target_hz > 0)
-	{
-		qnn_resample.target_hz = target_hz;
-		qnn_resample.target_dt = 1.0f / (float)target_hz;
-	}
-}
-
-void QNN_ResampleAccumulate(const qnn_action_t *action, float frame_dt)
-{
-	qnn_resample.accumulated_dt += frame_dt;
-
-	/* Merge discrete actions across the window (OR — any press counts).
-	 * Move is a continuous wishdir inferred once at emission time. */
-	if (action->fire)
-		qnn_resample.fire_any = 1;
-}
-
-qboolean QNN_ResampleShouldEmit(void)
-{
-	if (qnn_resample.target_hz <= 0)
-		return true; /* disabled — emit every frame */
-
-	if (qnn_resample.accumulated_dt >= qnn_resample.target_dt)
-		return true;
-
-	return false;
-}
-
-void QNN_ResampleApplyActionMerge(qnn_action_t *action)
-{
-	if (qnn_resample.fire_any)
-		action->fire = 1;
-
-	/* Subtract one window instead of zeroing so the fractional remainder
-	 * carries forward.  This lets low-rate demos (native < target) produce
-	 * the correct number of emissions over time. */
-	if (qnn_resample.target_dt > 0.0f)
-		qnn_resample.accumulated_dt -= qnn_resample.target_dt;
-	else
-		qnn_resample.accumulated_dt = 0.0f;
-	qnn_resample.fire_any = 0;
-}
-
 /* ── Binary write helpers (little-endian) ────────────────────────── */
 
 void QNN_WriteU16LE(FILE *out, uint16_t value)
@@ -609,12 +557,4 @@ void QNN_WriteF32LE(FILE *out, float value)
 	union { float f; uint32_t u; } bits;
 	bits.f = value;
 	QNN_WriteU32LE(out, bits.u);
-}
-
-/* Weak stub for match-text detection.  The collector overrides this with
- * a real implementation in qnn_collect_main.c.  The trainer worker never
- * sees real match text, so a no-op is fine. */
-__attribute__((weak)) void QNN_MatchCheckPrint(const char *text)
-{
-	(void)text;
 }

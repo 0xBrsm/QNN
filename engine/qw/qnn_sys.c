@@ -32,6 +32,7 @@
  */
 
 #include "qnn.h"
+#include "qnn_object.h"
 #include "qnn_route.h"
 
 #include <ctype.h>
@@ -49,7 +50,6 @@
 /* ── shared globals ──────────────────────────────────────────────── */
 
 qnn_map_state_t qnn_map_state;
-qnn_resample_state_t qnn_resample;
 char qnn_basedir_storage[MAX_OSPATH] = ".";
 
 /* QW client declares isDedicated as extern in some paths */
@@ -218,4 +218,38 @@ const char *QNN_ProgString(string_t value)
 {
 	(void)value;
 	return "";
+}
+
+/* PM_RecursiveHullCheck — defined in upstream pmovetst.c but not declared
+ * in pmove.h.  Without this prototype the call below would default to
+ * int-based arg passing and the trace pointer would land in the wrong
+ * register. */
+qboolean PM_RecursiveHullCheck(hull_t *hull, int num, float p1f, float p2f,
+	vec3_t p1, vec3_t p2, pmtrace_t *trace);
+
+/* QNN_TraceLine (QW) — adapt upstream's PM_RecursiveHullCheck to our
+ * trace_t.  pmtrace_t and trace_t share layout for the fields we read
+ * (fraction, endpos), so we copy those out after the trace.  Shared
+ * declaration in qnn_object.h. */
+void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
+{
+	pmtrace_t pm;
+
+	if (trace == NULL)
+		return;
+	memset(trace, 0, sizeof(*trace));
+	if (cl.worldmodel == NULL)
+	{
+		trace->fraction = 1.0f;
+		VectorCopy(end, trace->endpos);
+		return;
+	}
+	memset(&pm, 0, sizeof(pm));
+	pm.fraction = 1.0f;
+	PM_RecursiveHullCheck(cl.worldmodel->hulls, 0, 0, 1,
+		(float *)start, (float *)end, &pm);
+	trace->allsolid = pm.allsolid;
+	trace->startsolid = pm.startsolid;
+	trace->fraction = pm.fraction;
+	VectorCopy(pm.endpos, trace->endpos);
 }

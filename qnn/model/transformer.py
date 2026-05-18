@@ -1,8 +1,16 @@
 """Transformer trunk for the token observation contract.
 
 Tokenizer converts packed observations into d_model token sequences.
-TransformerTrunk runs self-attention over those tokens and reads out
-a summary vector from the self-token at position 0.
+TransformerTrunk runs self-attention over those tokens and returns:
+
+  * ``self_readout`` — the self-token at position 0.
+  * ``target_feat`` — attention-pooled actor feature from ``TargetPointer``:
+    ``sum_i softmax(logits)[i] * entity_out[i]`` over actor slots only.
+    Concatenated into the fused feature vector so action heads condition
+    on the selected opponent.
+  * ``target_logits`` — ``(B, MAX_TOKEN_OBJECTS)`` raw attention scores,
+    supervised directly by BC labels via an auxiliary CE loss.  Not sampled
+    as an action.
 """
 
 from __future__ import annotations
@@ -18,13 +26,12 @@ from qnn.vocab import (
 )
 from qnn.schema import (
     SELF_SCALAR_DIM, SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM,
-    ACTION_HISTORY_LEN, ACTION_HISTORY_DIM,
 )
+from qnn.model.target import TargetPointer
 
 _TOKEN_KIND_SELF = 0
 _TOKEN_KIND_ENTITY = 1
 _TOKEN_KIND_SPATIAL = 2
-_TOKEN_KIND_ACTION = 3
 
 
 # ── Tokenizer ────────────────────────────────────────────────────
@@ -33,10 +40,12 @@ _TOKEN_KIND_ACTION = 3
 class Tokenizer(nn.Module):
     """Convert packed observations into d_model transformer tokens."""
 
-    def __init__(self, d_model: int, action_history_tokens: int = 0) -> None:
+    def __init__(
+        self,
+        d_model: int,
+    ) -> None:
         super().__init__()
         self.d_model = d_model
-        self.action_history_tokens = min(int(action_history_tokens), ACTION_HISTORY_LEN)
 
         # Self token
         self.self_proj = nn.Linear(SELF_SCALAR_DIM, d_model)
@@ -50,24 +59,19 @@ class Tokenizer(nn.Module):
         # Spatial
         self.spatial_proj = nn.Linear(SPATIAL_SCALAR_DIM, d_model)
 
-        # Action history
-        if self.action_history_tokens > 0:
-            self.action_proj = nn.Linear(ACTION_HISTORY_DIM, d_model)
-            self.action_pos_embed = nn.Embedding(ACTION_HISTORY_LEN, d_model)
-
         # Shared embeddings
         self.entity_embed = nn.Embedding(ENTITY_VOCAB_SIZE, d_model)
         self.action_embed = nn.Embedding(ACTION_VOCAB_SIZE, d_model)
         self.modality_embed = nn.Embedding(MODALITY_VOCAB_SIZE, d_model)
         self.player_embed = nn.Embedding(MAX_PLAYER_SLOTS + 1, d_model)
 
-        # Kind embeddings (self, entity, spatial, action)
-        self.kind_embed = nn.Embedding(4, d_model)
+        # Kind embeddings (self, entity, spatial)
+        self.kind_embed = nn.Embedding(3, d_model)
 
         # Self-specific embeddings
         self.movement_embed = nn.Embedding(5, d_model)
 
-        self.n_tokens = 1 + MAX_TOKEN_OBJECTS + SPATIAL_TOKEN_COUNT + self.action_history_tokens
+        self.n_tokens = 1 + MAX_TOKEN_OBJECTS + SPATIAL_TOKEN_COUNT
 
     def _project_entity_scalars(
         self,
@@ -105,7 +109,7 @@ class Tokenizer(nn.Module):
         """Build transformer input tokens from parsed observation dict.
 
         obs_dict must contain:
-            self_scalars: (batch, 14)
+            self_scalars: (batch, 16)
             self_weapon_id, self_armor_type_id, self_movement_id: (batch, 1)
             self_powerup_ids: (batch, 5)
             entity_types: (batch, 16) — token type tags, -1 for empty
@@ -116,7 +120,6 @@ class Tokenizer(nn.Module):
             entity_event_sources: (batch, 16, 4) — source IDs
             entity_event_counts: (batch, 16) — valid event count
             spatial_scalars: (batch, 9, 13)
-            action_history: (batch, 8, 8) [optional]
         """
         device = obs_dict["self_scalars"].device
         batch = obs_dict["self_scalars"].shape[0]
@@ -129,9 +132,6 @@ class Tokenizer(nn.Module):
         self_token = self_token.unsqueeze(1) + self.kind_embed(kind_self)
 
         # Self ID embeds
-        if "self_weapon_id" in obs_dict:
-            wid = obs_dict["self_weapon_id"].long().squeeze(-1).clamp(0, self.entity_embed.num_embeddings - 1)
-            self_token = self_token + self.entity_embed(wid).unsqueeze(1)
         if "self_armor_type_id" in obs_dict:
             aid = obs_dict["self_armor_type_id"].long().squeeze(-1).clamp(0, self.entity_embed.num_embeddings - 1)
             amask = (aid > 0).float().unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
@@ -151,7 +151,9 @@ class Tokenizer(nn.Module):
             entity_repr = self._project_entity_scalars(
                 entity_types, obs_dict["entity_scalars_raw"],
             )
-        entity_mask = (entity_types >= 0)  # (batch, 16)
+        # Phase 1 combat-only model: non-actor tokens are masked out of the
+        # sequence entirely so the trunk only reasons over self, spatial, and actors.
+        entity_mask = (entity_types == TOKEN_ACTOR)  # (batch, 16)
 
         # Subject embedding
         entity_subject = obs_dict["entity_ids"][:, :, 0].long().clamp(0, self.entity_embed.num_embeddings - 1)
@@ -188,26 +190,10 @@ class Tokenizer(nn.Module):
         kind_spatial = torch.full((batch, SPATIAL_TOKEN_COUNT), _TOKEN_KIND_SPATIAL, dtype=torch.long, device=device)
         spatial_token = spatial_token + self.kind_embed(kind_spatial)
 
-        # ---- Action history ----
-        if self.action_history_tokens > 0 and "action_history" in obs_dict:
-            n = self.action_history_tokens
-            action_slice = obs_dict["action_history"][:, -n:, :]
-            action_token = self.action_proj(action_slice)
-            kind_action = torch.full((batch, n), _TOKEN_KIND_ACTION, dtype=torch.long, device=device)
-            action_token = action_token + self.kind_embed(kind_action)
-            pos_ids = torch.arange(ACTION_HISTORY_LEN - n, ACTION_HISTORY_LEN, dtype=torch.long, device=device)
-            action_token = action_token + self.action_pos_embed(pos_ids).unsqueeze(0)
-            action_valid = action_slice.abs().sum(dim=-1) > 0
-
-            tokens = torch.cat([self_token, spatial_token, action_token, entity_repr], dim=1)
-            self_valid = torch.zeros((batch, 1), dtype=torch.bool, device=device)
-            spatial_valid = torch.zeros((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
-            key_padding_mask = torch.cat([self_valid, spatial_valid, ~action_valid, ~entity_mask], dim=1)
-        else:
-            tokens = torch.cat([self_token, spatial_token, entity_repr], dim=1)
-            self_valid = torch.zeros((batch, 1), dtype=torch.bool, device=device)
-            spatial_valid = torch.zeros((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
-            key_padding_mask = torch.cat([self_valid, spatial_valid, ~entity_mask], dim=1)
+        tokens = torch.cat([self_token, spatial_token, entity_repr], dim=1)
+        self_valid = torch.zeros((batch, 1), dtype=torch.bool, device=device)
+        spatial_valid = torch.zeros((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
+        key_padding_mask = torch.cat([self_valid, spatial_valid, ~entity_mask], dim=1)
 
         return tokens, key_padding_mask
 
@@ -253,17 +239,19 @@ class TransformerTrunk(nn.Module):
         n_layers: int = 2,
         ffn_dim: int = 256,
         dropout: float = 0.0,
-        readout: str = "self",
-        action_history_tokens: int = 0,
     ) -> None:
         super().__init__()
-        del obs_dim, readout
+        del obs_dim
+        self.d_model = int(d_model)
         self.output_dim = int(d_model)
-        self.tokenizer = Tokenizer(d_model=d_model, action_history_tokens=action_history_tokens)
+        self.tokenizer = Tokenizer(d_model=d_model)
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model=d_model, n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout) for _ in range(n_layers)]
         )
         self.final_ln = nn.LayerNorm(d_model)
+        # TargetPointer: supervised pointer head over entity tokens, producing
+        # target_logits (supervised by BC labels) and target_feat (conditioning).
+        self.target_pointer = TargetPointer(d_model=d_model)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -273,9 +261,34 @@ class TransformerTrunk(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, obs_dict: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self_readout, entity_outs, entity_mask = self.forward_raw(obs_dict)
+        target_logits, target_feat, target_query = self.target_pointer(self_readout, entity_outs, entity_mask)
+        return self_readout, target_feat, target_logits, target_query
+
+    def forward_raw(
+        self, obs_dict: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Same as ``forward`` but stops short of the target pointer.
+
+        Returns ``(self_readout, entity_outs, entity_mask)`` so callers can
+        run a recurrent layer over ``self_readout`` first and then point with
+        the recurrent feature.
+        """
         tokens, key_padding_mask = self.tokenizer(obs_dict)
         transformed = tokens
         for block in self.blocks:
             transformed = block(transformed, key_padding_mask=key_padding_mask)
-        return self.final_ln(transformed[:, 0, :])
+        transformed = self.final_ln(transformed)
+
+        self_readout = transformed[:, 0, :]  # (B, d_model)
+
+        # Entity tokens follow self (1) + spatial (SPATIAL_TOKEN_COUNT).
+        entity_start = 1 + SPATIAL_TOKEN_COUNT
+        entity_outs = transformed[:, entity_start:entity_start + MAX_TOKEN_OBJECTS, :]
+        entity_types = obs_dict["entity_types"].long()
+
+        entity_mask = (entity_types == TOKEN_ACTOR)  # (B, N)
+        return self_readout, entity_outs, entity_mask

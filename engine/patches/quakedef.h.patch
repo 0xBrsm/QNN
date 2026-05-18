@@ -1,0 +1,17 @@
+# quakedef.h — bump MAX_OSPATH from 128 to 512
+#
+# Some demo and corpus paths exceed 128 chars when nested under our asset
+# tree.  Doubling-plus the original limit keeps COM_FindFile / Sys_FileOpenRead
+# from silently truncating filenames.
+#
+--- quakedef.h
++++ quakedef.h
+@@ -94,7 +94,7 @@
+ 
+ 
+ #define	MAX_QPATH		64			// max length of a quake game pathname
+-#define	MAX_OSPATH		128			// max length of a filesystem pathname
++#define	MAX_OSPATH		512			// max length of a filesystem pathname
+ 
+ #define	ON_EPSILON		0.1			// point on plane side epsilon
+ 

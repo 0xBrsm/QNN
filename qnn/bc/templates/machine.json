@@ -1,9 +1,9 @@
 {
   "device": "gpu",
   "asset_root": "assets",
-  "bc_data_dir": "assets/collect/prod",
-  "batch_size": 64,
-  "microbatch_size": 256,
+  "bc_data_dir": "artifacts/collect/qwd",
+  "batch_size": 128,
+  "microbatch_size": 128,
   "pin_memory": true,
   "prefetch": 2,
   "snapshot_interval": 15

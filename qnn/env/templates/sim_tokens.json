@@ -10,7 +10,8 @@
     {
       "index": 0, "kind": "self",
       "health": 0.0, "armor": 0.0,
-      "weapon_sg": 0.0, "weapon_ng": 0.0, "weapon_gl": 0.0, "weapon_rl": 0.0, "weapon_lg": 0.0,
+      "weapon_sg": 0.0, "weapon_ssg": 0.0, "weapon_ng": 0.0, "weapon_sng": 0.0,
+      "weapon_gl": 0.0, "weapon_rl": 0.0, "weapon_lg": 0.0,
       "ammo_shells": 0.0, "ammo_nails": 0.0, "ammo_rockets": 0.0, "ammo_cells": 0.0,
       "vel": [0.0, 0.0, 0.0],
       "weapon_id": "NONE",

@@ -27,10 +27,7 @@ from qnn.vocab import (
 SPATIAL_TOKEN_COUNT = 9
 SPATIAL_SCALAR_DIM = 13
 
-ACTION_HISTORY_LEN = 8
-ACTION_HISTORY_DIM = 8  # move[3] + look[3] + fire + switch
-
-SELF_SCALAR_DIM = 14
+SELF_SCALAR_DIM = 16
 
 from qnn.wire import MAX_ENTITY_SCALAR_DIM, MAX_ENTITY_ID_DIM
 
@@ -52,5 +49,4 @@ OBS_SCHEMA: dict[str, tuple[int, ...]] = {
     "entity_event_sources": (MAX_TOKEN_OBJECTS, MAX_ENTITY_EVENTS),
     "entity_event_counts": (MAX_TOKEN_OBJECTS,),
     "spatial_scalars": (SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM),
-    "action_history": (ACTION_HISTORY_LEN, ACTION_HISTORY_DIM),
 }

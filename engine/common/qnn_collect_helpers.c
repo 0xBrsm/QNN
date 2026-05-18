@@ -4,21 +4,104 @@
  *
  * Contents:
  *   - Entity scanners for movers, push triggers, and other players
- *   - Jitter filter math (3-frame XY direction reversal detection)
+ *   - 3-frame jitter filter math (XY direction reversal detection)
  *   - Frozen-action predicate
- *   - QOBS framed tick emitter
+ *   - QOBS framed tick emitter + two-level buffer (obs delay + jitter)
+ *   - QNN_DetectFireEvent (shared by both QWD and MVD inference paths)
+ *   - QNN_EmitFilter (dead/frozen/god-mode rate caps)
+ *   - QNN_PackSnapshotObs / QNN_WriteObsTickPrepacked* (used by both
+ *     the live emit path and the MVD back-shift ring drain)
+ *   - QNN_EmitLabelerTick (LOBS writer used by labeler-mode emit)
+ *   - QNN_SavePrev (per-tick state advance)
+ *   - QNN_FillLookAndSwitch (look/weapon label, shared QWD + MVD)
  *
  * Touches only shared state (qnn_store, cl_entities, cl.model_precache,
  * cl.maxclients, cl.viewentity — all present natively on NQ and
  * synthesized on QW by QNN_SyncEngineCompat).
+ *
+ * MVD reconstruction (back-shift ring, log-normal hold tails) and the
+ * labeler LOBS emit branch live in their own modules — see
+ * qnn_mvd_collect.c / qnn_labeler_collect.c.
  */
 
 #include "qnn.h"
+#include "qnn_collect_helpers.h"
 #include "qnn_io.h"
 #include "qnn_store.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* The single collect-runtime instance, shared by both engines' workers. */
+qnn_runtime_t qnn_runtime;
+
+static void QNN_WriteJsonEscaped(FILE *out, const char *s)
+{
+	const unsigned char *p = (const unsigned char *)s;
+
+	fputc('"', out);
+	while (*p)
+	{
+		unsigned char c = *p++;
+		if (c == '"' || c == '\\')
+		{
+			fputc('\\', out);
+			fputc(c, out);
+		}
+		else if (c == '\n')
+			fputs("\\n", out);
+		else if (c == '\r')
+			fputs("\\r", out);
+		else if (c == '\t')
+			fputs("\\t", out);
+		else if (c < 0x20)
+			fprintf(out, "\\u%04x", (unsigned)c);
+		else
+			fputc(c, out);
+	}
+	fputc('"', out);
+}
+
+static void QNN_DumpFireRoutes(int row, int tick, int steps,
+	const qnn_action_t *action, const qnn_fire_route_event_t *routes,
+	int route_count)
+{
+	const char *path;
+	FILE *out;
+	int i;
+
+	if (route_count <= 0)
+		return;
+	path = getenv("QNN_FIRE_ROUTE_DUMP");
+	if (path == NULL || path[0] == '\0')
+		return;
+	out = fopen(path, "a");
+	if (out == NULL)
+		return;
+	for (i = 0; i < route_count; ++i)
+	{
+		const qnn_fire_route_event_t *r = &routes[i];
+		fprintf(out, "{\"row\":%d,\"tick\":%d,\"steps\":%d,"
+			"\"demo_path\":", row, tick, steps);
+		QNN_WriteJsonEscaped(out, qnn_runtime.demo_path);
+		fprintf(out,
+			",\"source_tick\":%d,\"dest_tick\":%d,"
+			"\"sound_index\":%d,\"weapon_id\":%d,"
+			"\"native_time\":%.6f,\"emit_start_native\":%.6f,"
+			"\"ping_sec\":%.6f,\"phase\":%.6f,"
+			"\"press_offset\":%.6f,"
+			"\"deterministic_offset\":%d,"
+			"\"route_offset\":%d,"
+			"\"emitted_fire\":%d}\n",
+			r->source_tick, r->dest_tick, r->sound_index,
+			r->weapon_id, r->native_time, r->emit_start_native,
+			r->ping_sec, r->phase, r->press_offset,
+			r->deterministic_offset,
+			r->route_offset, action->fire ? 1 : 0);
+	}
+	fclose(out);
+}
 
 /* Scan the entity store for movers and record their entity_num +
  * modelindex for BSP collision during physics baseline steps. */
@@ -139,12 +222,14 @@ void QNN_JitterFilter(qnn_action_t *mid, const float *prev_move,
 }
 
 /* True when the action label represents a fully idle tick — zero move,
- * zero look-delta, no fire/switch.  Used by the emit-rate filter to cap
- * runs of frozen frames. */
+ * zero look-delta, no fire.  Used by the emit-rate filter to cap runs
+ * of frozen frames.  Collect workers store dense full weapon intent in
+ * weapon, so it's not part of the activity check; standing on the
+ * same weapon doesn't constitute movement. */
 qboolean QNN_ActionIsFrozen(const qnn_action_t *a)
 {
 	return a->move[0] == 0.0f && a->move[1] == 0.0f && a->move[2] == 0.0f
-		&& a->fire == 0 && a->switch_slot == 0
+		&& a->fire == 0
 		&& fabsf(a->look[0] - 1.0f) < QNN_FROZEN_LOOK_TOL
 		&& fabsf(a->look[1]) < QNN_FROZEN_LOOK_TOL
 		&& fabsf(a->look[2]) < QNN_FROZEN_LOOK_TOL;
@@ -189,42 +274,21 @@ void QNN_TickEmitReset(qnn_tick_emit_state_t *st)
 	memset(st, 0, sizeof(*st));
 }
 
-/* Patch the emitted action into the obs buffer's last action history
- * slot so the training data has the correct T-1 action.  The obs was
- * packed before the jitter buffer delayed it, so its action history is
- * stale.  This overwrites token 7 (most recent) in-place. */
-static void QNN_PatchActionHistory(uint8_t *obs, const qnn_action_t *action)
-{
-	int off = QNN_OBS_OFF_ACTION_HISTORY + (QNN_OBS_ACTION_HISTORY_LEN - 1)
-		* QNN_OBS_ACTION_HISTORY_DIM * (int)sizeof(float);
-	float features[QNN_OBS_ACTION_HISTORY_DIM];
-	features[0] = action->move[0];
-	features[1] = action->move[1];
-	features[2] = action->move[2];
-	features[3] = action->look[0];
-	features[4] = action->look[1];
-	features[5] = action->look[2];
-	features[6] = (float)action->fire;
-	features[7] = (float)(action->switch_slot < 0 ? 0
-		: action->switch_slot > QNN_ACTION_SWITCH_SLOTS
-		? QNN_ACTION_SWITCH_SLOTS : action->switch_slot)
-		/ (float)QNN_ACTION_SWITCH_SLOTS;
-	memcpy(obs + off, features, sizeof(features));
-}
-
 static void QNN_TickEmitFlush(qnn_tick_emit_state_t *st)
 {
 	if (!st->has_jitter_buf)
 		return;
 	if (st->jitter_out != NULL)
 	{
-		if (st->has_prev_emitted)
-			QNN_PatchActionHistory(st->jitter_obs, &st->prev_emitted_action);
 		QNN_EmitTick(st->jitter_out, st->jitter_obs,
 			&st->jitter_action,
 			st->jitter_tick, st->jitter_steps,
 			st->jitter_tick_hz, st->jitter_flags);
-		st->prev_emitted_action = st->jitter_action;
+		QNN_DumpFireRoutes(st->emitted_rows, st->jitter_tick,
+			st->jitter_steps, &st->jitter_action,
+			st->jitter_fire_routes,
+			st->jitter_fire_route_count);
+		st->emitted_rows++;
 		st->has_prev_emitted = true;
 	}
 	st->has_prev_prev_move = true;
@@ -239,34 +303,39 @@ void QNN_FlushTickEmit(qnn_tick_emit_state_t *st)
 	QNN_TickEmitFlush(st);
 }
 
-void QNN_WriteObsTick(qnn_tick_emit_state_t *st, FILE *out,
-	const qnn_snapshot_t *snapshot, int tick, int steps, int tick_hz,
-	qboolean reset_flag)
+void QNN_PackSnapshotObs(const qnn_snapshot_t *snapshot, uint8_t *obs_out)
 {
-	uint8_t cur_obs[QNN_OBS_BUFFER_SIZE];
 	qnn_tick_result_t result;
-	uint16_t flags = 0;
-
-	(void)tick_hz;
-	(void)reset_flag;
 	QNN_IOEmit(snapshot, &result);
-	QNN_IOPackObsBuffer(cur_obs, &result);
-	/* Action history is NOT pushed into the global ring buffer here.
-	   The jitter buffer delays emission by 2 frames, so a capture-time
-	   push would leave stale data in the ring buffer by emit time.
-	   Instead, QNN_PatchActionHistory overwrites the last history slot
-	   (token 7) at emit time with the correct T-1 action.
-	   The ring buffer push (QNN_IOPushAction) is only used by the
-	   trainer/inference path which has no jitter buffer. */
+	QNN_IOPackObsBuffer(obs_out, &result);
+}
+
+/* Internal: drive the obs/jitter pipeline from pre-packed obs bytes.
+ * Shared body of QNN_WriteObsTick (which packs first) and
+ * QNN_WriteObsTickPrepacked (caller already packed at capture time
+ * to survive deferred emit through the MVD back-shift ring). */
+static void QNN_WriteObsTickInner(qnn_tick_emit_state_t *st, FILE *out,
+	const uint8_t *cur_obs, const qnn_action_t *action,
+	qboolean done, int tick, int steps, int tick_hz, qboolean reset_flag,
+	const qnn_fire_route_event_t *routes, int route_count)
+{
+	uint16_t flags = 0;
+	if (route_count < 0)
+		route_count = 0;
+	if (route_count > QNN_MAX_FIRE_ROUTE_EVENTS)
+		route_count = QNN_MAX_FIRE_ROUTE_EVENTS;
 
 	if (!st->has_buffered_obs)
 	{
-		if (snapshot->done)
+		if (done)
 		{
 			if (out != NULL)
 			{
-				QNN_EmitTick(out, cur_obs, &snapshot->action_label,
+				QNN_EmitTick(out, cur_obs, action,
 					tick, steps, tick_hz, 0x02);
+				QNN_DumpFireRoutes(st->emitted_rows, tick,
+					steps, action, routes, route_count);
+				st->emitted_rows++;
 			}
 			return;
 		}
@@ -275,19 +344,23 @@ void QNN_WriteObsTick(qnn_tick_emit_state_t *st, FILE *out,
 		return;
 	}
 
-	if (snapshot->done) flags |= 0x02;
+	if (done) flags |= 0x02;
 	if (reset_flag) flags |= 0x01;
 
 	if (!st->has_jitter_buf)
 	{
 		/* First real pair: push into jitter buffer, can't filter yet. */
 		memcpy(st->jitter_obs, st->buffered_obs, QNN_OBS_BUFFER_SIZE);
-		st->jitter_action = snapshot->action_label;
+		st->jitter_action = *action;
 		st->jitter_tick = tick;
 		st->jitter_steps = steps;
 		st->jitter_tick_hz = tick_hz;
 		st->jitter_flags = flags;
 		st->jitter_out = out;
+		st->jitter_fire_route_count = route_count;
+		if (route_count > 0)
+			memcpy(st->jitter_fire_routes, routes,
+				sizeof(qnn_fire_route_event_t) * route_count);
 		st->has_jitter_buf = true;
 	}
 	else
@@ -297,20 +370,23 @@ void QNN_WriteObsTick(qnn_tick_emit_state_t *st, FILE *out,
 		if (st->has_prev_prev_move)
 			QNN_JitterFilter(&st->jitter_action,
 				st->prev_prev_move,
-				snapshot->action_label.move);
+				action->move);
 
 		/* Emit the (possibly corrected) jitter-buffered tick. */
 		if (st->jitter_out != NULL)
 		{
-			if (st->has_prev_emitted)
-				QNN_PatchActionHistory(st->jitter_obs, &st->prev_emitted_action);
 			QNN_EmitTick(st->jitter_out, st->jitter_obs,
 				&st->jitter_action,
 				st->jitter_tick,
 				st->jitter_steps,
 				st->jitter_tick_hz,
 				st->jitter_flags);
-			st->prev_emitted_action = st->jitter_action;
+			QNN_DumpFireRoutes(st->emitted_rows,
+				st->jitter_tick, st->jitter_steps,
+				&st->jitter_action,
+				st->jitter_fire_routes,
+				st->jitter_fire_route_count);
+			st->emitted_rows++;
 			st->has_prev_emitted = true;
 		}
 
@@ -321,15 +397,19 @@ void QNN_WriteObsTick(qnn_tick_emit_state_t *st, FILE *out,
 		st->has_prev_prev_move = true;
 
 		memcpy(st->jitter_obs, st->buffered_obs, QNN_OBS_BUFFER_SIZE);
-		st->jitter_action = snapshot->action_label;
+		st->jitter_action = *action;
 		st->jitter_tick = tick;
 		st->jitter_steps = steps;
 		st->jitter_tick_hz = tick_hz;
 		st->jitter_flags = flags;
 		st->jitter_out = out;
+		st->jitter_fire_route_count = route_count;
+		if (route_count > 0)
+			memcpy(st->jitter_fire_routes, routes,
+				sizeof(qnn_fire_route_event_t) * route_count);
 	}
 
-	if (snapshot->done)
+	if (done)
 	{
 		QNN_TickEmitFlush(st);
 		st->has_buffered_obs = false;
@@ -337,4 +417,188 @@ void QNN_WriteObsTick(qnn_tick_emit_state_t *st, FILE *out,
 	}
 
 	memcpy(st->buffered_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
+}
+
+void QNN_WriteObsTick(qnn_tick_emit_state_t *st, FILE *out,
+	const qnn_snapshot_t *snapshot, int tick, int steps, int tick_hz,
+	qboolean reset_flag)
+{
+	uint8_t cur_obs[QNN_OBS_BUFFER_SIZE];
+	QNN_PackSnapshotObs(snapshot, cur_obs);
+	QNN_WriteObsTickInner(st, out, cur_obs, &snapshot->action_label,
+		snapshot->done, tick, steps, tick_hz, reset_flag,
+		NULL, 0);
+}
+
+void QNN_WriteObsTickPrepacked(qnn_tick_emit_state_t *st, FILE *out,
+	const uint8_t *obs_bytes, const qnn_action_t *action,
+	qboolean done, int tick, int steps, int tick_hz,
+	qboolean reset_flag)
+{
+	QNN_WriteObsTickInner(st, out, obs_bytes, action,
+		done, tick, steps, tick_hz, reset_flag,
+		NULL, 0);
+}
+
+void QNN_WriteObsTickPrepackedWithFireRoutes(qnn_tick_emit_state_t *st,
+	FILE *out, const uint8_t *obs_bytes, const qnn_action_t *action,
+	qboolean done, int tick, int steps, int tick_hz,
+	qboolean reset_flag, const qnn_fire_route_event_t *routes,
+	int route_count)
+{
+	QNN_WriteObsTickInner(st, out, obs_bytes, action,
+		done, tick, steps, tick_hz, reset_flag,
+		routes, route_count);
+}
+
+/* ── Collect runtime helpers ────────────────────────────────────── */
+
+void QNN_SavePrev(const qnn_snapshot_t *snapshot, float dt)
+{
+	if (qnn_runtime.has_prev && dt > 0.0f)
+	{
+		int i;
+		for (i = 0; i < 3; i++)
+			qnn_runtime.prev_velocity[i] =
+				(snapshot->player_origin[i] - qnn_runtime.prev_origin[i]) / dt;
+	}
+	else
+	{
+		qnn_runtime.prev_velocity[0] = 0.0f;
+		qnn_runtime.prev_velocity[1] = 0.0f;
+		qnn_runtime.prev_velocity[2] = 0.0f;
+	}
+	VectorCopy(snapshot->player_origin, qnn_runtime.prev_origin);
+	qnn_runtime.prev_ammo = snapshot->ammo;
+	qnn_runtime.prev_weapon_id = snapshot->weapon_id;
+	qnn_runtime.prev_grounded = snapshot->grounded;
+	VectorCopy(snapshot->player_velocity, qnn_runtime.prev_snap_velocity);
+	qnn_runtime.has_prev = true;
+}
+
+/* Single-frame fire-event detection used by both NQ and QW MVD paths.
+ * Returns true if THIS native frame contains a shot event:
+ *   - a weapon-fire sound matching the currently-held weapon, OR
+ *   - an ammo decrement on the same weapon as the previous frame.
+ * The weapon-id guard on the ammo branch prevents weapon-switch
+ * cascades — snapshot->ammo jumps between weapons' ammo pools and
+ * would otherwise read as a "decrement". */
+qboolean QNN_DetectFireEvent(const qnn_snapshot_t *snapshot)
+{
+	static FILE *fire_source_dump = NULL;
+	static qboolean fire_source_dump_checked = false;
+	qboolean sound_fire;
+	qboolean ammo_drop;
+
+	if (!qnn_runtime.has_prev)
+		return false;
+	sound_fire = QNN_SnapshotHasSelfWeaponFireSound(snapshot);
+	ammo_drop = (snapshot->weapon_id == qnn_runtime.prev_weapon_id
+		&& snapshot->ammo < qnn_runtime.prev_ammo) ? true : false;
+	if (!fire_source_dump_checked)
+	{
+		const char *path = getenv("QNN_FIRE_SOURCE_DUMP");
+		fire_source_dump_checked = true;
+		if (path != NULL && path[0] != '\0')
+			fire_source_dump = fopen(path, "a");
+	}
+	if (fire_source_dump != NULL && (sound_fire || ammo_drop))
+	{
+		fprintf(fire_source_dump,
+			"{\"tick\":%d,\"sound\":%d,\"ammo\":%d,"
+			"\"weapon\":%d,\"prev_weapon\":%d,\"ammo_count\":%d,"
+			"\"prev_ammo\":%d}\n",
+			qnn_runtime.tick, sound_fire ? 1 : 0, ammo_drop ? 1 : 0,
+			snapshot->weapon_id, qnn_runtime.prev_weapon_id,
+			snapshot->ammo, qnn_runtime.prev_ammo);
+		fflush(fire_source_dump);
+	}
+	return (sound_fire || ammo_drop) ? true : false;
+}
+
+/* Fill action->look (view-relative turn delta) and action->weapon
+ * (per-frame held-weapon state) from the current snapshot.  Shared by
+ * both the QWD usercmd-truth path and the MVD inference path.  weapon is
+ * always set to the current weapon when not already set by the caller's
+ * usercmd path (which provides press-time prediction); MVD has no
+ * usercmd so this is the only source. */
+void QNN_FillLookAndSwitch(qnn_action_t *action,
+	const qnn_snapshot_t *snapshot)
+{
+	vec3_t forward, right, up, cur_forward;
+
+	if (!qnn_runtime.has_emit_anchor)
+		return;
+
+	AngleVectors(qnn_runtime.emit_view_angles, forward, right, up);
+	QNN_ForwardFromAngles(snapshot->player_view_angles, cur_forward);
+	action->look[0] = DotProduct(cur_forward, forward);
+	action->look[1] = DotProduct(cur_forward, right);
+	action->look[2] = DotProduct(cur_forward, up);
+
+	if (action->weapon == 0 && snapshot->weapon_id > 0)
+		action->weapon = snapshot->weapon_id;
+}
+
+FILE *QNN_EmitFilter(qnn_snapshot_t *snapshot)
+{
+	int health = snapshot->health;
+
+	if (snapshot->done)
+	{
+		qnn_runtime.dead_emit_count = 0;
+		qnn_runtime.frozen_emit_count = 0;
+		return stdout;
+	}
+
+	/* God-mode (training): skip entirely. */
+	if (health > QNN_GOD_MODE_HEALTH)
+		return NULL;
+
+	/* Dead: keep first QNN_DEAD_MAX_EMIT frames, inject fire=1, zero
+	 * move (corpse physics ≠ player input — alive accel/friction vs
+	 * dead velocity decay diverges). */
+	if (health <= 0)
+	{
+		qnn_runtime.frozen_emit_count = 0;
+		qnn_runtime.dead_emit_count++;
+		if (qnn_runtime.dead_emit_count > QNN_DEAD_MAX_EMIT)
+			return NULL;
+		snapshot->action_label.fire = 1;
+		snapshot->action_label.move[0] = 0.0f;
+		snapshot->action_label.move[1] = 0.0f;
+		snapshot->action_label.move[2] = 0.0f;
+		return stdout;
+	}
+
+	qnn_runtime.dead_emit_count = 0;
+
+	if (QNN_ActionIsFrozen(&snapshot->action_label))
+	{
+		qnn_runtime.frozen_emit_count++;
+		if (qnn_runtime.frozen_emit_count > QNN_FROZEN_MAX_EMIT)
+			return NULL;
+		return stdout;
+	}
+
+	qnn_runtime.frozen_emit_count = 0;
+	return stdout;
+}
+
+/* Match the literal `"op":"<value>"` JSON key (with or without a space
+ * after the colon) anywhere on a worker command line.  Necessary because
+ * the dispatch loop runs over fields like the demo filename, and a naive
+ * strstr(line, "<value>") false-matches on filenames containing the
+ * keyword (e.g. _vs_hello_kitty_ → "hello" → wrong handler). */
+int QNN_OpIs(const char *line, const char *value)
+{
+	char needle[64];
+	int n;
+	n = snprintf(needle, sizeof(needle), "\"op\":\"%s\"", value);
+	if (n > 0 && n < (int)sizeof(needle) && strstr(line, needle) != NULL)
+		return 1;
+	n = snprintf(needle, sizeof(needle), "\"op\": \"%s\"", value);
+	if (n > 0 && n < (int)sizeof(needle) && strstr(line, needle) != NULL)
+		return 1;
+	return 0;
 }

@@ -22,19 +22,7 @@ int stricmp(const char *s1, const char *s2)
 /* CDAudio_Pause — referenced by cl_parse.c on pause */
 void CDAudio_Pause(void) {}
 
-/* SV_RecursiveHullCheck stub — shared qnn_entity.c uses it for FOV
- * occlusion.  Returns "no obstruction" unconditionally; QW PVS culling
- * in qnn_entity.c already filters most hidden entities, and the
- * remaining FOV-miss cost is acceptable for data collection. */
-qboolean SV_RecursiveHullCheck(hull_t *hull, int num, float p1f, float p2f,
-	vec3_t p1, vec3_t p2, trace_t *trace)
-{
-	if (trace)
-		trace->fraction = 1.0f;
-	return true;
-}
-
-/* NQ server compat globals — only referenced by trace_t / SV_RecursiveHullCheck */
+/* NQ server compat globals — only referenced by trace_t */
 edict_t *sv_player;
 server_t sv;
 globalvars_t _pr_global_struct;

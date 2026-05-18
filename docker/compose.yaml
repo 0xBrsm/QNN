@@ -23,6 +23,13 @@ services:
       - type: bind
         source: ${HOST_WORKSPACE:?Set HOST_WORKSPACE to the host repo path}
         target: /workspace
+      # Corpora disk (WSL ext4 mount) overlaid on top of the artifacts
+      # symlink baked into the repo. Without this the symlink loops inside
+      # the container because the corpus disk is only mounted on the dev
+      # WSL distro, not Docker Desktop's filesystem.
+      - type: bind
+        source: ${HOST_ARTIFACTS:-/mnt/wsl/corpora}
+        target: /workspace/artifacts
       - type: bind
         source: ${WSL_LIBDXCORE_PATH:-/usr/lib/wsl/lib/libdxcore.so}
         target: /usr/lib/libdxcore.so

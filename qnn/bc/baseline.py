@@ -5,8 +5,8 @@ on each action head.  This sets the floor that any trained model must beat
 and characterizes the temporal autocorrelation of the training corpus.
 
 Usage:
-    python -m qnn.bc.baseline assets/collect/prod/precomputed_val
-    python -m qnn.bc.baseline assets/collect/prod/precomputed_train --json
+    python -m qnn.bc.baseline artifacts/collect/qwd/precomputed_val
+    python -m qnn.bc.baseline artifacts/collect/qwd/precomputed_train --json
 """
 from __future__ import annotations
 

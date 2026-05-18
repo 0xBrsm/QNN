@@ -1,8 +1,8 @@
 /*
  * qnn_io.c — Unified tick IO: action in, tokens out.
  *
- * Encapsulates the per-tick pipeline: world model update, token emission,
- * action history, and obs buffer serialization.
+ * Encapsulates the per-tick pipeline: world model update, token
+ * emission, and obs buffer serialization.
  */
 
 #include "qnn_io.h"
@@ -16,99 +16,37 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ── Action history (internal) ─────────────────────────────────── */
-
-static float qnn_action_history[QNN_OBS_ACTION_HISTORY_LEN][QNN_OBS_ACTION_HISTORY_DIM];
-static int qnn_action_history_count = 0;
-
-static qboolean QNN_ActionHasSignal(const qnn_action_t *action)
-{
-	return (action->move[0] != 0.0f || action->move[1] != 0.0f || action->move[2] != 0.0f
-		|| action->look[0] != 0.0f || action->look[1] != 0.0f || action->look[2] != 0.0f
-		|| action->fire || action->switch_slot) ? true : false;
-}
-
-static void QNN_ActionReset(void)
-{
-	memset(qnn_action_history, 0, sizeof(qnn_action_history));
-	qnn_action_history_count = 0;
-}
-
-static void QNN_ActionPush(const qnn_action_t *action)
-{
-	float features[QNN_OBS_ACTION_HISTORY_DIM];
-	int i;
-
-	features[0] = action->move[0];
-	features[1] = action->move[1];
-	features[2] = action->move[2];
-	features[3] = action->look[0];
-	features[4] = action->look[1];
-	features[5] = action->look[2];
-	features[6] = (float)action->fire;
-	features[7] = (float)(action->switch_slot < 0 ? 0 : action->switch_slot > QNN_ACTION_SWITCH_SLOTS ? QNN_ACTION_SWITCH_SLOTS : action->switch_slot)
-		/ (float)QNN_ACTION_SWITCH_SLOTS;
-
-	if (qnn_action_history_count >= QNN_OBS_ACTION_HISTORY_LEN)
-	{
-		memmove(qnn_action_history[0], qnn_action_history[1],
-			(QNN_OBS_ACTION_HISTORY_LEN - 1) * sizeof(qnn_action_history[0]));
-		qnn_action_history_count = QNN_OBS_ACTION_HISTORY_LEN - 1;
-	}
-	for (i = 0; i < QNN_OBS_ACTION_HISTORY_DIM; ++i)
-		qnn_action_history[qnn_action_history_count][i] = features[i];
-	qnn_action_history_count++;
-}
-
-static int QNN_ActionEmit(qnn_action_token_t *out, int max_tokens)
-{
-	int n, i;
-
-	n = qnn_action_history_count < max_tokens ? qnn_action_history_count : max_tokens;
-	if (n > QNN_OBS_ACTION_HISTORY_LEN)
-		n = QNN_OBS_ACTION_HISTORY_LEN;
-
-	for (i = 0; i < n; ++i)
-	{
-		out[i].move[0]     = qnn_action_history[i][0];
-		out[i].move[1]     = qnn_action_history[i][1];
-		out[i].move[2]     = qnn_action_history[i][2];
-		out[i].look[0]     = qnn_action_history[i][3];
-		out[i].look[1]     = qnn_action_history[i][4];
-		out[i].look[2]     = qnn_action_history[i][5];
-		out[i].fire        = qnn_action_history[i][6];
-		out[i].switch_norm = qnn_action_history[i][7];
-	}
-	return n;
-}
-
 /* ── Lifecycle ─────────────────────────────────────────────────── */
 
 void QNN_IOInit(const qnn_map_state_t *map_state)
 {
-	QNN_EntityResetTeamCache();
+	QNN_PlayersResetTeamCache();
 	QNN_EventInit(map_state);
-	QNN_ActionReset();
 }
 
 /* ── Per-frame update ──────────────────────────────────────────── */
 
 void QNN_IOUpdate(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag)
 {
-	if (reset_flag)
-		QNN_ActionReset();
+	/* Stamp the entity store (e->pvs / origin / velocity) BEFORE
+	 * EventTick runs.  EventTick's freshness checks (dimlight, mover
+	 * toggle, player promote) compare e->pvs against now=cl.mtime[0],
+	 * and want a within-this-HF stamp.  When StoreUpdate ran later
+	 * (in IOEmit), e->pvs was always one HF stale → checks failed at
+	 * any tick rate where cl.mtime advanced per HF (always true at
+	 * 20 Hz host = engine tick = emit tick). */
+	QNN_StoreUpdate(snapshot, dt);
 	QNN_EventTick(snapshot, dt, reset_flag);
+	if (reset_flag)
+		QNN_OracleResetState();
 }
 
-/* ── Token emission ────────────────────────────────────────────── */
+/* ── Token emission ──────────────────────────────────────────────
+ * StoreUpdate is now in IOUpdate so it runs before EventTick.  Emit
+ * just reads the already-stamped store. */
 
 void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
 {
-	float emit_dt = (qnn_resample.target_dt > 0)
-		? qnn_resample.target_dt
-		: (float)(cl.mtime[0] - cl.mtime[1]);
-
-	QNN_StoreUpdate(snapshot, emit_dt);
 	memset(out, 0, sizeof(*out));
 
 	{
@@ -119,13 +57,6 @@ void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
 	}
 	QNN_SelfEmitToken(&out->self, snapshot);
 	QNN_SpatialEmitTokens(snapshot, out->spatial);
-	out->action_history_count = QNN_ActionEmit(out->action_history, QNN_OBS_ACTION_HISTORY_LEN);
-}
-
-void QNN_IOPushAction(const qnn_action_t *action)
-{
-	if (QNN_ActionHasSignal(action))
-		QNN_ActionPush(action);
 }
 
 /* ── Obs buffer serialization ─────────────────────────────────── */
@@ -145,17 +76,19 @@ void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 		scalars[0] = tok->health;
 		scalars[1] = tok->armor;
 		scalars[2] = tok->weapon_sg;
-		scalars[3] = tok->weapon_ng;
-		scalars[4] = tok->weapon_gl;
-		scalars[5] = tok->weapon_rl;
-		scalars[6] = tok->weapon_lg;
-		scalars[7] = tok->ammo_shells;
-		scalars[8] = tok->ammo_nails;
-		scalars[9] = tok->ammo_rockets;
-		scalars[10] = tok->ammo_cells;
-		scalars[11] = tok->vel[0];
-		scalars[12] = tok->vel[1];
-		scalars[13] = tok->vel[2];
+		scalars[3] = tok->weapon_ssg;
+		scalars[4] = tok->weapon_ng;
+		scalars[5] = tok->weapon_sng;
+		scalars[6] = tok->weapon_gl;
+		scalars[7] = tok->weapon_rl;
+		scalars[8] = tok->weapon_lg;
+		scalars[9] = tok->ammo_shells;
+		scalars[10] = tok->ammo_nails;
+		scalars[11] = tok->ammo_rockets;
+		scalars[12] = tok->ammo_cells;
+		scalars[13] = tok->vel[0];
+		scalars[14] = tok->vel[1];
+		scalars[15] = tok->vel[2];
 
 		for (i = 0; i < QNN_OBS_SELF_SCALAR_DIM; ++i)
 			QNN_BufWriteF32(obs, QNN_OBS_OFF_SELF_SCALARS + i * 4, scalars[i]);
@@ -187,21 +120,6 @@ void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 		QNN_BufWriteF32(obs, off, tok->water_frac); off += 4;
 		QNN_BufWriteF32(obs, off, tok->slime_frac); off += 4;
 		QNN_BufWriteF32(obs, off, tok->lava_frac); off += 4;
-	}
-
-	/* Action history — fixed position after spatial */
-	for (i = 0; i < r->action_history_count; ++i)
-	{
-		const qnn_action_token_t *tok = &r->action_history[i];
-		int off = QNN_OBS_OFF_ACTION_HISTORY + i * 8 * 4;
-		QNN_BufWriteF32(obs, off, tok->move[0]); off += 4;
-		QNN_BufWriteF32(obs, off, tok->move[1]); off += 4;
-		QNN_BufWriteF32(obs, off, tok->move[2]); off += 4;
-		QNN_BufWriteF32(obs, off, tok->look[0]); off += 4;
-		QNN_BufWriteF32(obs, off, tok->look[1]); off += 4;
-		QNN_BufWriteF32(obs, off, tok->look[2]); off += 4;
-		QNN_BufWriteF32(obs, off, tok->fire); off += 4;
-		QNN_BufWriteF32(obs, off, tok->switch_norm); off += 4;
 	}
 
 	/* Entities — variable-length tagged tokens at end of buffer.

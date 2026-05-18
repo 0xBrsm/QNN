@@ -211,6 +211,8 @@ def build_run_bc_config(
     machine = _require_mapping(run_cfg, "machine", "run config")
 
     bc_cfg = dict(train)
+    # Legacy no-op key: global length bucketing is unconditional now.
+    bc_cfg.pop("length_bucket_window", None)
     bc_cfg.update(model)
 
     checkpoints_dir = run_output_dirs(run_cfg)["checkpoints"]

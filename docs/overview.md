@@ -1,56 +1,87 @@
 # QNN Overview
 
 Competitive Quake PvP agent trained end-to-end: native C worker emits semantic
-tokens, a transformer encoder attends over them, GRU maintains temporal state,
-and Sample Factory APPO optimizes a factored policy against FrikBotNex opponents.
+tokens, a transformer encoder attends over them, a GRU maintains temporal
+state, supervised pointer attention picks an engagement target, and factored
+action heads (move, look, fire, weapon) drive the engine. The pipeline is
+seeded by behavioral cloning on Quake demos and fine-tuned via Sample Factory
+APPO against FrikBotNex opponents.
 
-Related docs: [token-spec.md](token-spec.md) (wire format),
+Related docs: [token-spec.md](token-spec.md) (wire format, head shapes),
 [vocab.md](vocab.md) (IDs and event mapping), [run.md](run.md) (config schema),
-[vendor.md](vendor.md) (dependencies).
+[vendor.md](vendor.md) (dependencies),
+[target_labeler_engine_alignment.md](target_labeler_engine_alignment.md)
+(target labeler + engine sticky design),
+[diag.md](diag.md) (capacity diagnostics on trained policies —
+`python -m qnn.diag`).
 
 ## Policy Architecture
 
 ```text
-TransformerTrunk (x_t: 64, self-token readout at position 0)
+TransformerTrunk
+  self_readout x_t           (self token at position 0)
+  actor tokens e_i           (entity slots where type == ACTOR)
         │
-        ├──► scout BC baseline: heads read x_t directly
-        │        ├──► move:       Linear(64→3)    [forward, strafe, jump-Z]
-        │        ├──► look:       Linear(64→3)    [yaw_delta, pitch_delta, roll]
-        │        ├──► fire:       Linear(64→2)    [off, on]
-        │        ├──► switch:     Linear(64→6)    [no-switch, 5 weapon classes]
-        │        ├──► recall_0…3: Linear(64→65)   [no-op, 64 object handles] ×4
-        │        └──► value:      Linear(64→1)
+        ├──► TargetPointer:  query = linear(x_t)        (or GRU output if gru_target_query)
+        │      scores  = (e_i * query).sum(-1), non-actor slots masked
+        │      target_logits   (B, 16) — CE label vs labeler
+        │      target_feat = softmax(scores) @ e_i  (soft pool)
         │
-        └──► recurrent confirmation path
-                 ▼
-          GRU (64 → 64, 1 layer) → h_t
-                 │
-                 └──► fuse z_t = concat(x_t, h_t) = 128
-                          │
-                          └──► same head families on fused 128-dim features
+        └──► GRU input:      x_t -> h_t                  (sequence of self_readouts)
+
+Action features (per tick):
+  motor heads (move, look, fire):
+    features = cat(gru_out, target_feat, weapon_context)
+  weapon head:
+    features = cat(gru_out, self_readout, target_feat)   (gru_out optional)
+
+  weapon_context comes from the held weapon in obs (default) or from a
+  softmax over the weapon head's own logits.
+
+  ├──► move    (3 categorical axes × 3 classes {neg, none, pos})
+  ├──► look    target-anchored base direction + learned residual
+  ├──► fire    binary BCE
+  └──► weapon  8-way categorical → Quake impulse byte 1..8
+
+  Target is supervised internally; it conditions action heads but is
+  never sampled. The 8-class weapon head emits a direct Quake impulse;
+  the engine-facing "switch" slot is gone end-to-end.
 ```
 
-8 factored heads total: 2 continuous play heads (`move[3]`, `look[3]`), 2
-discrete play heads (`fire`, `switch`), and 4 discrete recall heads.
+Primary supervised heads: `target` (pointer over actor slots), `move`,
+`look`, `fire`, `weapon`. The weapon class index is converted to a Quake
+impulse byte (1..8 = axe..lightning) by the engine bridge; no separate
+switch controller.
 
 | Trunk parameter | Value |
 |-----------------|-------|
 | d_model | 64 |
-| n_heads | 1 |
+| n_heads | 2 |
 | n_layers | 2 (pre-norm) |
 | ffn_dim | 256 |
+| gru_hidden | 64 |
 
-Token sequence: `self + 9 spatial + [action history] + 16 entities = 26+ tokens`.
-Invalid entity rows masked via `key_padding_mask`.
+Token sequence: `self(1) + spatial(9) + entities(up to 16) = up to 26 tokens`.
+Invalid entity rows masked via `key_padding_mask`. Action-history tokens are
+parked (templates set `action_history_tokens: 0`; no wire region in v11).
 
-### BC Loss: Sparse Binary Masking
+### BC Loss Notes
 
-Fire and switch are sparse actions (~10-15% positive rate in demos). Standard
-cross-entropy rewards "always predict 0" on the ~85% of idle ticks, collapsing
-the head before PPO can use it.
+Move is trained as three independent categorical axes; the up/down axis
+carries jump and can be reweighted via `jump_pos_weight` with linear decay.
 
-`_SPARSE_BINARY_HEADS` in `policy.py` masks out true-negative ticks (target=0
-AND pred=0) from the loss. Only mismatches and correct positives contribute
+Fire is trained as binary BCE with corpus-derived positive weighting.
+
+Weapon is trained as 8-class CE on the demonstrator's held-weapon impulse.
+No-weapon frames (pre-spawn, dead, transitional) carry 0 on disk and are
+masked from the CE loss via `ignore_index=-100`.
+
+Target is trained as 16-way CE on the labeler output described in
+[target_labeler_engine_alignment.md](target_labeler_engine_alignment.md);
+unlabeled frames carry `-100` and are skipped.
+
+Per-head loss weighting is configured via `head_loss_weights` in
+`train.json`; a head with weight 0 still emits logits but contributes no
 gradient.
 
 ## Reward System
@@ -86,23 +117,34 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 | Path | Purpose |
 |------|---------|
 | `qnn/vocab.py` | shared semantic IDs (source of truth) |
-| `qnn/actions.py` | canonical mixed action schema and look decoding |
-| `qnn/wire.py` | binary wire format parser, action struct layout |
+| `qnn/actions.py` | canonical mixed action schema, move pack/unpack, look decoding |
+| `qnn/wire.py` | binary wire format parser, action struct layout, LOBS labeler frame |
 | `qnn/schema.py` | OBS_SCHEMA, tokenizer input shapes |
+| `qnn/filter_dsl.py` | shared filter mini-language (collect + train) |
+| `qnn/collection_fingerprint.py` | collect-identity hash recorded at train time |
 | `qnn/model/transformer.py` | tokenizer + transformer trunk |
-| `qnn/model/policy.py` | actor-critic with GRU + mixed play/recall heads |
+| `qnn/model/target.py` | TargetPointer attention module |
+| `qnn/model/policy.py` | actor-critic with GRU + play heads |
 | `qnn/run/router.py` | run-dir router |
 | `qnn/run/config.py` | strict run-dir config loader and builders |
 | `qnn/{bc,ppo,eval}/` | mode runners (`bc`, `ppo`, `pbt`, `eval`, `optuna`) |
-| `qnn/bc/train.py` | BC training loop |
-| `qnn/bc/collect.py` | demo collection pipeline |
+| `qnn/bc/supervised_loop.py` | chunked supervised loop (extracted from `loop.py`) |
+| `qnn/bc/class_weights.py` | per-head class-weight derivation |
+| `qnn/bc/token_filter.py` | train-time token mask compiler |
+| `qnn/bc/target_labeler.py` | offline target label generator |
+| `qnn/bc/collect.py` | demo collection pipeline (dispatches to engine workers) |
 | `qnn/ppo/env.py` | Sample Factory gymnasium wrapper |
 | `qnn/ppo/encoder.py` | PPO encoder wrapper |
 | `qnn/ppo/train.py` | PPO registration + config builder |
 | `qnn/env/reward.py` | PvP reward shaping |
-| `engine/common/` | shared C worker: store, oracle, entity, event, io, sound, spatial |
-| `engine/nq/` | NetQuake collect/trainer main loops, physics, input |
+| `qnn/diag/` | trained-policy diagnostics package |
+| `qnn/probes/` | standalone target-head probes (causal TCN, GBT) |
+| `qnn/eval/live.py` | live-play entry point (NQ servers) |
+| `engine/common/` | shared C worker: store, oracle, entity, event, io, sound, spatial, fault, watchdog, tick |
+| `engine/common/qnn_mvd_collect.{c,h}` | shared MVD/QWD demo collect runtime |
+| `engine/common/qnn_qwd_collect.{c,h}` | QWD usercmd-path collect helpers |
+| `engine/common/qnn_labeler_collect.{c,h}` | native-rate labeler LOBS emit |
+| `engine/nq/` | NetQuake collect/trainer/client main loops, physics, input |
 | `engine/qw/` | QuakeWorld collect main loop, physics, input |
-| `engine/bridge.py` | worker subprocess management |
-| `engine/training_protocol.py` | training extras parser |
+| `engine/build/` | build scripts for `ppo_worker`, `nq_demo_worker`, `nq_client`, `qw_demo_worker`, `qw_classifier` |
 | `mapgen/` | procedural Quake .map generator for training variety |

@@ -101,10 +101,12 @@ BC:
 
 | Path | Purpose |
 |------|---------|
-| `bc_data_dir` | precomputed BC data root (`assets/collect/prod` by default) |
+| `bc_data_dir` | precomputed BC data root (`artifacts/collect/qwd` by default) |
 | `batch_size` | BC batch size |
+| `microbatch_size` | gradient-accumulation microbatch size |
 | `pin_memory` | pin host tensors for GPU transfer |
 | `prefetch` | batch prefetch toggle |
+| `snapshot_interval` | epochs between archived checkpoints |
 
 PPO / PBT / Optuna trials:
 
@@ -143,6 +145,8 @@ Present for PPO / PBT / Optuna runs only. BC runs do not carry a scenario.
 
 ## model.json
 
+Common:
+
 | Path | Purpose |
 |------|---------|
 | `trunk_hidden` | trunk width |
@@ -151,10 +155,24 @@ Present for PPO / PBT / Optuna runs only. BC runs do not carry a scenario.
 | `n_layers` | transformer depth |
 | `ffn_dim` | transformer FFN width |
 | `d_model` | transformer token width |
-| `readout` | transformer readout mode |
-| `action_history_tokens` | action-history token count |
 | `attn_dropout` | transformer attention dropout |
 | `use_gru` | recurrent toggle |
+
+BC-only (PPO model templates carry only the common keys):
+
+| Path | Purpose |
+|------|---------|
+| `use_weapon_head` | enable the 8-class weapon head |
+| `weapon_use_gru` | feed GRU output into weapon-head features |
+| `weapon_context_from_obs` | use observed (vs predicted) held weapon when building motor-head context |
+| `weapon_switch_confidence` | minimum weapon-head softmax to emit a switch at inference |
+| `weapon_switch_margin` | minimum margin over currently-held weapon to emit a switch |
+| `gru_target_query` | route GRU output into the TargetPointer query (otherwise self_readout) |
+| `hard_target_feat` | hard-argmax target pooling instead of softmax |
+| `weapon_in_target_query` | add a current-weapon embedding to the target query |
+| `linear_slot_prior` | additive linear slot-index prior on target logits |
+| `head_bottleneck_dim` | per-head bottleneck width (0 = no bottleneck) |
+| `head_use_relu` | apply ReLU inside the head bottleneck |
 
 ## train.json
 
@@ -164,14 +182,16 @@ BC:
 |------|---------|
 | `fixed_tick_hz` | expected cache tick rate (matches collection) |
 | `sequence_length` | BC chunk length (0 = full episode) |
-| `lr`, `lr_min`, `epochs`, `patience`, `seed` | BC optimization schedule |
-| `head_loss_weights`, `focal_gamma`, `sparse_discrete` | BC loss shaping |
-| `look_deadzone`, `look_turn_alpha`, `look_cosine` | look head loss and label controls |
-| `warmup_epochs` | linear LR warmup before cosine decay |
-| `class_weight_power`, `class_weight_min`, `class_weight_max` | BC class weighting |
+| `lr`, `lr_min`, `epochs`, `seed` | BC optimization schedule (flat LR by default) |
+| `dtype` | training precision (`bf16` is the production default) |
+| `head_loss_weights` | per-head loss weighting; weight 0 zeroes that head's gradient |
+| `jump_pos_weight`, `jump_pos_weight_end` | per-axis positive weighting for the move-ud (jump) class, optionally linearly decayed |
+| `warmup_epochs` | linear LR warmup before flat or cosine schedule |
 | `max_grad_norm`, `tbptt_limit` | stability controls |
-| `regression_stop`, `regression_threshold`, `regression_patience` | regression-based early stop |
+| `regression_threshold`, `regression_patience` | regression-style early stop |
 | `train_eval_interval`, `train_eval_gap_threshold`, `train_eval_val_regression_threshold`, `train_eval_train_improve_threshold` | train/val proxy gap triggers |
+| `segment_mask`, `token_mask` | filter-DSL expressions (see `qnn/filter_dsl.py`) for episode and per-token filtering |
+| `step_report_interval_seconds` | per-step metrics log cadence |
 | `prometheus_pushgateway_url` | optional metrics export target |
 
 PPO / PBT / Optuna trials:
@@ -183,7 +203,7 @@ PPO / PBT / Optuna trials:
 | `fixed_tick_hz`, `max_steps_per_episode`, `seed` | run timing and seed |
 | `rollout_steps`, `total_steps` | PPO horizon |
 | `policy_lr`, `ppo_epochs`, `clip_ratio` | optimizer controls |
-| `entropy_coef`, `bc_kl_coef`, `look_cosine`, `initial_stddev` | exploration, KL shaping, look-head action semantics, continuous action sampling width |
+| `entropy_coef`, `bc_kl_coef`, `initial_stddev` | exploration, KL shaping, continuous action sampling width |
 | `head_loss_weights` | per-head PPO loss weighting (same JSON schema as BC); weight 0 zeros that head's log-prob/entropy/KL so no gradient flows to its parameters |
 | `gamma`, `gae_lambda`, `max_grad_norm`, `value_coef` | PPO objective weights |
 | `with_pbt`, `num_policies`, `pbt_*` | PBT controls |

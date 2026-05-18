@@ -10,33 +10,66 @@ from sample_factory.model.core import ModelCore, ModelCoreIdentity
 
 
 class QuakeConcatRNNCore(ModelCore):
-    """GRU core that returns ``concat(x_t, h_t)`` instead of memory alone."""
+    """GRU core that splits cat(self, pool, target_feat) and fuses
+    cat(self, h_t, target_feat).
+
+    The encoder emits three d_model summaries:
+      * ``self_readout`` — transformer self-token readout ("the now")
+      * ``pool``         — self + mean(actors) projection, fed to the GRU
+      * ``target_feat``  — attention-pooled entity feature for head conditioning
+
+    The core routes pool through the GRU and passes self_readout and
+    target_feat through unchanged.  Action heads downstream read
+    cat(self_readout, h_t, target_feat).
+    """
 
     def __init__(self, cfg, input_size: int):
         super().__init__(cfg)
 
         self.cfg = cfg
         self.input_size = int(input_size)
+        # Encoder packs three d_model-sized vectors in order.
+        assert self.input_size % 3 == 0, (
+            f"QuakeConcatRNNCore expects encoder output divisible by 3 (self, pool, target_feat); got {self.input_size}"
+        )
+        self.d_model = self.input_size // 3
+        self.self_dim = self.d_model
+        self.pool_dim = self.d_model
+        self.target_dim = self.d_model
         self.is_gru = False
 
         if cfg.rnn_type == "gru":
-            self.core = nn.GRU(self.input_size, cfg.rnn_size, cfg.rnn_num_layers)
+            self.core = nn.GRU(self.pool_dim, cfg.rnn_size, cfg.rnn_num_layers)
             self.is_gru = True
         elif cfg.rnn_type == "lstm":
-            self.core = nn.LSTM(self.input_size, cfg.rnn_size, cfg.rnn_num_layers)
+            self.core = nn.LSTM(self.pool_dim, cfg.rnn_size, cfg.rnn_num_layers)
         else:
             raise RuntimeError(f"Unknown RNN type {cfg.rnn_type}")
 
         self.rnn_num_layers = int(cfg.rnn_num_layers)
-        self.core_output_size = self.input_size + int(cfg.rnn_size)
+        # Heads see self + gru_out + target_feat.
+        self.core_output_size = self.self_dim + int(cfg.rnn_size) + self.target_dim
+
+    def _split(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return torch.split(t, [self.self_dim, self.pool_dim, self.target_dim], dim=-1)
 
     def forward(self, head_output, rnn_states):
         is_packed = isinstance(head_output, PackedSequence)
         is_batched_sequence = torch.is_tensor(head_output) and head_output.ndim == 3
-        if is_packed or is_batched_sequence:
-            core_input = head_output
+        if is_packed:
+            self_data, pool_data, target_data = self._split(head_output.data)
+            core_input = PackedSequence(
+                pool_data,
+                head_output.batch_sizes,
+                head_output.sorted_indices,
+                head_output.unsorted_indices,
+            )
+        elif is_batched_sequence:
+            self_readout, pool, target_feat = self._split(head_output)
+            core_input = pool
         else:
-            core_input = head_output.unsqueeze(0)
+            self_readout, pool, target_feat = self._split(head_output)
+            core_input = pool.unsqueeze(0)
 
         if self.rnn_num_layers > 1:
             rnn_states = rnn_states.view(rnn_states.size(0), self.cfg.rnn_num_layers, -1)
@@ -53,15 +86,15 @@ class QuakeConcatRNNCore(ModelCore):
 
         if is_packed:
             fused = PackedSequence(
-                torch.cat([head_output.data, core_output.data], dim=1),
+                torch.cat([self_data, core_output.data, target_data], dim=1),
                 core_output.batch_sizes,
                 core_output.sorted_indices,
                 core_output.unsorted_indices,
             )
         elif is_batched_sequence:
-            fused = torch.cat([head_output, core_output], dim=-1)
+            fused = torch.cat([self_readout, core_output, target_feat], dim=-1)
         else:
-            fused = torch.cat([head_output, core_output.squeeze(0)], dim=1)
+            fused = torch.cat([self_readout, core_output.squeeze(0), target_feat], dim=1)
 
         if self.rnn_num_layers > 1:
             new_rnn_states = new_rnn_states.permute(1, 0, 2)

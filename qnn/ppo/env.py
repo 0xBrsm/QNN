@@ -27,22 +27,14 @@ _MOVE_DIM = ACTION_HEADS["move"]
 _LOOK_DIM = ACTION_HEADS["look"]
 _DISCRETE_HEAD_ORDER = [
     "fire",
-    "switch",
-    "recall_0",
-    "recall_1",
-    "recall_2",
-    "recall_3",
+    "weapon",
 ]
 
 _HEAD_NOOP_VALUES: Dict[str, object] = {
     "move": [0.0, 0.0, 0.0],
     "look": [0.0, 0.0, 0.0],
     "fire": 0,
-    "switch": 0,
-    "recall_0": 0,
-    "recall_1": 0,
-    "recall_2": 0,
-    "recall_3": 0,
+    "weapon": 0,
 }
 
 
@@ -94,12 +86,23 @@ def tuple_action_to_heads(action) -> Dict[str, object]:
     }
     discrete_offset = _MOVE_DIM + _LOOK_DIM
     for head_index, head in enumerate(_DISCRETE_HEAD_ORDER):
-        payload[head] = int(round(float(flat[discrete_offset + head_index])))
+        value = int(round(float(flat[discrete_offset + head_index])))
+        if head == "weapon":
+            # PPO action space is Discrete(8): class indices 0..7.
+            # The engine consumes a Quake impulse byte 1..8; convert
+            # at this boundary so ActionLabels.weapon and everything
+            # downstream carries the impulse byte directly.
+            value += 1
+        payload[head] = value
     return ActionLabels.from_dict(payload).to_dict()
 
 
 def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
-    """Convert a canonical action dict to the flat Tuple array expected by SF."""
+    """Convert a canonical action dict to the flat Tuple array expected by SF.
+
+    Inverse of tuple_action_to_heads: labels.weapon is the engine impulse
+    byte 1..8, SF Tuple wants the class index 0..7 in its Discrete slot.
+    """
     labels = ActionLabels.from_dict(heads)
     return np.asarray(
         [
@@ -110,11 +113,7 @@ def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
             float(labels.look[1]),
             float(labels.look[2]),
             int(labels.fire),
-            int(labels.switch),
-            int(labels.recall_0),
-            int(labels.recall_1),
-            int(labels.recall_2),
-            int(labels.recall_3),
+            int(labels.weapon) - 1,  # impulse 1..8 → class 0..7
         ],
         dtype=np.float32,
     )
@@ -154,7 +153,7 @@ class QuakeEnv(gymnasium.Env):
 
     Observation space: Dict of self/object/event/spatial token tensors from the inner encoder.
     Action space: Tuple(Box(3), Box(3), Discrete...) for move/look vectors,
-    discrete fire/switch, and four discrete recall heads.
+    and discrete fire/switch heads.
 
     SF passes env_config with at least "worker_index" and "env_id" keys.
     Per-worker scenario assignment uses env_id % len(scenarios) if a scenario
@@ -260,11 +259,7 @@ class QuakeEnv(gymnasium.Env):
                 gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_MOVE_DIM,), dtype=np.float32),
                 gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_LOOK_DIM,), dtype=np.float32),
                 gymnasium.spaces.Discrete(ACTION_HEADS["fire"]),
-                gymnasium.spaces.Discrete(ACTION_HEADS["switch"]),
-                gymnasium.spaces.Discrete(ACTION_HEADS["recall_0"]),
-                gymnasium.spaces.Discrete(ACTION_HEADS["recall_1"]),
-                gymnasium.spaces.Discrete(ACTION_HEADS["recall_2"]),
-                gymnasium.spaces.Discrete(ACTION_HEADS["recall_3"]),
+                gymnasium.spaces.Discrete(ACTION_HEADS["weapon"]),
             )
         )
 

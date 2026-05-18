@@ -44,7 +44,7 @@ def _validate_warm_start_arch(init_ckpt: str, ppo_cfg: dict[str, Any]) -> None:
         return
     arch_keys = (
         "trunk_hidden", "gru_hidden", "use_gru", "d_model", "n_heads",
-        "n_layers", "ffn_dim", "attn_dropout", "readout", "action_history_tokens",
+        "n_layers", "ffn_dim", "attn_dropout",
     )
     try:
         payload = trusted_torch_load(init_ckpt, map_location="cpu")
@@ -155,16 +155,13 @@ def run_training_job(
         use_gru=bool(require_cfg_value(ppo_cfg, "use_gru", "PPO config")),
         d_model=int(require_cfg_value(ppo_cfg, "d_model", "PPO config")),
         n_heads=int(require_cfg_value(ppo_cfg, "n_heads", "PPO config")),
-        readout=require_cfg_string(ppo_cfg, "readout", "PPO config"),
         n_layers=int(require_cfg_value(ppo_cfg, "n_layers", "PPO config")),
         ffn_dim=int(require_cfg_value(ppo_cfg, "ffn_dim", "PPO config")),
-        action_history_tokens=int(require_cfg_value(ppo_cfg, "action_history_tokens", "PPO config")),
         attn_dropout=float(require_cfg_value(ppo_cfg, "attn_dropout", "PPO config")),
         ppo_epochs=int(require_cfg_value(ppo_cfg, "ppo_epochs", "PPO config")),
         lr=float(require_cfg_value(ppo_cfg, "policy_lr", "PPO config")),
         entropy_coef=float(require_cfg_value(ppo_cfg, "entropy_coef", "PPO config")),
         bc_kl_coef=float(require_cfg_value(ppo_cfg, "bc_kl_coef", "PPO config")),
-        look_cosine=bool(require_cfg_value(ppo_cfg, "look_cosine", "PPO config")),
         clip_ratio=float(require_cfg_value(ppo_cfg, "clip_ratio", "PPO config")),
         gamma=float(require_cfg_value(ppo_cfg, "gamma", "PPO config")),
         gae_lambda=float(require_cfg_value(ppo_cfg, "gae_lambda", "PPO config")),
@@ -211,9 +208,7 @@ def run_training_job(
                 n_heads=int(require_cfg_value(ppo_cfg, "n_heads", "PPO config")),
                 n_layers=int(require_cfg_value(ppo_cfg, "n_layers", "PPO config")),
                 ffn_dim=int(require_cfg_value(ppo_cfg, "ffn_dim", "PPO config")),
-                action_history_tokens=int(require_cfg_value(ppo_cfg, "action_history_tokens", "PPO config")),
                 attn_dropout=float(require_cfg_value(ppo_cfg, "attn_dropout", "PPO config")),
-                readout=require_cfg_string(ppo_cfg, "readout", "PPO config"),
             )
             qnn_policy.save(qnn_ckpt_path)
             ppo_result["best_model_path"] = str(qnn_ckpt_path)

@@ -209,8 +209,6 @@ typedef struct
 
 extern qnn_semantic_event_atom_t qnn_semantic_events[QNN_MAX_EVENT_ATOMS];
 extern int qnn_event_head[QNN_EVENT_HEAD_CAPACITY];
-extern int qnn_prev_object_indices[QNN_MAX_TOKEN_OBJECTS];
-extern int qnn_prev_object_count;
 
 /* ── Static property helpers (qnn_map.c) ──────────────────────── */
 
@@ -222,6 +220,10 @@ int QNN_ObjectStaticPropertyInt(const qnn_static_object_t *obj, const char *key,
 int QNN_OracleEmitTokens(qnn_tagged_token_t *out_tokens, int max_tokens,
 	const qnn_snapshot_t *snapshot, const qnn_map_state_t *map_state,
 	int *out_player_cluster_id);
+
+/* Reset the sticky-engagement state machine in the oracle.  Called from
+ * QNN_IOUpdate when reset_flag is set (episode boundary). */
+void QNN_OracleResetState(void);
 
 /* ── Sound rule type (used by qnn_event.c) ─────────────────────── */
 
@@ -240,7 +242,14 @@ void QNN_EventTick(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag
 
 /* ── Entity perception (qnn_entity.c) ─────────────────────────── */
 
+/* BSP line trace from start to end against the world hull.  Per-engine
+ * implementation: NQ forwards to upstream's SV_RecursiveHullCheck, QW
+ * adapts upstream's PM_RecursiveHullCheck.  Caller's trace_t is filled
+ * with at minimum fraction (1.0 = no obstruction) and endpos. */
+void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace);
+
 qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target);
+qboolean QNN_EntityInPvs(const vec3_t viewer, const vec3_t target);
 
 /* Forward declaration — full definition in qnn_map.h */
 struct qnn_raw_entity_s;
@@ -251,7 +260,20 @@ int QNN_EntityClassifyStatic(const qnn_raw_entity_t *raw, int raw_count,
 int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 	qnn_entity_update_t *out_entities, int max_entities,
 	qnn_pvs_item_t *out_pvs, int max_pvs, int *out_pvs_count);
-void QNN_EntityResetTeamCache(void);
+int QNN_AppendPlayerEntityUpdates(const qnn_snapshot_t *snapshot,
+	qnn_entity_update_t *out_entities, int start_count, int max_entities);
+
+/* Returns true iff slot ``entity_num`` (1-indexed) currently holds a
+ * live first-person player on this engine — not the recorder, not an
+ * empty slot, not a spectator (QW), and has a real player body.  Both
+ * stores and the event handler must consult this before promoting a
+ * slot to an ACTOR entity, otherwise spectators in QWD demos and
+ * non-player edicts in NQ demos leak into the actor token stream. */
+qboolean QNN_IsLivePlayerSlot(int entity_num);
+
+/* Team detection lives in per-game qnn_players.c.  NQ uses pants color
+ * (the engine's own team field); QW uses userinfo "team" + cl.teamplay. */
+void QNN_PlayersResetTeamCache(void);
 float QNN_IsSameTeam(int entity_num);
 float QNN_FragFraction(int entity_frags);
 qboolean QNN_ClassifyStaticSubject(const qnn_static_object_t *obj, int *subject_id, int *qualifier_id, float *magnitude, qboolean *is_item, float *respawn_s);
@@ -264,8 +286,35 @@ int QNN_EventClassifySounds(const qnn_snapshot_t *snapshot, qnn_event_record_t *
 
 /* ── Self state capture (qnn_self.c) ──────────────────────────── */
 
+/* QNN_CaptureBaseSnapshot is per-game (origin/velocity acquisition
+ * differs).  QNN_CurrentFrags is per-game (frag source differs).
+ * QNN_WeaponId, QNN_CurrentArmortype, and QNN_SelfEmitToken are shared
+ * (read cl.stats[*] / snapshot only) and live in common/qnn_self.c. */
 void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot);
 int QNN_WeaponId(void);
+int QNN_ItemFlagFromImpulse(int impulse);
+int QNN_NextWeaponId(int reverse);
+float QNN_LatencySeconds(void);
+int QNN_LatencyFrames(int emit_hz);
+
+/* MVD-side label inference helper: how many emit frames to shift
+ * backward from a server-state-change observation to estimate the
+ * player's actual press time.  Returns ping_ms / (1000/emit_hz),
+ * integer floor — see qnn_self.c for the derivation.  Caller invokes
+ * QNN_ObservePings() each emit so the per-demo running median (used
+ * to clamp garbage svc_updateping values) stays fresh.  Returns 0 on
+ * NQ (no MVD inference) or before any svc_updateping has been seen. */
+void QNN_ObservePings(void);
+int QNN_PressBackShiftFrames(int player_slot, int emit_hz);
+/* Validated per-player ping in ms / sec.  Median-fallback + outlier
+ * reject — single source of truth for ping used by all back-shift
+ * paths (fire/jump per-sound, weapon/move per-emit-frame). */
+int QNN_PressPingMs(int player_slot);
+float QNN_PressPingSec(int player_slot);
+/* Reset per-demo running ping median.  Call at demo boundaries
+ * before the new demo's first QNN_ObservePings(). */
+void QNN_ResetPingEstimator(void);
+float QNN_CurrentArmortype(void);
 int QNN_CurrentFrags(void);
 
 /* ── Sound drain (qnn_event.c) ───────────────────────────────── */

@@ -16,6 +16,7 @@
 #include "qnn_object.h"
 #include "qnn_store.h"
 #include "qnn_io.h"
+#include "qnn_demo_sounds.h"
 
 /* Defined in common/qnn_sound.c */
 extern FILE *qnn_sound_dump;
@@ -52,8 +53,10 @@ static const qnn_sound_rule_t qnn_player_sound_rules[] = {
 	{"player/lburn1.wav",   QNN_ACTION_PAIN, QNN_SOURCE_LAVA, 0},
 	{"player/lburn2.wav",   QNN_ACTION_PAIN, QNN_SOURCE_LAVA, 0},
 	{"player/axhit1.wav",   QNN_ACTION_PAIN, QNN_SUBJECT_AXE, 0},
-	/* Movement */
-	{"player/plyrjmp8.wav", QNN_ACTION_JUMP, QNN_SOURCE_NONE, 0},
+	/* Movement — jump path from qnn_demo_sounds.h (shared with classifier). */
+#define X(path) {path, QNN_ACTION_JUMP, QNN_SOURCE_NONE, 0},
+	QNN_JUMP_SOUND_LIST(X)
+#undef X
 	{"player/land.wav",     QNN_ACTION_LAND, QNN_SOURCE_NONE, 0},
 	{"player/land2.wav",    QNN_ACTION_LAND, QNN_SOURCE_NONE, 0},
 	{"player/h2ojump.wav",  QNN_ACTION_LAND, QNN_SOURCE_WATER, 0},
@@ -68,16 +71,12 @@ static const qnn_sound_rule_t qnn_player_sound_rules[] = {
 	{NULL, 0, 0, 0},
 };
 
+/* Weapon-fire sound rules: paths + subject metadata sourced from
+ * qnn_demo_sounds.h (shared with src/demo/qw_classifier.c). */
 static const qnn_sound_rule_t qnn_weapon_sound_rules[] = {
-	{"weapons/ax1.wav", QNN_ACTION_FIRE, QNN_SUBJECT_AXE, 0},
-	{"weapons/guncock.wav", QNN_ACTION_FIRE, QNN_SUBJECT_SHOTGUN, 0},
-	{"weapons/shotgn2.wav", QNN_ACTION_FIRE, QNN_SUBJECT_SHOTGUN, 0},
-	{"weapons/rocket1i.wav", QNN_ACTION_FIRE, QNN_SUBJECT_NAILGUN, 0},
-	{"weapons/spike2.wav", QNN_ACTION_FIRE, QNN_SUBJECT_NAILGUN, 0},
-	{"weapons/grenade.wav", QNN_ACTION_FIRE, QNN_SUBJECT_GRENADE_LAUNCHER, 0},
-	{"weapons/sgun1.wav", QNN_ACTION_FIRE, QNN_SUBJECT_ROCKET_LAUNCHER, 0},
-	{"weapons/lstart.wav", QNN_ACTION_FIRE, QNN_SUBJECT_THUNDERBOLT, 0},
-	{"weapons/lhit.wav", QNN_ACTION_FIRE, QNN_SUBJECT_THUNDERBOLT, 0},
+#define X(path, subject) {path, QNN_ACTION_FIRE, subject, 0},
+	QNN_FIRE_SOUND_LIST(X)
+#undef X
 	{NULL, 0, 0, 0},
 };
 
@@ -194,9 +193,32 @@ qboolean QNN_SnapshotHasSelfWeaponFireSound(const qnn_snapshot_t *snapshot)
 	return QNN_SnapshotHasSelfActionSound(snapshot, qnn_weapon_sound_rules, QNN_ACTION_FIRE);
 }
 
+/* Per-sound check: true iff `sound` is a weapon-fire multicast for
+ * the self entity.  Same rule set as QNN_SnapshotHasSelfWeaponFireSound
+ * but evaluated one sound at a time so the caller can use the sound's
+ * native_time for per-event back-shift decisions. */
+qboolean QNN_IsSelfWeaponFireSound(const qnn_sound_event_t *sound)
+{
+	if (sound->entity_num != cl.viewentity)
+		return false;
+	return QNN_SoundMatchesAction(qnn_weapon_sound_rules,
+		sound->name, QNN_ACTION_FIRE);
+}
+
 qboolean QNN_SnapshotHasSelfJumpSound(const qnn_snapshot_t *snapshot)
 {
 	return QNN_SnapshotHasSelfActionSound(snapshot, qnn_player_sound_rules, QNN_ACTION_JUMP);
+}
+
+/* Per-sound check: true iff `sound` is a jump sound for the self entity.
+ * Evaluated one sound at a time so the caller can use the sound's
+ * native_time for per-event back-shift decisions. */
+qboolean QNN_IsSelfJumpSound(const qnn_sound_event_t *sound)
+{
+	if (sound->entity_num != cl.viewentity)
+		return false;
+	return QNN_SoundMatchesAction(qnn_player_sound_rules,
+		sound->name, QNN_ACTION_JUMP);
 }
 
 static qboolean QNN_EmitRecord(qnn_event_record_t *out, int *count, int max,
@@ -331,8 +353,6 @@ int QNN_EventClassifySounds(const qnn_snapshot_t *snapshot, qnn_event_record_t *
 
 qnn_semantic_event_atom_t qnn_semantic_events[QNN_MAX_EVENT_ATOMS];
 int qnn_event_head[QNN_EVENT_HEAD_CAPACITY];
-int qnn_prev_object_indices[QNN_MAX_TOKEN_OBJECTS];
-int qnn_prev_object_count = 0;
 
 static void QNN_AppendEvent(int owner_index, int action_id, int source_id)
 {
@@ -411,27 +431,6 @@ static void QNN_ExpireEvents(float now)
 		{
 			qnn_semantic_events[i].next_for_owner = qnn_event_head[oi];
 			qnn_event_head[oi] = i;
-		}
-	}
-}
-
-/* ══════════════════════════════════════════════════════════════════
- * Recall
- * ══════════════════════════════════════════════════════════════════ */
-
-static void QNN_ApplyRecall(const qnn_action_t *action, int prev_count, int *prev_indices)
-{
-	int r;
-	for (r = 0; r < 4; ++r)
-	{
-		int target = action->recall[r];
-		int idx;
-		if (target <= 0 || target > prev_count)
-			continue;
-		idx = prev_indices[target - 1];
-		if (idx >= 0 && idx < QNN_StoreCapacity() && qnn_store[idx].type != QNN_ENT_NONE)
-		{
-			qnn_store[idx].mem = (float)cl.mtime[0];
 		}
 	}
 }
@@ -604,7 +603,8 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 			if (best)
 			{
 				best->snd = now;
-				if (best->pvs < now - 0.001f)
+				/* Mover not visible this HF → infer state change from sound. */
+				if (best->pvs < now)
 				{
 					if (ev->match_subject_id == QNN_SUBJECT_DOOR
 						|| ev->match_subject_id == QNN_SUBJECT_PLATFORM
@@ -619,9 +619,12 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 		else
 		{
 			/* Entity-attributed sound (player, projectile, etc.).
-			   If entity is not a known player, try nearest player match. */
+			   If the slot isn't a live first-person player (empty,
+			   spectator, or already promoted to a non-actor), try
+			   nearest-player attribution and finally the overflow
+			   "unknown player" pool. */
 			owner = ev->entity_num;
-			if (owner <= 0 || owner > cl.maxclients
+			if (!QNN_IsLivePlayerSlot(owner)
 				|| qnn_store[owner].type != QNN_ENT_ACTOR)
 			{
 				int nearest = QNN_FindNearestPlayer(ev->origin, QNN_ITEM_PICKUP_PLAYER_SQ);
@@ -632,21 +635,22 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 			}
 		}
 
-		/* ---- Player-specific side effects ---- */
-		if (owner > 0 && owner <= cl.maxclients && owner != cl.viewentity)
+		/* ---- Player-specific side effects ----
+		 * Only promote the slot to an ACTOR entity when it is a live
+		 * first-person player.  Spectator slots and unknown-player
+		 * overflow indices skip this block (overflow indices are
+		 * outside [1, cl.maxclients] and IsLivePlayerSlot rejects). */
+		if (QNN_IsLivePlayerSlot(owner))
 		{
 			qnn_entity_t *e = &qnn_store[owner];
-
-			if (cl.scores != NULL && cl.scores[owner - 1].name[0] == '\0')
-				goto skip_event; /* empty scoreboard slot */
 
 			e->snd = now;
 			if (qnn_sound_dump)
 				fprintf(qnn_sound_dump, "SET_SND\t%.3f\town=%d\tact=%d\n", now, owner, ev->action_id);
 
-			if (e->pvs < now - 0.001f)
+			/* Player slot not visible this HF → re-promote from sound. */
+			if (e->pvs < now)
 			{
-
 				e->type = QNN_ENT_ACTOR;
 				e->subject_id = QNN_SUBJECT_PLAYER;
 				e->entity_num = owner;
@@ -680,18 +684,19 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 		/* ---- Universal event emit ---- */
 		if (owner > 0 && owner < QNN_StoreCapacity() && qnn_store[owner].type != QNN_ENT_NONE)
 			QNN_AppendEvent(owner, ev->action_id, ev->source_id);
-
-	skip_event:
-		;
 	}
 
-	/* ---- Sight-derived events: dimlight = active powerup ---- */
+	/* ---- Sight-derived events: dimlight = active powerup ----
+	 * pvs == now means StoreUpdate stamped this entity this HF (i.e.,
+	 * it was visible to the engine in the most recent demo packet).
+	 * StoreUpdate runs before EventTick in IOUpdate, so the comparison
+	 * is exact — same now value used for both stamp and read. */
 	for (i = 1; i < MAX_EDICTS; ++i)
 	{
 		qnn_entity_t *e = &qnn_store[i];
 		if (e->type == QNN_ENT_ACTOR
 			&& e->effects & QNN_EF_DIMLIGHT
-			&& e->pvs >= now - 0.001f)
+			&& e->pvs == now)
 		{
 			/* Player is glowing — emit ACTIVE/POWERUP (generic, unknown type).
 			   If a specific powerup hum/ending sound also fires this tick,
@@ -712,7 +717,6 @@ void QNN_EventInit(const qnn_map_state_t *map_state)
 
 	memset(qnn_semantic_events, 0, sizeof(qnn_semantic_events));
 	memset(qnn_event_head, -1, sizeof(qnn_event_head));
-	qnn_prev_object_count = 0;
 
 	if (qnn_sound_dump != NULL)
 	{
@@ -748,7 +752,4 @@ void QNN_EventTick(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag
 		QNN_EventProcessTick(snapshot);
 
 	}
-
-	if (!reset_flag)
-		QNN_ApplyRecall(&snapshot->action_label, qnn_prev_object_count, qnn_prev_object_indices);
 }

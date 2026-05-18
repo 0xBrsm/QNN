@@ -1,0 +1,19 @@
+# r_efrag.c — guard R_AddEfrags against NULL worldmodel
+#
+# Headless demo replay sometimes calls into R_AddEfrags before cl.worldmodel
+# is populated (or after a level transition that hasn't finished signon).
+# Without this guard the recursive r_pefragtopnode walk dereferences NULL
+# and segfaults.
+#
+--- r_efrag.c
++++ r_efrag.c
+@@ -207,6 +207,9 @@
+ 	if (!ent->model)
+ 		return;
+ 
++	if (!cl.worldmodel || !cl.worldmodel->nodes)
++		return;
++
+ 	if (ent == cl_entities)
+ 		return;		// never add the world
+ 

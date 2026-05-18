@@ -13,6 +13,7 @@
  */
 
 #include "qnn_io.h"
+#include "qnn_collect_helpers.h"   /* qnn_runtime: force_mvd_emit / labeler_mode */
 
 #include <string.h>
 
@@ -28,24 +29,200 @@ extern player_state_t qnn_mvd_latest_playerstate[MAX_CLIENTS];
 
 /* ── Engine state helpers ──────────────────────────────────────── */
 
-int QNN_WeaponId(void)
-{
-	int active;
-	int weapon_id;
+/* QNN_WeaponId, QNN_CurrentArmortype, QNN_SelfEmitToken live in
+ * common/qnn_self.c — they read cl.stats[*] / snapshot only and have
+ * no NQ/QW divergence. */
 
-	active = cl.stats[STAT_ACTIVEWEAPON];
-	if (active > 0)
+/* Most recent measured round-trip latency for an acked usercmd, in
+ * the engine's wall-clock seconds.  cl_demo.c sets senttime when a
+ * DEM_CMD record is processed; cl_parse.c sets receivedtime when a
+ * server packet arrives carrying that cmd's sequence in its netchan
+ * ack.  Single source of truth for ping — prefer this over the
+ * smoothed svc_updateping or the manifest's per-demo avg_ping_ms
+ * when per-event ping is needed.  Returns -1.0f if no ack yet. */
+float QNN_LatencySeconds(void)
+{
+	int ack = cls.netchan.incoming_acknowledged & UPDATE_MASK;
+	float sent = cl.frames[ack].senttime;
+	float recv = cl.frames[ack].receivedtime;
+	if (recv < 0.0f)
+		return -1.0f;
+	return recv - sent;
+}
+
+int QNN_LatencyFrames(int emit_hz)
+{
+	float sec = QNN_LatencySeconds();
+	if (sec < 0.0f || emit_hz <= 0)
+		return 0;
+	return (int)(sec * (float)emit_hz + 0.5f);
+}
+
+/* QNN_NextWeaponId — QW reads inventory from cl.stats[STAT_ITEMS]
+ * (NQ uses cl.items directly; see nq/qnn_self.c).  Simulates the
+ * server's CycleWeaponCommand (forward) / CycleWeaponReverseCommand
+ * (reverse) ring walk, gated on ownership + per-weapon ammo. */
+static int qnn_id_from_item(int item)
+{
+	if (item == IT_AXE) return 1;
+	if (item == IT_SHOTGUN) return 2;
+	if (item == IT_SUPER_SHOTGUN) return 3;
+	if (item == IT_NAILGUN) return 4;
+	if (item == IT_SUPER_NAILGUN) return 5;
+	if (item == IT_GRENADE_LAUNCHER) return 6;
+	if (item == IT_ROCKET_LAUNCHER) return 7;
+	if (item == IT_LIGHTNING) return 8;
+	return 0;
+}
+
+static int qnn_has_ammo_for(int item)
+{
+	if (item == IT_AXE) return 1;
+	if (item == IT_SHOTGUN) return cl.stats[STAT_SHELLS] >= 1;
+	if (item == IT_SUPER_SHOTGUN) return cl.stats[STAT_SHELLS] >= 2;
+	if (item == IT_NAILGUN) return cl.stats[STAT_NAILS] >= 1;
+	if (item == IT_SUPER_NAILGUN) return cl.stats[STAT_NAILS] >= 2;
+	if (item == IT_GRENADE_LAUNCHER) return cl.stats[STAT_ROCKETS] >= 1;
+	if (item == IT_ROCKET_LAUNCHER) return cl.stats[STAT_ROCKETS] >= 1;
+	if (item == IT_LIGHTNING) return cl.stats[STAT_CELLS] >= 1;
+	return 0;
+}
+
+/* ── MVD back-shift helper ───────────────────────────────────────
+ *
+ * QNN_ObservePings() should be called once per emit (or per host_frame)
+ * to keep a per-demo running median of svc_updateping values.  The
+ * median is used by QNN_PressBackShiftFrames as a fallback when the
+ * raw cl.players[slot].ping reading is out of range — the engine never
+ * validates the signed-short field, so spectator-slot memory can leak
+ * uninitialized values (-13057, 999) into our consumers.
+ *
+ * Formula:
+ *   shift = ping_ms / (1000 / emit_hz)
+ *
+ * Integer floor over half of round-trip ping.  Sub-frame components
+ * (client cmd quantization ~7 ms, server cmd dispatch ~6 ms, emit-window
+ * phase) are well below our 25 ms half-frame boundary so they don't
+ * affect integer output.  Also used by the QWD walk-back to derive a
+ * per-event ping-driven cap (max plausible delay), so stale impulses
+ * past that distance don't get falsely anchored to subsequent server-
+ * driven transitions. */
+
+#define QNN_PING_RING 32
+#define QNN_PING_MAX 500          /* hard cap; nothing real exceeds this */
+#define QNN_PING_OUTLIER_K 5      /* relative cap = k × running median */
+static int s_ping_ring[QNN_PING_RING];
+static int s_ping_count = 0;
+static int s_ping_cursor = 0;
+/* Per-slot last-observed ping for change detection.  svc_updateping
+ * broadcasts on the server's ping cycle (~1 s); the same value sits in
+ * cl.players[].ping across many emit ticks.  Push only fresh values. */
+static int s_last_slot_ping[MAX_CLIENTS];
+static qboolean s_last_slot_ping_valid[MAX_CLIENTS];
+
+void QNN_ObservePings(void)
+{
+	/* Sweep all slots for fresh, plausible svc_updateping values.
+	 * Spectator-recorded QWDs never get pings broadcast for cl.playernum
+	 * (the recorder's slot), so scoping to that slot misses the actual
+	 * players' pings.  Pooling across slots gives a robust per-demo
+	 * baseline regardless of whether the demo is player or spectator. */
+	int slot;
+	for (slot = 0; slot < MAX_CLIENTS; ++slot)
 	{
-		weapon_id = 1;
-		while (active > 1)
-		{
-			active >>= 1;
-			weapon_id += 1;
-		}
-		return weapon_id;
+		int p = cl.players[slot].ping;
+		if (p <= 0 || p > QNN_PING_MAX)
+			continue;
+		if (s_last_slot_ping_valid[slot] && s_last_slot_ping[slot] == p)
+			continue;
+		s_last_slot_ping[slot] = p;
+		s_last_slot_ping_valid[slot] = true;
+		s_ping_ring[s_ping_cursor & (QNN_PING_RING - 1)] = p;
+		s_ping_cursor++;
+		if (s_ping_count < QNN_PING_RING) s_ping_count++;
 	}
-	if (cl.stats[STAT_WEAPON] > 0)
-		return cl.stats[STAT_WEAPON];
+}
+
+void QNN_ResetPingEstimator(void)
+{
+	memset(s_ping_ring, 0, sizeof(s_ping_ring));
+	s_ping_count = 0;
+	s_ping_cursor = 0;
+	memset(s_last_slot_ping, 0, sizeof(s_last_slot_ping));
+	memset(s_last_slot_ping_valid, 0, sizeof(s_last_slot_ping_valid));
+}
+
+static int qnn_median_ping_ms(void)
+{
+	int buf[QNN_PING_RING];
+	int i, j, v;
+	if (s_ping_count == 0) return 0;  /* no observations yet */
+	memcpy(buf, s_ping_ring, sizeof(int) * (size_t)s_ping_count);
+	for (i = 1; i < s_ping_count; ++i)
+	{
+		v = buf[i];
+		j = i - 1;
+		while (j >= 0 && buf[j] > v) { buf[j+1] = buf[j]; --j; }
+		buf[j+1] = v;
+	}
+	return buf[s_ping_count / 2];
+}
+
+int QNN_PressPingMs(int player_slot)
+{
+	int raw;
+	int median;
+
+	if (player_slot < 0 || player_slot >= MAX_CLIENTS)
+		return 0;
+	raw = cl.players[player_slot].ping;
+	median = qnn_median_ping_ms();
+	if (raw <= 0 || raw > QNN_PING_MAX
+		|| (median > 0 && raw > QNN_PING_OUTLIER_K * median))
+		return median;
+	return raw;
+}
+
+float QNN_PressPingSec(int player_slot)
+{
+	return (float)QNN_PressPingMs(player_slot) / 1000.0f;
+}
+
+int QNN_PressBackShiftFrames(int player_slot, int emit_hz)
+{
+	int ping_ms;
+	int emit_period_ms;
+
+	if (emit_hz <= 0) return 0;
+	ping_ms = QNN_PressPingMs(player_slot);
+	emit_period_ms = 1000 / emit_hz;
+	return ping_ms / emit_period_ms;
+}
+
+int QNN_NextWeaponId(int reverse)
+{
+	static const int ring[8] = {
+		IT_AXE, IT_SHOTGUN, IT_SUPER_SHOTGUN, IT_NAILGUN,
+		IT_SUPER_NAILGUN, IT_GRENADE_LAUNCHER, IT_ROCKET_LAUNCHER,
+		IT_LIGHTNING
+	};
+	int active = cl.stats[STAT_ACTIVEWEAPON];
+	int items = cl.stats[STAT_ITEMS];
+	int idx = -1;
+	int i, step;
+	for (i = 0; i < 8; ++i)
+		if (ring[i] == active) { idx = i; break; }
+	if (idx < 0)
+		return 0;
+	step = reverse ? -1 : 1;
+	for (i = 0; i < 8; ++i)
+	{
+		int candidate;
+		idx = (idx + step + 8) & 7;
+		candidate = ring[idx];
+		if ((items & candidate) && qnn_has_ammo_for(candidate))
+			return qnn_id_from_item(candidate);
+	}
 	return 0;
 }
 
@@ -54,15 +231,6 @@ int QNN_CurrentFrags(void)
 	if (cl.playernum >= 0 && cl.playernum < MAX_CLIENTS)
 		return cl.players[cl.playernum].frags;
 	return 0;
-}
-
-static float QNN_CurrentArmortype(void)
-{
-	int items = cl.stats[STAT_ITEMS];
-	if (items & IT_ARMOR3) return 0.8f;
-	if (items & IT_ARMOR2) return 0.6f;
-	if (items & IT_ARMOR1) return 0.3f;
-	return 0.0f;
 }
 
 /* ── Get best player state for current frame ──────────────────── */
@@ -95,24 +263,38 @@ void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot)
 
 	ps = QNN_GetPlayerState();
 
-	/* Origin: prefer simorg (predicted), fallback to playerstate */
-	if (cl.simorg[0] != 0.0f || cl.simorg[1] != 0.0f || cl.simorg[2] != 0.0f)
+	/* Origin / velocity: prefer cl.simorg / cl.simvel (predicted via
+	 * CL_PredictMove on QWD's usercmds) and fall back to the server
+	 * playerstate.  EXCEPT under force_mvd_emit or labeler_mode, where
+	 * we must not leak QWD-specific pmove integration into the obs.
+	 * Real MVD playback delivers only server-authoritative origin /
+	 * velocity to the client; this branch takes the same path on QWD
+	 * so the inference / training pipeline operates on the same
+	 * distribution it would see during true MVD playback. */
 	{
-		VectorCopy(cl.simorg, snapshot->player_origin);
-	}
-	else if (ps != NULL)
-	{
-		VectorCopy(ps->origin, snapshot->player_origin);
-	}
+		qboolean mvd_faithful = (qnn_runtime.force_mvd_emit
+			|| qnn_runtime.labeler_mode);
+		if (!mvd_faithful
+			&& (cl.simorg[0] != 0.0f || cl.simorg[1] != 0.0f
+				|| cl.simorg[2] != 0.0f))
+		{
+			VectorCopy(cl.simorg, snapshot->player_origin);
+		}
+		else if (ps != NULL)
+		{
+			VectorCopy(ps->origin, snapshot->player_origin);
+		}
 
-	/* Velocity: prefer simvel (predicted), fallback to playerstate */
-	if (cl.simvel[0] != 0.0f || cl.simvel[1] != 0.0f || cl.simvel[2] != 0.0f)
-	{
-		VectorCopy(cl.simvel, snapshot->player_velocity);
-	}
-	else if (ps != NULL)
-	{
-		VectorCopy(ps->velocity, snapshot->player_velocity);
+		if (!mvd_faithful
+			&& (cl.simvel[0] != 0.0f || cl.simvel[1] != 0.0f
+				|| cl.simvel[2] != 0.0f))
+		{
+			VectorCopy(cl.simvel, snapshot->player_velocity);
+		}
+		else if (ps != NULL)
+		{
+			VectorCopy(ps->velocity, snapshot->player_velocity);
+		}
 	}
 
 	/* View angles: same as NQ */
@@ -145,59 +327,4 @@ void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot)
 	snapshot->current_region_id = 0;
 }
 
-/* ── Token emission (shared format with NQ) ───────────────────── */
-
-void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot)
-{
-	int items = snapshot->items_owned;
-	vec3_t vel_view;
-	int i;
-
-	memset(out, 0, sizeof(*out));
-
-	out->health = (float)snapshot->health / QNN_MAX_HEALTH;
-	out->armor = (float)snapshot->armor * snapshot->armor_type / QNN_MAX_ARMOR;
-	out->weapon_sg = (items & IT_SUPER_SHOTGUN) ? 1.0f : (items & IT_SHOTGUN) ? 0.5f : 0.0f;
-	out->weapon_ng = (items & IT_SUPER_NAILGUN) ? 1.0f : (items & IT_NAILGUN) ? 0.5f : 0.0f;
-	out->weapon_gl = (items & IT_GRENADE_LAUNCHER) ? 1.0f : 0.0f;
-	out->weapon_rl = (items & IT_ROCKET_LAUNCHER) ? 1.0f : 0.0f;
-	out->weapon_lg = (items & IT_LIGHTNING) ? 1.0f : 0.0f;
-	out->ammo_shells = QNN_Clamp((float)snapshot->ammo_shells / QNN_MAX_SHELLS, 0.0f, 1.0f);
-	out->ammo_nails = QNN_Clamp((float)snapshot->ammo_nails / QNN_MAX_NAILS, 0.0f, 1.0f);
-	out->ammo_rockets = QNN_Clamp((float)snapshot->ammo_rockets / QNN_MAX_ROCKETS, 0.0f, 1.0f);
-	out->ammo_cells = QNN_Clamp((float)snapshot->ammo_cells / QNN_MAX_CELLS, 0.0f, 1.0f);
-
-	QNN_RelativeFrame(snapshot->player_view_angles, snapshot->player_velocity, vel_view);
-	out->vel[0] = QNN_Normalize(vel_view[0], QNN_VELOCITY_SCALE);
-	out->vel[1] = QNN_Normalize(vel_view[1], QNN_VELOCITY_SCALE);
-	out->vel[2] = QNN_Normalize(vel_view[2], QNN_VELOCITY_SCALE);
-
-	out->weapon_id = qnn_weapon_subject_from_id(snapshot->weapon_id);
-
-	if (items & IT_ARMOR3)
-		out->armor_type_id = QNN_SUBJECT_ARMOR_RED;
-	else if (items & IT_ARMOR2)
-		out->armor_type_id = QNN_SUBJECT_ARMOR_YELLOW;
-	else if (items & IT_ARMOR1)
-		out->armor_type_id = QNN_SUBJECT_ARMOR_GREEN;
-
-	switch (snapshot->waterlevel)
-	{
-	case 1: out->movement_id = 2; break;
-	case 2: out->movement_id = 3; break;
-	case 3: out->movement_id = 4; break;
-	default: out->movement_id = snapshot->grounded ? 0 : 1; break;
-	}
-
-	i = 0;
-	if (items & IT_QUAD)
-		out->powerup_ids[i++] = QNN_SUBJECT_QUAD;
-	if (items & IT_INVULNERABILITY)
-		out->powerup_ids[i++] = QNN_SUBJECT_PENT;
-	if (items & IT_INVISIBILITY)
-		out->powerup_ids[i++] = QNN_SUBJECT_RING;
-	if (items & IT_SUIT)
-		out->powerup_ids[i++] = QNN_SUBJECT_SUIT;
-	if (snapshot->health > 100)
-		out->powerup_ids[i++] = QNN_SUBJECT_MEGAHEALTH;
-}
+/* QNN_SelfEmitToken lives in common/qnn_self.c. */

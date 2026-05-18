@@ -39,6 +39,41 @@ _TICK_KEYS = (
     "hit_count", "shots_fired",
     "health_gain", "armor_gain",
 )
+_TARGET_TICK_KEYS = (
+    "target_pred_slot",
+    "target_pred_pid",
+    "target_pred_prob",
+    "target_entropy",
+)
+
+
+def _target_tick_values(
+    policy: Any,
+    batched: np.ndarray | Dict[str, np.ndarray],
+    hidden: np.ndarray | None,
+) -> dict[str, float]:
+    if not isinstance(batched, dict):
+        return {}
+    if not hasattr(policy, "_forward_tensors"):
+        return {}
+    with torch.inference_mode():
+        try:
+            _, _, _, _, target_logits = policy._forward_tensors(batched, hidden=hidden)
+        except Exception:
+            return {}
+    if target_logits.ndim != 2 or target_logits.shape[0] != 1:
+        return {}
+    probs = torch.softmax(target_logits[0], dim=0)
+    pred_slot = int(torch.argmax(probs).item())
+    pred_prob = float(probs[pred_slot].item())
+    entropy = float((-(probs * torch.log(probs.clamp_min(1e-8))).sum()).item())
+    pred_pid = float(int(batched["entity_ids"][0, pred_slot, 2])) if pred_slot < batched["entity_ids"].shape[1] else 0.0
+    return {
+        "target_pred_slot": float(pred_slot),
+        "target_pred_pid": pred_pid,
+        "target_pred_prob": pred_prob,
+        "target_entropy": entropy,
+    }
 
 
 def _run_episode(
@@ -54,12 +89,14 @@ def _run_episode(
     deaths = 0
     steps = 0
     ticks: dict[str, list[float]] = {k: [] for k in _TICK_KEYS}
+    target_ticks: dict[str, list[float]] = {k: [] for k in _TARGET_TICK_KEYS}
 
     for step in range(max_steps):
         if isinstance(obs, dict):
             batched = {k: np.expand_dims(v, 0) for k, v in obs.items()}
         else:
             batched = np.expand_dims(obs, 0)
+        target_step = _target_tick_values(policy, batched, hidden)
         result = policy.act(batched, mode="greedy", hidden=hidden)
         hidden = result.next_hidden
 
@@ -68,8 +105,10 @@ def _run_episode(
             value = result.actions[head][0]
             if head in CONTINUOUS_ACTION_HEADS:
                 action[head] = value.astype(np.float32).tolist()
-            else:
+            elif np.ndim(value) == 0:
                 action[head] = int(value)
+            else:
+                action[head] = value.astype(np.int64).tolist()
 
         obs, reward, done, info = env.step(action)
         total_reward += float(reward)
@@ -78,8 +117,12 @@ def _run_episode(
         deaths += 1 if info.get("player_died") else 0
         for key in _TICK_KEYS:
             ticks[key].append(float(info.get(key, 0.0)))
+        for key in _TARGET_TICK_KEYS:
+            target_ticks[key].append(float(target_step.get(key, 0.0)))
         if done:
             break
+
+    ticks.update(target_ticks)
 
     summary = {
         "reward": total_reward,
