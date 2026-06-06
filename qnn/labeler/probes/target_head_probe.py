@@ -24,7 +24,7 @@ Eval is bucketed:
   - bucket B: target != engine slot 0 (the interesting ~2.5%)
 
 Usage:
-    PYTHONPATH=src python -m qnn.probes.target_head_probe \
+    PYTHONPATH=src python -m qnn.labeler.probes.target_head_probe \
         --data-dir artifacts/collect/qwd \
         --output   runs/probe/target_v0 \
         --epochs 3 --chunk-len 512 --max-shards 3

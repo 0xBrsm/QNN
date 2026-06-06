@@ -189,6 +189,7 @@ def prepare_eval_checkpoint(checkpoint_path: str, output_dir: str) -> str:
         return str(path)
 
     from qnn.utils.checkpoint_converter import sf_to_qnn
+    from qnn.model.policy import ModelConfig
 
     sidecar_path = path.with_suffix(".json")
     if not sidecar_path.exists():
@@ -196,22 +197,8 @@ def prepare_eval_checkpoint(checkpoint_path: str, output_dir: str) -> str:
     meta = read_json(sidecar_path)
     if not isinstance(meta, Mapping):
         raise RuntimeError(f"SF checkpoint sidecar must be a JSON object: {sidecar_path}")
-    required_keys = (
-        "obs_dim",
-        "trunk_hidden",
-        "gru_hidden",
-        "use_gru",
-        "d_model",
-        "n_heads",
-        "n_layers",
-        "ffn_dim",
-        "attn_dropout",
-    )
-    missing = [key for key in required_keys if key not in meta]
-    if missing:
-        raise RuntimeError(
-            f"SF checkpoint sidecar is missing architecture fields ({', '.join(missing)}): {sidecar_path}"
-        )
+    if "obs_dim" not in meta:
+        raise RuntimeError(f"SF checkpoint sidecar missing 'obs_dim': {sidecar_path}")
     converted_dir = Path(output_dir).parent / "_eval_ckpts"
     converted_dir.mkdir(parents=True, exist_ok=True)
     converted_path = converted_dir / f"{path.stem}_qnn.pth"
@@ -221,15 +208,8 @@ def prepare_eval_checkpoint(checkpoint_path: str, output_dir: str) -> str:
         policy = sf_to_qnn(
             sf_checkpoint_path=path,
             obs_dim=int(meta["obs_dim"]),
-            trunk_hidden=int(meta["trunk_hidden"]),
-            gru_hidden=int(meta["gru_hidden"]),
-            use_gru=bool(meta["use_gru"]),
+            model=ModelConfig.from_flat_dict(meta),
             device="cpu",
-            d_model=int(meta["d_model"]),
-            n_heads=int(meta["n_heads"]),
-            n_layers=int(meta["n_layers"]),
-            ffn_dim=int(meta["ffn_dim"]),
-            attn_dropout=float(meta["attn_dropout"]),
         )
         policy.save(converted_path)
         converted_sidecar_path.write_text(

@@ -131,7 +131,13 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
         "resume": resume,
     }
 
-    required_keys = ["train", "machine", "model"]
+    if mode == "head_probe":
+        # Head probes train memoryless MLPs from frozen shards — no
+        # trunk/GRU/pointer model.json, but they do carry a probe.json
+        # with the MLP shape + feature list.
+        required_keys = ["train", "machine", "probe"]
+    else:
+        required_keys = ["train", "machine", "model"]
     if mode in {"ppo", "pbt", "optuna", "eval"}:
         required_keys.extend(["scenario", "reward"])
     optional_keys = ["eval", "scenario", "reward"]
@@ -205,7 +211,14 @@ def build_run_bc_config(
     run_cfg: dict[str, Any],
     requested_device: str,
 ) -> dict[str, Any]:
-    """Build BC config from a flat run-dir config dict."""
+    """Build BC config from a flat run-dir config dict.
+
+    Model arch lives under ``bc_cfg["model"]`` as a ``ModelConfig``
+    instance built from ``config/model.json``. Train + machine knobs
+    populate the remaining BCConfig fields.
+    """
+    from qnn.model.policy import ModelConfig
+
     train = _require_mapping(run_cfg, "train", "run config")
     model = _require_mapping(run_cfg, "model", "run config")
     machine = _require_mapping(run_cfg, "machine", "run config")
@@ -213,7 +226,7 @@ def build_run_bc_config(
     bc_cfg = dict(train)
     # Legacy no-op key: global length bucketing is unconditional now.
     bc_cfg.pop("length_bucket_window", None)
-    bc_cfg.update(model)
+    bc_cfg["model"] = ModelConfig.from_dict(model)
 
     checkpoints_dir = run_output_dirs(run_cfg)["checkpoints"]
     bc_cfg["output_dir"] = str(checkpoints_dir)
@@ -223,8 +236,12 @@ def build_run_bc_config(
     bc_cfg["pin_memory"] = bool(_require_key(machine, "pin_memory", "machine.json"))
     bc_cfg["prefetch"] = int(_require_key(machine, "prefetch", "machine.json"))
     bc_cfg["microbatch_size"] = int(_require_key(machine, "microbatch_size", "machine.json"))
-    bc_cfg["snapshot_interval"] = int(machine.get("snapshot_interval", 15))
+    bc_cfg["snapshot_interval"] = int(_require_key(machine, "snapshot_interval", "machine.json"))
+    bc_cfg["preload_to_gpu"] = bool(_require_key(machine, "preload_to_gpu", "machine.json"))
     bc_cfg["dtype"] = str(_require_string(train, "dtype", "train.json"))
+    bc_cfg["collection_fingerprint"] = _require_string(
+        train, "collection_fingerprint", "train.json"
+    )
 
     return bc_cfg
 
@@ -392,6 +409,19 @@ def build_run_plan_values(run_cfg: dict[str, Any]) -> dict[str, int]:
             "total_steps": 0,
             "minibatch_size": 0,
             "eval_episodes": int(_key_with_prefix_fallback(machine, "num_episodes", "eval_", "machine.json")),
+        }
+
+    if mode == "head_probe":
+        # head_probe goes through the canonical BC trainer, so its
+        # planning surface mirrors BC's: batch_size is a machine knob.
+        machine = _require_mapping(run_cfg, "machine", "run config")
+        return {
+            "bc_batch_size": int(_require_key(machine, "batch_size", "machine.json")),
+            "num_envs": 0,
+            "rollout_steps": 0,
+            "total_steps": 0,
+            "minibatch_size": 0,
+            "eval_episodes": 0,
         }
 
     raise RuntimeError(f"Unsupported run mode in run.json: {mode}")

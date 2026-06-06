@@ -117,27 +117,25 @@ def apply_token_mask(
     return obs_out
 
 
-def clear_targets_on_masked_slots(
-    target: np.ndarray,
+def clear_target_dist_on_masked_slots(
+    target_dist: np.ndarray,
     obs: Mapping[str, np.ndarray],
-    ignore_index: int = -100,
 ) -> np.ndarray:
-    """Return a copy of ``target`` with rows pointing to masked slots
-    replaced with ``ignore_index``.
+    """Return a copy of ``target_dist`` with mass on masked slots moved
+    to NO_TARGET (index 0).
 
     A slot is "masked" iff its ``entity_types`` is the -1 empty sentinel.
-    Useful right after ``apply_token_mask`` so the target head doesn't
-    try to predict a slot that's been zeroed.
+    Mass that would otherwise fall on a hidden slot is folded into
+    NO_TARGET so row sums stay 1.0 and the target head doesn't get
+    gradient pulling toward a slot the model can't see.
     """
-    target = np.asarray(target).copy()
-    valid = target != ignore_index
-    if not valid.any():
-        return target
-    types = np.asarray(obs["entity_types"])  # (T, N) int8
-    rows = np.arange(types.shape[0])
-    # Bound the slot index so np.take doesn't IndexError when target == -100
-    # (we mask those out below anyway).
-    bounded = np.clip(target, 0, types.shape[1] - 1)
-    slot_type = types[rows, bounded]
-    target[valid & (slot_type == -1)] = ignore_index
-    return target
+    target_dist = np.asarray(target_dist, dtype=np.float32).copy()
+    if target_dist.size == 0:
+        return target_dist
+    types = np.asarray(obs["entity_types"])         # (T, N) int8
+    # target_dist[:, 0] = NO_TARGET; target_dist[:, 1:] = slot probabilities.
+    masked_slot = (types == -1).astype(np.float32)  # (T, N) — 1 where the slot is gone
+    moved = (target_dist[:, 1:] * masked_slot).sum(axis=1)
+    target_dist[:, 1:] *= (1.0 - masked_slot)
+    target_dist[:, 0] += moved
+    return target_dist

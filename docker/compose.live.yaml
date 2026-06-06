@@ -1,0 +1,21 @@
+services:
+  qnn-live:
+    image: ${QNN_LIVE_IMAGE_TAG:-qnn-live:arm64}
+    platform: linux/arm64
+    build:
+      context: ../..
+      dockerfile: src/docker/Dockerfile.live
+      platforms:
+        - linux/arm64
+    working_dir: /app
+    volumes:
+      - type: bind
+        source: /app/bin
+        target: /app/bin
+        read_only: true
+      - type: bind
+        source: /app/models
+        target: /app/models
+        read_only: true
+    stdin_open: true
+    tty: true

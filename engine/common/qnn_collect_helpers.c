@@ -540,6 +540,34 @@ void QNN_FillLookAndSwitch(qnn_action_t *action,
 		action->weapon = snapshot->weapon_id;
 }
 
+uint8_t QNN_PackOpInput(
+	int alive,
+	int fb_press, int lr_press,
+	int jump_press, int swim_press, int fire_press,
+	int in_water,
+	int op_jump, int op_fire, int op_impulse,
+	int has_impulse)
+{
+	uint8_t op;
+
+	if (!alive)
+		return 0;
+	op = 0;
+	if (fb_press)
+		op |= 0x01;
+	if (lr_press)
+		op |= 0x02;
+	if (jump_press && op_jump)
+		op |= 0x04;
+	else if (swim_press && in_water)
+		op |= 0x04;
+	if (fire_press && op_fire)
+		op |= 0x08;
+	if (has_impulse && op_impulse)
+		op |= 0x10;
+	return op;
+}
+
 FILE *QNN_EmitFilter(qnn_snapshot_t *snapshot)
 {
 	int health = snapshot->health;

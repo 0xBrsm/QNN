@@ -26,11 +26,11 @@ class QuakeTransformerEncoder(Encoder):
     def __init__(self, cfg, obs_space) -> None:
         super().__init__(cfg)
 
-        d_model: int = int(getattr(cfg, "quake_d_model", 64))
-        n_heads: int = int(getattr(cfg, "quake_n_heads", 1))
-        n_layers: int = int(getattr(cfg, "quake_n_layers", 2))
-        ffn_dim: int = int(getattr(cfg, "quake_ffn_dim", 256))
-        dropout: float = float(getattr(cfg, "quake_attn_dropout", 0.0))
+        d_model: int = int(getattr(cfg, "quake_d_model"))
+        n_heads: int = int(getattr(cfg, "quake_n_heads"))
+        n_layers: int = int(getattr(cfg, "quake_n_layers"))
+        ffn_dim: int = int(getattr(cfg, "quake_ffn_dim"))
+        dropout: float = float(getattr(cfg, "quake_attn_dropout"))
 
         self.trunk = TransformerTrunk(
             obs_dim=0,

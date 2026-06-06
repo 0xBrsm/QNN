@@ -47,14 +47,6 @@
  * emission by exactly QNN_BACKSHIFT_K ticks; flushed at demo end. */
 #define QNN_BACKSHIFT_K 24
 
-/* Hard cap on the impulse walk-back when anchoring a QWD weapon
- * transition to its causing impulse.  10 emit frames = 500 ms at
- * 20 Hz, well above any plausible click→server latency; if the
- * matching impulse isn't within this window the transition is
- * almost certainly server-driven (pickup, auto-switch on ammo-out,
- * etc.) and we leave the label at the server-observed frame. */
-#define QNN_BACKSHIFT_MAX_IMPULSE_WALKBACK 10
-
 typedef struct
 {
 	uint8_t		obs[QNN_OBS_BUFFER_SIZE];
@@ -69,11 +61,6 @@ typedef struct
 	qboolean	valid;
 	qnn_fire_route_event_t fire_routes[QNN_MAX_FIRE_ROUTE_EVENTS];
 	int		fire_route_count;
-	/* Weapon id (1..8) the cmd-window impulse resolved to for the
-	 * emit tick this slot represents.  0 = no impulse in window.
-	 * Read by the QWD impulse-anchored back-shift; MVD slots always
-	 * carry 0 (no cmd data available). */
-	int		impulse_target_weapon;
 } qnn_backshift_slot_t;
 
 typedef struct
@@ -235,5 +222,25 @@ int QNN_OpIs(const char *line, const char *value);
  * the QWD usercmd-truth path and the MVD inference path. */
 void QNN_FillLookAndSwitch(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
+
+/* Pack the per-axis op_input mask given press bits + per-axis op
+ * predicate results.  Single source of truth used by both the BC
+ * QwdInferEmitAction path (action->op_input on the QOBS wire) and the
+ * labeler LOBS emit (LOBS payload op_input byte).
+ *
+ *   bit0 = fb       : fb_press
+ *   bit1 = lr       : lr_press
+ *   bit2 = ud       : (jump_press AND op_jump) OR (swim_press AND in_water)
+ *   bit3 = fire     : fire_press AND op_fire
+ *   bit4 = impulse  : has_impulse AND op_impulse
+ *
+ * Dead frames (alive=0) return 0x00.  Bits 5..7 reserved. */
+uint8_t QNN_PackOpInput(
+	int alive,
+	int fb_press, int lr_press,
+	int jump_press, int swim_press, int fire_press,
+	int in_water,
+	int op_jump, int op_fire, int op_impulse,
+	int has_impulse);
 
 #endif /* QNN_COLLECT_HELPERS_H */

@@ -221,8 +221,8 @@ int QNN_OracleEmitTokens(qnn_tagged_token_t *out_tokens, int max_tokens,
 	const qnn_snapshot_t *snapshot, const qnn_map_state_t *map_state,
 	int *out_player_cluster_id);
 
-/* Reset the sticky-engagement state machine in the oracle.  Called from
- * QNN_IOUpdate when reset_flag is set (episode boundary). */
+/* Episode-boundary hook for the oracle.  Currently a no-op; reserved for
+ * future cross-episode state that needs clearing on reset. */
 void QNN_OracleResetState(void);
 
 /* ── Sound rule type (used by qnn_event.c) ─────────────────────── */
@@ -311,6 +311,10 @@ int QNN_PressBackShiftFrames(int player_slot, int emit_hz);
  * paths (fire/jump per-sound, weapon/move per-emit-frame). */
 int QNN_PressPingMs(int player_slot);
 float QNN_PressPingSec(int player_slot);
+/* Recording-client's own ping in ms.  Engine-agnostic wrapper:
+ * QW returns QNN_PressPingMs(cl.playernum); NQ returns 0 (no
+ * MVD-style ping broadcast). */
+int QNN_SelfPingMs(void);
 /* Reset per-demo running ping median.  Call at demo boundaries
  * before the new demo's first QNN_ObservePings(). */
 void QNN_ResetPingEstimator(void);

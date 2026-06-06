@@ -195,20 +195,17 @@ def run_training_job(
         best_dir.mkdir(parents=True, exist_ok=True)
         qnn_ckpt_path = best_dir / "best_model.pth"
         try:
+            from qnn.model.policy import ModelConfig
+            obs_dim = (
+                int(require_cfg_value(ppo_cfg, "obs_dim", "PPO config"))
+                if "obs_dim" in ppo_cfg
+                else _detect_obs_dim_from_checkpoint(ppo_cfg, ppo_ckpt)
+            )
             qnn_policy = sf_to_qnn(
                 sf_checkpoint_path=ppo_ckpt,
-                obs_dim=int(require_cfg_value(ppo_cfg, "obs_dim", "PPO config"))
-                if "obs_dim" in ppo_cfg
-                else _detect_obs_dim_from_checkpoint(ppo_cfg, ppo_ckpt),
-                trunk_hidden=int(require_cfg_value(ppo_cfg, "trunk_hidden", "PPO config")),
-                gru_hidden=int(require_cfg_value(ppo_cfg, "gru_hidden", "PPO config")),
-                use_gru=bool(require_cfg_value(ppo_cfg, "use_gru", "PPO config")),
+                obs_dim=obs_dim,
+                model=ModelConfig.from_flat_dict(ppo_cfg),
                 device="cpu",
-                d_model=int(require_cfg_value(ppo_cfg, "d_model", "PPO config")),
-                n_heads=int(require_cfg_value(ppo_cfg, "n_heads", "PPO config")),
-                n_layers=int(require_cfg_value(ppo_cfg, "n_layers", "PPO config")),
-                ffn_dim=int(require_cfg_value(ppo_cfg, "ffn_dim", "PPO config")),
-                attn_dropout=float(require_cfg_value(ppo_cfg, "attn_dropout", "PPO config")),
             )
             qnn_policy.save(qnn_ckpt_path)
             ppo_result["best_model_path"] = str(qnn_ckpt_path)

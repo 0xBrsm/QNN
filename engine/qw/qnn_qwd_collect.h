@@ -6,10 +6,14 @@
  * cl.frames[] each Host_Frame and aggregates them into a single
  * emit-rate action label.
  *
- * Pure cmd-window action extraction — no inference, no back-shift.
- * The back-shift ring's impulse walk-back consumes the returned
- * impulse-target weapon to anchor server-observed weapon transitions
- * to the cmd press that caused them.
+ * Pure cmd-window decode — no inference, no back-shift, no ring
+ * rewriting.  action.weapon is written directly at the press tick from
+ * the decoded impulse target, with carry-forward on non-press ticks and
+ * a stat-transition check to pick up engine-forced switches (pickup
+ * auto-switch via weapon_touch, respawn defaults, etc.).  All inference
+ * machinery (back-shift ring, chain-fill, log-normal hold) lives behind
+ * mvd_path; force_mvd_emit is the only legal way to run a QWD file
+ * through inference.
  */
 
 #ifndef QNN_QWD_COLLECT_H
@@ -17,7 +21,14 @@
 
 #include "qnn.h"
 
+/* Reset module-private state (held-weapon tracker + prev-stat).
+ * Called at demo start alongside the labeler/MVD module resets. */
+void QNN_QwdCollectReset(void);
+
 /* Walk the current dem_cmd window into a single emit-rate action label.
+ * Pure cmd-byte decode — does not touch action->weapon or any module
+ * state.  Returns the resolved impulse_target weapon (1..8) or 0 if no
+ * weapon-select impulse appeared in the window.
  *
  *   fire / jump (move[2] set to QNN_SV_JUMP_SPEED/QNN_SV_MAXSPEED):
  *     OR across all cmds in the window (any press counts).
@@ -27,21 +38,47 @@
  *     a single 50ms-integrated cmd.
  *   upmove (swim down):
  *     Most-negative value across the window.
- *   weapon:
- *     Left at 0 — the caller's QNN_FillLookAndSwitch fills it with
- *     snapshot->weapon_id.  The returned impulse-target weapon is
- *     sidecar data for the back-shift ring.
  *
- * Returns the cmd-window impulse target weapon (1..8) or 0 if no
- * weapon-select impulse appeared in the window.  Resolves impulses
- * 1-8 (direct select, gated on inventory ownership) and 10/12
- * (next/prev weapon cycle via QNN_NextWeaponId).
+ * action->weapon is left untouched by this function; the held-weapon
+ * state machine lives in QNN_QwdInferEmitAction.
  */
-int QNN_QwdExtractAction(qnn_action_t *action);
+int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot);
 
-/* Emit-time QWD action: usercmd extraction + look/switch fill.
- * Returns the same impulse-target weapon sidecar as QNN_QwdExtractAction. */
-int QNN_QwdInferEmitAction(qnn_action_t *action,
+/* Emit-time QWD action: usercmd extraction + held-weapon state machine
+ * (impulse / engine-forced / carry, using snapshot->weapon_id) +
+ * look/switch fill. */
+void QNN_QwdInferEmitAction(qnn_action_t *action,
+	const qnn_snapshot_t *snapshot);
+
+/* Per-cmd fire-predicate eval + cmd-block aggregation across the
+ * current QWD cmd window.  Calls QNN_ProgsEvalAttack once per cmd
+ * (advancing the QC attack_finished state at cmd granularity) and
+ * aggregates raw usercmd bytes: fmove/smove as mean, umove as
+ * jump-canonical-or-most-negative, buttons OR'd, impulse as the
+ * last non-zero byte in the window (matches sv_user.c:3575 overwrite
+ * semantics).  Jump operativeness now lives in QNN_QwdEvalPmoveJump
+ * (pmove-driven, no QC predicate involvement). */
+void QNN_QwdEvalOperativePerCmd(
+	const qnn_snapshot_t *snapshot,
+	int *out_op_fire,
+	int *out_fmove,
+	int *out_smove,
+	int *out_umove,
+	int *out_buttons,
+	int *out_impulse);
+
+/* Pmove-driven jump operativeness.  Per-cmd PlayerMove() invocation
+ * with pmove globals seeded from the snapshot; returns 1 iff any cmd
+ * in this tick's window triggered the patched JumpButton() success
+ * branch.  See qnn_pmove_hooks.h for the flag and save/restore. */
+int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot);
+
+/* Fill action->op_input from press bits (read off action->move/fire,
+ * already filled by QwdExtractAction) + per-axis op predicate results.
+ * Must run exactly once per tick — invoked from QwdInferEmitAction
+ * right after FillLookAndSwitch.  Reads qwd_state.last_op_fire /
+ * last_impulse_any stashed by the same-tick QwdExtractAction call. */
+void QNN_QwdPackOpInput(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
 
 #endif /* QNN_QWD_COLLECT_H */

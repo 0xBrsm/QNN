@@ -138,7 +138,7 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 | `qnn/ppo/train.py` | PPO registration + config builder |
 | `qnn/env/reward.py` | PvP reward shaping |
 | `qnn/diag/` | trained-policy diagnostics package |
-| `qnn/probes/` | standalone target-head probes (causal TCN, GBT) |
+| `qnn/labeler/probes/` | standalone target-head probes (causal TCN, GBT) |
 | `qnn/eval/live.py` | live-play entry point (NQ servers) |
 | `engine/common/` | shared C worker: store, oracle, entity, event, io, sound, spatial, fault, watchdog, tick |
 | `engine/common/qnn_mvd_collect.{c,h}` | shared MVD/QWD demo collect runtime |

@@ -73,6 +73,8 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin,
 {
 	qnn_sound_event_t *snd;
 	const char *name;
+	int i;
+	float now;
 
 	(void)entchannel;
 
@@ -90,9 +92,29 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin,
 			name = sfx->name;
 	}
 
+	now = (float)cl.mtime[0];
+
 	if (qnn_sound_dump != NULL)
-		fprintf(qnn_sound_dump, "%.3f\t%d\t%s\n",
-			(float)cl.mtime[0], entnum, name);
+		fprintf(qnn_sound_dump, "%.3f\t%d\t%s\n", now, entnum, name);
+
+	/* Dedupe within the current native tick.  qnn_sound_buffer is reset
+	 * every QNN_DrainSounds (once per native tick), so any event
+	 * already in the buffer is from this tick.  If a new event matches
+	 * an existing one on (entity, sample), drop it — some demos carry
+	 * duplicate svc_sound messages for the same emit (root cause is in
+	 * the QW server / recorder / protocol stack and not yet pinned
+	 * down).  We deliberately do NOT compare native_time because the
+	 * duplicates we've measured come at near-identical (but not
+	 * bit-identical) times within the same Host_Frame, and a single
+	 * tick can't physically contain two distinct emits of the same
+	 * sample on the same entity. */
+	for (i = 0; i < qnn_sound_count; ++i)
+	{
+		qnn_sound_event_t *prev = &qnn_sound_buffer[i];
+		if (prev->entity_num == entnum
+			&& strncmp(prev->name, name, sizeof(prev->name)) == 0)
+			return;
+	}
 
 	snd = &qnn_sound_buffer[qnn_sound_count];
 	VectorCopy(origin, snd->origin);

@@ -66,18 +66,32 @@ def _select_action(
 def _write_tick_record(fp: IO[str], tick: int, obs: Mapping[str, np.ndarray],
                        action: Mapping[str, object]) -> None:
     """Append a JSONL row dumping the obs we fed and the action we sent."""
-    s = obs["self_scalars"].astype(float).tolist()
-    n_ent = int((obs["entity_types"] != -1).sum())
+    # engine_norm phase 2: bridge emits native-width keys per
+    # qnn.engine_norm (no more (T, 17) self_scalars vector). We log
+    # human-readable values directly from the native fields. Bit
+    # flags from self_items are extracted on the fly using the
+    # engine_norm bit constants so the log stays interpretable.
+    from qnn import engine_norm as _en
+    items = int(obs["self_items"].item() if hasattr(obs["self_items"], "item") else obs["self_items"])
+    vel = obs["vel"].astype(float).tolist()
     rec = {
         "t": tick,
         "self": {
-            "health": s[0], "armor": s[1],
-            "wpn_sg": s[2], "wpn_ng": s[3], "wpn_gl": s[4], "wpn_rl": s[5], "wpn_lg": s[6],
-            "ammo_sh": s[7], "ammo_n": s[8], "ammo_r": s[9], "ammo_c": s[10],
-            "vel": [s[11], s[12], s[13]],
-            "weapon_id": int(obs["self_weapon_id"][0]),
+            "health":  int(obs["health"]),
+            "armor":   int(obs["effective_armor"]),
+            "wpn_sg":  int((items & _en.IT_SHOTGUN)         != 0),
+            "wpn_ng":  int((items & _en.IT_NAILGUN)         != 0),
+            "wpn_gl":  int((items & _en.IT_GRENADE_LAUNCHER)!= 0),
+            "wpn_rl":  int((items & _en.IT_ROCKET_LAUNCHER) != 0),
+            "wpn_lg":  int((items & _en.IT_LIGHTNING)       != 0),
+            "ammo_sh": int(obs["ammo_shells"]),
+            "ammo_n":  int(obs["ammo_nails"]),
+            "ammo_r":  int(obs["ammo_rockets"]),
+            "ammo_c":  int(obs["ammo_cells"]),
+            "vel":     vel,
+            "weapon_id": int(obs["self_weapon_id"]),
         },
-        "n_entities": n_ent,
+        "n_entities": int(obs["entity_count"]),
         "action": {
             "move": list(action["move"]),
             "look": list(action["look"]),

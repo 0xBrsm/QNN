@@ -27,7 +27,14 @@ from qnn.vocab import (
 SPATIAL_TOKEN_COUNT = 9
 SPATIAL_SCALAR_DIM = 13
 
-SELF_SCALAR_DIM = 16
+SELF_SCALAR_DIM = 17  # + attack_finished at slot 16
+
+# Quake weapon classes: axe, shotgun, super_shotgun, nailgun,
+# super_nailgun, grenade_launcher, rocket_launcher, thunderbolt.
+# Indexed 1..8 in the game's impulse byte; class 0 is reserved for
+# "no weapon held" in the self-token embedding (pre-spawn / dead /
+# transitional). qnn.model.policy.WEAPON_HEAD_SIZE imports this.
+WEAPON_HEAD_SIZE = 8
 
 from qnn.wire import MAX_ENTITY_SCALAR_DIM, MAX_ENTITY_ID_DIM
 

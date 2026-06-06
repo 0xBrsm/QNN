@@ -30,15 +30,40 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 
-from qnn import filter_dsl
+from qnn import filter_dsl, engine_norm as en
 from qnn.wire import (
     OBS_BUFFER_SIZE, ACTION_SIZE, TICK_HEADER_SIZE,
-    ACTION_FIELDS, FLAG_DONE,
-    unpack_obs_buffer,
+    FLAG_DONE,
+    unpack_obs_buffer_native,
 )
 from qnn.actions import MOVE_AXIS_THRESHOLD, MOVE_CLASS_NEG, MOVE_CLASS_NONE, MOVE_CLASS_POS
-from qnn.bc.target_labeler import TARGET_IGNORE, label_enemy_target
-from qnn.vocab import TOKEN_ACTOR  # noqa: F401 — kept for back-compat imports
+from qnn.bc.target_labeler import (
+    DEFAULT_LABELER_CONFIG,
+    NO_TARGET_INDEX,
+    TARGET_DIST_CLASSES,
+    label_enemy_target_distribution,
+)
+from qnn.vocab import (
+    TOKEN_ACTOR, TOKEN_PROJECTILE, TOKEN_ITEM, TOKEN_MOVER,
+    MAX_TOKEN_OBJECTS, MAX_ENTITY_EVENTS, ACTOR_SCALAR_DIM,
+)
+
+
+# Engine action struct: move[3] + look[3] + fire + weapon + op_input = 36 bytes.
+# Layout matches qnn_action_t on the C side. The int32 at offset 28
+# holds the raw engine weapon byte (0..8); the int32 at offset 32 holds
+# the per-axis op_input mask (only the low 5 bits are populated, bit i ⇔
+# the engine acted on axis i this tick; see QNN_PackOpInput in
+# qnn_collect_helpers.c for the canonical packing). Kept as a private
+# record dtype since the new wire pipeline no longer routes through
+# qnn.wire.ACTION_FIELDS (deleted with the legacy parser).
+_ACTION_FIELDS_LAYOUT = {
+    "move":     (0,  np.float32, (3,)),
+    "look":     (12, np.float32, (3,)),
+    "fire":     (24, np.int32,   ()),
+    "weapon":   (28, np.int32,   ()),
+    "op_input": (32, np.int32,   ()),
+}
 
 
 
@@ -49,14 +74,19 @@ TICK_TOTAL_SIZE = TICK_HEADER_SIZE + OBS_BUFFER_SIZE + ACTION_SIZE
 # The filter is a JSON config file (--filter-config) with schema:
 #
 #   {
-#     "keep": {<predicate-dict>},
-#     "drop": {<predicate-dict>},
-#     "drop_tick_labels": ["intermission", "paused", ...]
+#     "demos":    { "keep": {<predicate>}, "drop": {<predicate>} },
+#     "segments": { "drop": ["intermission", "paused", ...] },
+#     "tokens":   { "keep": [<field>...], "drop": [<field>...] },
+#     "actions":  { "keep": [<field>...], "drop": [<field>...] }
 #   }
 #
-# The "keep" predicate must match for a demo to be included.  ANY
-# "drop" predicate matching causes the demo to be excluded.  Both
-# default to empty (no constraint).
+# demos.keep must match for a demo to be included; ANY demos.drop match
+# excludes.  segments.drop names manifest label intervals (signon, dead,
+# intermission) whose frames get masked out, with each surviving
+# contiguous run becoming its own sub-episode.  tokens / actions
+# keep/drop list obs / act field names (uses field-level whitelist or
+# blacklist; mutually exclusive).  Every axis is optional; an empty
+# config collects every demo, every frame, every field.
 #
 # Predicate dicts use MongoDB query syntax: each key is a field path,
 # each value is either a bare scalar (implicit $eq) or an operator
@@ -110,7 +140,7 @@ _KNOWN_LABEL_NAMES = frozenset((
     "dead", "intermission", "paused", "impossible_health", "signon", "match",
 ))
 
-# Direct labels that can appear in `drop_tick_labels`.
+# Direct labels that can appear in `segments.drop`.
 _VALID_TICK_DROP_LABELS = frozenset((
     "dead", "intermission", "paused", "impossible_health", "signon",
 ))
@@ -188,36 +218,202 @@ def _eval_filter(entry: dict, predicate: dict) -> bool:
     return bool(filter_dsl.eval_filter(_flatten_manifest_entry(entry), predicate))
 
 
+# Native obs field names (engine_norm phase 2). Mirrors the keys produced
+# by qnn.wire.unpack_obs_buffer_native — see that module for the
+# authoritative list. Used to validate filter `tokens.{keep,drop}` lists.
+_VALID_TOKEN_FIELDS = frozenset({
+    # Self block (native widths per engine_norm.SELF_FIELDS).
+    "health", "effective_armor",
+    "ammo_shells", "ammo_nails", "ammo_rockets", "ammo_cells",
+    "vel", "attack_finished",
+    "self_weapon_id", "self_movement_id", "self_items",
+    # Spatial block (per-field arrays).
+    "spatial_dir", "spatial_nearest_dist", "spatial_mean_dist",
+    "spatial_openness", "spatial_clearance", "spatial_traversable",
+    "spatial_dropoff", "spatial_solid_frac", "spatial_water_frac",
+    "spatial_slime_frac", "spatial_lava_frac",
+    # Entity block (variable-length on disk, see _ShardWriter docstring).
+    "entity_types", "entity_subject_id", "entity_modality_id",
+    "entity_player_id", "entity_event_count",
+    "entity_event_actions", "entity_event_sources",
+    "entity_half_extents", "entity_rel", "entity_vel",
+    "entity_path", "entity_path_dist", "entity_eta", "entity_recency",
+    "entity_facing", "entity_team", "entity_score",
+    "entity_amount", "entity_regen", "entity_state",
+    "entity_count",
+})
+_VALID_ACTION_FIELDS = frozenset({"move", "look", "fire", "weapon", "target_dist"})
+
+
 def _validate_filter_schema(spec: dict) -> None:
     """Validate filter config at startup; surfaces unknown fields,
     operators, label names, and channel names loudly before collection
-    runs.  Per agents/conventions.md. """
+    runs.  Per agents/conventions.md.
+
+    Schema:
+        {
+          "demos":    { "keep": {<predicate>}, "drop": {<predicate>} },
+          "segments": { "drop": ["signon", "dead", "intermission"] },
+          "tokens":   { "keep": [<field>...], "drop": [<field>...] },
+          "actions":  { "keep": [<field>...], "drop": [<field>...] }
+        }
+
+    Each axis is optional.  Within each axis, keep/drop are mutually
+    exclusive for tokens and actions (whitelist vs blacklist).  demos
+    accepts both since they compose (drop wins).
+    """
     if not isinstance(spec, dict):
         raise ValueError(
             f"filter config must be a JSON object, got "
             f"{type(spec).__name__}"
         )
-    allowed = {"keep", "drop", "drop_tick_labels"}
+    allowed = {"demos", "segments", "tokens", "actions"}
     extras = set(spec.keys()) - allowed
     if extras:
         raise ValueError(
             f"unknown top-level keys in filter config: {sorted(extras)}.  "
             f"Allowed: {sorted(allowed)}"
         )
-    for which in ("keep", "drop"):
-        sub = spec.get(which) or {}
-        if not isinstance(sub, dict):
-            raise ValueError(f"{which!r} must be a dict, got {type(sub).__name__}")
-        filter_dsl.validate_predicate(sub, _is_valid_manifest_path)
-    tick_labels = spec.get("drop_tick_labels") or []
-    if not isinstance(tick_labels, list):
-        raise ValueError("drop_tick_labels must be a list of label names")
-    bad = [n for n in tick_labels if n not in _VALID_TICK_DROP_LABELS]
+
+    # demos: predicate dicts (MongoDB DSL).
+    demos = spec.get("demos") or {}
+    if not isinstance(demos, dict):
+        raise ValueError(f"'demos' must be an object, got {type(demos).__name__}")
+    demos_allowed = {"keep", "drop"}
+    bad = set(demos.keys()) - demos_allowed
     if bad:
         raise ValueError(
-            f"unknown drop_tick_labels: {bad}.  Valid: "
+            f"unknown keys in 'demos': {sorted(bad)}.  "
+            f"Allowed: {sorted(demos_allowed)}"
+        )
+    for which in ("keep", "drop"):
+        sub = demos.get(which) or {}
+        if not isinstance(sub, dict):
+            raise ValueError(
+                f"'demos.{which}' must be a predicate dict, "
+                f"got {type(sub).__name__}"
+            )
+        filter_dsl.validate_predicate(sub, _is_valid_manifest_path)
+
+    # segments: drop-only, list of named tick-label intervals.
+    segments = spec.get("segments") or {}
+    if not isinstance(segments, dict):
+        raise ValueError(f"'segments' must be an object, got {type(segments).__name__}")
+    segments_allowed = {"drop"}
+    bad = set(segments.keys()) - segments_allowed
+    if bad:
+        raise ValueError(
+            f"unknown keys in 'segments': {sorted(bad)}.  "
+            f"Allowed: {sorted(segments_allowed)} (no whitelist — "
+            f"omit to drop nothing)"
+        )
+    seg_drop = segments.get("drop") or []
+    if not isinstance(seg_drop, list):
+        raise ValueError("'segments.drop' must be a list of label names")
+    bad = [n for n in seg_drop if n not in _VALID_TICK_DROP_LABELS]
+    if bad:
+        raise ValueError(
+            f"unknown 'segments.drop' labels: {bad}.  Valid: "
             f"{sorted(_VALID_TICK_DROP_LABELS)}"
         )
+
+    # tokens / actions: keep XOR drop, lists of valid field names.
+    for axis, valid in (("tokens", _VALID_TOKEN_FIELDS),
+                         ("actions", _VALID_ACTION_FIELDS)):
+        block = spec.get(axis) or {}
+        if not isinstance(block, dict):
+            raise ValueError(f"{axis!r} must be an object, got {type(block).__name__}")
+        block_allowed = {"keep", "drop"}
+        bad = set(block.keys()) - block_allowed
+        if bad:
+            raise ValueError(
+                f"unknown keys in {axis!r}: {sorted(bad)}.  "
+                f"Allowed: {sorted(block_allowed)}"
+            )
+        for which in ("keep", "drop"):
+            names = block.get(which) or []
+            if not isinstance(names, list):
+                raise ValueError(
+                    f"{axis!r}.{which!r} must be a list of field names"
+                )
+            bad = [n for n in names if n not in valid]
+            if bad:
+                raise ValueError(
+                    f"unknown {axis!r}.{which!r}: {bad}.  Valid: "
+                    f"{sorted(valid)}"
+                )
+        keep = block.get("keep") or []
+        drop = block.get("drop") or []
+        if keep and drop:
+            raise ValueError(
+                f"{axis!r} cannot set both keep and drop "
+                f"(pick one — keep is whitelist, drop is blacklist)"
+            )
+
+
+def _load_and_pin_filter(output: Path, cli_path: Path | None) -> dict:
+    """Establish the canonical filter for this collection.
+
+    The filter is part of the collection's on-disk identity: it always
+    lives at ``<output>/filter.json``. The CLI ``--filter-config`` flag
+    seeds it on a fresh collect; a re-run finds it in the cache dir
+    automatically with no flag needed. Mismatch between an existing
+    pinned filter and a CLI override fails loud.
+
+    Behavior:
+      - Neither exists: write ``{}`` to ``<output>/filter.json``
+        (explicit "no filter" record) and return an empty spec.
+      - Only CLI path: load, validate, write canonical JSON to
+        ``<output>/filter.json``.
+      - Only pinned: load, validate, return as-is.
+      - Both: fail loud if they disagree; otherwise use the pinned copy.
+    """
+    output.mkdir(parents=True, exist_ok=True)
+    pinned_path = output / "filter.json"
+    cli_spec: dict | None = None
+    if cli_path is not None:
+        try:
+            cli_spec = json.loads(cli_path.read_text())
+            _validate_filter_schema(cli_spec)
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            raise SystemExit(f"--filter-config {str(cli_path)!r}: {exc}")
+    if pinned_path.exists():
+        try:
+            pinned_spec = json.loads(pinned_path.read_text())
+            _validate_filter_schema(pinned_spec)
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            raise SystemExit(f"{pinned_path}: {exc}")
+        if cli_spec is not None and cli_spec != pinned_spec:
+            raise SystemExit(
+                f"--filter-config {str(cli_path)!r} differs from pinned "
+                f"filter at {pinned_path}. To change the filter for this "
+                f"output, delete the pinned file or use a different --output."
+            )
+        return pinned_spec
+    spec = cli_spec if cli_spec is not None else {}
+    pinned_path.write_text(json.dumps(spec, indent=2) + "\n")
+    return spec
+
+
+def _apply_field_filter(
+    arrays: dict[str, np.ndarray],
+    keep: tuple[str, ...] | list[str],
+    drop: tuple[str, ...] | list[str],
+) -> None:
+    """Restrict ``arrays`` in place to the configured field set.  ``keep``
+    wins if non-empty (whitelist).  Otherwise ``drop`` excludes the listed
+    keys (blacklist).  Empty/None on both → no-op (default, all fields
+    survive). """
+    if keep:
+        keep_set = frozenset(keep)
+        for k in list(arrays.keys()):
+            if k not in keep_set:
+                del arrays[k]
+    elif drop:
+        drop_set = frozenset(drop)
+        for k in list(arrays.keys()):
+            if k in drop_set:
+                del arrays[k]
 
 
 def _label_keep_mask(labels: dict,
@@ -254,7 +450,7 @@ def _runs_from_mask(keep: np.ndarray) -> list[tuple[int, int]]:
 
     Returns a list of [start, end) half-open intervals.  Used by
     `_unpack_episode` to split a single demo into one sub-episode per
-    surviving run of frames after `drop_tick_labels` carves intervals
+    surviving run of frames after `segments.drop` carves intervals
     out, so each run carries causal continuity through the trainer's
     GRU hidden state rather than splicing across dropped frames. """
     if keep.size == 0 or not keep.any():
@@ -266,13 +462,22 @@ def _runs_from_mask(keep: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(starts.tolist(), ends.tolist()))
 _WORKER_DEMO_PROC: subprocess.Popen | None = None
 _WORKER_DEMO_ARGS: tuple[str, str, int, str] | None = None
+# Collect-time tokens/actions field filter, set per-run via
+# _init_collect_worker.  Tuple positions: (tokens_keep, tokens_drop,
+# actions_keep, actions_drop).  Within each axis, keep wins if non-empty
+# (whitelist), else drop blacklists, else all fields pass through.  Read
+# by _unpack_episode right after compaction, before episodes get handed
+# to the shard writer.
+_WORKER_FIELD_FILTER: tuple[
+    tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]
+] = ((), (), (), ())
 _WORKER_DEMO_STDERR_FILE = None
 _WORKER_DEMO_STDERR_PATH: Path | None = None
 _ACTION_RECORD_DTYPE = np.dtype(
     {
-        "names": list(ACTION_FIELDS.keys()),
-        "formats": [dtype if not shape else (dtype, shape) for _, dtype, shape in ACTION_FIELDS.values()],
-        "offsets": [offset for offset, _, _ in ACTION_FIELDS.values()],
+        "names": list(_ACTION_FIELDS_LAYOUT.keys()),
+        "formats": [dtype if not shape else (dtype, shape) for _, dtype, shape in _ACTION_FIELDS_LAYOUT.values()],
+        "offsets": [offset for offset, _, _ in _ACTION_FIELDS_LAYOUT.values()],
         "itemsize": ACTION_SIZE,
     }
 )
@@ -344,9 +549,19 @@ def _shutdown_worker() -> None:
         _cleanup_worker_stderr()
 
 
-def _init_collect_worker(demo_worker: str, asset_root: str, tick_hz: int, game_dir: str) -> None:
-    global _WORKER_DEMO_ARGS
+def _init_collect_worker(
+    demo_worker: str, asset_root: str, tick_hz: int, game_dir: str,
+    tokens_keep:  tuple[str, ...] = (),
+    tokens_drop:  tuple[str, ...] = (),
+    actions_keep: tuple[str, ...] = (),
+    actions_drop: tuple[str, ...] = (),
+) -> None:
+    global _WORKER_DEMO_ARGS, _WORKER_FIELD_FILTER
     _WORKER_DEMO_ARGS = (demo_worker, asset_root, int(tick_hz), game_dir)
+    _WORKER_FIELD_FILTER = (
+        tuple(tokens_keep),  tuple(tokens_drop),
+        tuple(actions_keep), tuple(actions_drop),
+    )
     _shutdown_worker()
     atexit.register(_shutdown_worker)
 
@@ -364,48 +579,75 @@ def _get_collect_worker() -> subprocess.Popen:
 
 # ── Demo playback ────────────────────────────────────────────────────
 
+def _read_collect_frames(
+    proc: subprocess.Popen,
+    op: dict,
+    magic: bytes,
+    frame_after_magic: int,
+    parse_frame,
+) -> list[dict] | None:
+    """Dispatch ``op`` to the worker and read its framed output stream.
+    ``parse_frame`` takes the bytes after the magic and returns a tick
+    dict that must include ``"done": bool``.  Returns the list of ticks
+    on success, ``None`` on worker death (the caller fetches stderr
+    tail and decides whether it's a watchdog stall or a crash).
+
+    Shared by the BC (QOBS) and labeler (LOBS) wire formats.  Each
+    caller supplies its own magic bytes, frame size, and parse
+    callback; the op-dispatch / error-line intercept / bad-magic guard /
+    partial-read termination logic is identical and lives here. """
+    proc.stdin.write((json.dumps(op) + "\n").encode())
+    proc.stdin.flush()
+    ticks: list[dict] = []
+    while True:
+        if proc.poll() is not None:
+            return None
+        m = proc.stdout.read(4)
+        if not m or len(m) < 4:
+            return None
+        if m[0:1] == b'{':
+            rest = proc.stdout.readline()
+            try:
+                err = json.loads(m + rest)
+                raise RuntimeError(err.get("error", "unknown error"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise RuntimeError(f"Worker error: {(m + rest)[:200]!r}")
+        if m != magic:
+            raise RuntimeError(f"Bad magic: {m!r}")
+        raw = proc.stdout.read(frame_after_magic) if proc.poll() is None else b""
+        if len(raw) < frame_after_magic:
+            return None
+        tick = parse_frame(raw)
+        ticks.append(tick)
+        if tick.get("done"):
+            break
+    return ticks
+
+
+def _parse_qobs_frame(raw: bytes) -> dict:
+    """Parse one QOBS frame (after the 4-byte magic).  Returns a tick
+    dict with separate obs / action byte-views and a done flag. """
+    header = struct.unpack_from("<IIIHH", raw)
+    flags = header[3]
+    return {
+        "obs":    raw[TICK_HEADER_SIZE:TICK_HEADER_SIZE + OBS_BUFFER_SIZE],
+        "action": raw[TICK_HEADER_SIZE + OBS_BUFFER_SIZE:],
+        "done":   bool(flags & FLAG_DONE),
+    }
+
+
 def _collect_one_demo(proc: subprocess.Popen, demo_name: str,
                       play_start: int = 0, play_end: int = 999999999,
                       force_mvd_emit: bool = False,
                       ) -> list[dict] | None:
-    cmd = json.dumps({
+    op = {
         "op": "collect", "demo_path": demo_name, "seed": 0,
         "play_start": play_start, "play_end": play_end,
         "force_mvd_emit": 1 if force_mvd_emit else 0,
-    }) + "\n"
-    proc.stdin.write(cmd.encode())
-    proc.stdin.flush()
-
-    ticks = []
-    while True:
-        if proc.poll() is not None:
-            return None
-        magic = proc.stdout.read(4)
-        if not magic or len(magic) < 4:
-            return None
-        if magic[0:1] == b'{':
-            rest = proc.stdout.readline()
-            try:
-                err = json.loads(magic + rest)
-                raise RuntimeError(err.get("error", "unknown error"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                raise RuntimeError(f"Worker error: {(magic + rest)[:200]!r}")
-        if magic != b'QOBS':
-            raise RuntimeError(f"Bad magic: {magic!r}")
-        raw = proc.stdout.read(TICK_TOTAL_SIZE) if proc.poll() is None else b""
-        if len(raw) < TICK_TOTAL_SIZE:
-            return None
-
-        header = struct.unpack_from("<IIIHH", raw)
-        flags = header[3]
-        ticks.append({
-            "obs": raw[TICK_HEADER_SIZE:TICK_HEADER_SIZE + OBS_BUFFER_SIZE],
-            "action": raw[TICK_HEADER_SIZE + OBS_BUFFER_SIZE:],
-            "done": bool(flags & FLAG_DONE),
-        })
-        if flags & FLAG_DONE:
-            break
-    return ticks
+    }
+    return _read_collect_frames(
+        proc, op, b"QOBS", TICK_TOTAL_SIZE, _parse_qobs_frame
+    )
 
 
 def _worker_stderr_tail(proc: subprocess.Popen | None, limit: int = 4000) -> str:
@@ -428,30 +670,194 @@ def _worker_stderr_tail(proc: subprocess.Popen | None, limit: int = 4000) -> str
     return text[-limit:]
 
 
-def _compact_obs_arrays(obs_arrays: dict[str, np.ndarray]) -> None:
-    """Downcast obs to compact on-disk dtypes.  Mutates in place.
+# ── Labeler-input densifier (native → legacy normalized) ────────────
+#
+# The native obs format stores per-field entity arrays at native widths
+# concatenated across all tokens in an episode. The target labeler
+# (qnn.bc.target_labeler) was written against the legacy dense layout —
+# (T, 16, 19) float32 entity_scalars_raw, (T, 16, 3) int32 entity_ids,
+# (T, 16) int32 entity_types, (T, 17) float32 self_scalars — and reads
+# values at fixed slot offsets matching qnn_onnx.c:emit_actor (see
+# _ACTOR_*_OFFSET constants in target_labeler.py).
+#
+# We construct that dense view here from per-frame native arrays just
+# for the labeler call. The result is discarded after target_dist is
+# computed; only the native arrays go to disk.
 
-    Float scalars are bounded under abs(3.4) per a corpus scan, so fp16
-    (max ~65k) is lossless within signal floor.  Int columns are bounded by
-    qnn.vocab sizes (action vocab=20, entity vocab=42), all fit in uint8.
-    entity_types uses -1 as the empty sentinel — int8 keeps the sign cleanly
-    instead of remapping to a uint sentinel.
+# Legacy actor scalar slot layout (mirrors qnn.model.dequant entity slot
+# comments — kept in sync there):
+#   [hx,hy,hz, rx,ry,rz, dist, vx,vy,vz, px,py,pz, pd, eta, fac,team,score, rec]
+#                          ^ slot 6 = dist, recomputed from rel
+_ACTOR_SLOT_HALFEXT = 0
+_ACTOR_SLOT_REL     = 3
+_ACTOR_SLOT_DIST    = 6
+_ACTOR_SLOT_VEL     = 7
+_ACTOR_SLOT_PATH    = 10
+_ACTOR_SLOT_PD      = 13
+_ACTOR_SLOT_ETA     = 14
+_ACTOR_SLOT_FACING  = 15
+_ACTOR_SLOT_TEAM    = 16
+_ACTOR_SLOT_SCORE   = 17
+_ACTOR_SLOT_RECENCY = 18
+
+# Self scalars (T, 17) legacy slot layout matches qnn.model.dequant
+# SelfDequantizer _SLOT_* constants — kept in sync with that module.
+_SELF_SLOT_HEALTH      = 0
+_SELF_SLOT_ARMOR       = 1
+_SELF_SLOT_WEAPON_SG   = 2
+_SELF_SLOT_WEAPON_SSG  = 3
+_SELF_SLOT_WEAPON_NG   = 4
+_SELF_SLOT_WEAPON_SNG  = 5
+_SELF_SLOT_WEAPON_GL   = 6
+_SELF_SLOT_WEAPON_RL   = 7
+_SELF_SLOT_WEAPON_LG   = 8
+_SELF_SLOT_AMMO_SH     = 9
+_SELF_SLOT_AMMO_NA     = 10
+_SELF_SLOT_AMMO_RK     = 11
+_SELF_SLOT_AMMO_CE     = 12
+_SELF_SLOT_VEL         = 13   # 13..15
+_SELF_SLOT_ATTACK_FIN  = 16
+
+
+def _densify_native_obs_for_labeler(
+    native_obs: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Reconstruct the legacy normalized-float dense view the labeler
+    expects from a per-tick stack of native obs fields.
+
+    Input ``native_obs`` carries the per-tick native arrays after
+    stacking across the episode:
+      - Self/spatial fields: ``(T, ...)`` at native dtypes.
+      - Entity fields: ``(T, ...)`` at the **per-tick variable-length**
+        shape — entity_types ``(T, N_t)``, entity_rel ``(T, N_t, 3)``,
+        etc. (Variable across t — handled by the caller stacking with
+        np.array(..., dtype=object) or by passing a list of dicts; here
+        we accept the per-tick concatenation produced by
+        ``_native_obs_to_dense_arrays``.)
+
+    Returns ``{entity_types, entity_ids, entity_scalars_raw,
+    self_scalars}`` — exactly the keys
+    ``label_enemy_target_distribution`` reads from. Other native fields
+    are dropped (not needed by the labeler).
     """
-    _f16 = ("self_scalars", "spatial_scalars", "entity_scalars_raw")
-    for key in _f16:
-        arr = obs_arrays.get(key)
-        if arr is not None and arr.dtype != np.float16:
-            obs_arrays[key] = np.ascontiguousarray(arr, dtype=np.float16)
+    T = native_obs["health"].shape[0]
+    N = MAX_TOKEN_OBJECTS  # legacy 16-slot dense layout
 
-    _u8 = ("entity_event_actions", "entity_event_sources", "entity_ids")
-    for key in _u8:
-        arr = obs_arrays.get(key)
-        if arr is not None and arr.dtype != np.uint8:
-            obs_arrays[key] = np.ascontiguousarray(arr, dtype=np.uint8)
+    # ---- Self scalars (T, 17) ----
+    self_scalars = np.zeros((T, 17), dtype=np.float32)
+    self_scalars[:, _SELF_SLOT_HEALTH]     = native_obs["health"]          .astype(np.float32) / en.MAX_HEALTH
+    self_scalars[:, _SELF_SLOT_ARMOR]      = native_obs["effective_armor"] .astype(np.float32) / en.MAX_ARMOR_EFFECT
+    self_scalars[:, _SELF_SLOT_AMMO_SH]    = native_obs["ammo_shells"]     .astype(np.float32) / en.MAX_SHELLS
+    self_scalars[:, _SELF_SLOT_AMMO_NA]    = native_obs["ammo_nails"]      .astype(np.float32) / en.MAX_NAILS
+    self_scalars[:, _SELF_SLOT_AMMO_RK]    = native_obs["ammo_rockets"]    .astype(np.float32) / en.MAX_ROCKETS
+    self_scalars[:, _SELF_SLOT_AMMO_CE]    = native_obs["ammo_cells"]      .astype(np.float32) / en.MAX_CELLS
+    self_scalars[:, _SELF_SLOT_VEL:_SELF_SLOT_VEL + 3] = (
+        native_obs["vel"].astype(np.float32) / en.MAX_VELOCITY
+    )
+    self_scalars[:, _SELF_SLOT_ATTACK_FIN] = native_obs["attack_finished"] .astype(np.float32) / en.TIME_SCALE
+    # cl.items bit-extracted weapon flags (slots 2..8).
+    items_i64 = native_obs["self_items"].astype(np.int64)
+    self_scalars[:, _SELF_SLOT_WEAPON_SG ] = ((items_i64 & en.IT_SHOTGUN)          != 0).astype(np.float32)
+    self_scalars[:, _SELF_SLOT_WEAPON_SSG] = ((items_i64 & en.IT_SUPER_SHOTGUN)    != 0).astype(np.float32)
+    self_scalars[:, _SELF_SLOT_WEAPON_NG ] = ((items_i64 & en.IT_NAILGUN)          != 0).astype(np.float32)
+    self_scalars[:, _SELF_SLOT_WEAPON_SNG] = ((items_i64 & en.IT_SUPER_NAILGUN)    != 0).astype(np.float32)
+    self_scalars[:, _SELF_SLOT_WEAPON_GL ] = ((items_i64 & en.IT_GRENADE_LAUNCHER) != 0).astype(np.float32)
+    self_scalars[:, _SELF_SLOT_WEAPON_RL ] = ((items_i64 & en.IT_ROCKET_LAUNCHER)  != 0).astype(np.float32)
+    self_scalars[:, _SELF_SLOT_WEAPON_LG ] = ((items_i64 & en.IT_LIGHTNING)        != 0).astype(np.float32)
 
-    types = obs_arrays.get("entity_types")
-    if types is not None and types.dtype != np.int8:
-        obs_arrays["entity_types"] = np.ascontiguousarray(types, dtype=np.int8)
+    # ---- Entity dense (T, 16, ...) ----
+    # Native entity fields are stored per-tick as 1D Python lists in
+    # ``native_obs["_per_tick_entities"]`` — a list of length T where
+    # each item is the per-tick dict from unpack_obs_buffer_native.
+    # Fast path: zero out and fill the actor slots used by the labeler.
+    entity_types        = np.full((T, N),  -1, dtype=np.int32)
+    entity_ids          = np.zeros((T, N, 3),   dtype=np.int32)
+    entity_scalars_raw  = np.zeros((T, N, ACTOR_SCALAR_DIM), dtype=np.float32)
+
+    per_tick = native_obs.get("_per_tick_entities")
+    if per_tick is None:
+        # Caller forgot to attach. Empty fallback so the labeler sees
+        # "no targets" rather than crash, but this is an error path.
+        raise RuntimeError(
+            "_densify_native_obs_for_labeler requires "
+            "'_per_tick_entities' (list of per-tick parsed entity dicts)"
+        )
+
+    for t, tick_ents in enumerate(per_tick):
+        n_tokens = int(tick_ents["entity_count"])
+        if n_tokens <= 0:
+            continue
+        # Hard cap at N=16 — legacy dense layout has fixed slot count;
+        # native worker emits ≤ N anyway, but be defensive.
+        nt = min(n_tokens, N)
+        types_t = tick_ents["entity_types"][:nt]
+        entity_types[t, :nt] = types_t.astype(np.int32)
+        entity_ids[t, :nt, 0] = tick_ents["entity_subject_id"][:nt].astype(np.int32)
+        entity_ids[t, :nt, 1] = tick_ents["entity_modality_id"][:nt].astype(np.int32)
+        entity_ids[t, :nt, 2] = tick_ents["entity_player_id"][:nt].astype(np.int32)
+
+        # Common normalized scalars per actor slot. Tokens of other
+        # types still get rel/recency filled (the labeler treats them
+        # via mask later), but only actors contribute to target.
+        # half_ext
+        entity_scalars_raw[t, :nt, _ACTOR_SLOT_HALFEXT:_ACTOR_SLOT_HALFEXT + 3] = (
+            tick_ents["entity_half_extents"][:nt].astype(np.float32) / en.DIST_SCALE
+        )
+        # rel + derived dist
+        rel = tick_ents["entity_rel"][:nt].astype(np.float32) / en.DIST_SCALE
+        entity_scalars_raw[t, :nt, _ACTOR_SLOT_REL:_ACTOR_SLOT_REL + 3] = rel
+        entity_scalars_raw[t, :nt, _ACTOR_SLOT_DIST] = np.linalg.norm(rel, axis=-1)
+        # vel (proj+actor only have vel; item/mover have zero — safe to write)
+        entity_scalars_raw[t, :nt, _ACTOR_SLOT_VEL:_ACTOR_SLOT_VEL + 3] = (
+            tick_ents["entity_vel"][:nt].astype(np.float32) / en.MAX_VELOCITY
+        )
+        # path / path_dist / eta — proj has none on the wire; native
+        # parser returns zeros for those slots, which is the right
+        # fallback for the dense layout.
+        entity_scalars_raw[t, :nt, _ACTOR_SLOT_PATH:_ACTOR_SLOT_PATH + 3] = (
+            tick_ents["entity_path"][:nt].astype(np.float32) / en.DIST_SCALE
+        )
+        entity_scalars_raw[t, :nt, _ACTOR_SLOT_PD] = (
+            tick_ents["entity_path_dist"][:nt].astype(np.float32) / en.DIST_SCALE
+        )
+        entity_scalars_raw[t, :nt, _ACTOR_SLOT_ETA] = (
+            tick_ents["entity_eta"][:nt].astype(np.float32) / en.TIME_SCALE
+        )
+        # Actor-only fields (facing/team/score) — set where applicable.
+        actor_mask = types_t == TOKEN_ACTOR
+        if actor_mask.any():
+            entity_scalars_raw[t, :nt, _ACTOR_SLOT_FACING] = np.where(
+                actor_mask,
+                tick_ents["entity_facing"][:nt].astype(np.float32) / 255.0,
+                0.0,
+            )
+            entity_scalars_raw[t, :nt, _ACTOR_SLOT_TEAM] = np.where(
+                actor_mask,
+                tick_ents["entity_team"][:nt].astype(np.float32),
+                0.0,
+            )
+            entity_scalars_raw[t, :nt, _ACTOR_SLOT_SCORE] = np.where(
+                actor_mask,
+                tick_ents["entity_score"][:nt].astype(np.float32) / 255.0,
+                0.0,
+            )
+        # Recency is present for every token type.
+        entity_scalars_raw[t, :nt, _ACTOR_SLOT_RECENCY] = (
+            tick_ents["entity_recency"][:nt].astype(np.float32) / en.TIME_SCALE
+        )
+
+    return {
+        "entity_types":       entity_types,
+        "entity_ids":         entity_ids,
+        "entity_scalars_raw": entity_scalars_raw,
+        "self_scalars":       self_scalars,
+    }
+
+
+# target_dist was previously encoded as sparse (T, 3) u8 here and
+# expanded back at training time. Both the encoder and decoder have
+# been removed: target_dist is now cached as a dense per-shard sidecar
+# written by collect and consumed directly by BC training.
 
 
 def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
@@ -459,22 +865,32 @@ def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
 
     Mutates `act_arrays` in place.  See qnn.actions docstring for the spec.
 
-      move    float32[T, 3]  → uint8[T] packed: bits 0-1=fb, 2-3=lr, 4-5=ud,
-                                each holding a class index in {0=neg, 1=none, 2=pos}.
-      look    float32[T, 3]  → float16[T, 3]
-      fire    int32[T]       → uint8[T]
-      weapon  int32[T] raw engine weapon byte → uint8[T] same value:
-                0 = no weapon held (pre-spawn, dead, transitional),
-                1..8 = Quake weapon id in impulse order (axe..thunderbolt).
-              No-weapon frames are kept on disk so downstream signals
-              (move, fire, look) still train; the model side masks them
-              out of the weapon-head CE loss via ignore_index.
-      target  int64[T]       (left as-is — token slot indices need full range)
+      move          float32[T, 3]  → uint8[T] packed: bits 0-1=fb, 2-3=lr,
+                                      4-5=ud, each holding a class index in
+                                      {0=neg, 1=none, 2=pos}.
+      look          float32[T, 3]  → float16[T, 3].
+      fire          int32[T]       → uint8[T].
+      weapon        int32[T] raw engine weapon byte → uint8[T] same value:
+                                      0 = no weapon held (pre-spawn, dead,
+                                      transitional), 1..8 = Quake weapon id
+                                      in impulse order (axe..thunderbolt).
+                                      No-weapon frames are kept on disk so
+                                      downstream signals (move, fire, look)
+                                      still train; the model side masks them
+                                      out of the weapon-head CE loss via
+                                      ignore_index.
+      target_dist   float32[T, 17] → uint8[T, 3] sparse
+                                      ``(idx, idx2, w2_u8)`` per engine_norm.
+                                      ActionDequantizer expands at the model
+                                      boundary; the dataloader expands at
+                                      load time for the legacy float code
+                                      path. See _encode_sparse_target_dist.
 
-    Each axis is thresholded independently against MOVE_AXIS_THRESHOLD = 0.1.
-    The C-side cmd values (forwardmove/maxspeed etc., in [-1, 1]) are clean
-    multiples of 200/320 ≈ 0.625 in standard QW play, so 0.1 separates
-    "pressed" from "released" without dropping any real press.
+    Each move axis is thresholded independently against
+    MOVE_AXIS_THRESHOLD = 0.1.  The C-side cmd values (forwardmove/maxspeed
+    etc., in [-1, 1]) are clean multiples of 200/320 ≈ 0.625 in standard QW
+    play, so 0.1 separates "pressed" from "released" without dropping any
+    real press.
 
     The engine-facing `switch` slot is derived from the weapon head's
     argmax at inference time (model.policy._weapon_switch_slots_from_choices);
@@ -482,6 +898,7 @@ def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
     the slot is a pure function of the weapon class.
     """
     move = np.asarray(act_arrays.get("move"))
+    fire = act_arrays.get("fire")
     if move is not None and move.dtype != np.uint8:
         # move shape: (T, 3) float — fb, lr, ud
         t = MOVE_AXIS_THRESHOLD
@@ -492,17 +909,22 @@ def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
         fb_cls = none + (move[:, 0] >  t).astype(np.uint8) - (move[:, 0] < -t).astype(np.uint8)
         lr_cls = none + (move[:, 1] >  t).astype(np.uint8) - (move[:, 1] < -t).astype(np.uint8)
         ud_cls = none + (move[:, 2] >  t).astype(np.uint8) - (move[:, 2] < -t).astype(np.uint8)
-        # Pack bits 0-1=fb, 2-3=lr, 4-5=ud (2 bits per axis × 3 axes = 6 bits).
+        # Pack bits 0-1=fb, 2-3=lr, 4-5=ud (2 bits per axis × 3 axes = 6 bits)
+        # + bit 6 = fire (BUTTON_ATTACK). Bit 7 reserved.
         packed = (fb_cls & 0x3) | ((lr_cls & 0x3) << 2) | ((ud_cls & 0x3) << 4)
+        if fire is not None:
+            fire_bit = (np.asarray(fire, dtype=np.int32) != 0).astype(np.uint8)
+            packed = packed | (fire_bit << 6)
         act_arrays["move"] = packed.astype(np.uint8)
+        # Fire is now packed into the move byte; drop the redundant
+        # standalone array — the loader (qnn.bc.train._unpack_move_axes)
+        # extracts bit 6 to reconstruct the (T,) fire stream the heads
+        # consume.
+        act_arrays.pop("fire", None)
 
     look = act_arrays.get("look")
     if look is not None and look.dtype != np.float16:
         act_arrays["look"] = np.ascontiguousarray(look, dtype=np.float16)
-
-    fire = act_arrays.get("fire")
-    if fire is not None and fire.dtype != np.uint8:
-        act_arrays["fire"] = np.ascontiguousarray(fire, dtype=np.uint8)
 
     weapon = act_arrays.get("weapon")
     if weapon is not None:
@@ -516,6 +938,61 @@ def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
             )
         act_arrays["weapon"] = np.ascontiguousarray(weapon_bytes.astype(np.uint8))
 
+    # op_input: int32 on the wire (struct alignment) but only the low
+    # 5 bits are populated (see QNN_PackOpInput). Compact to uint8 on
+    # disk — 4x size reduction, no information loss.
+    op_input = act_arrays.get("op_input")
+    if op_input is not None and op_input.dtype != np.uint8:
+        op_bytes = np.asarray(op_input, dtype=np.int32).reshape(-1)
+        invalid = op_bytes[(op_bytes < 0) | (op_bytes > 0x1F)]
+        if invalid.size:
+            sample = sorted({int(v) for v in invalid[:8]})
+            raise ValueError(
+                f"op_input bytes must use only bits 0..4 (0..31), "
+                f"got {sample}"
+            )
+        act_arrays["op_input"] = np.ascontiguousarray(op_bytes.astype(np.uint8))
+
+    # target_dist: cast to f16 for on-disk caching, or drop if the
+    # caller hasn't computed it. The labeler is ~95% of BC load time
+    # when run live; caching here amortizes it across every subsequent
+    # training launch. f16 max quantization error measured at 2.4e-4
+    # on real labeler output (values in [0, 1], min nonzero ~7e-3);
+    # well below noise. Train-time loader auto-detects the cache file
+    # via shard manifest and falls back to live labeler if absent.
+    td = act_arrays.get("target_dist")
+    if td is not None and td.dtype != np.float16:
+        act_arrays["target_dist"] = np.ascontiguousarray(td, dtype=np.float16)
+
+
+# Field categories for native obs handling. Self/spatial are fixed-
+# shape per frame and stack along axis 0 like the legacy code path.
+# Entity fields carry the per-frame variable token count; they
+# concatenate along axis 0 across ticks and the on-disk shape becomes
+# (total_tokens_in_shard, ...).
+_NATIVE_SELF_FIELDS = (
+    "health", "effective_armor",
+    "ammo_shells", "ammo_nails", "ammo_rockets", "ammo_cells",
+    "vel", "attack_finished",
+    "self_weapon_id", "self_movement_id", "self_items",
+)
+_NATIVE_SPATIAL_FIELDS = (
+    "spatial_dir",
+    "spatial_nearest_dist", "spatial_mean_dist",
+    "spatial_openness", "spatial_clearance", "spatial_traversable",
+    "spatial_dropoff", "spatial_solid_frac", "spatial_water_frac",
+    "spatial_slime_frac", "spatial_lava_frac",
+)
+_NATIVE_ENTITY_FIELDS = (
+    "entity_types", "entity_subject_id", "entity_modality_id",
+    "entity_player_id", "entity_event_count",
+    "entity_event_actions", "entity_event_sources",
+    "entity_half_extents", "entity_rel", "entity_vel",
+    "entity_path", "entity_path_dist", "entity_eta", "entity_recency",
+    "entity_facing", "entity_team", "entity_score",
+    "entity_amount", "entity_regen", "entity_state",
+)
+
 
 def _unpack_episode(
     ticks: list[dict],
@@ -524,10 +1001,17 @@ def _unpack_episode(
     drop_label_names: tuple[str, ...] = (),
     total_frames: int = 0,
     sight_only: bool = False,
+    target_dist_cache: bool = True,
 ) -> list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]]:
     """Unpack raw ticks into one or more (obs, action) sub-episodes.
 
-    When `drop_tick_labels` carves intervals out of the demo, each
+    Native wire format (engine_norm phase 2). Per-frame self/spatial
+    fields stack at native dtypes; entity fields are stored as
+    concatenated per-token arrays plus a per-row ``entity_count``
+    array so the loader can recover slice boundaries via cumsum without
+    on-disk padding.
+
+    When `segments.drop` carves intervals out of the demo, each
     surviving contiguous run of frames is emitted as its own sub-
     episode — never concatenated across dropped intervals — so the
     trainer can reset its GRU hidden state at each sub-episode
@@ -540,15 +1024,45 @@ def _unpack_episode(
     if n == 0:
         return []
 
-    obs_list = [unpack_obs_buffer(t["obs"]) for t in ticks]
-    obs_arrays: dict[str, np.ndarray] = {}
-    for key in obs_list[0]:
-        obs_arrays[key] = np.stack([obs[key] for obs in obs_list], axis=0)
+    # Parse each tick into per-field numpy arrays. self / spatial are
+    # fixed-shape; entity fields are (n_tokens_t, ...) where n_tokens_t
+    # is variable per tick. Keep the per-tick dicts around for the
+    # labeler densifier (it needs (T, 16, 19) dense entity scalars).
+    per_tick: list[dict[str, np.ndarray]] = [
+        unpack_obs_buffer_native(t["obs"]) for t in ticks
+    ]
 
+    obs_arrays: dict[str, np.ndarray] = {}
+    # Fixed-shape self / spatial: stack along the new T axis.
+    for key in _NATIVE_SELF_FIELDS + _NATIVE_SPATIAL_FIELDS:
+        obs_arrays[key] = np.stack([tick[key] for tick in per_tick], axis=0)
+    # Variable-length entity fields: concatenate along the existing
+    # first axis (each per-tick array is already (n_tokens_t, ...)).
+    entity_counts = np.array(
+        [int(tick["entity_count"]) for tick in per_tick],
+        dtype=np.uint8,
+    )
+    obs_arrays["entity_count"] = entity_counts
+    if entity_counts.sum() == 0:
+        # No tokens anywhere — emit zero-length arrays with the right
+        # shape so downstream concat / slice paths stay typed.
+        for key in _NATIVE_ENTITY_FIELDS:
+            tmpl = per_tick[0][key]
+            obs_arrays[key] = np.zeros((0,) + tmpl.shape[1:], dtype=tmpl.dtype)
+    else:
+        for key in _NATIVE_ENTITY_FIELDS:
+            obs_arrays[key] = np.concatenate(
+                [tick[key] for tick in per_tick], axis=0,
+            )
+
+    # Action block: decode the per-tick 32-byte action struct into a
+    # contiguous record array, then split into per-field arrays at
+    # native (float32 / int32) widths. _compact_action_arrays
+    # downcasts later.
     action_blob = b"".join(t["action"] for t in ticks)
     records = np.frombuffer(action_blob, dtype=_ACTION_RECORD_DTYPE, count=n)
     act_arrays: dict[str, np.ndarray] = {}
-    for name, (_, _, shape) in ACTION_FIELDS.items():
+    for name, (_, _, shape) in _ACTION_FIELDS_LAYOUT.items():
         field = np.asarray(records[name])
         act_arrays[name] = field.copy().reshape(n, *shape) if shape else field.copy()
 
@@ -568,31 +1082,152 @@ def _unpack_episode(
 
     episodes: list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = []
     for s, e in runs:
-        sub_obs = {key: values[s:e] for key, values in obs_arrays.items()}
+        # Self / spatial / entity_count slice cleanly along axis 0.
+        sub_obs: dict[str, np.ndarray] = {}
+        for key in _NATIVE_SELF_FIELDS + _NATIVE_SPATIAL_FIELDS:
+            sub_obs[key] = obs_arrays[key][s:e]
+        sub_counts = obs_arrays["entity_count"][s:e]
+        sub_obs["entity_count"] = sub_counts
+        # Entity fields use a token-axis slice. Compute the [start_tok,
+        # end_tok) range on the concatenated arrays from cumsum.
+        cs = np.cumsum(obs_arrays["entity_count"].astype(np.int64))
+        tok_start = int(cs[s - 1]) if s > 0 else 0
+        tok_end   = int(cs[e - 1]) if e > 0 else 0
+        for key in _NATIVE_ENTITY_FIELDS:
+            sub_obs[key] = obs_arrays[key][tok_start:tok_end]
+        sub_per_tick = per_tick[s:e]
+
         sub_act = {key: values[s:e] for key, values in act_arrays.items()}
 
-        # Derive combat target labels per sub-episode so the labeler
-        # never reads across a dropped interval.
-        sub_act["target"] = label_enemy_target(sub_obs, sub_act,
-                                                sight_only=sight_only)
-
-        # Combat-only further filters within a sub-episode.  It still
-        # concatenates surviving frames inside the sub-episode (no
-        # second-level segmentation here — the filter-config keep mask
-        # is the segmentation boundary).
-        if combat_only:
-            keep2 = np.asarray(sub_act["target"]).reshape(-1) != TARGET_IGNORE
-            if not bool(np.any(keep2)):
-                continue
-            if not bool(np.all(keep2)):
-                sub_obs = {key: values[keep2] for key, values in sub_obs.items()}
-                sub_act = {key: values[keep2] for key, values in sub_act.items()}
+        # Labeler runs at collect time when either:
+        #   - combat_only=True: needed to derive the `present` mask for
+        #     non-engagement frame filtering below.
+        #   - target_dist_cache=True: result is written to disk as an
+        #     extra action array so BC training can mmap it instead of
+        #     recomputing on every load (~95% of load time saved).
+        if combat_only or target_dist_cache:
+            labeler_view = _densify_native_obs_for_labeler({
+                **{k: sub_obs[k] for k in _NATIVE_SELF_FIELDS},
+                "_per_tick_entities": sub_per_tick,
+            })
+            sub_act["target_dist"] = label_enemy_target_distribution(
+                labeler_view, sub_act, config=DEFAULT_LABELER_CONFIG,
+                sight_only=sight_only)
+            if combat_only:
+                present = 1.0 - sub_act["target_dist"][:, NO_TARGET_INDEX]
+                keep2 = present >= 0.25
+                if not bool(np.any(keep2)):
+                    continue
+                if not bool(np.all(keep2)):
+                    sub_obs, sub_counts = _apply_frame_mask(sub_obs, keep2)
+                    sub_act = {key: values[keep2] for key, values in sub_act.items()}
 
         _compact_action_arrays(sub_act)
-        _compact_obs_arrays(sub_obs)
+        # No obs compaction step: the native parser already returns
+        # arrays at the on-disk dtype. Just enforce dtype/shape
+        # contracts via _validate_native_obs to catch drift early.
+        _validate_native_obs(sub_obs)
+        # Field filter (set per-run by _init_collect_worker).  Default is
+        # no-op — empty keep/drop means every field passes through.  Same
+        # keep/drop shape as the demos predicate, applied to dict keys.
+        tokens_keep, tokens_drop, actions_keep, actions_drop = _WORKER_FIELD_FILTER
+        _apply_field_filter(sub_obs, tokens_keep,  tokens_drop)
+        _apply_field_filter(sub_act, actions_keep, actions_drop)
         episodes.append((sub_obs, sub_act))
 
     return episodes
+
+
+def _apply_frame_mask(
+    obs: dict[str, np.ndarray], mask: np.ndarray,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Filter a native obs dict by a per-frame boolean ``mask``.
+
+    Self/spatial/entity_count slice along axis 0; entity per-token
+    fields slice along the token-axis range computed from the kept
+    rows' entity_count via cumsum. Returns ``(new_obs, new_count)``.
+    """
+    new_obs: dict[str, np.ndarray] = {}
+    for key in _NATIVE_SELF_FIELDS + _NATIVE_SPATIAL_FIELDS:
+        if key in obs:
+            new_obs[key] = obs[key][mask]
+    counts = obs["entity_count"]
+    new_counts = counts[mask]
+    new_obs["entity_count"] = new_counts
+    # Build a per-token mask from the per-frame mask by replicating
+    # mask[i] count_i times in the original concatenated order.
+    tok_mask = np.repeat(mask, counts.astype(np.int64))
+    for key in _NATIVE_ENTITY_FIELDS:
+        if key in obs:
+            new_obs[key] = obs[key][tok_mask]
+    return new_obs, new_counts
+
+
+def _validate_native_obs(obs: dict[str, np.ndarray]) -> None:
+    """Assert per-field dtypes match engine_norm; surfaces drift loudly.
+
+    No silent fallback — see feedback_no_silent_drops. Each field's
+    dtype must equal what unpack_obs_buffer_native produced for the
+    native wire format. Entity-count consistency is also checked:
+    sum(entity_count) must equal the leading dim of every entity
+    per-token array.
+    """
+    expected = {
+        # Self
+        "health":           np.uint8,   "effective_armor":  np.uint8,
+        "ammo_shells":      np.uint8,   "ammo_nails":       np.uint8,
+        "ammo_rockets":     np.uint8,   "ammo_cells":       np.uint8,
+        "vel":              np.int16,   "attack_finished":  np.float16,
+        "self_weapon_id":   np.uint8,   "self_movement_id": np.uint8,
+        "self_items":       np.int32,
+        # Spatial
+        "spatial_dir":          np.int8,
+        "spatial_nearest_dist": np.uint16, "spatial_mean_dist": np.uint16,
+        "spatial_openness":    np.uint8,  "spatial_clearance":  np.uint8,
+        "spatial_traversable": np.uint8,  "spatial_dropoff":    np.uint8,
+        "spatial_solid_frac":  np.uint8,  "spatial_water_frac": np.uint8,
+        "spatial_slime_frac":  np.uint8,  "spatial_lava_frac":  np.uint8,
+        # Entity
+        "entity_count":         np.uint8,
+        "entity_types":         np.int8,
+        "entity_subject_id":    np.uint8,
+        "entity_modality_id":   np.uint8,
+        "entity_player_id":     np.uint8,
+        "entity_event_count":   np.uint8,
+        "entity_event_actions": np.uint8,
+        "entity_event_sources": np.uint8,
+        "entity_half_extents":  np.uint8,
+        "entity_rel":  np.int16,  "entity_vel":  np.int16,
+        "entity_path": np.int16,
+        "entity_path_dist": np.uint16,
+        "entity_eta":     np.float16, "entity_recency": np.float16,
+        "entity_facing":  np.uint8,   "entity_team":    np.uint8,
+        "entity_score":   np.uint8,   "entity_amount":  np.uint8,
+        "entity_regen":   np.float16, "entity_state":   np.uint8,
+    }
+    for key, dt in expected.items():
+        arr = obs.get(key)
+        if arr is None:
+            continue  # field may be dropped by tokens.{keep,drop}
+        if arr.dtype != dt:
+            raise RuntimeError(
+                f"native obs field {key!r}: expected dtype {dt.__name__}, "
+                f"got {arr.dtype}. The native wire parser must produce "
+                f"native widths — silent downcast would be a regression."
+            )
+    counts = obs.get("entity_count")
+    if counts is not None:
+        total = int(counts.astype(np.int64).sum())
+        for key in _NATIVE_ENTITY_FIELDS:
+            arr = obs.get(key)
+            if arr is None:
+                continue
+            if arr.shape[0] != total:
+                raise RuntimeError(
+                    f"native obs entity field {key!r}: leading dim "
+                    f"{arr.shape[0]} != sum(entity_count)={total}. "
+                    f"Cumsum-based slicing would mis-index the loader."
+                )
 
 
 # ── Train/val split assignment ───────────────────────────────────────
@@ -611,6 +1246,23 @@ class _ShardWriter:
 
     On resume, loads the existing manifest and continues numbering
     shards from where the previous run left off so we never overwrite.
+
+    Ordering contract: ``add_episode`` is called in submit-order from
+    the orchestration loop (see :func:`collect` — workers run in
+    parallel via ``ProcessPoolExecutor``, but completed results are
+    drained from a small ``pending`` dict in submit-order before
+    reaching the writer). The submit order is the ``sorted(demos)``
+    list — alphabetical by demo filename, NOT manifest position
+    (the source ndjson manifest may itself be in any order). The
+    on-disk shard sequence is therefore deterministic and reproducible
+    across collect runs of the same corpus: shard ``N+1`` only ever
+    contains demos whose filename sorts after shard ``N``'s demos,
+    and within each shard episodes are in arrival order. The trainer
+    relies on this — it can iterate shards sequentially without
+    re-sorting or random-access reshuffling. The per-episode
+    ``demo_idx`` field still refers to the source manifest position,
+    so it is not monotonic across shards — but it isn't used for
+    ordering, only as a per-episode identifier.
     """
 
     def __init__(self, split_dir: Path, shard_rows: int):
@@ -694,8 +1346,21 @@ class _ShardWriter:
         total_episodes = sum(len(s["episode_lengths"]) for s in self.shards)
         manifest = {
             "format": "sharded_v1",
+            # engine_norm phase 2 native wire format. The loader checks
+            # for this string and refuses caches without it — legacy f16
+            # shards have no format_version and must be recollected
+            # (no in-place migration support, per the no-backcompat
+            # directive). See qnn.bc.train._load_precomputed.
+            "format_version": "native_v1",
             "episodes": total_episodes,
             "shard_rows": self.shard_rows,
+            "target_labeler_version": "v3-simple",
+            "target_dist_classes": TARGET_DIST_CLASSES,
+            # On-disk layout note: per-shard entity_* .npy files are
+            # variable-length along axis 0 (one row per token, not per
+            # frame). The companion obs/entity_count.npy is row-indexed
+            # and is the loader's cumsum key for recovering per-frame
+            # token slices. See qnn.engine_norm entity-block docstring.
             "shards": self.shards,
         }
         (self.split_dir / "manifest.json").write_text(json.dumps(manifest))
@@ -743,25 +1408,37 @@ def _game_dir_for_demo_dir(demo_dir: Path, asset_root: Path) -> str:
     return os.path.relpath(demo_dir.absolute(), asset_root.absolute())
 
 
-def _collect_demo(args: tuple) -> dict:
-    """Collect one demo, return unpacked arrays. Runs in worker process."""
-    (demo_name, force_mvd_emit, combat_only, labels,
-     total_frames, drop_label_names, sight_only) = args
-    # Worker always walks the full demo; any clipping happens via the
-    # tick mask (drop_tick_labels in the filter config).
-    proc = None
+def _run_per_demo_collect(
+    demo_name: str,
+    collect_fn,
+    unpack_fn,
+    min_ticks: int = 10,
+) -> dict:
+    """Shared boilerplate for a per-demo pool-worker entry: spawn the
+    worker, dispatch the collect, classify errors, unpack episodes,
+    return a status dict.
 
+    Callers supply two callbacks:
+      ``collect_fn(proc) -> list[dict] | None``
+          Sends an op to the worker and reads the framed output stream
+          (typically built on top of :func:`_read_collect_frames`).
+      ``unpack_fn(ticks) -> list[tuple[obs, act]]``
+          Turns the raw tick stream into the per-shard (obs, act)
+          sub-episode tuples that ``run_collect`` consumes.
+
+    The "always shut down after a demo" discipline lives here: static
+    engine state (oldrealtime, cl_maxfps, cls.latency, ...) leaks
+    across demos and truncates the second demo's detected tick rate, so
+    a fresh process is the only reliable way to start clean.  Cost is
+    ~50 ms per demo, dwarfed by demo I/O. """
+    proc = None
     try:
         proc = _get_collect_worker()
-        ticks = _collect_one_demo(proc, demo_name,
-                                  play_start=0, play_end=999999999,
-                                  force_mvd_emit=force_mvd_emit)
+        ticks = collect_fn(proc)
     except Exception as exc:
         err_tail = _worker_stderr_tail(proc)
         _shutdown_worker()
-        msg = str(exc)
-        if err_tail:
-            msg = f"{msg}\n{err_tail}"
+        msg = f"{exc}\n{err_tail}" if err_tail else str(exc)
         return {"demo": demo_name, "status": "error", "msg": msg[-4000:]}
 
     if ticks is None:
@@ -771,40 +1448,45 @@ def _collect_demo(args: tuple) -> dict:
         if rc == _WATCHDOG_EXIT_CODE:
             return {"demo": demo_name, "status": "error",
                     "msg": f"watchdog stall\n{err_tail}"[-4000:]}
-        return {"demo": demo_name, "status": "crash", "msg": err_tail or "worker crash"}
+        return {"demo": demo_name, "status": "crash",
+                "msg": err_tail or "worker crash"}
 
-    # Always shut down the worker after a successful demo: static engine
-    # state (oldrealtime in Host_Frame, cl_maxfps / rate cvars, cls.latency,
-    # and so on) leaks across demos in ways that truncate the second demo's
-    # detected tick rate and cut emission short on multi-map replays.  The
-    # per-demo Host_Init cost is small (~50ms) next to the second-plus of
-    # actual demo processing, and a fresh process is the only reliable way
-    # to start from a known-clean state.
     _shutdown_worker()
 
-    if len(ticks) < 10:
+    if len(ticks) < min_ticks:
         return {"demo": demo_name, "status": "skipped", "ticks": len(ticks)}
 
-    episodes = _unpack_episode(ticks,
-                                combat_only=combat_only,
-                                labels=labels,
-                                drop_label_names=drop_label_names,
-                                total_frames=total_frames,
-                                sight_only=sight_only)
-    # Drop empty episodes; preserve original order so episode_idx is
+    episodes = unpack_fn(ticks)
+    # Drop empty sub-episodes; preserve order so episode_idx is
     # deterministic from (manifest_order, run_index).
     sized = [(obs, act, int(next(iter(act.values())).shape[0]) if act else 0)
              for obs, act in episodes]
     sized = [(obs, act, rows) for obs, act, rows in sized if rows > 0]
     if not sized:
-        return {"demo": demo_name, "status": "skipped", "ticks": 0}
+        return {"demo": demo_name, "status": "skipped", "ticks": len(ticks)}
     return {
-        "demo": demo_name,
-        "status": "ok",
-        "ticks": len(ticks),
+        "demo": demo_name, "status": "ok", "ticks": len(ticks),
         "episodes": [{"obs": obs, "actions": act, "rows": rows}
                      for obs, act, rows in sized],
     }
+
+
+def _collect_demo(args: tuple) -> dict:
+    """Collect one demo, return unpacked arrays. Runs in worker process."""
+    (demo_name, force_mvd_emit, combat_only, labels,
+     total_frames, drop_label_names, sight_only, target_dist_cache) = args
+    # Worker always walks the full demo; any clipping happens via the
+    # tick mask (segments.drop in the filter config).
+    return _run_per_demo_collect(
+        demo_name,
+        collect_fn=lambda proc: _collect_one_demo(
+            proc, demo_name, force_mvd_emit=force_mvd_emit),
+        unpack_fn=lambda ticks: _unpack_episode(
+            ticks, combat_only=combat_only, labels=labels,
+            drop_label_names=drop_label_names, total_frames=total_frames,
+            sight_only=sight_only,
+            target_dist_cache=target_dist_cache),
+    )
 
 
 # ── Done tracking (append-only) ─────────────────────────────────────
@@ -873,7 +1555,7 @@ def _available_maps(asset_root: Path) -> set[str]:
             maps.add(bsp.stem.lower())
         else:
             print(f"[collect] skipping invalid BSP: {bsp}", file=sys.stderr)
-    for pak in asset_root.rglob("pak*.pak"):
+    for pak in list(asset_root.rglob("pak*.pak")) + list(asset_root.rglob("PAK*.PAK")):
         try:
             with open(pak, "rb") as f:
                 head = f.read(12)
@@ -926,6 +1608,10 @@ def run_collect(
     extra_demo_filter=None,
     extra_metadata: dict | None = None,
     filter_path: Path | None = None,
+    tokens_keep:  tuple[str, ...] = (),
+    tokens_drop:  tuple[str, ...] = (),
+    actions_keep: tuple[str, ...] = (),
+    actions_drop: tuple[str, ...] = (),
 ) -> None:
     """Orchestrate filter → pool → shard → metadata → fingerprint.
 
@@ -1052,43 +1738,86 @@ def run_collect(
     total_work = len(work)
     progress_step = max(1, total_work // 20)
 
+    # Workers fan out in parallel via the pool, but the writer side
+    # drains results in *submit order* so the on-disk shards preserve
+    # the ``sorted(demos)`` ordering — alphabetical by filename, not
+    # manifest position. The trainer can then iterate shards
+    # sequentially without re-sorting or random access.
+    #
+    # Mechanics: each future carries its submit index. As futures
+    # complete (in arbitrary order), the result is stashed in
+    # ``pending`` keyed by submit index. After every completion we
+    # drain a contiguous prefix from ``pending`` starting at
+    # ``next_idx``. Worst-case memory overhead is bounded by
+    # ``n_workers - 1`` results held while a slow demo at the front
+    # of the queue finishes — small relative to the per-worker
+    # working set, and the historical measurement was ~20% wall-time
+    # cost.
+    splits = [_split_for_demo(w[0], train_ratio, seed) for w in work]
+
+    def _consume(idx: int, payload: object) -> None:
+        nonlocal collected, skipped, errors, total_ticks
+        work_item = work[idx]
+        demo_name = work_item[0]
+        if isinstance(payload, BaseException):
+            print(f"  {demo_name}... EXCEPTION: {payload}")
+            errors += 1
+            return
+        result = payload  # type: ignore[assignment]
+        status = result["status"]
+        if status == "ok":
+            writer = train_writer if splits[idx] == "train" else val_writer
+            for episode_idx, ep in enumerate(result["episodes"]):
+                rows = int(ep["rows"])
+                writer.add_episode(ep["obs"], ep["actions"], rows,
+                                    demo_idx_map[demo_name], episode_idx)
+                total_ticks += rows
+            _append_done(done_path, demo_name)
+            collected += 1
+        elif status == "skipped":
+            _append_done(done_path, demo_name)
+            skipped += 1
+        elif status in ("crash", "error"):
+            msg = result.get("msg") or "worker crash"
+            tag = "FAILED (worker crash)" if status == "crash" else "ERROR"
+            print(f"  {demo_name}... {tag}: {msg}")
+            errors += 1
+        else:
+            print(f"  {demo_name}... unexpected status={status!r}")
+            errors += 1
+
     with ProcessPoolExecutor(
         max_workers=n_workers,
         initializer=_init_collect_worker,
-        initargs=(demo_worker, str(asset_root), tick_hz, game_dir),
+        initargs=(
+            demo_worker, str(asset_root), tick_hz, game_dir,
+            tuple(tokens_keep),  tuple(tokens_drop),
+            tuple(actions_keep), tuple(actions_drop),
+        ),
     ) as pool:
-        futures = {pool.submit(per_demo_fn, w): w for w in work}
+        futures = {pool.submit(per_demo_fn, w): i for i, w in enumerate(work)}
+        pending: dict[int, object] = {}
+        next_idx = 0
         for future in as_completed(futures):
-            work_item = futures[future]
-            demo_name = work_item[0]
+            # ``futures.pop`` is load-bearing: a ``Future`` caches its
+            # own ``.result()`` internally, so leaving completed
+            # futures in the dict keeps every demo's per-episode
+            # arrays alive until the whole as_completed loop ends.
+            # Pre-crash measurement (82f6f39a) was 18 GB peak with
+            # ``futures[future]`` here, 0.71 GB peak after switching
+            # to ``pop``. The result moves into ``pending`` (and out
+            # of it via _consume below), so the only remaining strong
+            # refs to the future are the loop variable (replaced next
+            # iter) and as_completed's internal bookkeeping (released
+            # on yield).
+            idx = futures.pop(future)
             try:
-                result = future.result()
+                pending[idx] = future.result()
             except Exception as exc:
-                print(f"  {demo_name}... EXCEPTION: {exc}")
-                errors += 1
-            else:
-                status = result["status"]
-                if status == "ok":
-                    split = _split_for_demo(demo_name, train_ratio, seed)
-                    writer = train_writer if split == "train" else val_writer
-                    for episode_idx, ep in enumerate(result["episodes"]):
-                        rows = int(ep["rows"])
-                        writer.add_episode(ep["obs"], ep["actions"], rows,
-                                            demo_idx_map[demo_name], episode_idx)
-                        total_ticks += rows
-                    _append_done(done_path, demo_name)
-                    collected += 1
-                elif status == "skipped":
-                    _append_done(done_path, demo_name)
-                    skipped += 1
-                elif status in ("crash", "error"):
-                    msg = result.get("msg") or "worker crash"
-                    tag = "FAILED (worker crash)" if status == "crash" else "ERROR"
-                    print(f"  {demo_name}... {tag}: {msg}")
-                    errors += 1
-                else:
-                    print(f"  {demo_name}... unexpected status={status!r}")
-                    errors += 1
+                pending[idx] = exc
+            while next_idx in pending:
+                _consume(next_idx, pending.pop(next_idx))
+                next_idx += 1
 
                 done_count = collected + skipped + errors
                 if done_count % progress_step == 0 or done_count == total_work:
@@ -1101,7 +1830,8 @@ def run_collect(
                     eta = f"{hrs}h{mins:02d}m" if hrs else f"{mins}m{secs:02d}s"
                     print(f"  [{done_count}/{total_work}] {rate:.1f} demos/s, "
                           f"{ticks_rate/1000:.0f}K ticks/s, "
-                          f"{total_ticks/1e6:.1f}M ticks total, ETA {eta}")
+                          f"{total_ticks/1e6:.1f}M ticks total, "
+                          f"queue={len(pending)}, ETA {eta}")
 
     train_writer.write_manifest()
     val_writer.write_manifest()
@@ -1119,6 +1849,10 @@ def run_collect(
         "tick_hz": tick_hz,
         "seed": seed,
         "shard_kind": shard_kind,
+        "tokens_keep":  list(tokens_keep),
+        "tokens_drop":  list(tokens_drop),
+        "actions_keep": list(actions_keep),
+        "actions_drop": list(actions_drop),
     }
     if extra_metadata:
         metadata.update(extra_metadata)
@@ -1189,42 +1923,61 @@ def main() -> None:
         action="store_true",
         help="Restrict the target labeler to modality 0 (SIGHT) actors only;"
              " engagements break when the target pid enters SOUND or MEMORY"
-             " modality.  Combined with a train-time token_mask that drops the"
-             " same modalities, this reproduces the deprecated"
-             " ``--entity-filter pvs_actors`` behavior end-to-end.",
+             " modality. Pair with a matching train-time token_mask when"
+             " reproducing sight-only entity ablations.",
+    )
+    parser.add_argument(
+        "--no-target-dist-cache",
+        dest="target_dist_cache",
+        action="store_false",
+        default=True,
+        help="Disable writing the per-shard target_dist (.npy f16) sidecar."
+             " Default: enabled. Caching the labeler output amortizes the"
+             " ~95%% of BC load time the labeler accounts for (run once at"
+             " collect, mmap thereafter). Use --no-target-dist-cache when"
+             " iterating on the labeler itself — without the cache, train"
+             " always re-runs the labeler, picking up your config edits.",
     )
     parser.add_argument(
         "--filter-config",
         default=None,
         help="Path to a JSON filter config (MongoDB query syntax).  Schema:"
-             " {keep, drop} are predicate dicts evaluated per manifest entry"
-             " (demo kept iff keep matches AND no drop matches);"
-             " drop_tick_labels is a list of label names whose intervals are"
-             " masked out of the kept frames.  Field paths: manifest fields"
-             " or `labels.<name>.<aggregate>` where aggregate is one of"
-             " coverage, count, duration, exists.  Operators: $eq, $ne,"
-             " $in, $nin, $gt, $gte, $lt, $lte, plus $and/$or/$not.  Unknown"
-             " fields/operators/labels fail loud at startup.  Default: no"
-             " filtering (every manifest entry collected).",
+             " {demos: {keep, drop}, segments: {drop}, tokens: {keep, drop},"
+             " actions: {keep, drop}}.  demos.{keep,drop} are predicate dicts"
+             " evaluated per manifest entry (demo kept iff demos.keep matches"
+             " AND no demos.drop matches); segments.drop is a list of label"
+             " names whose intervals are masked out of the kept frames;"
+             " tokens / actions keep/drop list obs / act field names to"
+             " include or exclude (mutually exclusive within an axis)."
+             " Field paths: manifest fields or `labels.<name>.<aggregate>`"
+             " where aggregate is one of coverage, count, duration, exists."
+             " Operators: $eq, $ne, $in, $nin, $gt, $gte, $lt, $lte, plus"
+             " $and/$or/$not.  Unknown fields/operators/labels fail loud at"
+             " startup.  Default: no filtering (every manifest entry"
+             " collected, every field on disk).",
     )
     args = parser.parse_args()
-
-    if args.filter_config:
-        try:
-            with open(args.filter_config) as f:
-                filter_spec = json.load(f)
-            _validate_filter_schema(filter_spec)
-        except (json.JSONDecodeError, ValueError, OSError) as exc:
-            parser.error(f"--filter-config {args.filter_config!r}: {exc}")
-    else:
-        filter_spec = {}
-    keep_pred = filter_spec.get("keep") or {}
-    drop_pred = filter_spec.get("drop") or {}
-    drop_label_names = tuple(filter_spec.get("drop_tick_labels") or ())
 
     demo_dir = Path(args.demo_dir)
     demo_type = _infer_demo_type(demo_dir)
     output = Path(args.output) if args.output else Path("artifacts/collect") / demo_type
+
+    # Pin the filter to <output>/filter.json so the spec used to produce
+    # this cache always travels with it. See _load_and_pin_filter.
+    filter_spec = _load_and_pin_filter(
+        output, Path(args.filter_config) if args.filter_config else None)
+    demos_block    = filter_spec.get("demos") or {}
+    segments_block = filter_spec.get("segments") or {}
+    tokens_block   = filter_spec.get("tokens") or {}
+    actions_block  = filter_spec.get("actions") or {}
+    keep_pred = demos_block.get("keep") or {}
+    drop_pred = demos_block.get("drop") or {}
+    drop_label_names = tuple(segments_block.get("drop") or ())
+    tokens_keep  = tuple(tokens_block.get("keep") or ())
+    tokens_drop  = tuple(tokens_block.get("drop") or ())
+    actions_keep = tuple(actions_block.get("keep") or ())
+    actions_drop = tuple(actions_block.get("drop") or ())
+
     demo_worker_path = args.demo_worker or _default_demo_worker(demo_type)
     demo_worker = str(Path(demo_worker_path).resolve())
     game_dir = _game_dir_for_demo_dir(demo_dir, Path(args.asset_root))
@@ -1239,12 +1992,13 @@ def main() -> None:
     print(f"Demo type: {demo_type}")
 
     # Per-demo work tuple: (demo_name, force_mvd_emit,
-    # combat_only, labels, total_frames, drop_label_names, sight_only) —
-    # the shape _collect_demo unpacks.
+    # combat_only, labels, total_frames, drop_label_names, sight_only,
+    # target_dist_cache) — the shape _collect_demo unpacks.
     def build_work_args(entry, labels, total_frames, drop_labels):
         return (entry["file"], args.force_mvd_emit,
                 args.combat_only, labels, total_frames, drop_labels,
-                args.sight)
+                args.sight,
+                args.target_dist_cache)
 
     run_collect(
         output=output,
@@ -1264,7 +2018,11 @@ def main() -> None:
         per_demo_fn=_collect_demo,
         build_work_args=build_work_args,
         shard_kind="bc",
-        filter_path=Path(args.filter_config) if args.filter_config else None,
+        filter_path=output / "filter.json",
+        tokens_keep=tokens_keep,
+        tokens_drop=tokens_drop,
+        actions_keep=actions_keep,
+        actions_drop=actions_drop,
     )
 
 

@@ -7,9 +7,11 @@
 #include <fcntl.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -20,7 +22,6 @@ qnn_map_state_t qnn_map_state;
 char qnn_basedir_storage[MAX_OSPATH] = ".";
 
 qboolean isDedicated;
-int nostdout = 1;
 char *basedir = qnn_basedir_storage;
 char *cachedir = "/tmp";
 cvar_t sys_linerefresh = {"sys_linerefresh", "0"};
@@ -35,7 +36,11 @@ void Sys_DebugNumber(int y, int val)
 
 void Sys_Printf(char *fmt, ...)
 {
-	(void)fmt;
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stdout, fmt, ap);
+	va_end(ap);
 }
 
 void Sys_Quit(void)
@@ -169,7 +174,26 @@ void Sys_Sleep(void)
 
 char *Sys_ConsoleInput(void)
 {
-	return NULL;
+	static char text[256];
+	fd_set fdset;
+	struct timeval timeout;
+	ssize_t len;
+
+	FD_ZERO(&fdset);
+	FD_SET(0, &fdset);
+	timeout.tv_sec = 0;
+	timeout.tv_usec = 0;
+	if (select(1, &fdset, NULL, NULL, &timeout) <= 0 || !FD_ISSET(0, &fdset))
+		return NULL;
+	len = read(0, text, sizeof(text) - 1);
+	if (len < 1)
+		return NULL;
+	/* Strip trailing newline so Cbuf_AddText doesn't double-terminate. */
+	if (text[len - 1] == '\n')
+		text[len - 1] = '\0';
+	else
+		text[len] = '\0';
+	return text;
 }
 
 void Sys_HighFPPrecision(void)

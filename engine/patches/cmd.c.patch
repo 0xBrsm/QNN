@@ -1,0 +1,15 @@
+--- cmd.c	2024-01-01 00:00:00.000000000 +0000
++++ cmd.c	2024-01-01 00:00:01.000000000 +0000
+@@ -534,6 +534,2 @@
+ 	cmd_function_t	*cmd;
+-	
+-	if (host_initialized)	// because hunk allocation would get stomped
+-		Sys_Error ("Cmd_AddCommand after host_initialized");
+-		
+ // fail if the command is a variable name
+@@ -556 +552,4 @@
+-	cmd = Hunk_Alloc (sizeof(cmd_function_t));
++	if (host_initialized)
++		cmd = Z_Malloc (sizeof(cmd_function_t));
++	else
++		cmd = Hunk_Alloc (sizeof(cmd_function_t));

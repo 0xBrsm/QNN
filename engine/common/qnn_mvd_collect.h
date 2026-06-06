@@ -2,15 +2,30 @@
  * qnn_mvd_collect.h — MVD reconstruction path for the QW demo worker.
  *
  * Used when no usercmd_t is available (real MVD demos OR `force_mvd_emit`
- * on QWD).  Owns the back-shift ring (deferred label emit), the chain-fill
- * + log-normal tail samplers, the per-event sound back-shift, and the MVD
- * action-inference functions (fire from sound/ammo cues, move from
- * view-relative position-delta).
+ * on QWD).  Three discrete-cmd inference paths plus one move path:
+ *
+ *   FIRE   sound (weapon-fire PHS multicast) → walkback by full ping
+ *          → fire=1 → co-temporal dedup → cooldown-gated chain-fill
+ *          → forward log-normal hold tail (qnn_hold_samplers.c)
+ *   JUMP   sound (player/plyrjmp8.wav) → walkback by full ping →
+ *          move[2]=jump_speed → grounded-count chain gate → forward
+ *          log-normal hold tail (qnn_hold_samplers.c)
+ *   SWITCH per-emit action.weapon from snapshot; on weapon_id
+ *          transitions, rewrite trailing K slots back to the press
+ *          frame (pickup gate at call site suppresses server-forced
+ *          touches)
+ *   MOVE   per-emit fb/lr from view-relative position-delta sign;
+ *          back-shifted into the ring by QNN_MvdBackShiftWriteMoveXY
  *
  * All MVD-private state (back-shift ring, fire/jump hold counters,
  * per-weapon dedup tables) lives as module-private static inside
  * qnn_mvd_collect.c.  Callers reset it at demo start via
  * QNN_MvdCollectReset().
+ *
+ * Not used by the labeler training pipeline.  The labeler collects
+ * sparse one-tick-per-event signals via the QWD path
+ * (qnn_qwd_collect.c) — these hold/chain-fill mechanisms only run
+ * when MVD inference emits BC training labels.
  */
 
 #ifndef QNN_MVD_COLLECT_H
@@ -60,11 +75,6 @@ qboolean QNN_MvdBackShiftPrevStatItems(int *prev_items_out);
 /* Number of slots currently held in the ring (0..QNN_BACKSHIFT_K). */
 int QNN_MvdBackShiftCount(void);
 
-/* Walk the ring back from the latest push (offset 0) up to `cap` slots
- * and return the offset (1-based shift) of the first slot whose recorded
- * impulse_target_weapon matches `weapon_id`.  Returns 0 if no match. */
-int QNN_MvdBackShiftImpulseWalkback(int weapon_id, int cap);
-
 /* Push the current emit tick's (pre-packed obs + action + metadata)
  * into the ring.  See qnn_collect_helpers.h's QNN_BackShiftPush for
  * the full contract — this is a thin wrapper that exposes the module-
@@ -73,7 +83,7 @@ void QNN_MvdBackShiftPush(qnn_tick_emit_state_t *emit, FILE *out,
 	const uint8_t *obs_bytes, const qnn_action_t *action,
 	qboolean done, int tick, int steps, int tick_hz,
 	qboolean reset_flag, qboolean grounded,
-	int weapon_id, int impulse_target_weapon, int stat_items);
+	int weapon_id, int stat_items);
 
 /* Rewrite the trailing `shift_frames` slots so they carry the new
  * weapon — anchoring intent at the press frame. */

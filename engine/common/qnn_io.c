@@ -61,191 +61,223 @@ void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
 
 /* ── Obs buffer serialization ─────────────────────────────────── */
 
+/* Pack the event block: u8 count followed by `count` interleaved
+ * (action, source) u8 pairs.  Matches the Python wire parser in
+ * src/qnn/wire.py:_unpack_native_entity_stream. */
+static int QNN_PackEventSlots(uint8_t *obs, int pos,
+	const qnn_token_event_t *events, int event_count)
+{
+	int j;
+	int cap = event_count;
+	if (cap > QNN_MAX_ENTITY_EVENTS) cap = QNN_MAX_ENTITY_EVENTS;
+	if (cap < 0) cap = 0;
+
+	obs[pos++] = (uint8_t)cap;
+	for (j = 0; j < cap; ++j)
+	{
+		obs[pos++] = (uint8_t)events[j].action_id;
+		obs[pos++] = (uint8_t)events[j].source_id;
+	}
+	return pos;
+}
+
 void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 {
-	int i, j;
+	int i;
 	int pos;
 
 	memset(obs, 0, QNN_OBS_BUFFER_SIZE);
 
-	/* Self */
+	/* ── Self block (20 B) ───────────────────────────────────── */
 	{
 		const qnn_self_token_t *tok = &r->self;
-		float scalars[QNN_OBS_SELF_SCALAR_DIM];
+		float eff_armor = (float)tok->raw_armor * tok->armor_type;
 
-		scalars[0] = tok->health;
-		scalars[1] = tok->armor;
-		scalars[2] = tok->weapon_sg;
-		scalars[3] = tok->weapon_ssg;
-		scalars[4] = tok->weapon_ng;
-		scalars[5] = tok->weapon_sng;
-		scalars[6] = tok->weapon_gl;
-		scalars[7] = tok->weapon_rl;
-		scalars[8] = tok->weapon_lg;
-		scalars[9] = tok->ammo_shells;
-		scalars[10] = tok->ammo_nails;
-		scalars[11] = tok->ammo_rockets;
-		scalars[12] = tok->ammo_cells;
-		scalars[13] = tok->vel[0];
-		scalars[14] = tok->vel[1];
-		scalars[15] = tok->vel[2];
+		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_HEALTH,
+			QNN_QuantizeU8Saturating((float)tok->health));
+		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_EFF_ARMOR,
+			QNN_QuantizeU8Saturating(eff_armor));
+		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_AMMO_SHELLS,
+			QNN_QuantizeU8Saturating((float)tok->ammo_shells));
+		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_AMMO_NAILS,
+			QNN_QuantizeU8Saturating((float)tok->ammo_nails));
+		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_AMMO_ROCKETS,
+			QNN_QuantizeU8Saturating((float)tok->ammo_rockets));
+		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_AMMO_CELLS,
+			QNN_QuantizeU8Saturating((float)tok->ammo_cells));
 
-		for (i = 0; i < QNN_OBS_SELF_SCALAR_DIM; ++i)
-			QNN_BufWriteF32(obs, QNN_OBS_OFF_SELF_SCALARS + i * 4, scalars[i]);
+		QNN_BufWriteI16(obs, QNN_OBS_OFF_SELF_VEL + 0,
+			QNN_QuantizeI16Clamped(tok->vel[0], QNN_VELOCITY_SCALE));
+		QNN_BufWriteI16(obs, QNN_OBS_OFF_SELF_VEL + 2,
+			QNN_QuantizeI16Clamped(tok->vel[1], QNN_VELOCITY_SCALE));
+		QNN_BufWriteI16(obs, QNN_OBS_OFF_SELF_VEL + 4,
+			QNN_QuantizeI16Clamped(tok->vel[2], QNN_VELOCITY_SCALE));
 
-		QNN_BufWriteI32(obs, QNN_OBS_OFF_SELF_WEAPON_ID, tok->weapon_id);
-		QNN_BufWriteI32(obs, QNN_OBS_OFF_SELF_ARMOR_TYPE_ID, tok->armor_type_id);
+		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_ATTACK_FIN, tok->attack_finished);
 
-		for (i = 0; i < QNN_OBS_SELF_POWERUP_SLOTS; ++i)
-			QNN_BufWriteI32(obs, QNN_OBS_OFF_SELF_POWERUP_IDS + i * 4, tok->powerup_ids[i]);
+		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_WEAPON_ID,
+			(uint8_t)tok->weapon_id);
+		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_MOVEMENT_ID,
+			(uint8_t)tok->movement_id);
 
-		QNN_BufWriteI32(obs, QNN_OBS_OFF_SELF_MOVEMENT_ID, tok->movement_id);
+		QNN_BufWriteI32(obs, QNN_OBS_OFF_SELF_ITEMS, tok->items);
 	}
 
-	/* Spatial — fixed position after self: 9 × 13 float32 */
-	for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i)
+	/* ── Spatial block (135 B = field-major across 9 sectors) ─
+	 * Layout: 9 sectors × dir (27 B), 9 × nearest_dist (18 B),
+	 *         9 × mean_dist (18 B), then 8 × (9 × u8) for the
+	 *         clamped [0, 1] fractions.  Matches qnn/wire.py's
+	 *         _unpack_native_spatial. */
 	{
-		const qnn_spatial_token_t *tok = &r->spatial[i];
-		int off = QNN_OBS_OFF_SPATIAL + i * QNN_OBS_SPATIAL_SCALAR_DIM * 4;
-		QNN_BufWriteF32(obs, off, tok->dir[0]); off += 4;
-		QNN_BufWriteF32(obs, off, tok->dir[1]); off += 4;
-		QNN_BufWriteF32(obs, off, tok->dir[2]); off += 4;
-		QNN_BufWriteF32(obs, off, QNN_Normalize(tok->nearest_dist, QNN_DIST_SCALE)); off += 4;
-		QNN_BufWriteF32(obs, off, QNN_Normalize(tok->mean_dist, QNN_DIST_SCALE)); off += 4;
-		QNN_BufWriteF32(obs, off, tok->openness); off += 4;
-		QNN_BufWriteF32(obs, off, tok->clearance); off += 4;
-		QNN_BufWriteF32(obs, off, tok->traversable); off += 4;
-		QNN_BufWriteF32(obs, off, tok->dropoff); off += 4;
-		QNN_BufWriteF32(obs, off, tok->solid_frac); off += 4;
-		QNN_BufWriteF32(obs, off, tok->water_frac); off += 4;
-		QNN_BufWriteF32(obs, off, tok->slime_frac); off += 4;
-		QNN_BufWriteF32(obs, off, tok->lava_frac); off += 4;
-	}
-
-	/* Entities — variable-length tagged tokens at end of buffer.
-	   Format: [n_tokens: u8] per token: [type: u8] [ids...] [scalars...] [n_events: u8] [events...] */
-	{
-	int pack_count = r->entity_count < QNN_MAX_TOKEN_OBJECTS ? r->entity_count : QNN_MAX_TOKEN_OBJECTS;
-	pos = QNN_OBS_OFF_ENTITY_STREAM;
-	obs[pos++] = (uint8_t)pack_count;
-	for (i = 0; i < pack_count; ++i)
-	{
-		const qnn_tagged_token_t *tt = &r->entities[i];
-		obs[pos++] = (uint8_t)tt->type;
-
-		switch (tt->type)
+		int p = QNN_OBS_OFF_SPATIAL;
+		/* spatial_dir [9, 3] i8 */
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i)
 		{
-		case QNN_TOKEN_PROJECTILE:
-			{
-				const qnn_projectile_token_t *tok = &tt->projectile;
-				QNN_BufWriteI32(obs, pos, tok->subject_id); pos += 4;
-				QNN_BufWriteI32(obs, pos, tok->modality_id); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->dist); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->vel[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->vel[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->vel[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->recency); pos += 4;
-				obs[pos++] = (uint8_t)tok->event_count;
-				for (j = 0; j < tok->event_count; ++j)
-				{
-					QNN_BufWriteI32(obs, pos, tok->events[j].action_id); pos += 4;
-					QNN_BufWriteI32(obs, pos, tok->events[j].source_id); pos += 4;
-				}
-			}
-			break;
-		case QNN_TOKEN_ACTOR:
-			{
-				const qnn_actor_token_t *tok = &tt->actor;
-				QNN_BufWriteI32(obs, pos, tok->subject_id); pos += 4;
-				QNN_BufWriteI32(obs, pos, tok->modality_id); pos += 4;
-				QNN_BufWriteI32(obs, pos, tok->player_id); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->dist); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->vel[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->vel[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->vel[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path_dist); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->eta); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->facing); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->team); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->score); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->recency); pos += 4;
-				obs[pos++] = (uint8_t)tok->event_count;
-				for (j = 0; j < tok->event_count; ++j)
-				{
-					QNN_BufWriteI32(obs, pos, tok->events[j].action_id); pos += 4;
-					QNN_BufWriteI32(obs, pos, tok->events[j].source_id); pos += 4;
-				}
-			}
-			break;
-		case QNN_TOKEN_ITEM:
-			{
-				const qnn_item_token_t *tok = &tt->item;
-				QNN_BufWriteI32(obs, pos, tok->subject_id); pos += 4;
-				QNN_BufWriteI32(obs, pos, tok->modality_id); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->dist); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path_dist); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->eta); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->amount); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->regen); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->recency); pos += 4;
-				obs[pos++] = (uint8_t)tok->event_count;
-				for (j = 0; j < tok->event_count; ++j)
-				{
-					QNN_BufWriteI32(obs, pos, tok->events[j].action_id); pos += 4;
-					QNN_BufWriteI32(obs, pos, tok->events[j].source_id); pos += 4;
-				}
-			}
-			break;
-		case QNN_TOKEN_MOVER:
-			{
-				const qnn_mover_token_t *tok = &tt->mover;
-				QNN_BufWriteI32(obs, pos, tok->subject_id); pos += 4;
-				QNN_BufWriteI32(obs, pos, tok->modality_id); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->half_extents[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->rel[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->dist); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[0]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[1]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path[2]); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->path_dist); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->eta); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->state); pos += 4;
-				QNN_BufWriteF32(obs, pos, tok->recency); pos += 4;
-				obs[pos++] = (uint8_t)tok->event_count;
-				for (j = 0; j < tok->event_count; ++j)
-				{
-					QNN_BufWriteI32(obs, pos, tok->events[j].action_id); pos += 4;
-					QNN_BufWriteI32(obs, pos, tok->events[j].source_id); pos += 4;
-				}
-			}
-			break;
+			const qnn_spatial_token_t *tok = &r->spatial[i];
+			QNN_BufWriteI8(obs, p++, QNN_QuantizeI8(tok->dir[0]));
+			QNN_BufWriteI8(obs, p++, QNN_QuantizeI8(tok->dir[1]));
+			QNN_BufWriteI8(obs, p++, QNN_QuantizeI8(tok->dir[2]));
 		}
+		/* spatial_nearest_dist [9] u16 */
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i)
+		{
+			QNN_BufWriteU16(obs, p, QNN_QuantizeU16Saturating(r->spatial[i].nearest_dist));
+			p += 2;
+		}
+		/* spatial_mean_dist [9] u16 */
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i)
+		{
+			QNN_BufWriteU16(obs, p, QNN_QuantizeU16Saturating(r->spatial[i].mean_dist));
+			p += 2;
+		}
+		/* 8 × (9 × u8) — openness, clearance, traversable, dropoff,
+		 * solid_frac, water_frac, slime_frac, lava_frac. */
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].openness);
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].clearance);
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].traversable);
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].dropoff);
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].solid_frac);
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].water_frac);
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].slime_frac);
+		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].lava_frac);
 	}
+
+	/* ── Entity stream (variable-length, native widths) ──────── */
+	{
+		int pack_count = r->entity_count < QNN_MAX_TOKEN_OBJECTS
+			? r->entity_count : QNN_MAX_TOKEN_OBJECTS;
+		pos = QNN_OBS_OFF_ENTITY_STREAM;
+		obs[pos++] = (uint8_t)pack_count;
+
+		for (i = 0; i < pack_count; ++i)
+		{
+			const qnn_tagged_token_t *tt = &r->entities[i];
+			obs[pos++] = (uint8_t)tt->type;
+
+			switch (tt->type)
+			{
+			case QNN_TOKEN_PROJECTILE:
+				{
+					const qnn_projectile_token_t *tok = &tt->projectile;
+					/* Common IDs — projectile has no player_id. */
+					obs[pos++] = (uint8_t)tok->subject_id;
+					obs[pos++] = (uint8_t)tok->modality_id;
+					/* Events */
+					pos = QNN_PackEventSlots(obs, pos, tok->events, tok->event_count);
+					/* Per-type scalars (14 B): rel i16×3, vel i16×3, recency f16 */
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[0], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[1], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[2], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[0], QNN_VELOCITY_SCALE)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[1], QNN_VELOCITY_SCALE)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[2], QNN_VELOCITY_SCALE)); pos += 2;
+					QNN_BufWriteF16(obs, pos, tok->recency); pos += 2;
+				}
+				break;
+
+			case QNN_TOKEN_ACTOR:
+				{
+					const qnn_actor_token_t *tok = &tt->actor;
+					obs[pos++] = (uint8_t)tok->subject_id;
+					obs[pos++] = (uint8_t)tok->modality_id;
+					obs[pos++] = (uint8_t)tok->player_id;
+					pos = QNN_PackEventSlots(obs, pos, tok->events, tok->event_count);
+					/* Per-type (30 B): half u8×3, rel i16×3, vel i16×3, path i16×3,
+					 * path_dist u16, eta f16, facing u8, team u8, score u8, recency f16 */
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[0])); pos += 1;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[1])); pos += 1;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[2])); pos += 1;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[0], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[1], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[2], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[0], QNN_VELOCITY_SCALE)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[1], QNN_VELOCITY_SCALE)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[2], QNN_VELOCITY_SCALE)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[0], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[1], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[2], 32767.0f)); pos += 2;
+					QNN_BufWriteU16(obs, pos, QNN_QuantizeU16Saturating(tok->path_dist)); pos += 2;
+					QNN_BufWriteF16(obs, pos, tok->eta); pos += 2;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Unit(tok->facing)); pos += 1;
+					QNN_BufWriteU8 (obs, pos, (uint8_t)(tok->team > 0.5f ? 1 : 0)); pos += 1;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Unit(tok->score)); pos += 1;
+					QNN_BufWriteF16(obs, pos, tok->recency); pos += 2;
+				}
+				break;
+
+			case QNN_TOKEN_ITEM:
+				{
+					const qnn_item_token_t *tok = &tt->item;
+					obs[pos++] = (uint8_t)tok->subject_id;
+					obs[pos++] = (uint8_t)tok->modality_id;
+					pos = QNN_PackEventSlots(obs, pos, tok->events, tok->event_count);
+					/* Per-type (24 B): half u8×3, rel i16×3, path i16×3,
+					 * path_dist u16, eta f16, amount u8, regen f16, recency f16 */
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[0])); pos += 1;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[1])); pos += 1;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[2])); pos += 1;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[0], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[1], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[2], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[0], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[1], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[2], 32767.0f)); pos += 2;
+					QNN_BufWriteU16(obs, pos, QNN_QuantizeU16Saturating(tok->path_dist)); pos += 2;
+					QNN_BufWriteF16(obs, pos, tok->eta); pos += 2;
+					/* Raw engine pickup amount as u8 saturating; model
+					 * applies per-subject normalization via
+					 * qnn.engine_norm.ITEM_AMOUNT_MULT/CONST. */
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->amount)); pos += 1;
+					QNN_BufWriteF16(obs, pos, tok->regen); pos += 2;
+					QNN_BufWriteF16(obs, pos, tok->recency); pos += 2;
+				}
+				break;
+
+			case QNN_TOKEN_MOVER:
+				{
+					const qnn_mover_token_t *tok = &tt->mover;
+					obs[pos++] = (uint8_t)tok->subject_id;
+					obs[pos++] = (uint8_t)tok->modality_id;
+					pos = QNN_PackEventSlots(obs, pos, tok->events, tok->event_count);
+					/* Per-type (22 B): half u8×3, rel i16×3, path i16×3,
+					 * path_dist u16, eta f16, state u8, recency f16 */
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[0])); pos += 1;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[1])); pos += 1;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[2])); pos += 1;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[0], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[1], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[2], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[0], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[1], 32767.0f)); pos += 2;
+					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[2], 32767.0f)); pos += 2;
+					QNN_BufWriteU16(obs, pos, QNN_QuantizeU16Saturating(tok->path_dist)); pos += 2;
+					QNN_BufWriteF16(obs, pos, tok->eta); pos += 2;
+					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Unit(tok->state)); pos += 1;
+					QNN_BufWriteF16(obs, pos, tok->recency); pos += 2;
+				}
+				break;
+			}
+		}
 	}
 }
 

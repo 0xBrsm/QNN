@@ -43,12 +43,32 @@ class Tokenizer(nn.Module):
     def __init__(
         self,
         d_model: int,
+        *,
+        self_weapon_embed_in_self: bool,
     ) -> None:
         super().__init__()
         self.d_model = d_model
+        self.self_weapon_embed_in_self = bool(self_weapon_embed_in_self)
+
+        # Native-width → float adapters. Each is a no-op pass-through
+        # when the obs dict already carries the legacy float tensors
+        # (self_scalars / spatial_scalars / entity_scalars_raw), so
+        # checkpoints trained on the f16 cache load and run unchanged.
+        # The dataloader migration decides which format the model sees.
+        from qnn.model.dequant import (
+            SelfDequantizer, SpatialDequantizer, EntityDequantizer,
+        )
+        self.self_dequant    = SelfDequantizer()
+        self.spatial_dequant = SpatialDequantizer()
+        self.entity_dequant  = EntityDequantizer()
 
         # Self token
         self.self_proj = nn.Linear(SELF_SCALAR_DIM, d_model)
+        # Current weapon as an additive contribution on the self token uses
+        # the shared entity_embed (weapons live at ENTITY_IDS rows 3..10 by
+        # design — see qnn.vocab). Pre-v22 used this path; v22 removed
+        # weapon-from-self because the weapon head trivially predicts the
+        # current weapon. The flag is retained for ablation.
 
         # Per-type entity projections
         self.proj_projectile = nn.Linear(PROJECTILE_SCALAR_DIM, d_model)
@@ -105,7 +125,12 @@ class Tokenizer(nn.Module):
                 result[mask] = proj(raw).to(result.dtype)
         return result
 
-    def forward(self, obs_dict: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+        *,
+        include_spatial: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build transformer input tokens from parsed observation dict.
 
         obs_dict must contain:
@@ -121,28 +146,54 @@ class Tokenizer(nn.Module):
             entity_event_counts: (batch, 16) — valid event count
             spatial_scalars: (batch, 9, 13)
         """
+        # Convert any engine-native fields to the legacy float tensors
+        # the rest of this function expects. The three dequantizers
+        # short-circuit if the obs already carries the legacy floats.
+        obs_dict = self.entity_dequant(
+            self.spatial_dequant(
+                self.self_dequant(obs_dict)
+            )
+        )
+
         device = obs_dict["self_scalars"].device
         batch = obs_dict["self_scalars"].shape[0]
 
         # ---- Self token ----
-        self_token = self.self_proj(obs_dict["self_scalars"])
+        # Build all additive contributions as a list of (batch, 1, D) tensors,
+        # then stack + sum in one reduction. The previous version did 4-5
+        # sequential `self_token = self_token + …` adds — each a separate
+        # kernel launch. Stacking lets the GPU do one reduction kernel,
+        # cutting ROCm dispatch-queue churn that dominated this loop.
+        contribs: list[torch.Tensor] = [self.self_proj(obs_dict["self_scalars"]).unsqueeze(1)]
 
-        # Kind embedding
         kind_self = torch.full((batch, 1), _TOKEN_KIND_SELF, dtype=torch.long, device=device)
-        self_token = self_token.unsqueeze(1) + self.kind_embed(kind_self)
+        contribs.append(self.kind_embed(kind_self))
 
         # Self ID embeds
         if "self_armor_type_id" in obs_dict:
             aid = obs_dict["self_armor_type_id"].long().squeeze(-1).clamp(0, self.entity_embed.num_embeddings - 1)
             amask = (aid > 0).float().unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
-            self_token = self_token + self.entity_embed(aid).unsqueeze(1) * amask
+            contribs.append(self.entity_embed(aid).unsqueeze(1) * amask)
         if "self_movement_id" in obs_dict:
             mid = obs_dict["self_movement_id"].long().squeeze(-1).clamp(0, 4)
-            self_token = self_token + self.movement_embed(mid).unsqueeze(1)
+            contribs.append(self.movement_embed(mid).unsqueeze(1))
+        if self.self_weapon_embed_in_self and "self_weapon_id" in obs_dict:
+            wid = obs_dict["self_weapon_id"].long().squeeze(-1).clamp(
+                0, self.entity_embed.num_embeddings - 1,
+            )
+            wmask = (wid > 0).float().unsqueeze(-1).unsqueeze(-1)
+            contribs.append(self.entity_embed(wid).unsqueeze(1) * wmask)
         if "self_powerup_ids" in obs_dict:
             pids = obs_dict["self_powerup_ids"].long().clamp(0, self.entity_embed.num_embeddings - 1)  # (batch, 5)
             pmask = (pids > 0).float().unsqueeze(-1)  # (batch, 5, 1)
-            self_token = self_token + (self.entity_embed(pids) * pmask).sum(dim=1, keepdim=True)
+            contribs.append((self.entity_embed(pids) * pmask).sum(dim=1, keepdim=True))
+
+        # One reduction kernel instead of N-1 adds. Stack to
+        # (N, batch, 1, D) then sum dim 0 → (batch, 1, D).
+        if len(contribs) > 1:
+            self_token = torch.stack(contribs, dim=0).sum(dim=0)
+        else:
+            self_token = contribs[0]
         # ---- Entity tokens ----
         entity_types = obs_dict["entity_types"].long()  # (batch, 16)
         if "entity_scalars_proj" in obs_dict:
@@ -180,20 +231,32 @@ class Tokenizer(nn.Module):
         evt_mask = (evt_range < evt_counts.unsqueeze(-1)).unsqueeze(-1).float()
         entity_repr = entity_repr + (evt_embed * evt_mask).sum(dim=2)
 
-        # Kind embedding
-        kind_entity = torch.full((batch, MAX_TOKEN_OBJECTS), _TOKEN_KIND_ENTITY, dtype=torch.long, device=device)
+        # Kind embedding. n_entity_tokens is data-dependent (variable
+        # per batch under the native variable-length entity wire), so
+        # take the actual second-dim of entity_types rather than the
+        # historical MAX_TOKEN_OBJECTS constant.
+        n_entity_tokens = entity_types.shape[1]
+        kind_entity = torch.full(
+            (batch, n_entity_tokens), _TOKEN_KIND_ENTITY,
+            dtype=torch.long, device=device,
+        )
         entity_repr = entity_repr + self.kind_embed(kind_entity)
 
-        # ---- Spatial tokens ----
-        spatial_scalars = obs_dict["spatial_scalars"]
-        spatial_token = self.spatial_proj(spatial_scalars)
-        kind_spatial = torch.full((batch, SPATIAL_TOKEN_COUNT), _TOKEN_KIND_SPATIAL, dtype=torch.long, device=device)
-        spatial_token = spatial_token + self.kind_embed(kind_spatial)
-
-        tokens = torch.cat([self_token, spatial_token, entity_repr], dim=1)
+        if include_spatial:
+            # ---- Spatial tokens ----
+            spatial_scalars = obs_dict["spatial_scalars"]
+            spatial_token = self.spatial_proj(spatial_scalars)
+            kind_spatial = torch.full((batch, SPATIAL_TOKEN_COUNT), _TOKEN_KIND_SPATIAL, dtype=torch.long, device=device)
+            spatial_token = spatial_token + self.kind_embed(kind_spatial)
+            tokens = torch.cat([self_token, spatial_token, entity_repr], dim=1)
+        else:
+            tokens = torch.cat([self_token, entity_repr], dim=1)
         self_valid = torch.zeros((batch, 1), dtype=torch.bool, device=device)
-        spatial_valid = torch.zeros((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
-        key_padding_mask = torch.cat([self_valid, spatial_valid, ~entity_mask], dim=1)
+        if include_spatial:
+            spatial_valid = torch.zeros((batch, SPATIAL_TOKEN_COUNT), dtype=torch.bool, device=device)
+            key_padding_mask = torch.cat([self_valid, spatial_valid, ~entity_mask], dim=1)
+        else:
+            key_padding_mask = torch.cat([self_valid, ~entity_mask], dim=1)
 
         return tokens, key_padding_mask
 
@@ -202,7 +265,7 @@ class Tokenizer(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, ffn_dim: int, dropout: float = 0.0) -> None:
+    def __init__(self, d_model: int, n_heads: int, ffn_dim: int, dropout: float) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
@@ -214,7 +277,7 @@ class TransformerBlock(nn.Module):
         )
         self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None) -> torch.Tensor:
         normed = self.ln1(x)
         attn_out, _ = self.attn(
             normed,
@@ -233,25 +296,48 @@ class TransformerTrunk(nn.Module):
 
     def __init__(
         self,
+        *,
         obs_dim: int,
-        d_model: int = 64,
-        n_heads: int = 2,
-        n_layers: int = 2,
-        ffn_dim: int = 256,
-        dropout: float = 0.0,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        ffn_dim: int,
+        dropout: float,
+        self_weapon_embed_in_self: bool,
     ) -> None:
         super().__init__()
         del obs_dim
         self.d_model = int(d_model)
-        self.output_dim = int(d_model)
-        self.tokenizer = Tokenizer(d_model=d_model)
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model=d_model, n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout) for _ in range(n_layers)]
+        self.output_dim = self.d_model
+        self.tokenizer = Tokenizer(
+            d_model=self.d_model,
+            self_weapon_embed_in_self=self_weapon_embed_in_self,
         )
-        self.final_ln = nn.LayerNorm(d_model)
-        # TargetPointer: supervised pointer head over entity tokens, producing
-        # target_logits (supervised by BC labels) and target_feat (conditioning).
-        self.target_pointer = TargetPointer(d_model=d_model)
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=self.d_model,
+                    n_heads=int(n_heads),
+                    ffn_dim=int(ffn_dim),
+                    dropout=float(dropout),
+                )
+                for _ in range(int(n_layers))
+            ]
+        )
+        self.final_ln = nn.LayerNorm(self.d_model)
+        # Plain TargetPointer for the no-GRU path. The GRU path in
+        # _CombatObjectiveNet replaces this attribute with a richer
+        # variant (gru_target_query / hard_target / inject_weapon / slot prior).
+        self.target_pointer = TargetPointer(
+            d_model=self.d_model,
+            query_in_dim=self.d_model,
+            inject_weapon=False,
+            weapon_vocab=8,
+            hard_target=False,
+            linear_slot_prior=False,
+            gt_dist_target_feat=False,
+            prev_target_in_query=False,
+        )
         self._init_weights()
 
     def _init_weights(self) -> None:

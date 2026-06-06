@@ -17,6 +17,13 @@ Single attention mechanism that serves two consumers:
         valid index, otherwise ``argmax(logits)``. Decouples target-head loss
         tuning from motor-head training distribution so target weighting
         (focal/class) doesn't reshape what the motor heads see frame-to-frame.
+        Motor gradient does NOT reach the pointer in this mode.
+      - **gt-dist STE** (``gt_dist_target_feat=True``, training only): forward
+        pools by the labeler's GT slot distribution; backward routes through
+        ``softmax(logits)`` so motor gradient still trains the pointer.
+        Gated on ``self.training`` — eval/PPO falls back to soft so the
+        generalization metric isn't biased by privileged-input forward.
+        Mutually exclusive with ``hard_target``.
 
 Both outputs share one ``query_proj`` Linear and one attention pass; they
 differ only in what the consumer reads.
@@ -53,21 +60,38 @@ import torch.nn.functional as F
 class TargetPointer(nn.Module):
     def __init__(
         self,
-        d_model: int,
         *,
-        query_in_dim: int | None = None,
-        inject_weapon: bool = False,
-        weapon_vocab: int = 8,
-        hard_target: bool = False,
-        linear_slot_prior: bool = False,
+        d_model: int,
+        query_in_dim: int,
+        inject_weapon: bool,
+        weapon_vocab: int,
+        hard_target: bool,
+        linear_slot_prior: bool,
+        gt_dist_target_feat: bool,
+        prev_target_in_query: bool,
+        prev_target_n_slots: int = 16,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
-        self.query_in_dim = int(query_in_dim) if query_in_dim is not None else self.d_model
+        self.query_in_dim = int(query_in_dim)
         self.inject_weapon = bool(inject_weapon)
         self.hard_target = bool(hard_target)
         self.linear_slot_prior = bool(linear_slot_prior)
-        self.query_proj = nn.Linear(self.query_in_dim, self.d_model)
+        self.gt_dist_target_feat = bool(gt_dist_target_feat)
+        self.prev_target_in_query = bool(prev_target_in_query)
+        self.prev_target_n_slots = int(prev_target_n_slots)
+        if self.hard_target and self.gt_dist_target_feat:
+            raise ValueError(
+                "hard_target_feat and gt_dist_target_feat are mutually exclusive"
+            )
+        # When prev_target_in_query is True, query_proj sees
+        # cat(query_input, prev_target_dist) as input. The caller passes
+        # the previous frame's renormalized GT slot distribution at train
+        # time and None (→ zeros) at eval time; the train/eval forward
+        # signal differs by design — this is a privileged-input probe
+        # like gt_dist_target_feat. See target docstring.
+        proj_in_dim = self.query_in_dim + (self.prev_target_n_slots if self.prev_target_in_query else 0)
+        self.query_proj = nn.Linear(proj_in_dim, self.d_model)
         if self.inject_weapon:
             self.weapon_query_embed = nn.Embedding(int(weapon_vocab), self.d_model)
             nn.init.normal_(self.weapon_query_embed.weight, std=0.02)
@@ -84,6 +108,8 @@ class TargetPointer(nn.Module):
         *,
         self_weapon_slot: torch.Tensor | None = None,  # (B,) long, [0, weapon_vocab)
         target_gt: torch.Tensor | None = None,         # (B,) long, -100 = ignore
+        target_dist_slot: torch.Tensor | None = None,  # (B, N) slot probs, sums to 1
+        prev_target_dist: torch.Tensor | None = None,  # (B, N) prev-frame slot probs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return (target_logits, target_feat, query).
 
@@ -92,6 +118,18 @@ class TargetPointer(nn.Module):
         embedding) — slot labels alone don't push the model to encode
         identity in the query vector.
         """
+        if self.prev_target_in_query:
+            n = self.prev_target_n_slots
+            if prev_target_dist is None:
+                prev_target_dist = torch.zeros(
+                    query_input.shape[0], n,
+                    dtype=query_input.dtype, device=query_input.device,
+                )
+            elif prev_target_dist.shape[-1] != n:
+                raise ValueError(
+                    f"prev_target_dist last dim {prev_target_dist.shape[-1]} != {n}"
+                )
+            query_input = torch.cat([query_input, prev_target_dist], dim=-1)
         query = self.query_proj(query_input)                            # (B, D)
         if self.inject_weapon:
             assert self_weapon_slot is not None, "inject_weapon=True requires self_weapon_slot"
@@ -121,6 +159,16 @@ class TargetPointer(nn.Module):
                 slot = pred_slot
             batch_idx = torch.arange(entity_outs.shape[0], device=entity_outs.device)
             target_feat = entity_outs[batch_idx, slot] * has_any
+        elif self.gt_dist_target_feat and self.training and target_dist_slot is not None:
+            # STE with the labeler's GT distribution: forward uses the GT slot
+            # mass to give motors a clean target_feat blend, backward routes
+            # through softmax(logits) so motor gradient still trains the
+            # pointer.  Gated on self.training so val/eval/PPO take the soft
+            # branch — that keeps the generalization metric honest (no
+            # privileged input at eval time).
+            soft = F.softmax(logits, dim=-1)
+            choice = target_dist_slot + (soft - soft.detach())
+            target_feat = (choice.unsqueeze(-1) * entity_outs).sum(dim=1) * has_any
         else:
             probs = F.softmax(logits, dim=-1)                           # (B, N)
             target_feat = (probs.unsqueeze(-1) * entity_outs).sum(dim=1) * has_any

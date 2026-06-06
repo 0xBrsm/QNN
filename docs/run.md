@@ -190,7 +190,7 @@ BC:
 | `max_grad_norm`, `tbptt_limit` | stability controls |
 | `regression_threshold`, `regression_patience` | regression-style early stop |
 | `train_eval_interval`, `train_eval_gap_threshold`, `train_eval_val_regression_threshold`, `train_eval_train_improve_threshold` | train/val proxy gap triggers |
-| `segment_mask`, `token_mask` | filter-DSL expressions (see `qnn/filter_dsl.py`) for episode and per-token filtering |
+| `segment_mask`, `token_mask` | filter-DSL expressions (see `qnn/filter_dsl.py`) for per-frame segment filtering and per-token entity filtering |
 | `step_report_interval_seconds` | per-step metrics log cadence |
 | `prometheus_pushgateway_url` | optional metrics export target |
 

@@ -6,45 +6,53 @@
  *   - QNN_LabelerHandleTick() called from the per-tick play loop when
  *     qnn_runtime.labeler_mode is set.  Bypasses the QOBS pipeline.
  *
- * One LOBS frame per native tick.  Target labels come from the
- * action_label filled upstream — usercmd truth on QWD, MVD-rule
- * inference on real MVD.  See `target_valid_mask` rules in the header
- * comment (mirrors src/demo/sanitize.py).
+ * One LOBS frame per native tick.
  *
- * Single global fire cooldown counter (NOT per-weapon): vanilla Quake
- * stores attack_finished on the player edict, not per-weapon, so a
- * press carries cooldown across weapon switches.
+ * Wire layout puts two parallel columns side-by-side per tick:
+ *   `cmd_*` — the player's aggregated usercmd bytes (angles, move,
+ *             buttons, impulse), in QW wire-format precision (int16
+ *             for angles/move, raw u8 for buttons/impulse).
+ *   `op_input` — strict per-axis op mask of that usercmd: bit i set
+ *                iff the engine acted on the player's press on axis i
+ *                this tick.  No-input frames → bit clear (caller
+ *                derives training-keep as `no_press | op_input_bit`).
+ *
+ * Source of truth for ops:
+ *   bit 0 (fb)      : `cmd_move.fb != 0` (pmove integrates fb unconditionally)
+ *   bit 1 (lr)      : `cmd_move.lr != 0`
+ *   bit 2 (ud)      : QC PlayerJump when (button2 OR umove>0),
+ *                     waterlevel>=2 when umove<0
+ *   bit 3 (fire)    : QC W_WeaponFrame on button0
+ *   bit 4 (impulse) : QC ImpulseCommands on last-non-zero impulse
+ *
+ * The QC predicates run via qnn_progs.c (qwprogs.dat in the real
+ * server VM) — the C side never transcribes engine rules.
  */
 
 #include "qnn_labeler_collect.h"
 #include "qnn_collect_helpers.h"
 #include "qnn_io.h"
 
+#include <stdint.h>
 #include <string.h>
 
 /* ── Module-private state ──────────────────────────────────────────── */
 
-typedef struct
-{
-	/* Earliest qnn_runtime.tick at which a NEXT attack press would clear
-	 * attack_finished — i.e., be "engine-effective".  Updated each time a
-	 * press is accepted in the emit branch.  Used only to fill bit3 of
-	 * target_valid_mask in the LOBS payload. */
-	int fire_next_ok;
-} qnn_labeler_state_t;
-
-static qnn_labeler_state_t lab_state;
+/* No labeler-local state — the pmove jump driver and QC predicate-VM
+ * state both live in their own modules and reset at demo boundaries
+ * via QNN_QwdCollectReset / QNN_ProgsInit. */
 
 void QNN_LabelerCollectReset(void)
 {
-	memset(&lab_state, 0, sizeof(lab_state));
+	/* No-op: cross-tick state for the labeler lives in qwd_state
+	 * (qnn_qwd_collect.c) and qnn_progs.c statics. */
 }
 
 /* ── fp16 conversion (used by LOBS writer) ─────────────────────────── */
 
 /* IEEE-754 binary32 → binary16 conversion.  Round-to-nearest-even.
- * Sufficient for the labeler obs fields (velocity / view-delta, both
- * normalized into ~[-1, 1] so the exponent never overflows binary16). */
+ * Sufficient for the labeler obs fields (velocity is normalized into
+ * ~[-1, 1] so the exponent never overflows binary16). */
 static uint16_t QNN_F32ToF16(float f)
 {
 	uint32_t u;
@@ -95,17 +103,18 @@ void QNN_EmitLabelerTick(FILE *out,
 	int tick, int tick_hz, uint16_t flags,
 	const float pos_delta_vel[3],
 	int movement_id,
-	const float view_delta[3],
-	int c_rule_fire,
-	int c_rule_jump,
-	uint8_t move_packed,
-	uint8_t target_valid_mask,
-	uint8_t usercmd_fire,
-	uint8_t weapon_id)
+	const int16_t cmd_angles[3],
+	const int16_t cmd_move[3],
+	uint8_t cmd_buttons,
+	uint8_t cmd_impulse,
+	uint8_t op_input,
+	uint8_t weapon_id,
+	uint8_t c_rule_fire,
+	uint8_t c_rule_jump)
 {
 	uint8_t header[10];
-	uint16_t vel_h[3], view_h[3];
-	uint8_t  mid_u8, fire_u8, jump_u8;
+	uint16_t vel_h[3];
+	uint8_t  mid_u8;
 
 	memcpy(header + 0, &tick,    4);
 	memcpy(header + 4, &tick_hz, 4);
@@ -115,25 +124,20 @@ void QNN_EmitLabelerTick(FILE *out,
 	vel_h[1] = QNN_F32ToF16(pos_delta_vel[1]);
 	vel_h[2] = QNN_F32ToF16(pos_delta_vel[2]);
 
-	view_h[0] = QNN_F32ToF16(view_delta[0]);
-	view_h[1] = QNN_F32ToF16(view_delta[1]);
-	view_h[2] = QNN_F32ToF16(view_delta[2]);
-
-	mid_u8  = (uint8_t)(movement_id & 0xFF);
-	fire_u8 = (uint8_t)(c_rule_fire ? 1 : 0);
-	jump_u8 = (uint8_t)(c_rule_jump ? 1 : 0);
+	mid_u8 = (uint8_t)(movement_id & 0xFF);
 
 	fwrite("LOBS",  1, 4, out);
 	fwrite(header,  1, sizeof(header), out);
-	fwrite(vel_h,   1, sizeof(vel_h),  out);
-	fwrite(&mid_u8, 1, 1, out);
-	fwrite(view_h,  1, sizeof(view_h), out);
-	fwrite(&fire_u8, 1, 1, out);
-	fwrite(&jump_u8, 1, 1, out);
-	fwrite(&move_packed, 1, 1, out);
-	fwrite(&target_valid_mask, 1, 1, out);
-	fwrite(&usercmd_fire, 1, 1, out);
-	fwrite(&weapon_id, 1, 1, out);
+	fwrite(vel_h,   1, sizeof(vel_h),  out);   /* offset 0..5   */
+	fwrite(&mid_u8, 1, 1, out);                 /* offset 6      */
+	fwrite(cmd_angles, 1, 6, out);              /* offset 7..12  */
+	fwrite(cmd_move,   1, 6, out);              /* offset 13..18 */
+	fwrite(&cmd_buttons, 1, 1, out);            /* offset 19     */
+	fwrite(&cmd_impulse, 1, 1, out);            /* offset 20     */
+	fwrite(&op_input, 1, 1, out);               /* offset 21     */
+	fwrite(&weapon_id, 1, 1, out);              /* offset 22     */
+	fwrite(&c_rule_fire, 1, 1, out);            /* offset 23     */
+	fwrite(&c_rule_jump, 1, 1, out);            /* offset 24     */
 	fflush(out);
 }
 
@@ -143,10 +147,17 @@ void QNN_LabelerHandleTick(const qnn_snapshot_t *snapshot, FILE *out)
 {
 	vec3_t pos_delta_body;
 	int mid;
-	int c_fire, c_jump;
-	uint8_t mp;
-	uint8_t target_valid_mask;
-	int ud_class;
+	int16_t cmd_angles[3];
+	int16_t cmd_move[3];
+	uint8_t cmd_buttons;
+	uint8_t cmd_impulse;
+	int op_fire = 0;
+	int op_jump = 0;
+	int op_impulse = 0;
+	int fmove_int = 0, smove_int = 0, umove_int = 0;
+	int buttons_int = 0, impulse_int = 0;
+	uint8_t op_input;
+	int i;
 
 	/* World-frame origin-delta velocity over the previous native tick —
 	 * already computed by QNN_SavePrev. */
@@ -164,140 +175,100 @@ void QNN_LabelerHandleTick(const qnn_snapshot_t *snapshot, FILE *out)
 	default: mid = snapshot->grounded ? 0 : 1; break;
 	}
 
-	/* C-rule fire: sound + ammo decrement; velocity-free, so it survives
-	 * the player_velocity zeroing in labeler-mode. */
-	c_fire = QNN_DetectFireEvent(snapshot) ? 1 : 0;
+	/* Per-cmd fire predicate + cmd-block aggregation. */
+	QNN_QwdEvalOperativePerCmd(snapshot,
+		&op_fire,
+		&fmove_int, &smove_int, &umove_int,
+		&buttons_int, &impulse_int);
 
-	/* C-rule jump: ground→air transition with world-frame upward velocity
-	 * above the engine-jump impulse floor (~270 u/s).  prev_velocity[2]
-	 * is the per-tick origin z-delta / dt — non-zero on the impulse tick
-	 * even with snapshot velocity zeroed. */
-	c_jump = (qnn_runtime.prev_grounded
-		&& !snapshot->grounded
-		&& qnn_runtime.prev_velocity[2] > 100.0f) ? 1 : 0;
+	/* Per-cmd pmove driver for jump operativeness — replaces the QC
+	 * PlayerJump predicate's K-gated workaround with direct observation
+	 * of pmove's ground-jump success branch.  Frame-exact press
+	 * attribution; no snapshot.grounded lag artifact. */
+	op_jump = QNN_QwdEvalPmoveJump(snapshot);
 
-	/* Pack move target.  Threshold 0.1 matches MOVE_AXIS_THRESHOLD on
-	 * the Python side.  ud_class is the resulting per-tick ud class
-	 * (0=neg, 1=none, 2=pos) — held for the jump-acceptance check below. */
-	ud_class = 1;
+	/* Pack cmd_move as int16 (raw QW units).  Clamp to int16 range —
+	 * QW values rarely exceed ±400 so headroom is huge, but defensive. */
 	{
-		int i;
-		mp = 0;
+		int vals[3];
+		vals[0] = fmove_int;
+		vals[1] = smove_int;
+		vals[2] = umove_int;
 		for (i = 0; i < 3; i++)
 		{
-			float v = snapshot->action_label.move[i];
-			uint8_t cls = (v >  0.1f) ? 2
-				: (v < -0.1f) ? 0 : 1;
-			mp |= (uint8_t)((cls & 0x3) << (i * 2));
-			if (i == 2)
-				ud_class = cls;
+			int v = vals[i];
+			if (v >  32767) v =  32767;
+			if (v < -32768) v = -32768;
+			cmd_move[i] = (int16_t)v;
 		}
 	}
+	cmd_buttons = (uint8_t)(buttons_int & 0xFF);
+	cmd_impulse = (uint8_t)(impulse_int & 0xFF);
 
-	/* ── target_valid_mask ─────────────────────────────
-	 * Engine-effectiveness bits per axis (mirrors
-	 * src/demo/sanitize.py rules):
-	 *   bit0 = fb       (alive)
-	 *   bit1 = lr       (alive)
-	 *   bit2 = ud       (alive; if pressed up, grounded or in water)
-	 *   bit3 = fire     (alive; if pressed, held weapon off cooldown)
-	 *   bit4 = weapon   (alive — dense held-weapon target, no
-	 *                    engine-effect gate)
-	 * Bits 5..7 reserved (zero). */
-	target_valid_mask = 0;
-	if (snapshot->health > 0)
+	/* Encode view angles in QW wire format: int16 = degrees × 65536/360,
+	 * modular-wrapped to 16 bits.  Reader recovers degrees via
+	 * (uint16)cmd_angles * (360/65536).  Matches MSG_WriteAngle16 /
+	 * MSG_ReadAngle16 in vendor/quake/QW/client/common.c. */
+	for (i = 0; i < 3; i++)
 	{
-		int wid = snapshot->weapon_id;
-		int fire_press = snapshot->action_label.fire ? 1 : 0;
-		qboolean in_water = (snapshot->waterlevel >= 2);
-		qboolean ud_pressed_up = (ud_class == 2);
-		qboolean ud_pressed_down = (ud_class == 0);
-		/* fb / lr always pass through while alive. */
-		target_valid_mask |= 0x01;
-		target_valid_mask |= 0x02;
-
-		/* ud: pressed-up is accepted only when grounded or in water;
-		 * pressed-down only in water (no crouch in vanilla QW).  The
-		 * "none" class (ud_class == 1) is the unconditional pass-
-		 * through majority. */
-		if (ud_pressed_up)
-		{
-			if (snapshot->grounded || in_water)
-				target_valid_mask |= 0x04;
-		}
-		else if (ud_pressed_down)
-		{
-			if (in_water)
-				target_valid_mask |= 0x04;
-		}
-		else
-		{
-			target_valid_mask |= 0x04;
-		}
-
-		/* fire: check per-weapon attack_finished cooldown.  Native-tick
-		 * cooldowns match src/demo/sanitize.py::FIRE_COOLDOWN_NATIVE and
-		 * scripts/compare_collects.py — Python-rounded (banker's) from
-		 * the QC attack_finished delays:
-		 *   axe 0.5s→38  sg 0.5s→38  ssg 0.7s→54
-		 *   ng  0.2s→15  sng 0.2s→15  gl  0.6s→46
-		 *   rl  0.8s→62  lg  0.1s→8
-		 * fixed_tick_hz is the actual emit cadence (matches native rate
-		 * when hello.tick_hz=0; matches the requested rate otherwise).
-		 * When fixed_tick_hz != 77 (e.g., demo recorded at 70 Hz, or
-		 * non-native emit) the table is scaled proportionally. */
-		if (fire_press == 0)
-		{
-			target_valid_mask |= 0x08;
-		}
-		else if (wid >= 1 && wid <= 8
-			&& qnn_runtime.fixed_tick_hz > 0
-			&& qnn_runtime.tick >= lab_state.fire_next_ok)
-		{
-			static const int k_fire_cd_native[9] = {
-				0,
-				38, 38, 54, 15,
-				15, 46, 62,  8,
-			};
-			int base_cd = k_fire_cd_native[wid];
-			int cd_ticks = (qnn_runtime.fixed_tick_hz == 77)
-				? base_cd
-				: (int)((float)base_cd
-					* (float)qnn_runtime.fixed_tick_hz
-					/ 77.0f + 0.5f);
-			target_valid_mask |= 0x08;
-			lab_state.fire_next_ok =
-				qnn_runtime.tick + cd_ticks;
-		}
-		/* else: held weapon out of {1..8} (e.g., 0 = no weapon held
-		 * mid-respawn); press is a no-op. */
-
-		/* weapon (held-weapon target): dense per-frame — action_label
-		 * .weapon is the currently-held weapon byte, which is observable
-		 * and unambiguous on every alive frame.  The labeler isn't
-		 * predicting a sparse "switch event"; it predicts "what weapon
-		 * is held right now."  No engine-effect filtering applies.  Bit
-		 * is on iff alive. */
-		target_valid_mask |= 0x10;
+		float deg = snapshot->player_view_angles[i];
+		int q = (int)(deg * 65536.0f / 360.0f);
+		cmd_angles[i] = (int16_t)(q & 0xFFFF);
 	}
-	/* else: dead — all bits remain 0 (masked out). */
+
+	/* op_impulse: stateful QC ImpulseCommands eval — maintains
+	 * persistent self.weapon across calls so sticky-impulse cmds (held
+	 * across the snapshot.weapon_id lag window) only fire op_impulse=1
+	 * on the actual press tick.  Called unconditionally every tick so
+	 * the predicate's snapshot-sync logic stays current even on
+	 * cmd_impulse=0 ticks where server-forced switches may occur. */
+	op_impulse = QNN_ProgsEvalWeaponImpulseOperative(
+		snapshot->health, snapshot->items_owned,
+		snapshot->ammo_shells, snapshot->ammo_nails,
+		snapshot->ammo_rockets, snapshot->ammo_cells,
+		snapshot->weapon_id, (int)cmd_impulse);
+
+	/* Strict per-axis op-of-usercmd.  bit i set iff there was a press
+	 * on axis i AND the engine acted on it this tick.  Same packer is
+	 * used by the BC QWD path via QNN_QwdPackOpInput. */
+	op_input = QNN_PackOpInput(
+		(snapshot->health > 0),
+		(cmd_move[0] != 0),
+		(cmd_move[1] != 0),
+		((cmd_buttons & 2) != 0) || (cmd_move[2] > 0),
+		(cmd_move[2] < 0),
+		(cmd_buttons & 1) != 0,
+		(snapshot->waterlevel >= 2),
+		op_jump, op_fire, op_impulse,
+		(cmd_impulse != 0));
 
 	{
 		uint16_t lobs_flags = snapshot->done ? 0x02u : 0u;
-		uint8_t usercmd_fire = (uint8_t)
-			(snapshot->action_label.fire ? 1 : 0);
 		uint8_t weapon_id_u8 = (uint8_t)
 			(snapshot->weapon_id & 0xFF);
+		/* Sound-derived discrete-cmd reconstructions — same generators
+		 * as the MVD inference path uses at apply time
+		 * (QNN_SnapshotHasSelfWeaponFireSound / SelfJumpSound).  Sparse
+		 * one-tick-per-event: a 1 here means the server multicast a
+		 * fire/jump sound for the self entity at this snapshot.  The
+		 * labeler trainer feeds these as features so train-time and
+		 * apply-time input distributions match. */
+		uint8_t c_rule_fire = QNN_SnapshotHasSelfWeaponFireSound(snapshot)
+			? 1 : 0;
+		uint8_t c_rule_jump = QNN_SnapshotHasSelfJumpSound(snapshot)
+			? 1 : 0;
+
 		QNN_EmitLabelerTick(out,
 			qnn_runtime.tick,
 			qnn_runtime.fixed_tick_hz,
 			lobs_flags,
 			pos_delta_body, mid,
-			snapshot->action_label.look,
-			c_fire, c_jump, mp,
-			target_valid_mask,
-			usercmd_fire,
-			weapon_id_u8);
+			cmd_angles, cmd_move,
+			cmd_buttons, cmd_impulse,
+			op_input,
+			weapon_id_u8,
+			c_rule_fire,
+			c_rule_jump);
 	}
 
 	QNN_SavePrev(snapshot, qnn_runtime.fixed_dt);

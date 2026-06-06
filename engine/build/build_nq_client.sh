@@ -31,13 +31,32 @@ CUSTOM_SOURCES=(
   "${ENGINE_DIR}/common/qnn_spatial.c"
   "${ENGINE_DIR}/nq/qnn_self.c"
   "${ENGINE_DIR}/common/qnn_self_common.c"
+  "${ENGINE_DIR}/nq/qnn_progs_stub.c"
   "${ENGINE_DIR}/common/qnn_io.c"
   "${ENGINE_DIR}/common/qnn_fault.c"
   "${ENGINE_DIR}/common/qnn_store.c"
   "${ENGINE_DIR}/common/qnn_tick.c"
+  # In-process ONNX inference (ORT C API wrapper + tick_result→tensor
+  # packer + sticky-weapon/argmax decode). Replaces the old stdin/stdout
+  # protocol to Python.
+  "${ENGINE_DIR}/common/qnn_onnx.c"
+  # Minimal qnn_runtime definition (the full one lives in qnn_collect_helpers.c
+  # which the client doesn't link).
+  "${ENGINE_DIR}/nq/qnn_client_runtime_stub.c"
 )
 
 check_build_deps "the Quake network client"
+
+# Fetch ORT (header + .so) into vendor/onnxruntime if it's not there yet.
+# tools/onnx_smoke/build.sh owns the curl + unpack logic.
+ORT_DIR="${REPO_ROOT}/vendor/onnxruntime"
+if [[ ! -f "${ORT_DIR}/lib/libonnxruntime.so" ]]; then
+  bash "${REPO_ROOT}/tools/onnx_smoke/build.sh" >/dev/null
+fi
+
+# Surface ORT to build_common.sh's compile/link.
+export EXTRA_INCLUDES="-I${ORT_DIR}/include"
+export EXTRA_LINK_FLAGS="-L${ORT_DIR}/lib -lonnxruntime -Wl,-rpath,${ORT_DIR}/lib"
 
 BUILD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/quake-client-build.XXXXXX")
 trap 'rm -rf "${BUILD_ROOT}"' EXIT

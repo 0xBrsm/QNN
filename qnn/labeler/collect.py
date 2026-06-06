@@ -1,26 +1,49 @@
 """Native-rate slim collect for the move labeler.
 
 Walks a QWD corpus, drives qw_demo_worker at native rate (tick_hz=0),
-and writes only the slim per-tick arrays the labeler consumes:
+and writes per-tick arrays for labeler training:
 
-  obs/self_velocity        fp16 (T, 3)    body-frame, pre-normalized in C
+  obs/self_velocity        fp16  (T, 3)   body-frame, pre-normalized in C
   obs/self_movement_id     uint8 (T,)
-  obs/look                 fp16 (T, 3)    per-native-frame view delta
-  obs/c_rule_fire          uint8 (T,)     engine sound+ammo fire detection
-  obs/c_rule_jump          uint8 (T,)     engine ground→air jump detection
-  obs/target_valid_mask    uint8 (T,)     per-axis engine-effective bits
-                                          (bit0=fb..bit4=weapon)
-  obs/usercmd_fire         uint8 (T,)     true fire press (cmd-window OR'd)
-  obs/weapon_id            uint8 (T,)     held weapon 1..8 (0 = none)
-  actions/move             uint8 (T,)     packed fb|lr<<2|ud<<4
+  obs/cmd_angles           int16 (T, 3)   usercmd view angles, QW 65536/360
+                                          quantization (pitch/yaw/roll)
+  obs/cmd_move             int16 (T, 3)   usercmd fb/lr/ud aggregated across
+                                          cmd window (mean fb/lr; jump-or-
+                                          most-negative ud), raw QW units
+  obs/cmd_buttons          uint8 (T,)     usercmd buttons OR'd across cmd
+                                          window (bit0=fire, bit1=button2)
+  obs/cmd_impulse          uint8 (T,)     usercmd last non-zero impulse in
+                                          cmd window (matches engine)
+  obs/op_input             uint8 (T,)     strict per-axis op mask of the
+                                          cmd_* fields (bit0=fb..bit4=
+                                          impulse).  1 = press AND engine
+                                          acted on it this tick.  QC VM is
+                                          source of truth for bits 2/3/4.
+  obs/weapon_id            uint8 (T,)     server-held weapon byte (1..8;
+                                          0 = none).  Lags impulses by
+                                          the cmd-pipeline delay.
+  obs/c_rule_fire          uint8 (T,)     sound-derived self weapon-fire
+                                          bit (PHS multicast).  Sparse
+                                          one-tick-per-event — same
+                                          generator MVD inference uses
+                                          at apply time.
+  obs/c_rule_jump          uint8 (T,)     sound-derived self plyrjmp8
+                                          bit.  Same role as c_rule_fire.
+  obs/look                 fp16  (T, 3)   per-tick view delta — derived
+                                          here from cmd_angles + prev-tick
+                                          anchor basis.  Trainer-facing
+                                          feature (Quake AngleVectors port).
+  actions/move             uint8 (T,)     3-class fb|lr<<2|ud<<4 derived
+                                          from cmd_move via threshold.
+                                          Trainer-facing target.
 
 Demo-level filtering goes through `--filter-config` (same JSON schema as
-qnn.bc.collect, with `keep` / `drop` MongoDB-style predicates plus
-`drop_tick_labels`).  Pointing it at `artifacts/collect/qwd/filter.json`
-selects the same demo set the BC corpus uses.  `drop_tick_labels`
-intervals (signon / dead / intermission) carve sub-episodes out of each
-demo so the labeler's bidirectional context never bridges a dropped
-interval — same semantics as bc.collect.
+qnn.bc.collect: nested `demos` / `segments` / `tokens` / `actions` axes
+with `keep` / `drop` sub-keys).  Pointing it at
+`artifacts/collect/qwd/filter.json` selects the same demo set the BC
+corpus uses.  `segments.drop` intervals (signon / dead / intermission)
+carve sub-episodes out of each demo so the labeler's bidirectional
+context never bridges a dropped interval — same semantics as bc.collect.
 
 Native-rate constraint: `--min-hz` (default 70) drops demos detected
 below this recording rate.  Labeler-specific, on top of the
@@ -49,35 +72,118 @@ import numpy as np
 
 from qnn.wire import FLAG_DONE
 from qnn.bc.collect import (
-    _WATCHDOG_EXIT_CODE,
     _default_demo_worker,
     _game_dir_for_demo_dir,
-    _get_collect_worker,
     _label_keep_mask,
+    _load_and_pin_filter,
+    _read_collect_frames,
+    _run_per_demo_collect,
     _runs_from_mask,
-    _shutdown_worker,
-    _validate_filter_schema,
-    _worker_stderr_tail,
     run_collect,
 )
 
 
 # ── LOBS stream IO ────────────────────────────────────────────────────────────
 #
-# LOBS framing (matches QNN_EmitLabelerTick in qnn_collect_helpers.c):
+# LOBS framing (matches QNN_EmitLabelerTick in qnn_labeler_collect.c):
 #   "LOBS"                4 bytes magic
 #   tick u32              4
 #   tick_hz u32           4
 #   flags u16             2
-#   payload               19  (see qnn.wire.unpack_labeler_buffer)
-# Total: 33 bytes per native tick.
-#
-# Kept local to this module so the BC collect doesn't have to know
-# about the labeler-only wire format.
+#   payload              25  (see qnn.wire.unpack_labeler_buffer)
+# Total: 39 bytes per native tick.
 
 _LOBS_HEADER_SIZE = 10
-_LOBS_PAYLOAD_SIZE = 19
+_LOBS_PAYLOAD_SIZE = 25
 _LOBS_FRAME_AFTER_MAGIC = _LOBS_HEADER_SIZE + _LOBS_PAYLOAD_SIZE
+
+
+# ── derivations from raw usercmd ───────────────────────────────────────────────
+
+# Threshold for "is there a press on this axis" (in raw QW move units).
+# QW's cl_forwardspeed default is ~200 (run forward unmoded); +speed activation
+# doubles to 400.  Anything within ±_MOVE_PRESS_THRESHOLD counts as "none"
+# (no press) — keeps a small dead zone around zero for averaged values to
+# settle on, matching the prior 3-class derivation's 0.1 normalized threshold
+# (= 0.1 × QNN_SV_MAXSPEED = ~32 in raw units).
+_MOVE_PRESS_THRESHOLD = 32
+
+
+def _decode_angles(cmd_angles_int16: np.ndarray) -> np.ndarray:
+    """Decode int16 QW-quantized angles to degrees in [0, 360).  Treats the
+    int16 pattern as unsigned 16-bit (matching MSG_ReadAngle16's modular
+    encoding) then scales by 360/65536."""
+    return (cmd_angles_int16.astype(np.int32) & 0xFFFF).astype(
+        np.float32) * (360.0 / 65536.0)
+
+
+def _angles_to_basis(angles_deg: np.ndarray
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Quake's AngleVectors, vectorized over (T, 3) input.  Returns
+    (forward, right, up) each shape (T, 3)."""
+    pitch = np.deg2rad(angles_deg[:, 0])
+    yaw   = np.deg2rad(angles_deg[:, 1])
+    roll  = np.deg2rad(angles_deg[:, 2])
+    sp, cp = np.sin(pitch), np.cos(pitch)
+    sy, cy = np.sin(yaw), np.cos(yaw)
+    sr, cr = np.sin(roll), np.cos(roll)
+    forward = np.stack([cp * cy, cp * sy, -sp], axis=1)
+    right = np.stack([
+        -sr * sp * cy + cr * sy,
+        -sr * sp * sy - cr * cy,
+        -sr * cp,
+    ], axis=1)
+    up = np.stack([
+        cr * sp * cy + sr * sy,
+        cr * sp * sy - sr * cy,
+        cr * cp,
+    ], axis=1)
+    return forward, right, up
+
+
+def _derive_view_delta(cmd_angles_int16: np.ndarray) -> np.ndarray:
+    """Per-tick body-frame view delta from cmd_angles.  Mirrors
+    QNN_FillLookAndSwitch in C: look = cur_forward · prev-anchor-basis,
+    where the anchor is the previous emit's angles (= previous tick in
+    labeler mode, since every native tick emits).
+
+    Tick 0 has no anchor → (0, 0, 0)."""
+    if cmd_angles_int16.shape[0] < 2:
+        return np.zeros((cmd_angles_int16.shape[0], 3), dtype=np.float16)
+    angles_deg = _decode_angles(cmd_angles_int16)
+    forward, right, up = _angles_to_basis(angles_deg)
+    T = forward.shape[0]
+    out = np.zeros((T, 3), dtype=np.float32)
+    out[1:, 0] = np.einsum("ij,ij->i", forward[1:], forward[:-1])
+    out[1:, 1] = np.einsum("ij,ij->i", forward[1:], right[:-1])
+    out[1:, 2] = np.einsum("ij,ij->i", forward[1:], up[:-1])
+    return out.astype(np.float16)
+
+
+def _derive_move_packed(cmd_move_int16: np.ndarray) -> np.ndarray:
+    """3-class fb|lr<<2|ud<<4 from raw int16 cmd_move (mean-aggregated
+    QW units).  Class 0=neg, 1=none, 2=pos with a ±_MOVE_PRESS_THRESHOLD
+    dead zone around zero (matches the prior 0.1-normalized threshold)."""
+    def classify(v: np.ndarray) -> np.ndarray:
+        return np.where(v >  _MOVE_PRESS_THRESHOLD, 2,
+               np.where(v < -_MOVE_PRESS_THRESHOLD, 0, 1)).astype(np.uint8)
+    fb = classify(cmd_move_int16[:, 0])
+    lr = classify(cmd_move_int16[:, 1])
+    ud = classify(cmd_move_int16[:, 2])
+    return ((fb & 0x3) | ((lr & 0x3) << 2) | ((ud & 0x3) << 4)).astype(np.uint8)
+
+
+def _parse_lobs_frame(raw: bytes) -> dict:
+    """Parse one LOBS frame (after the 4-byte magic).  Returns a tick
+    dict with the native-rate header fields and the raw payload bytes. """
+    tick_idx, tick_hz, flags = struct.unpack_from("<IIH", raw, 0)
+    return {
+        "tick":    int(tick_idx),
+        "tick_hz": int(tick_hz),
+        "flags":   int(flags),
+        "lobs":    raw[_LOBS_HEADER_SIZE:],
+        "done":    bool(flags & FLAG_DONE),
+    }
 
 
 def _collect_one_demo_labeler(
@@ -88,47 +194,19 @@ def _collect_one_demo_labeler(
     force_mvd_emit: bool = False,
 ) -> list[dict] | None:
     """Dispatch one demo to the worker in labeler_mode and read its LOBS
-    stream.  Mirrors qnn.bc.collect._collect_one_demo but for the slim
-    labeler wire format — the BC code never has to handle LOBS."""
-    cmd = json.dumps({
+    stream.  Wraps qnn.bc.collect._read_collect_frames with the
+    labeler-specific op (labeler_mode=1), magic (LOBS), and payload
+    layout (see ``_parse_lobs_frame``).  The worker always runs the QC
+    VM predicates to fill op_input."""
+    op = {
         "op": "collect", "demo_path": demo_name, "seed": 0,
         "play_start": play_start, "play_end": play_end,
-        "force_mvd_emit": 1 if force_mvd_emit else 0,
-        "labeler_mode":   1,
-    }) + "\n"
-    proc.stdin.write(cmd.encode())
-    proc.stdin.flush()
-
-    ticks: list[dict] = []
-    while True:
-        if proc.poll() is not None:
-            return None
-        magic = proc.stdout.read(4)
-        if not magic or len(magic) < 4:
-            return None
-        if magic[0:1] == b'{':
-            rest = proc.stdout.readline()
-            try:
-                err = json.loads(magic + rest)
-                raise RuntimeError(err.get("error", "unknown error"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                raise RuntimeError(f"Worker error: {(magic + rest)[:200]!r}")
-        if magic != b'LOBS':
-            raise RuntimeError(f"Bad magic: {magic!r}")
-        raw = proc.stdout.read(_LOBS_FRAME_AFTER_MAGIC) if proc.poll() is None else b""
-        if len(raw) < _LOBS_FRAME_AFTER_MAGIC:
-            return None
-        tick_idx, tick_hz, flags = struct.unpack_from("<IIH", raw, 0)
-        ticks.append({
-            "tick":    int(tick_idx),
-            "tick_hz": int(tick_hz),
-            "flags":   int(flags),
-            "lobs":    raw[_LOBS_HEADER_SIZE:],
-            "done":    bool(flags & FLAG_DONE),
-        })
-        if flags & FLAG_DONE:
-            break
-    return ticks
+        "force_mvd_emit":  1 if force_mvd_emit  else 0,
+        "labeler_mode":    1,
+    }
+    return _read_collect_frames(
+        proc, op, b"LOBS", _LOBS_FRAME_AFTER_MAGIC, _parse_lobs_frame
+    )
 
 
 # ── slim unpack ───────────────────────────────────────────────────────────────
@@ -140,7 +218,7 @@ def _unpack_labeler_episode(
     total_frames: int = 0,
 ) -> list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]]:
     """Slim unpack: directly read fields out of the LOBS per-tick payload
-    and split into sub-episodes wherever ``drop_tick_labels`` carves a
+    and split into sub-episodes wherever ``segments.drop`` carves a
     gap.  Mirrors qnn.bc.collect._unpack_episode's segmentation
     semantics so the labeler's bidirectional context never bridges a
     dropped interval.
@@ -153,45 +231,66 @@ def _unpack_labeler_episode(
         return []
 
     payload = np.frombuffer(b"".join(t["lobs"] for t in ticks), dtype=np.uint8)
-    if payload.size != n * 19:
+    if payload.size != n * _LOBS_PAYLOAD_SIZE:
         return []
-    payload = payload.reshape(n, 19)
+    payload = payload.reshape(n, _LOBS_PAYLOAD_SIZE)
 
     # Layout (matches QNN_EmitLabelerTick): bytes 0..5 = vel fp16[3];
-    # 6 = movement_id u8; 7..12 = view fp16[3]; 13 = c_rule_fire u8;
-    # 14 = c_rule_jump u8; 15 = move_packed u8;
-    # 16 = target_valid_mask u8; 17 = usercmd_fire u8; 18 = weapon_id u8.
+    # 6 = movement_id u8; 7..12 = cmd_angles int16[3];
+    # 13..18 = cmd_move int16[3]; 19 = cmd_buttons u8;
+    # 20 = cmd_impulse u8; 21 = op_input u8; 22 = weapon_id u8;
+    # 23 = c_rule_fire u8 (sound-derived self weapon-fire bit);
+    # 24 = c_rule_jump u8 (sound-derived self plyrjmp8 bit).
     self_velocity = payload[:, 0:6].copy().view(np.float16).reshape(n, 3)
     movement_id   = payload[:, 6].copy()
-    look          = payload[:, 7:13].copy().view(np.float16).reshape(n, 3)
-    c_rule_fire   = payload[:, 13].copy()
-    c_rule_jump   = payload[:, 14].copy()
-    move_packed   = payload[:, 15].copy()
-    target_valid_mask = payload[:, 16].copy()
-    usercmd_fire  = payload[:, 17].copy()
-    weapon_id     = payload[:, 18].copy()
+    cmd_angles    = payload[:, 7:13].copy().view(np.int16).reshape(n, 3)
+    cmd_move      = payload[:, 13:19].copy().view(np.int16).reshape(n, 3)
+    cmd_buttons   = payload[:, 19].copy()
+    cmd_impulse   = payload[:, 20].copy()
+    op_input      = payload[:, 21].copy()
+    weapon_id     = payload[:, 22].copy()
+    c_rule_fire   = payload[:, 23].copy()
+    c_rule_jump   = payload[:, 24].copy()
+
+    # Derived trainer-facing fields.  `look` is the per-tick body-frame
+    # view delta the labeler model consumes as a feature; `move_packed`
+    # is the 3-class fb/lr/ud target.  Both are pure functions of
+    # cmd_angles / cmd_move respectively — derived once at collect time
+    # so the trainer doesn't have to know about the wire format.
+    look          = _derive_view_delta(cmd_angles)
+    move_packed   = _derive_move_packed(cmd_move)
 
     obs_full = {
         "self_velocity":    self_velocity,
         "self_movement_id": movement_id.astype(np.uint8, copy=False),
+        # Per-tick body-frame view delta — derived from cmd_angles.
+        # Labeler model feature.
         "look":             look,
+        # Raw usercmd block — exact QW wire-format precision.
+        "cmd_angles":       cmd_angles.astype(np.int16, copy=False),
+        "cmd_move":         cmd_move.astype(np.int16, copy=False),
+        "cmd_buttons":      cmd_buttons.astype(np.uint8, copy=False),
+        "cmd_impulse":      cmd_impulse.astype(np.uint8, copy=False),
+        # Strict per-axis op mask of the cmd_* fields.  1 = press AND
+        # engine acted on it.  Trainer derives CE-keep mask per axis
+        # as (no_press_axis) | (op_input_bit_axis).
+        "op_input":         op_input.astype(np.uint8, copy=False),
+        # Server-held weapon byte (1..8 axe..LG; 0 if no weapon).  Lags
+        # impulses by the cmd-pipeline delay.
+        "weapon_id":        weapon_id.astype(np.uint8, copy=False),
+        # Sound-derived discrete-cmd reconstructions — same generators
+        # MVD inference uses at apply time.  Sparse one-tick-per-event;
+        # no hold/chain-fill (those live behind the MVD inference path
+        # for BC policy labels, not labeler training features).
         "c_rule_fire":      c_rule_fire.astype(np.uint8, copy=False),
         "c_rule_jump":      c_rule_jump.astype(np.uint8, copy=False),
-        # Per-axis engine-effective bitmask (bit0=fb, bit1=lr, bit2=ud,
-        # bit3=fire, bit4=weapon).  Stored alongside obs so the trainer
-        # can opt into sanitizing targets via --sanitize-targets; ignored
-        # otherwise.
-        "target_valid_mask": target_valid_mask.astype(np.uint8, copy=False),
-        # True press signal (usercmd.fire OR'd across the cmd window).
-        # Used to verify the mask's first-press cooldown gate against
-        # truth; also useful as apply-time obs.
-        "usercmd_fire":    usercmd_fire.astype(np.uint8, copy=False),
-        # Currently-held weapon byte (1..8 axe..LG; 0 if no weapon).
-        # Needed for weapon-keyed cooldown gating in
-        # first_shot_per_cooldown; also the dense per-frame weapon target.
-        "weapon_id":       weapon_id.astype(np.uint8, copy=False),
     }
-    act_full = {"move": move_packed.astype(np.uint8, copy=False)}
+    act_full = {
+        # 3-class fb|lr<<2|ud<<4 derived from cmd_move via threshold.
+        # Trainer-facing target.  Sparse weapon-impulse target lives
+        # implicitly in obs/cmd_impulse + obs/op_input bit 4.
+        "move":   move_packed.astype(np.uint8, copy=False),
+    }
 
     if labels and drop_label_names:
         keep = _label_keep_mask(labels, drop_label_names, total_frames, n)
@@ -216,63 +315,22 @@ def _collect_demo_slim(
 ) -> dict:
     """Pool-worker entry: collect one demo into slim labeler sub-episodes.
 
-    Returns the same ``{"demo", "status", "ticks", "episodes":
-    [{"obs", "actions", "rows"}, ...]}`` shape as
-    qnn.bc.collect._collect_demo, so qnn.bc.collect.run_collect can
-    dispatch this strategy interchangeably with the BC one.
-    """
+    Thin wrapper around ``_run_per_demo_collect`` (shared with BC) that
+    supplies the labeler-specific collect (LOBS) and unpack (slim
+    self-only obs)."""
     (demo_name, play_start, play_end, force_mvd_emit,
      labels, total_frames, drop_label_names) = args
-    proc = None
-
-    try:
-        proc = _get_collect_worker()
-        ticks = _collect_one_demo_labeler(
+    return _run_per_demo_collect(
+        demo_name,
+        collect_fn=lambda proc: _collect_one_demo_labeler(
             proc, demo_name,
             play_start=play_start, play_end=play_end,
-            force_mvd_emit=force_mvd_emit)
-    except Exception as exc:
-        err_tail = _worker_stderr_tail(proc)
-        _shutdown_worker()
-        msg = f"{exc}\n{err_tail}" if err_tail else str(exc)
-        return {"demo": demo_name, "status": "error", "msg": msg[-4000:]}
-
-    if ticks is None:
-        err_tail = _worker_stderr_tail(proc)
-        rc = proc.poll() if proc is not None else None
-        _shutdown_worker()
-        if rc == _WATCHDOG_EXIT_CODE:
-            return {"demo": demo_name, "status": "error",
-                    "msg": f"watchdog stall\n{err_tail}"[-4000:]}
-        return {"demo": demo_name, "status": "crash", "msg": err_tail or "worker crash"}
-
-    # Match bc_collect's per-demo worker shutdown to avoid engine state leaks.
-    _shutdown_worker()
-
-    if len(ticks) < 10:
-        return {"demo": demo_name, "status": "skipped", "ticks": len(ticks)}
-
-    episodes = _unpack_labeler_episode(
-        ticks,
-        labels=labels,
-        drop_label_names=drop_label_names,
-        total_frames=total_frames,
+            force_mvd_emit=force_mvd_emit),
+        unpack_fn=lambda ticks: _unpack_labeler_episode(
+            ticks, labels=labels,
+            drop_label_names=drop_label_names,
+            total_frames=total_frames),
     )
-    # Translate (obs, acts) tuples to the shape run_collect expects,
-    # dropping empty sub-episodes; order preserved so episode_idx is
-    # stable across collects given the same labels + drop_label_names.
-    sized: list[dict] = []
-    for obs, acts in episodes:
-        rows = int(np.asarray(acts["move"]).shape[0])
-        if rows <= 0:
-            continue
-        sized.append({"obs": obs, "actions": acts, "rows": rows})
-    if not sized:
-        return {"demo": demo_name, "status": "skipped", "ticks": len(ticks)}
-    return {
-        "demo": demo_name, "status": "ok", "ticks": len(ticks),
-        "episodes": sized,
-    }
 
 
 # ── corpus filter ─────────────────────────────────────────────────────────────
@@ -319,29 +377,27 @@ def main() -> None:
                          "button-truth — matches the apply-time distribution.")
     ap.add_argument("--filter-config", type=Path, default=None,
                     help="Path to a JSON filter config (same schema as "
-                         "qnn.bc.collect --filter-config).  Demo-level "
-                         "keep / drop predicates gate inclusion; "
-                         "drop_tick_labels carves sub-episodes out of each "
+                         "qnn.bc.collect --filter-config).  demos.keep / "
+                         "demos.drop predicates gate inclusion; "
+                         "segments.drop carves sub-episodes out of each "
                          "kept demo.  Point at artifacts/collect/qwd/"
                          "filter.json to mirror the BC corpus.")
     args = ap.parse_args()
-
-    if args.filter_config is not None:
-        try:
-            filter_spec = json.loads(Path(args.filter_config).read_text())
-            _validate_filter_schema(filter_spec)
-        except (json.JSONDecodeError, ValueError, OSError) as exc:
-            sys.exit(f"--filter-config {args.filter_config!r}: {exc}")
-    else:
-        filter_spec = {}
-    keep_pred = filter_spec.get("keep") or {}
-    drop_pred = filter_spec.get("drop") or {}
-    drop_label_names = tuple(filter_spec.get("drop_tick_labels") or ())
 
     asset_root = args.asset_root.resolve()
     demo_dir = args.demo_dir.resolve()
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
+
+    # Pin the filter to <output>/filter.json so the spec used to produce
+    # this cache always travels with it. See _load_and_pin_filter.
+    filter_spec = _load_and_pin_filter(
+        output, Path(args.filter_config) if args.filter_config else None)
+    demos_block    = filter_spec.get("demos") or {}
+    segments_block = filter_spec.get("segments") or {}
+    keep_pred = demos_block.get("keep") or {}
+    drop_pred = demos_block.get("drop") or {}
+    drop_label_names = tuple(segments_block.get("drop") or ())
 
     manifest_path = (args.manifest if args.manifest
                      else demo_dir.parent / f"{demo_dir.name}_manifest.ndjson")
@@ -398,14 +454,12 @@ def main() -> None:
         shard_kind="labeler",
         extra_demo_filter=rate_gate,
         extra_metadata={
-            "format": "labeler_v2",
+            "format": "labeler_v9",
             "force_mvd_emit": force_mvd_emit,
             "min_hz": min_hz,
-            "filter_config": (str(args.filter_config)
-                              if args.filter_config else None),
-            "drop_tick_labels": list(drop_label_names),
+            "segments_drop": list(drop_label_names),
         },
-        filter_path=Path(args.filter_config) if args.filter_config else None,
+        filter_path=output / "filter.json",
     )
 
 

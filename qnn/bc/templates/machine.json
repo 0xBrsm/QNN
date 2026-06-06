@@ -6,5 +6,6 @@
   "microbatch_size": 128,
   "pin_memory": true,
   "prefetch": 2,
-  "snapshot_interval": 15
+  "snapshot_interval": 15,
+  "preload_to_gpu": false
 }

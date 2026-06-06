@@ -1,11 +1,40 @@
 # Changelog
 
+## 0.19.0
+
+### Added
+
+- v3 confidence-distributed target labeler (`qnn.bc.target_labeler`): weapon-aware analytic-cone lead correction, noisy-OR aggregation, logistic engagement confidence; emits a soft `act_target_dist.npy` and TargetPointer trains by soft-CE. Predicates evaluated against a real QuakeC VM (`qwprogs.dat`); shared `weapon_physics.py` projectile/lead model
+- Native-obs wire format (`engine_norm`): canonical native-width field tables for the self/spatial/entity/action blocks with Self/Spatial/Entity/Action dequantizers and a `wire.py` native buffer parser
+- In-process ONNX inference (`qnn_onnx.c` / libqnn) for `nq_client`, dropping the Python pipe; console-driven `qnn_client` (Quake-style argv, `-model` flag, idle-without-model startup, `.onnx` auto-append), shipped via `docker/Dockerfile.live` and the `engine/build` client scripts
+- `head_probe` run-dir mode: per-head MLP ablation pipeline where `probe.json` is the only entry point (no Python-level defaults); flat-feature fire/target probes migrated onto the canonical BC pipeline
+- `op_input` operative-feasibility column + QC-VM `noop_input_mask` per-tick no-op signal; `op_input_mask` loss toggle that drops held-but-ignored frames per axis
+- Legacy QNN checkpoint-meta converter (`migrate_legacy_flat_meta`) for pre-`engine_norm` weights
+
+### Changed
+
+- BC collect writes native-width obs on disk with a sparse `target_dist`; parallel per-shard loader + numpy densify (17 min → ~3 min preload), GPU-resident epoch loop with pre-dequantize, chunked per-batch dequant (~75k rows/s) and `MADV` page-drop
+- `pmove` seeded from `cl.simorg`/`simvel` and prev-tick state (closes a 91% recall gap); `op_jump` derived from pmove substeps; `self.weapon` persisted across QC `ImpulseCommands`; fire/jump predicates driven per-cmd
+- `self_items` u32 → i32, `half_extents` u8, `act_fire` packed into `act_move` bit 6; item-amount normalization moved C → model lookup; entity table drops the redundant `dist` scalar
+- self token gains an `attack_finished` cooldown scalar (`SELF_SCALAR_DIM` 16→17, `QNN_TIME_SCALE`-normalized) and a current-weapon embedding
+- `ModelConfig` centralizes the architecture (defaults/ReLU stripped); oracle entity order is pool-then-edict (sort stripped)
+
+### Removed
+
+- Wire back-compat passthrough (native obs is the only contract), the legacy f32 wire parser, and `act_target_dist` from the wire (recomputed at training start)
+- Legacy precomputed BC loader; `demo/sanitize.py` (superseded by QC-driven `noop_input_mask`); v3 labeler hard-label compat shims and the hard per-weapon range gate
+
+### Fixed
+
+- Case-sensitive PAK glob on Linux; shards written in submit-order without blocking workers; completed futures popped so parent RSS doesn't grow with worker count
+- Checkpoint converter defaults fire/jump `distance_sigma` to 0.0 in `migrate_legacy_flat_meta`
+
 ## 0.18.0
 
 ### Added
 
 - `qnn.diag` package for trained-policy analysis: ablation, attention, convergence, gradients, linear_probe, participation, pruning, rank, report — driven by the `/diag` skill
-- `qnn.probes.target_head_probe` standalone causal TCN slot probe + GBT variants for offline target-head analysis
+- `qnn.labeler.probes.target_head_probe` standalone causal TCN slot probe + GBT variants for offline target-head analysis
 - `qw_classifier` C binary replaces the Python QWD classifier end-to-end
 - `nq_client` binary + `qnn.eval.live` — canonical live-play entry point against real NQ servers
 - Per-head F1 headline metrics with per-class weapon/move visibility; `head_loss_weights` for per-head loss gating; `jump_pos_weight` with linear decay

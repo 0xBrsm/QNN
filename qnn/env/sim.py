@@ -103,6 +103,7 @@ _SELF_SCALAR_LAYOUT: Dict[str, int] = {
     "weapon_gl": 6, "weapon_rl": 7, "weapon_lg": 8,
     "ammo_shells": 9, "ammo_nails": 10, "ammo_rockets": 11, "ammo_cells": 12,
     # "vel" handled separately — maps to indices 13, 14, 15.
+    "attack_finished": 16,  # normalized seconds remaining over QNN_TIME_SCALE (60s)
 }
 _SPATIAL_LAYOUT: Dict[str, Tuple[int, int]] = {
     "dir":          (0, 3),
@@ -924,11 +925,38 @@ def main() -> int:
         f"|target|={np.linalg.norm(target_world):.3f}"
     )
 
+    from qnn.model.policy import ModelConfig
+    model_cfg = ModelConfig(
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        ffn_dim=args.ffn_dim,
+        attn_dropout=0.0,
+        use_gru=args.use_gru,
+        gru_hidden=args.gru_hidden,
+        use_weapon_head=False,
+        weapon_switch_confidence=0.65,
+        weapon_switch_margin=0.15,
+        weapon_use_gru=False,
+        weapon_use_self_readout=True,
+        weapon_context_from_obs=False,
+        look_bypass_gru=False,
+        gru_target_query=False,
+        hard_target_feat=False,
+        weapon_in_target_query=False,
+        linear_slot_prior=False,
+        gt_dist_target_feat=False,
+        prev_target_in_query=False,
+        self_weapon_embed_in_self=False,
+        head_bottleneck_dim={"move": 0, "look": 0, "fire": 0, "weapon": 0},
+        head_activation="none",
+    )
     policy = QNNPolicy(
-        obs_dim=0, trunk_hidden=args.d_model, gru_hidden=args.gru_hidden,
-        use_gru=args.use_gru, seed=args.seed, device=args.device,
-        d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
-        ffn_dim=args.ffn_dim, attn_dropout=0.0,
+        obs_dim=0,
+        model=model_cfg,
+        jump_pos_weight=1.0,
+        seed=args.seed,
+        device=args.device,
     )
     print(
         f"policy: d_model={policy.d_model} gru={policy.use_gru} "

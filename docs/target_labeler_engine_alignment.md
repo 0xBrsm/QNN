@@ -541,7 +541,7 @@ and a re-collect with all four token pools (not just PVS actors).
 
 Built a standalone causal target-prediction probe to isolate the 16-way
 slot classification problem from the full BC trunk
-(`qnn/probes/target_head_probe.py`). Architecture: per-slot scalar
+(`qnn/labeler/probes/target_head_probe.py`). Architecture: per-slot scalar
 MLP → flat per-frame vector → 7-layer dilated causal TCN (kernel 3,
 channels 128, RF=127 frames ≈ 1.8 s @ 70 Hz), 369k params total.
 Trained on the full opt3-relabeled QWD corpus with slot-0 down-weighted
@@ -863,14 +863,14 @@ The original analysis scripts (§2-6 metrics) live in `/tmp/`:
 
 The §8 post-deployment scripts are checked in:
 
-- `qnn/probes/target_head_probe.py` — causal TCN target-prediction
+- `qnn/labeler/probes/target_head_probe.py` — causal TCN target-prediction
   probe (§8.1)
-- `qnn/probes/target_head_diag.py` — feature-ablation diagnostics on
+- `qnn/labeler/probes/target_head_diag.py` — feature-ablation diagnostics on
   trained TCN
-- `qnn/probes/target_head_gbt.py` — LightGBM target-prediction probe
+- `qnn/labeler/probes/target_head_gbt.py` — LightGBM target-prediction probe
   (§8.3); supports `default` and `randomize` modes plus `--no-masks` and
   `--token-mask` knobs
-- `qnn/probes/target_head_gbt_eval.py` — per-original-slot eval of
+- `qnn/labeler/probes/target_head_gbt_eval.py` — per-original-slot eval of
   randomize-mode GBT (§8.3.2 table)
 
 The 4-pool re-collect baseline tables in §8.2 were produced by ad-hoc

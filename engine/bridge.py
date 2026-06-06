@@ -257,7 +257,12 @@ class NativeProcessBase:
 
 import numpy as np
 
-from qnn.wire import OBS_BUFFER_SIZE, unpack_obs_buffer as _unpack_obs_buffer
+# engine_norm phase 2: C side emits the native-width obs buffer per
+# qnn.engine_norm (see src/engine/common/qnn_io.{h,c}). The legacy f32
+# parser is dead; we use the native dict format end-to-end on this
+# bridge. Downstream consumers (qnn.model.policy via Tokenizer's
+# dequantizers, qnn.eval.live's logging) read the native key set.
+from qnn.wire import OBS_BUFFER_SIZE, unpack_obs_buffer_native as _unpack_obs_buffer
 
 
 class NativeObsBufferProcess(NativeProcessBase):

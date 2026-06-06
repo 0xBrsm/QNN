@@ -24,6 +24,7 @@ CUSTOM_SOURCES=(
   "${ENGINE_DIR}/common/qnn_spatial.c"
   "${ENGINE_DIR}/nq/qnn_self.c"
   "${ENGINE_DIR}/common/qnn_self_common.c"
+  "${ENGINE_DIR}/nq/qnn_progs_stub.c"
   "${ENGINE_DIR}/common/qnn_io.c"
   "${ENGINE_DIR}/common/qnn_metrics.c"
   "${ENGINE_DIR}/common/qnn_fault.c"

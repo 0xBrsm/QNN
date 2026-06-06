@@ -33,7 +33,7 @@ python -m qnn.run.router --run-dir runs/bc/bc_v1
 | `qnn/eval/` | Evaluation — run checkpoints against bots and live NQ servers |
 | `qnn/env/` | Live engine interface — NativeWorldEnv, reward, planning |
 | `qnn/diag/` | Capacity diagnostics for trained policies |
-| `qnn/probes/` | Standalone target-head probes (causal TCN, GBT) |
+| `qnn/labeler/probes/` | Standalone target-head probes (causal TCN, GBT) |
 | `engine/` | C worker source — `common/` (shared), `nq/` (NetQuake), `qw/` (QuakeWorld) |
 | `engine/build/` | Build scripts for worker binaries (`ppo_worker`, `nq_demo_worker`, `nq_client`, `qw_demo_worker`, `qw_classifier`) |
 | `demo/` | Quake `.dem` parser and label extraction |

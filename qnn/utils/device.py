@@ -83,6 +83,12 @@ def describe_torch_runtime(requested: str | None = None) -> Dict[str, Any]:
         spec = TorchDeviceSpec(requested=requested or "auto", resolved="unavailable", backend="unavailable")
         error = str(exc)
 
+    probe_cuda = spec.backend in {"cuda", "rocm"} or (
+        spec.requested not in {"cpu"} and spec.backend != "cpu"
+    )
+    cuda_available = bool(torch.cuda.is_available()) if probe_cuda else False
+    cuda_device_count = int(torch.cuda.device_count()) if cuda_available else 0
+
     summary: Dict[str, Any] = {
         "torch_version": torch.__version__,
         "requested_device": spec.requested,
@@ -90,15 +96,15 @@ def describe_torch_runtime(requested: str | None = None) -> Dict[str, Any]:
         "backend": spec.backend,
         "cpu_count": int(os.cpu_count() or 1),
         "cpu_affinity_count": int(len(os.sched_getaffinity(0))) if hasattr(os, "sched_getaffinity") else int(os.cpu_count() or 1),
-        "cuda_available": bool(torch.cuda.is_available()),
-        "cuda_device_count": int(torch.cuda.device_count()),
+        "cuda_available": cuda_available,
+        "cuda_device_count": cuda_device_count,
         "cuda_version": torch.version.cuda,
         "hip_version": getattr(torch.version, "hip", None),
         "mps_available": _mps_available(),
     }
     if error is not None:
         summary["error"] = error
-    if torch.cuda.is_available():
+    if cuda_available:
         summary["devices"] = [
             {
                 "index": idx,

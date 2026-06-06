@@ -38,6 +38,10 @@
  * into the NQ-flavor fields the shared worker code reads. */
 extern void QNN_SyncEngineCompat(void);
 extern void QNN_SyncBaselines(void);
+/* Per-frame entity visibility refresh — clears cl_entities[].model
+ * for non-PVS slots so the shared QNN_EntityClassifyKnown walk sees
+ * the same universe a normal NQ client would.  See qnn_engine_compat.c. */
+extern void QNN_SyncPacketEntities(void);
 
 #define QNN_TELEPORT_DIST_SQ (400.0f * 400.0f)
 
@@ -246,6 +250,11 @@ static void QNN_DetectNativeTickHz(void)
 static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, qboolean reset_flag)
 {
 	QNN_SyncEngineCompat();
+	/* Refresh cl_entities[] PVS visibility from this frame's packet
+	 * entity list before QNN_CaptureBaseSnapshot → QNN_IOUpdate →
+	 * QNN_StoreUpdate → QNN_EntityClassifyKnown reads the universe.
+	 * Without this, baseline-seeded items leak through as always-PVS. */
+	QNN_SyncPacketEntities();
 	QNN_CaptureBaseSnapshot(snapshot);
 	snapshot->done = reset_flag ? false : qnn_runtime.done;
 	QNN_DrainSounds(snapshot);
@@ -287,6 +296,7 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, char *error, size_t e
 	QNN_TickEmitReset(&qnn_runtime.tick_emit);
 	QNN_MvdCollectReset((uintptr_t)qnn_runtime.demo_path);
 	QNN_LabelerCollectReset();
+	QNN_QwdCollectReset();
 	QNN_ResetPingEstimator();
 	cls.demonum = -1;
 	cls.timedemo = false;
@@ -531,6 +541,23 @@ static int QNN_HandleCollect(const char *line)
 		return 0;
 	}
 
+	/* QC VM init must happen AFTER QNN_ResetWorldLocal: the world reset
+	 * resets the QW client's hunk (Host_ClearMemory), which would wipe
+	 * any memory PR_LoadProgs had allocated for progs/pr_functions/
+	 * pr_strings/etc.  Initializing here puts the QC bytecode at the
+	 * top of the hunk where it stays valid for the duration of demo
+	 * playback.  QC VM is the canonical source of truth for the labeler's
+	 * op_input (fire / jump operativeness) — if it fails to load,
+	 * the worker has no principled sanitization, so we hard-fail. */
+	if (!QNN_ProgsInit())
+	{
+		QNN_WriteError("qnn_progs: QC VM init failed (qwprogs.dat missing or "
+			"version mismatch).  Labeler-mode collect requires QC VM for "
+			"op_input sanitization.");
+		QNN_FaultSetContext(NULL);
+		return 0;
+	}
+
 	/* cl_nopred: always run prediction.
 	 *
 	 * Prediction is left on regardless of mode because CL_PredictMove
@@ -577,10 +604,14 @@ static int QNN_HandleCollect(const char *line)
 			cl.playernum, cl.players[cl.playernum].name);
 	}
 
-	/* Initialize BSP-clipped physics for movement inference whenever the
-	 * inference path will be exercised — real MVDs and force_mvd_emit on
-	 * QWDs both need it. */
-	if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
+	/* Initialize BSP-clipped physics for any path that will call into
+	 * PlayerMove() during this demo: MVD movement inference, QWD MVD-
+	 * inference (force_mvd_emit), and the QWD labeler's per-cmd pmove
+	 * jump driver.  Without this, pmove.physents[0].model points at the
+	 * previous demo's freed worldmodel (or NULL on the first demo) and
+	 * the next trace SEGVs. */
+	if (cls.mvdplayback || qnn_runtime.force_mvd_emit
+		|| qnn_runtime.labeler_mode)
 		QNN_PhysInit();
 
 	/* Engine tick = emit tick.  fixed_dt was set from hello.tick_hz and
@@ -688,22 +719,35 @@ static int QNN_HandleCollect(const char *line)
 				}
 			}
 
-			/* Extract per-frame action */
+			/* Extract per-frame action (MVD path only).
+			 *
+			 * MVD branch carries a real side effect:
+			 * QNN_MvdInferNativeAction sets
+			 * qnn_runtime.native_fire_this_window for the back-shift
+			 * fire emit downstream.
+			 *
+			 * QWD branch was a dead call: native_action is
+			 * write-only across this function, so the only effect of
+			 * calling QwdExtractAction here was advancing
+			 * qnn_progs_attack_finished a second time within the same
+			 * tick — QwdInferEmitAction (line below) internally calls
+			 * QwdExtractAction once per tick already, and the per-cmd
+			 * loop's QNN_ProgsEvalAttack on the second call saw the
+			 * just-set future attack_finished and rejected every
+			 * fire, leaving qwd_state.last_op_fire = 0 in the stash
+			 * QwdPackOpInput reads. Result: op_input bit 3 never set
+			 * across the BC QWD corpus. Same failure mode commit
+			 * 4c7c9b4d fixed for the labeler path. */
 			if (!snapshot.done)
 			{
 				if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
 					QNN_MvdInferNativeAction(&native_action,
 						&snapshot);
-				else
-					(void)QNN_QwdExtractAction(&native_action);
 			}
-			else
-				QNN_ClearAction(&native_action);
 
-			/* Emit-time action label + (QWD only) the cmd-window impulse
-			 * target weapon that the back-shift ring's impulse walk-back
-			 * will anchor server-observed transitions to. */
-			int qwd_impulse_target = 0;
+			/* Emit-time action label.  QWD path is a pure usercmd-byte
+			 * decoder (action.weapon written canonically inside
+			 * QNN_QwdInferEmitAction); MVD path runs inference. */
 			if (!snapshot.done)
 			{
 				if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
@@ -732,7 +776,7 @@ static int QNN_HandleCollect(const char *line)
 				}
 				else
 				{
-					qwd_impulse_target = QNN_QwdInferEmitAction(
+					QNN_QwdInferEmitAction(
 						&snapshot.action_label,
 						&snapshot);
 				}
@@ -764,7 +808,7 @@ static int QNN_HandleCollect(const char *line)
 				if (qnn_runtime.force_mvd_emit && !cls.mvdplayback)
 				{
 					filter_snapshot = snapshot;
-					(void)QNN_QwdInferEmitAction(&filter_snapshot.action_label,
+					QNN_QwdInferEmitAction(&filter_snapshot.action_label,
 						&snapshot);
 					emit_out = QNN_EmitFilter(&filter_snapshot);
 					if (snapshot.health <= 0)
@@ -780,13 +824,10 @@ static int QNN_HandleCollect(const char *line)
 					emit_out = QNN_EmitFilter(&snapshot);
 				}
 
-				/* Both QWD and MVD paths go through the back-shift
-				 * ring; the difference is the back-shift mechanism:
-				 *   QWD: walk back to the cmd-window impulse that
-				 *        caused the observed transition (exact).
-				 *   MVD: shift by ping + tick/2 (approximate).
-				 * Action labels themselves are the same — current
-				 * server-observed weapon (snapshot->weapon_id). */
+				/* QWD path is a pure cmd-byte decoder — action.weapon
+				 * is already the canonical label, no rewriting needed.
+				 * Only the MVD path runs back-shift inference (weapon
+				 * via ping-shift + pickup gate, fire/jump per-event). */
 				QNN_PackSnapshotObs(&snapshot, obs_bytes);
 
 				/* Maintain per-demo running median of svc_updateping
@@ -794,6 +835,7 @@ static int QNN_HandleCollect(const char *line)
 				 * path as a garbage-input fallback). */
 				QNN_ObservePings();
 
+				if (mvd_path)
 				{
 					int prev_weapon = 0;
 					qboolean has_prev_weapon =
@@ -802,15 +844,15 @@ static int QNN_HandleCollect(const char *line)
 						&& prev_weapon != cur_weapon
 						&& cur_weapon > 0)
 					{
-						int shift = 0;
-						/* Pickup gate (applies to both paths): if the new
-						 * weapon's IT_ bit flipped 0→1 this frame, the
-						 * transition is the server's weapon_touch auto-switch
-						 * — items|=new and self.weapon=new happen in one QC
-						 * call.  Impulse handlers can't fire on a bit that
-						 * wasn't already on, so a player-intent switch to a
-						 * just-acquired weapon can only land ≥1 frame later.
-						 * Leave the label at the server-observed frame. */
+						int shift;
+						/* Pickup gate: if the new weapon's IT_ bit
+						 * flipped 0→1 this frame, the transition is the
+						 * server's weapon_touch auto-switch (items|=new
+						 * and self.weapon=new in one QC call).  Impulse
+						 * handlers can't fire on a bit that wasn't
+						 * already on, so a player-intent switch can
+						 * only land ≥1 frame later.  Leave the label
+						 * at the server-observed frame. */
 						int it_bit = QNN_ItemFlagFromImpulse(cur_weapon);
 						int items_now = cl.stats[STAT_ITEMS];
 						int prev_items = 0;
@@ -822,36 +864,10 @@ static int QNN_HandleCollect(const char *line)
 							&& (items_now & it_bit)
 							&& !(prev_items & it_bit);
 						if (is_pickup)
-						{
-							/* shift stays 0 */
-						}
-						else if (mvd_path)
-						{
+							shift = 0;
+						else
 							shift = QNN_PressBackShiftFrames(
 								cl.playernum, emit_hz);
-						}
-						else if (qwd_impulse_target == cur_weapon)
-						{
-							/* Press lands in current frame's cmd window;
-							 * transition is anchored at T already. */
-							shift = 0;
-						}
-						else
-						{
-							/* QWD walk-back, bounded by what ping makes
-							 * plausible.  Cap = ping-derived expected shift
-							 * + 1 frame slack for jitter.  Beyond that,
-							 * matches are stale impulses being falsely
-							 * anchored to subsequent server-driven
-							 * transitions (out-of-ammo etc.), not real
-							 * press-to-server delay. */
-							int cap = QNN_PressBackShiftFrames(
-								cl.playernum, emit_hz) + 1;
-							if (cap > QNN_BACKSHIFT_MAX_IMPULSE_WALKBACK)
-								cap = QNN_BACKSHIFT_MAX_IMPULSE_WALKBACK;
-							shift = QNN_MvdBackShiftImpulseWalkback(
-								cur_weapon, cap);
-						}
 						QNN_MvdBackShiftOnWeaponChange(
 							cur_weapon, prev_weapon, shift);
 
@@ -871,7 +887,7 @@ static int QNN_HandleCollect(const char *line)
 					snapshot.done,
 					qnn_runtime.tick, qnn_runtime.steps,
 					emit_hz, false, snapshot.grounded,
-					cur_weapon, qwd_impulse_target,
+					cur_weapon,
 					cl.stats[STAT_ITEMS]);
 
 				if (mvd_path)
@@ -980,6 +996,16 @@ int main(int argc, char **argv)
 	cls.demonum = -1;
 	CL_Disconnect();
 	cls.state = ca_disconnected;
+
+	/* Optional: load qwprogs.dat into the server VM and run a smoke
+	 * test of the QC VM predicates.  Per-demo QNN_ProgsInit fires from
+	 * the "reset" handler; this argv switch lets bring-up validation
+	 * run without dispatching a real demo. */
+	if (COM_CheckParm("-sanitize-smoke"))
+	{
+		if (QNN_ProgsInit())
+			QNN_ProgsSmokeTest();
+	}
 
 	while (fgets(line, sizeof(line), stdin) != NULL)
 	{

@@ -188,6 +188,13 @@ float QNN_PressPingSec(int player_slot)
 	return (float)QNN_PressPingMs(player_slot) / 1000.0f;
 }
 
+int QNN_SelfPingMs(void)
+{
+	if (cl.playernum < 0 || cl.playernum >= MAX_CLIENTS)
+		return 0;
+	return QNN_PressPingMs(cl.playernum);
+}
+
 int QNN_PressBackShiftFrames(int player_slot, int emit_hz)
 {
 	int ping_ms;

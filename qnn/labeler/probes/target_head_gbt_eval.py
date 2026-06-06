@@ -12,7 +12,7 @@ For mis-predictions, reports what the model picked instead — was it the
 "primary" enemy (slot 0 in pre-permute), some other enemy, or a non-enemy?
 
 Usage:
-    PYTHONPATH=src python -m qnn.probes.target_head_gbt_eval \
+    PYTHONPATH=src python -m qnn.labeler.probes.target_head_gbt_eval \
         --data-dir artifacts/collect/qwd \
         --model    runs/probe/gbt_randomize/lgb_model.txt \
         --seed     17
@@ -26,8 +26,8 @@ from pathlib import Path
 import numpy as np
 import lightgbm as lgb
 
-from qnn.probes.target_head_probe import _load_split
-from qnn.probes.target_head_gbt import _build_flat_features
+from qnn.labeler.probes.target_head_probe import _load_split
+from qnn.labeler.probes.target_head_gbt import _build_flat_features
 
 
 def main() -> None:

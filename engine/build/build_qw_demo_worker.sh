@@ -27,6 +27,9 @@ OUTPUT_PATH=${1:-"${REPO_ROOT}/assets/bin/qw_demo_worker"}
 # our own sound/sys/main implementations.
 
 QW_UPSTREAM_SOURCES=(
+  pr_exec.c
+  pr_edict.c
+  pr_cmds.c
   cl_cam.c
   cl_demo.c
   cl_ents.c
@@ -97,6 +100,7 @@ QW_CUSTOM_SOURCES=(
   "${ENGINE_DIR}/common/qnn_sys_common.c"
   "${ENGINE_DIR}/qw/qnn_collect_main.c"
   "${ENGINE_DIR}/common/qnn_collect_helpers.c"
+  "${ENGINE_DIR}/common/qnn_hold_samplers.c"
   "${ENGINE_DIR}/common/qnn_mvd_collect.c"
   "${ENGINE_DIR}/qw/qnn_qwd_collect.c"
   "${ENGINE_DIR}/common/qnn_labeler_collect.c"
@@ -118,6 +122,9 @@ QW_CUSTOM_SOURCES=(
   "${ENGINE_DIR}/common/qnn_tick.c"
   "${ENGINE_DIR}/qw/qnn_phys.c"
   "${ENGINE_DIR}/qw/qnn_stubs.c"
+  "${ENGINE_DIR}/qw/qnn_progs_stubs.c"
+  "${ENGINE_DIR}/qw/qnn_progs.c"
+  "${ENGINE_DIR}/qw/qnn_pmove_hooks.c"
 )
 
 # ── C++ nav sources (shared with NQ) ─────────────────────────────
@@ -185,6 +192,21 @@ git -C "${UPSTREAM_DIR}" fetch -q --depth 1 origin "${UPSTREAM_COMMIT}"
 git -C "${UPSTREAM_DIR}" checkout -q --detach FETCH_HEAD
 
 cp -R "${UPSTREAM_DIR}/QW/client" "${WORKTREE_DIR}"
+
+# Also bring in the QW server-side QC VM sources (pr_exec.c, pr_edict.c,
+# pr_cmds.c + their headers).  The worker normally doesn't need them, but
+# the optional --sanitize-inputs collect mode loads qwprogs.dat through
+# the real VM to evaluate per-tick operative-input predicates exactly as
+# the server engine would.
+cp "${UPSTREAM_DIR}/QW/server/pr_exec.c"  "${WORKTREE_DIR}/"
+cp "${UPSTREAM_DIR}/QW/server/pr_edict.c" "${WORKTREE_DIR}/"
+cp "${UPSTREAM_DIR}/QW/server/pr_cmds.c"  "${WORKTREE_DIR}/"
+cp "${UPSTREAM_DIR}/QW/server/progs.h"    "${WORKTREE_DIR}/"
+cp "${UPSTREAM_DIR}/QW/server/progdefs.h" "${WORKTREE_DIR}/"
+cp "${UPSTREAM_DIR}/QW/server/pr_comp.h"  "${WORKTREE_DIR}/"
+cp "${UPSTREAM_DIR}/QW/server/qwsvdef.h"  "${WORKTREE_DIR}/"
+cp "${UPSTREAM_DIR}/QW/server/server.h"   "${WORKTREE_DIR}/"
+cp "${UPSTREAM_DIR}/QW/server/world.h"    "${WORKTREE_DIR}/"
 
 # ── Patch helper ─────────────────────────────────────────────────
 #
@@ -367,7 +389,12 @@ extern player_state_t qnn_mvd_latest_playerstate[MAX_CLIENTS];
  * CL_EntityNum bumps it), but shared QNN code uses it to bound the
  * cl_entities[] iteration in QNN_MapBuildFromBaselines and
  * QNN_EntityClassifyKnown. Without this, items and movers (which only
- * enter qnn_store via the baseline path) are silently skipped. */
+ * enter qnn_store via the baseline path) are silently skipped.
+ *
+ * Per-frame visibility is then refreshed by QNN_SyncPacketEntities,
+ * which mirrors vanilla NQ's CL_RelinkEntities behavior — entities
+ * not in the current packet's PVS list get model = NULL so the
+ * shared QNN_EntityClassifyKnown walk drops them naturally. */
 void QNN_SyncBaselines(void)
 {
     int i;
@@ -379,11 +406,10 @@ void QNN_SyncBaselines(void)
         VectorCopy(cl_baselines[i].origin, cl_entities[i].origin);
         VectorCopy(cl_baselines[i].origin, cl_entities[i].msg_origins[0]);
         VectorCopy(cl_baselines[i].origin, cl_entities[i].msg_origins[1]);
-        /* Also seed cl_entities[].model from the precached model. QW
-         * packetentities only carry entries for entities that move or
-         * change state, so stationary brush movers (closed doors,
-         * un-triggered plats) would otherwise leave model == NULL and
-         * get skipped by QNN_EntityClassifyKnown. */
+        /* Seed cl_entities[].model from the precached model so the
+         * one-time QNN_MapBuildFromBaselines pass (run at map load)
+         * sees every map item / mover.  QNN_SyncPacketEntities then
+         * owns model freshness per frame from cl.frames[]. */
         if (mi > 0 && mi < MAX_MODELS)
         {
             cl_entities[i].model = cl.model_precache[mi];
@@ -395,6 +421,83 @@ void QNN_SyncBaselines(void)
         }
     }
     cl.num_entities = max_baseline + 1;
+}
+
+/* Apply a single entity_state_t snapshot to a cl_entities[] slot.
+ * Shared helper between the per-frame packet entity refresh and any
+ * future per-state writer.  Updates the NQ-compat fields the shared
+ * QNN_EntityClassifyKnown / QNN_StoreUpdate path reads. */
+static void QNN_ApplyEntityState(entity_t *ent, const entity_state_t *s,
+    struct model_s *mdl, float now)
+{
+    VectorCopy(ent->msg_origins[0], ent->msg_origins[1]);
+    VectorCopy(s->origin, ent->msg_origins[0]);
+    VectorCopy(s->origin, ent->origin);
+    VectorCopy(s->angles, ent->angles);
+    ent->model   = mdl;
+    ent->effects = s->effects;
+    ent->skinnum = s->skinnum;
+    ent->frame   = s->frame;
+    ent->msgtime = now;
+}
+
+/* Refresh cl_entities[] per frame to match the recording's current
+ * PVS universe, mirroring vanilla NQ's CL_RelinkEntities convention:
+ *   cl_entities[i].model != NULL  <=>  entity in this frame's PVS.
+ *
+ * QWD demos are server-PVS-filtered — packet_entities carries the
+ * full PVS list each tick (vanilla QW delta-decode rebuilds the full
+ * set from prior frame).  Sweep clears model for any non-player slot
+ * not refreshed this frame so the shared QNN_EntityClassifyKnown
+ * model-NULL check drops everything outside PVS.
+ *
+ * MVD recordings carry the whole map every frame (no server cull).
+ * The geometric QNN_EntityInPvs overlay in qnn_entity.c is the
+ * per-viewer filter for those, so we leave baselines live here. */
+void QNN_SyncPacketEntities(void)
+{
+    float now = (float)cl.mtime[0];
+    int   i;
+
+    if (cls.mvdplayback)
+        return;
+
+    if (cl.validsequence > 0)
+    {
+        packet_entities_t *pack = &cl.frames[cl.validsequence & UPDATE_MASK].packet_entities;
+        for (i = 0; i < pack->num_entities; ++i)
+        {
+            entity_state_t *s = &pack->entities[i];
+            int             entnum = s->number;
+            struct model_s *mdl;
+
+            if (entnum <= 0 || entnum >= QW_CL_ENTITIES_SIZE)
+                continue;
+            /* Slots 1..maxclients are players, owned by qnn_players.c
+             * via playerstate.  Don't disturb them. */
+            if (entnum >= 1 && entnum <= cl.maxclients)
+                continue;
+            if (s->modelindex <= 0 || s->modelindex >= MAX_MODELS)
+                continue;
+            mdl = cl.model_precache[s->modelindex];
+            if (mdl == NULL)
+                continue;
+
+            QNN_ApplyEntityState(&cl_entities[entnum], s, mdl, now);
+        }
+    }
+
+    /* Sweep: drop any non-player cl_entity not refreshed this frame.
+     * Skip the local viewentity (cl.viewentity) and the player band
+     * (1..maxclients).  QNN_EntityClassifyKnown filters on model
+     * != NULL so this is the per-frame PVS gate. */
+    for (i = cl.maxclients + 1; i < cl.num_entities; ++i)
+    {
+        if (i == cl.viewentity)
+            continue;
+        if (cl_entities[i].msgtime != now)
+            cl_entities[i].model = NULL;
+    }
 }
 
 /* Called each frame to sync NQ-compat fields from QW state */
@@ -1719,6 +1822,27 @@ if 'Multi-session demo recording' not in t:
 p.write_text(t, errors='surrogateescape')
 PY
 
+# 26. Hook pmove.c JumpButton success branch to set qnn_pmove_jump_fired
+#     so the QWD labeler's per-cmd pmove driver can detect physics jumps
+#     directly (no snapshot.grounded lag, no K-gate workaround).  Single
+#     line added inside JumpButton after the velocity+270 bump; guarded
+#     so rebuilds are idempotent.
+apply_subst pmove.c 'qnn_pmove_jump_fired' <<'EOF'
+	onground = -1;
+	pmove.velocity[2] += 270;
+
+	pmove.oldbuttons |= BUTTON_JUMP;	// don't jump again until released
+}
+===NEW===
+	onground = -1;
+	pmove.velocity[2] += 270;
+
+	{ extern int qnn_pmove_jump_fired; qnn_pmove_jump_fired = 1; }
+
+	pmove.oldbuttons |= BUTTON_JUMP;	// don't jump again until released
+}
+EOF
+
 echo "==> QW sources patched for headless build (with MVD support)"
 
 # ── Compile ──────────────────────────────────────────────────────
@@ -1813,5 +1937,13 @@ c++ \
   -o "${OUTPUT_PATH}" \
   "${OBJECTS[@]}" \
   -lm
+
+# Install qwprogs.dat into the asset search path (assets/qw/).  Required
+# by the worker's --sanitize-inputs mode, which loads it through the
+# real QC VM (qnn_progs.c) for per-tick predicate evaluation.  Sourced
+# from the same vendor commit as the C sources above.
+QWPROGS_DST="${REPO_ROOT}/assets/qw/qwprogs.dat"
+mkdir -p "$(dirname "${QWPROGS_DST}")"
+cp "${UPSTREAM_DIR}/QW/progs/qwprogs.dat" "${QWPROGS_DST}"
 
 printf '%s\n' "${OUTPUT_PATH}"

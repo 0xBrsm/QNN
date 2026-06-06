@@ -578,9 +578,11 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 	int pvs_count = 0;
 	int entity_num;
 	float server_dt = (float)(cl.mtime[0] - cl.mtime[1]);
-	/* QW MVD demos contain all entities (no server-side PVS culling).
-	 * Apply client-side PVS filtering so the model trains on what a
-	 * normal client would actually see. NQ demos are already culled. */
+	/* MVD recordings carry every map entity (no server PVS culling).
+	 * Apply a per-viewer geometric PVS overlay so the model sees only
+	 * what a normal client would see. QWD and NQ recordings are already
+	 * server-PVS-filtered, and QNN_SyncPacketEntities / CL_RelinkEntities
+	 * mirror that filter into cl_entities[].model — no extra gate needed. */
 #ifdef QNN_QW_BUILD
 	qboolean apply_pvs = cls.mvdplayback ? true : false;
 #else

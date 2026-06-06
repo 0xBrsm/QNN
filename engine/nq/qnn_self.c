@@ -32,6 +32,9 @@ int QNN_PressBackShiftFrames(int player_slot, int emit_hz)
 	return 0;
 }
 
+int QNN_PressPingMs(int player_slot) { (void)player_slot; return 0; }
+int QNN_SelfPingMs(void) { return 0; }
+
 /* NQ inventory lives in cl.items directly (not cl.stats[STAT_ITEMS]).
  * Same cycle order as QW since the IT_* constants and weapons.qc
  * priority match between the two engines. */

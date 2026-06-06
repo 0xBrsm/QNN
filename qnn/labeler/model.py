@@ -45,6 +45,7 @@ CORE_FEAT_DIM  = 9         # vel(3) + mid_oh(3) + look(3)
 BASELINE_DIM   = 6         # per-axis one-hot {neg, none, pos} for fb + lr
 BASELINE_EPS   = 0.01      # normalized 20 u/s — same threshold as the bakeoff B variant
 GBT_STACK_DIM  = 6         # per-axis softmax probs from GBT (fb 3 + lr 3) as TCN inputs
+WEAPON_OH_DIM  = 9         # one-hot of weapon_id ∈ {0..8} (0=none, 1=axe..8=LG)
 VEL_CLIP       = 1.0       # clip body-frame normalized vel to [-1, 1] (matches QW max ~700 u/s)
 
 
@@ -52,6 +53,7 @@ VEL_CLIP       = 1.0       # clip body-frame normalized vel to [-1, 1] (matches 
 class FeatureSpec:
     is_firing:         bool = False
     is_jumping:        bool = False
+    use_weapon_id:     bool = False   # one-hot of server-held weapon (9 dims)
     use_baseline:      bool = False   # per-frame sign(velocity) baseline concatenated into input
     use_baseline_skip: bool = False   # baseline bypasses trunk and adds directly to output logits
     # When use_baseline_skip is set, restrict the skip to specific axes.
@@ -65,6 +67,7 @@ class FeatureSpec:
         return (CORE_FEAT_DIM
             + int(self.is_firing)
             + int(self.is_jumping)
+            + (WEAPON_OH_DIM if self.use_weapon_id else 0)
             + (BASELINE_DIM if self.use_baseline else 0)
             + (GBT_STACK_DIM if self.use_gbt_stack else 0))
 
@@ -98,6 +101,7 @@ def build_features(
     *,
     c_rule_fire: np.ndarray | None = None,          # (T,) {0,1}
     c_rule_jump: np.ndarray | None = None,          # (T,) {0,1}
+    weapon_id: np.ndarray | None = None,            # (T,) uint8 ∈ {0..8}
     gbt_probs: np.ndarray | None = None,            # (T, 6) softmax probs (fb 3 + lr 3)
     spec: FeatureSpec | None = None,
 ) -> np.ndarray:
@@ -110,6 +114,7 @@ def build_features(
         spec = FeatureSpec(
             is_firing=c_rule_fire is not None,
             is_jumping=c_rule_jump is not None,
+            use_weapon_id=weapon_id is not None,
             use_gbt_stack=gbt_probs is not None,
         )
 
@@ -134,6 +139,14 @@ def build_features(
         if c_rule_jump is None:
             raise ValueError("spec.is_jumping set but c_rule_jump is None")
         parts.append(np.asarray(c_rule_jump, dtype=np.float32).reshape(-1, 1))
+    if spec.use_weapon_id:
+        if weapon_id is None:
+            raise ValueError("spec.use_weapon_id set but weapon_id is None")
+        wid = np.asarray(weapon_id, dtype=np.int32).reshape(-1)
+        wid = np.clip(wid, 0, WEAPON_OH_DIM - 1)
+        weapon_oh = np.zeros((wid.shape[0], WEAPON_OH_DIM), dtype=np.float32)
+        weapon_oh[np.arange(wid.shape[0]), wid] = 1.0
+        parts.append(weapon_oh)
     if spec.use_baseline:
         # Per-axis sign-of-velocity baseline (fb, lr) as 2x one-hot {neg, none, pos}.
         # Same threshold the bakeoff B+shift variant used; lets the model start

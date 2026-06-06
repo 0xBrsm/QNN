@@ -117,6 +117,7 @@ NAV_CXX_SOURCES=(
 
 COMMON_PATCHES=(
   "${ENGINE_DIR}/patches/cl_parse.c.patch"
+  "${ENGINE_DIR}/patches/cmd.c.patch"
   "${ENGINE_DIR}/patches/com_parse.c.patch"
   "${ENGINE_DIR}/patches/common.c.patch"
   "${ENGINE_DIR}/patches/common.h.patch"
@@ -215,6 +216,7 @@ compile_c_strict() {
     -I"${WORKTREE_DIR}" \
     -I"${ENGINE_DIR}/common" \
     -I"${ENGINE_DIR}/nq" \
+    ${EXTRA_INCLUDES:-} \
     -c "${src}" \
     -o "${obj}"
   OBJECTS+=("${obj}")
@@ -266,12 +268,18 @@ build_worker() {
   # -rdynamic exports symbols into the dynamic table so
   # backtrace_symbols_fd() in qnn_fault.c can print function names
   # rather than raw addresses when a worker crashes.
+  #
+  # EXTRA_LINK_OBJECTS / EXTRA_LINK_FLAGS let individual workers
+  # (e.g. nq_client linking libqnn + libonnxruntime) extend the link
+  # without forcing every worker to inherit those deps.
   c++ \
     -O2 \
     -w \
     -rdynamic \
     -o "${output_path}" \
     "${OBJECTS[@]}" \
+    ${EXTRA_LINK_OBJECTS:-} \
+    ${EXTRA_LINK_FLAGS:-} \
     -lm
 
   printf '%s\n' "${output_path}"

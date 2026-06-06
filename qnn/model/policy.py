@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Tuple
+from typing import Any, Callable, Dict, Iterable, Mapping, Tuple
 
 import numpy as np
 import torch
@@ -27,13 +27,6 @@ from qnn.utils.device import configure_torch_runtime, resolve_torch_device
 from qnn.utils.io import trusted_torch_load
 from qnn.vocab import ENTITY_IDS, TOKEN_ACTOR
 
-def _resolve_bottleneck_dims(raw: "int | dict") -> "dict[str, int]":
-    """Normalise head_bottleneck_dim (int or per-head dict) to a full dict."""
-    if isinstance(raw, dict):
-        return {k: int(v) for k, v in raw.items()}
-    val = int(raw)
-    return {"move": val, "look": val, "fire": val, "weapon": val}
-
 
 HEAD_LOSS_WEIGHTS: Dict[str, float] = {
     "target": 1.0,
@@ -41,6 +34,78 @@ HEAD_LOSS_WEIGHTS: Dict[str, float] = {
     "look": 1.0,
     "fire": 1.0,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ModelConfig:
+    """Canonical model architecture config — sole source of truth for arch.
+
+    All fields are required; defaults live only in model.json. The
+    dataclass is frozen so a constructed config can't drift from its
+    serialized form. ``head_activation`` is "none" or "gelu" (ReLU was
+    removed). ``head_bottleneck_dim`` is per-head ({move,look,fire,weapon}
+    → int); ``0`` disables the bottleneck for that head.
+    """
+    d_model: int
+    n_heads: int
+    n_layers: int
+    ffn_dim: int
+    attn_dropout: float
+    use_gru: bool
+    gru_hidden: int
+    use_weapon_head: bool
+    weapon_switch_confidence: float
+    weapon_switch_margin: float
+    weapon_use_gru: bool
+    weapon_context_from_obs: bool
+    look_bypass_gru: bool
+    gru_target_query: bool
+    hard_target_feat: bool
+    weapon_in_target_query: bool
+    linear_slot_prior: bool
+    gt_dist_target_feat: bool
+    prev_target_in_query: bool
+    weapon_use_self_readout: bool
+    self_weapon_embed_in_self: bool
+    head_bottleneck_dim: "dict[str, int]"
+    head_activation: str
+
+    @classmethod
+    def from_dict(cls, raw: "Mapping[str, Any]") -> "ModelConfig":
+        """Build from a model.json-style mapping.
+
+        Accepts ``head_bottleneck_dim`` as either an int (broadcast to all
+        four heads) or a per-head dict. Strips the legacy ``trunk_hidden``
+        alias of ``d_model``. Any other unknown key or any missing
+        required field raises TypeError — every architectural flag must
+        be set explicitly in model.json.
+        """
+        data = dict(raw)
+        data.pop("trunk_hidden", None)
+        hbd = data.get("head_bottleneck_dim")
+        if isinstance(hbd, int):
+            v = int(hbd)
+            data["head_bottleneck_dim"] = {"move": v, "look": v, "fire": v, "weapon": v}
+        elif isinstance(hbd, Mapping):
+            data["head_bottleneck_dim"] = {k: int(v) for k, v in hbd.items()}
+        if data.get("head_activation") not in ("none", "gelu", "relu"):
+            raise ValueError(
+                f"head_activation must be 'none', 'gelu', or 'relu', got {data.get('head_activation')!r}"
+            )
+        return cls(**data)
+
+    @classmethod
+    def from_flat_dict(cls, raw: "Mapping[str, Any]") -> "ModelConfig":
+        """Like ``from_dict`` but extracts the model fields from a larger
+        flat config dict (e.g. a PPO config that merges train + model
+        keys). Missing required model fields still raise TypeError.
+        """
+        keys = {f.name for f in fields(cls)} | {"trunk_hidden"}
+        subset = {k: v for k, v in raw.items() if k in keys}
+        return cls.from_dict(subset)
+
+    def to_dict(self) -> "dict[str, Any]":
+        return asdict(self)
 
 # Move head: 3 independent categorical axes (fb, lr, ud), each a 3-class
 # softmax over {neg, none, pos}.  Implemented as one Linear(features, 9) and
@@ -53,7 +118,10 @@ LOOK_HEAD_SIZE = 3  # 3D direction vector
 FIRE_HEAD = "fire"
 FIRE_HEAD_SIZE = 1  # binary logit
 WEAPON_HEAD = "weapon"
-WEAPON_HEAD_SIZE = 8
+# WEAPON_HEAD_SIZE = 8 lives in qnn.schema (canonical home alongside
+# SELF_SCALAR_DIM); re-exported here for back-compat with callers that
+# import it from qnn.model.policy.
+from qnn.schema import WEAPON_HEAD_SIZE  # noqa: F401  re-export
 WEAPON_HEAD_CLASS_NAMES: Tuple[Tuple[int, str], ...] = (
     (0, "axe"),
     (1, "shotgun"),
@@ -80,82 +148,62 @@ class PolicyActionBatch:
 
 
 class _CombatObjectiveNet(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        trunk_hidden: int,
-        d_model: int | None = None,
-        n_heads: int = 1,
-        n_layers: int = 2,
-        ffn_dim: int = 256,
-        attn_dropout: float = 0.0,
-        use_gru: bool = False,
-        gru_hidden: int = 0,
-        use_weapon_head: bool = False,
-        look_bypass_gru: bool = False,
-        weapon_use_gru: bool = True,
-        weapon_context_from_obs: bool = True,
-        head_bottleneck_dim: "int | dict" = 32,
-        head_use_relu: bool = True,
-        head_activation: "str | None" = None,
-        gru_target_query: bool = False,
-        hard_target_feat: bool = False,
-        weapon_in_target_query: bool = False,
-        linear_slot_prior: bool = False,
-    ) -> None:
+    def __init__(self, obs_dim: int, model: ModelConfig) -> None:
         super().__init__()
         self.obs_dim = int(obs_dim)
-        self.d_model = int(d_model if d_model is not None else trunk_hidden)
+        self.config = model
+        self.d_model = int(model.d_model)
         self.trunk = TransformerTrunk(
             obs_dim=obs_dim,
-            d_model=self.d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            ffn_dim=ffn_dim,
-            dropout=attn_dropout,
+            d_model=int(model.d_model),
+            n_heads=int(model.n_heads),
+            n_layers=int(model.n_layers),
+            ffn_dim=int(model.ffn_dim),
+            dropout=float(model.attn_dropout),
+            self_weapon_embed_in_self=bool(model.self_weapon_embed_in_self),
         )
-        self.use_gru = bool(use_gru and gru_hidden > 0)
-        self.gru_hidden = int(gru_hidden) if self.use_gru else 0
-        self.use_weapon_head = bool(use_weapon_head)
+        self.use_gru = bool(model.use_gru and model.gru_hidden > 0)
+        self.gru_hidden = int(model.gru_hidden) if self.use_gru else 0
+        self.use_weapon_head = bool(model.use_weapon_head)
         # look_bypass_gru is a v17-fidelity load-time flag.  v20+ always sets
         # this False — when True (only via QNNPolicy.load on a v17 checkpoint)
         # the look head is fed cat(self_readout, target_feat) instead of
         # cat(gru_flat, target_feat), matching the features it was trained on.
-        self.look_bypass_gru = bool(look_bypass_gru and self.use_gru)
-        self.weapon_use_gru = bool(weapon_use_gru and self.use_gru)
-        self.weapon_context_from_obs = bool(weapon_context_from_obs)
-        # gru_target_query: route the GRU output (instead of self_readout) into
-        # the target attention query. Only meaningful when use_gru is True.
-        self.gru_target_query = bool(gru_target_query and self.use_gru)
-        # hard_target_feat couples two changes:
-        #   - target_feat switches from soft attention pool to a single chosen
-        #     entity vector (hard pick) — heads see "one real enemy", not a blend.
-        #   - During training the chosen slot is the BC GT (teacher forcing) so
-        #     the motor heads always see the correctly-paired enemy regardless
-        #     of pointer confidence. At eval the chosen slot is argmax(logits).
-        # Decoupling means target-head loss tuning (focal / class weights)
-        # stops reshaping motor-head training distribution.
-        self.hard_target_feat = bool(hard_target_feat)
-        # weapon_in_target_query: add an additive currently-held weapon embedding
-        # to the target query (post-projection) so target attention can condition
-        # on weapon (e.g. RL pulls toward distant enemies, shotgun toward close).
-        # Lives in the query/key dot-product space, stays out of the weapon head's
-        # input — can't poison weapon-head training. Independent of hard_target_feat.
-        self.weapon_in_target_query = bool(weapon_in_target_query and self.use_gru)
-        # linear_slot_prior: add an additive logit prior linear in slot index
-        # (-alpha * k) to target_logits before masking. Encodes the slot ordering
-        # policy (slot 0 most likely) directly so the residual attention scores
-        # only need to override when a non-slot-0 target is better.
-        self.linear_slot_prior = bool(linear_slot_prior and self.use_gru)
-        self.head_bottleneck_dims = _resolve_bottleneck_dims(head_bottleneck_dim)
-        self.head_use_relu = bool(head_use_relu)
-        self.head_activation = (
-            str(head_activation).lower()
-            if head_activation is not None
-            else ("relu" if self.head_use_relu else "none")
-        )
-        if self.head_activation not in ("none", "relu", "gelu"):
-            raise ValueError(f"Unknown head_activation: {self.head_activation}")
+        self.look_bypass_gru = bool(model.look_bypass_gru and self.use_gru)
+        self.weapon_use_gru = bool(model.weapon_use_gru and self.use_gru)
+        # Weapon head selector composition is per-flag: at least one of
+        # {gru_flat, self_readout} must be present (target_feat is always
+        # included). Default (true, true) preserves the historical
+        # [gru_flat, self_readout, target_feat] layout.
+        self.weapon_use_self_readout = bool(model.weapon_use_self_readout)
+        if not (self.weapon_use_gru or self.weapon_use_self_readout):
+            raise ValueError(
+                "weapon head needs at least one of weapon_use_gru or "
+                "weapon_use_self_readout — got both False (target_feat "
+                "alone is too thin)"
+            )
+        self.weapon_context_from_obs = bool(model.weapon_context_from_obs)
+        self.gru_target_query = bool(model.gru_target_query and self.use_gru)
+        # hard_target_feat: target_feat is the entity vector at a single chosen
+        # slot (BC GT during training, argmax at eval) instead of a soft pool.
+        # Decouples target-head loss tuning from motor-head training distribution.
+        self.hard_target_feat = bool(model.hard_target_feat)
+        self.weapon_in_target_query = bool(model.weapon_in_target_query and self.use_gru)
+        self.linear_slot_prior = bool(model.linear_slot_prior and self.use_gru)
+        # gt_dist_target_feat: training-time STE that pools target_feat by the
+        # labeler's GT slot distribution in the forward and routes gradient
+        # through softmax(logits) on the backward. Motors see clean target
+        # context; the pointer still trains from motor gradient. Gated on
+        # self.training inside TargetPointer so val/eval/PPO use soft.
+        self.gt_dist_target_feat = bool(model.gt_dist_target_feat and self.use_gru)
+        # prev_target_in_query: concat previous-frame renormalized slot
+        # distribution (16 floats) to the target pointer's query input. At
+        # BC train the caller passes the GT prev dist (privileged); at
+        # eval the caller passes None and TargetPointer substitutes zeros
+        # (probe-style train/eval forward mismatch — see target docstring).
+        self.prev_target_in_query = bool(model.prev_target_in_query and self.use_gru)
+        self.head_bottleneck_dims = dict(model.head_bottleneck_dim)
+        self.head_activation = model.head_activation
         weapon_ctx_dim = self.d_model if self.use_weapon_head else 0
         # v20-settled GRU layout:
         #   GRU input  = self_readout (no mean-actors pool projection)
@@ -167,8 +215,11 @@ class _CombatObjectiveNet(nn.Module):
         move_in = base_features_dim + weapon_ctx_dim
         look_in = base_features_dim + weapon_ctx_dim
         fire_in = base_features_dim + weapon_ctx_dim
-        # Weapon selector: gru_flat (optional) + self_readout + target_feat.
-        weapon_in = (self.gru_hidden if self.weapon_use_gru else 0) + (2 * self.d_model)
+        weapon_in = (
+            (self.gru_hidden if self.weapon_use_gru else 0)
+            + (self.d_model if self.weapon_use_self_readout else 0)
+            + self.d_model  # target_feat is always present
+        )
         if self.use_gru:
             self.gru = nn.GRU(self.d_model, self.gru_hidden, batch_first=False)
             self.target_pointer = TargetPointer(
@@ -178,43 +229,38 @@ class _CombatObjectiveNet(nn.Module):
                 weapon_vocab=WEAPON_HEAD_SIZE,
                 hard_target=self.hard_target_feat,
                 linear_slot_prior=self.linear_slot_prior,
+                gt_dist_target_feat=self.gt_dist_target_feat,
+                prev_target_in_query=self.prev_target_in_query,
             )
         if self.use_weapon_head:
-            self.weapon_head = self._make_head(weapon_in, WEAPON_HEAD_SIZE, self.head_bottleneck_dims.get("weapon", 0))
+            self.weapon_head = self._make_head(weapon_in, WEAPON_HEAD_SIZE, self.head_bottleneck_dims["weapon"])
             self.weapon_embed = nn.Embedding(WEAPON_HEAD_SIZE, self.d_model)
-        # Move head: 3 categorical axes × 3 classes = 9 logits, reshaped at
-        # forward time.
-        self.move_head = self._make_head(move_in, MOVE_HEAD_SIZE, self.head_bottleneck_dims.get("move", 0))
+        self.move_head = self._make_head(move_in, MOVE_HEAD_SIZE, self.head_bottleneck_dims["move"])
         # Look head outputs a residual added to a target-anchored prior:
-        #   base_look  = normalize(soft_target_rel)   -- "look at your target"
-        #   delta_look = look_head(features)          -- learned deviation
+        #   base_look  = normalize(soft_target_rel)
+        #   delta_look = look_head(features)
         #   pred_look  = normalize(base_look + delta_look)
-        self.look_head = self._make_head(look_in, LOOK_HEAD_SIZE, self.head_bottleneck_dims.get("look", 0))
-        # Fire head consumes the fused features.  The alignment scalar
-        # (cosine between pred_look and base_look) was settled-null in
-        # earlier ablation and removed.
-        self.fire_head = self._make_head(fire_in, FIRE_HEAD_SIZE, self.head_bottleneck_dims.get("fire", 0))
+        self.look_head = self._make_head(look_in, LOOK_HEAD_SIZE, self.head_bottleneck_dims["look"])
+        self.fire_head = self._make_head(fire_in, FIRE_HEAD_SIZE, self.head_bottleneck_dims["fire"])
         self._init_weights()
 
     def _make_head(self, in_dim: int, out_dim: int, bottleneck_dim: int) -> nn.Module:
         """Build an output head.
 
-        Activation controlled by self.head_activation ("none" | "relu" | "gelu").
-        Shape:
-          (B>0, "none") → Linear(in, B) → Linear(B, out)            — low-rank, no activation
-          (B>0, act≠none) → Linear(in, B) → act → Linear(B, out)    — 2-layer MLP with activation
-          (0,   "none") → Linear(in, out)                            — v21 baseline (single linear)
-          (0,   act≠none) → Linear(in, in) → act → Linear(in, out)  — full-width MLP
+        head_activation is "none", "gelu", or "relu" (relu kept for v22-era
+        legacy checkpoint compatibility — current training defaults to gelu).
+          (B>0, "none") → Linear(in, B) → Linear(B, out)
+          (B>0, act)    → Linear(in, B) → act → Linear(B, out)
+          (0,   "none") → Linear(in, out)
+          (0,   act)    → Linear(in, in) → act → Linear(in, out)
         """
         hidden = bottleneck_dim if bottleneck_dim > 0 else in_dim
-        has_activation = self.head_activation != "none"
+        activations = {"gelu": nn.GELU, "relu": nn.ReLU}
+        has_activation = self.head_activation in activations
         if bottleneck_dim > 0 or has_activation:
             layers: list[nn.Module] = [nn.Linear(in_dim, hidden)]
             if has_activation:
-                if self.head_activation == "gelu":
-                    layers.append(nn.GELU())
-                else:
-                    layers.append(nn.ReLU(inplace=True))
+                layers.append(activations[self.head_activation]())
             layers.append(nn.Linear(hidden, out_dim))
             return nn.Sequential(*layers)
         return nn.Linear(in_dim, out_dim)
@@ -322,8 +368,14 @@ class _CombatObjectiveNet(nn.Module):
         hidden: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
         target_gt: torch.Tensor | None = None,
+        target_dist_slot: torch.Tensor | None = None,
+        prev_target_dist: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        sample = obs["self_scalars"]
+        # Use `vel` to detect (B, 3) flat vs (T, B, 3) sequence — same
+        # ndim semantics as the legacy self_scalars (B, 17) / (T, B, 17).
+        sample = obs.get("vel")
+        if sample is None:
+            sample = obs["self_scalars"]  # legacy fallback
         input_is_sequence = sample.ndim == 3
         if input_is_sequence:
             seq_len = int(sample.shape[0])
@@ -357,20 +409,35 @@ class _CombatObjectiveNet(nn.Module):
                         flat_obs["self_weapon_id"].reshape(-1)
                     ).clamp(0, WEAPON_HEAD_SIZE - 1)
                 tp_target_gt = target_gt.reshape(-1) if target_gt is not None else None
+                tp_target_dist_slot = (
+                    target_dist_slot.reshape(-1, target_dist_slot.shape[-1])
+                    if target_dist_slot is not None else None
+                )
+                tp_prev_target_dist = (
+                    prev_target_dist.reshape(-1, prev_target_dist.shape[-1])
+                    if prev_target_dist is not None else None
+                )
                 target_logits, target_feat, target_query = self.target_pointer(
                     tp_query_input,
                     entity_outs,
                     entity_mask,
                     self_weapon_slot=tp_weapon_slot,
                     target_gt=tp_target_gt,
+                    target_dist_slot=tp_target_dist_slot,
+                    prev_target_dist=tp_prev_target_dist,
                 )
                 features_base_flat = torch.cat([gru_flat, target_feat], dim=-1)
-                # Weapon selector composition is gated by weapon_use_gru: drop
-                # gru_flat to test whether weapon choice needs recurrence.
+                # Weapon selector composition gated by weapon_use_gru and
+                # weapon_use_self_readout independently. target_feat always
+                # present; at least one of gru_flat/self_readout (guarded
+                # in __init__).
+                _ws_parts = []
                 if self.weapon_use_gru:
-                    weapon_selector_flat = torch.cat([gru_flat, self_readout, target_feat], dim=-1)
-                else:
-                    weapon_selector_flat = torch.cat([self_readout, target_feat], dim=-1)
+                    _ws_parts.append(gru_flat)
+                if self.weapon_use_self_readout:
+                    _ws_parts.append(self_readout)
+                _ws_parts.append(target_feat)
+                weapon_selector_flat = torch.cat(_ws_parts, dim=-1)
                 next_hidden = h_final.squeeze(0)
             else:
                 self_readout, target_feat, target_logits, target_query = self.trunk(flat_obs)
@@ -438,18 +505,31 @@ class _CombatObjectiveNet(nn.Module):
                     obs["self_weapon_id"].reshape(-1)
                 ).clamp(0, WEAPON_HEAD_SIZE - 1)
             tp_target_gt = target_gt.reshape(-1) if target_gt is not None else None
+            tp_target_dist_slot = (
+                target_dist_slot.reshape(-1, target_dist_slot.shape[-1])
+                if target_dist_slot is not None else None
+            )
+            tp_prev_target_dist = (
+                prev_target_dist.reshape(-1, prev_target_dist.shape[-1])
+                if prev_target_dist is not None else None
+            )
             target_logits, target_feat, target_query = self.target_pointer(
                 tp_query_input,
                 entity_outs,
                 entity_mask,
                 self_weapon_slot=tp_weapon_slot,
                 target_gt=tp_target_gt,
+                target_dist_slot=tp_target_dist_slot,
+                prev_target_dist=tp_prev_target_dist,
             )
             features_base = torch.cat([recurrent, target_feat], dim=-1)
+            _ws_parts = []
             if self.weapon_use_gru:
-                weapon_selector = torch.cat([recurrent, self_readout, target_feat], dim=-1)
-            else:
-                weapon_selector = torch.cat([self_readout, target_feat], dim=-1)
+                _ws_parts.append(recurrent)
+            if self.weapon_use_self_readout:
+                _ws_parts.append(self_readout)
+            _ws_parts.append(target_feat)
+            weapon_selector = torch.cat(_ws_parts, dim=-1)
             next_hidden = h_final.squeeze(0)
         else:
             self_readout, target_feat, target_logits, target_query = self.trunk(obs)
@@ -513,68 +593,93 @@ class QNNPolicy:
 
     def __init__(
         self,
+        *,
         obs_dim: int,
-        trunk_hidden: int = 64,
-        gru_hidden: int = 64,
-        use_gru: bool = True,
-        seed: int = 0,
-        device: str = "auto",
-        d_model: int | None = None,
-        n_heads: int = 1,
-        n_layers: int = 2,
-        ffn_dim: int = 256,
-        attn_dropout: float = 0.0,
-        use_weapon_head: bool = False,
-        weapon_switch_confidence: float = 0.65,
-        weapon_switch_margin: float = 0.15,
-        jump_pos_weight: float = 1.0,
-        target_focal_gamma: float = 0.0,
-        look_bypass_gru: bool = False,
-        weapon_use_gru: bool = True,
-        weapon_context_from_obs: bool = True,
-        head_bottleneck_dim: "int | dict" = 32,
-        head_use_relu: bool = True,
-        head_activation: "str | None" = None,
-        gru_target_query: bool = False,
-        hard_target_feat: bool = False,
-        weapon_in_target_query: bool = False,
-        linear_slot_prior: bool = False,
+        model: ModelConfig,
+        jump_pos_weight: float,
+        fire_focal_gamma: float,
+        fire_focal_alpha: float,
+        fire_distance_sigma: float,
+        jump_distance_sigma: float,
+        seed: int,
+        device: str,
+        model_factory: Callable[[int, ModelConfig], nn.Module] | None = None,
     ) -> None:
+        """Construct a BC policy.
+
+        ``model_factory`` is an optional override for the inner ``nn.Module``:
+        when ``None`` (the default, used by all production BC training) the
+        canonical ``_CombatObjectiveNet`` is built from ``model``. Ablation
+        runners (e.g. ``qnn.bc.heads``) pass a factory that builds an
+        alternate module — typically one that drops the trunk or GRU — but
+        the factory must respect ``_CombatObjectiveNet``'s forward contract
+        so the canonical BC supervised loop can drive it unchanged.
+
+        The injected module's flags should still be consistent with
+        ``model`` (use_gru / use_weapon_head / etc.) since QNNPolicy's
+        policy-layer logic — hidden-state shaping, weapon-switch heuristics,
+        head-loss gating — reads from ``model``, not from the module.
+        """
         self.obs_dim = int(obs_dim)
-        self.d_model = int(d_model if d_model is not None else trunk_hidden)
-        self.trunk_hidden = self.d_model
-        self.use_gru = bool(use_gru and gru_hidden > 0)
-        self.gru_hidden = int(gru_hidden) if self.use_gru else 0
-        self.use_weapon_head = bool(use_weapon_head)
-        self.look_bypass_gru = bool(look_bypass_gru and self.use_gru)
-        self.weapon_switch_confidence = float(weapon_switch_confidence)
-        self.weapon_switch_margin = float(weapon_switch_margin)
-        self.weapon_use_gru = bool(weapon_use_gru)
-        self.weapon_context_from_obs = bool(weapon_context_from_obs)
-        self.gru_target_query = bool(gru_target_query and self.use_gru)
-        self.hard_target_feat = bool(hard_target_feat)
-        self.weapon_in_target_query = bool(weapon_in_target_query and self.use_gru)
-        self.linear_slot_prior = bool(linear_slot_prior and self.use_gru)
-        self.head_bottleneck_dims = _resolve_bottleneck_dims(head_bottleneck_dim)
-        self.head_use_relu = bool(head_use_relu)
-        self.head_activation = (
-            str(head_activation).lower()
-            if head_activation is not None
-            else ("relu" if self.head_use_relu else "none")
-        )
+        self.config = model
+        self.d_model = int(model.d_model)
+        self.use_gru = bool(model.use_gru and model.gru_hidden > 0)
+        self.gru_hidden = int(model.gru_hidden) if self.use_gru else 0
+        self.use_weapon_head = bool(model.use_weapon_head)
+        self.look_bypass_gru = bool(model.look_bypass_gru and self.use_gru)
+        self.weapon_switch_confidence = float(model.weapon_switch_confidence)
+        self.weapon_switch_margin = float(model.weapon_switch_margin)
+        self.weapon_use_gru = bool(model.weapon_use_gru)
+        self.weapon_use_self_readout = bool(model.weapon_use_self_readout)
+        self.weapon_context_from_obs = bool(model.weapon_context_from_obs)
+        self.gru_target_query = bool(model.gru_target_query and self.use_gru)
+        self.hard_target_feat = bool(model.hard_target_feat)
+        self.weapon_in_target_query = bool(model.weapon_in_target_query and self.use_gru)
+        self.linear_slot_prior = bool(model.linear_slot_prior and self.use_gru)
+        self.gt_dist_target_feat = bool(model.gt_dist_target_feat and self.use_gru)
+        self.prev_target_in_query = bool(model.prev_target_in_query and self.use_gru)
+        self.head_bottleneck_dims = dict(model.head_bottleneck_dim)
+        self.head_activation = model.head_activation
         # jump_pos_weight > 1.0 upweights the POS class on the move ud-axis CE
         # — direct imbalance fix for the rare jump-positive case (~4% pos rate).
         # Inverse-frequency reference: ~24× for 4% positive rate.
         self.jump_pos_weight = float(jump_pos_weight)
-        # target_focal_gamma > 0 modulates target-slot CE by (1 - p_t)^gamma so
-        # the loss concentrates on exception frames (true target != slot 0)
-        # instead of saturating on the 96% slot-0 majority. 2.0 is the
-        # standard focal-loss exponent.
-        self.target_focal_gamma = float(target_focal_gamma)
-        self.n_heads = int(n_heads)
-        self.n_layers = int(n_layers)
-        self.ffn_dim = int(ffn_dim)
-        self.attn_dropout = float(attn_dropout)
+        # fire_focal_gamma > 0 swaps the fire-head BCE for focal BCE
+        # (Lin et al. 2017): each frame's BCE is multiplied by
+        # (1 - p_t)^gamma so easy examples contribute less gradient and
+        # capacity flows to the borderline ready-frame "fire or wait?"
+        # decisions. 0 = standard BCE.
+        self.fire_focal_gamma = float(fire_focal_gamma)
+        # fire_focal_alpha is Lin's per-class prefactor on the focal weight:
+        # alpha_t = alpha on positives, (1 - alpha) on negatives. Active
+        # only when fire_focal_gamma > 0. Default 0.5 is neutral (both
+        # classes weighted equally up to a global scale). To run the Lin
+        # recipe end-to-end set fire_pos_weight_override=1.0 alongside —
+        # otherwise pos_weight stacks multiplicatively on the positive
+        # branch and alpha loses its canonical class-fraction meaning.
+        self.fire_focal_alpha = float(fire_focal_alpha)
+        # op_input_mask is a training-time attribute (NOT a ModelConfig
+        # field — checkpoint meta stays clean and the same ckpt can be
+        # retrained either way). Trainer sets this to True after
+        # construction when train.json.op_input_mask is true. Read by
+        # ``_compute_head_losses_and_metrics`` to drop frames where the
+        # demo held a press but the engine ignored it.
+        self.op_input_mask: bool = False
+        # fire_distance_sigma > 0 enables Gaussian-shouldered BCE on the
+        # fire head: per-frame BCE is multiplied by 1 at positives and by
+        # 1 - exp(-d^2/(2*sigma^2)) at negatives, where d is distance (in
+        # frames) to the nearest positive. Adjacent-to-press FPs cost
+        # near-zero loss; far-from-press FPs cost full loss. Inference is
+        # unchanged. See src/qnn/bc/heads/loss_shaping.py. 0 = standard BCE.
+        self.fire_distance_sigma = float(fire_distance_sigma)
+        # Same shoulder applied to the move ud-axis (jump) CE. Tuned
+        # independently of fire because jump-press timing noise has a
+        # different scale.
+        self.jump_distance_sigma = float(jump_distance_sigma)
+        self.n_heads = int(model.n_heads)
+        self.n_layers = int(model.n_layers)
+        self.ffn_dim = int(model.ffn_dim)
+        self.attn_dropout = float(model.attn_dropout)
         self.head_hidden = (self.gru_hidden + self.d_model) if self.use_gru else (2 * self.d_model)
         self.seed = int(seed)
         self.device_spec = resolve_torch_device(device)
@@ -589,28 +694,15 @@ class QNNPolicy:
                 self._rocm_inference_pad_batch = 32
 
         torch.manual_seed(self.seed)
-        self.model = _CombatObjectiveNet(
-            obs_dim=self.obs_dim,
-            trunk_hidden=self.trunk_hidden,
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            n_layers=self.n_layers,
-            ffn_dim=self.ffn_dim,
-            attn_dropout=self.attn_dropout,
-            use_gru=self.use_gru,
-            gru_hidden=self.gru_hidden,
-            use_weapon_head=self.use_weapon_head,
-            look_bypass_gru=self.look_bypass_gru,
-            weapon_use_gru=self.weapon_use_gru,
-            weapon_context_from_obs=self.weapon_context_from_obs,
-            head_bottleneck_dim=self.head_bottleneck_dims,
-            head_use_relu=self.head_use_relu,
-            head_activation=self.head_activation,
-            gru_target_query=self.gru_target_query,
-            hard_target_feat=self.hard_target_feat,
-            weapon_in_target_query=self.weapon_in_target_query,
-            linear_slot_prior=self.linear_slot_prior,
-        ).to(self.device)
+        if model_factory is None:
+            self.model = _CombatObjectiveNet(obs_dim=self.obs_dim, model=model).to(self.device)
+        else:
+            built = model_factory(self.obs_dim, model)
+            if not isinstance(built, nn.Module):
+                raise TypeError(
+                    f"model_factory must return nn.Module, got {type(built).__name__}"
+                )
+            self.model = built.to(self.device)
         self.model.train()
         self._optimizers: Dict[str, torch.optim.Optimizer] = {}
 
@@ -673,7 +765,12 @@ class QNNPolicy:
         self,
         obs_dict: Dict[str, torch.Tensor],
     ) -> tuple[Dict[str, torch.Tensor], int]:
-        sample = obs_dict["self_scalars"]
+        # `vel` matches the old `self_scalars` ndim semantics: (B, 3)
+        # flat, (B, T, 3) sequence. Native obs replaced self_scalars
+        # as a single-field key with per-field arrays.
+        sample = obs_dict.get("vel")
+        if sample is None:
+            sample = obs_dict["self_scalars"]  # legacy fallback
         if sample.ndim != 2 or self._rocm_inference_pad_batch <= 0:
             return obs_dict, 0
 
@@ -690,6 +787,26 @@ class QNNPolicy:
             padded_obs[key] = torch.cat([value, pad_value], dim=0)
         return padded_obs, pad_rows
 
+    @staticmethod
+    def _pad_companion(
+        tensor: torch.Tensor | None, pad_rows: int,
+    ) -> torch.Tensor | None:
+        """Zero-pad a companion tensor along dim 0 to match obs padding.
+
+        Used after ``_maybe_pad_obs_batch`` to extend hidden state and
+        per-frame supervision tensors (target_gt, target_dist_slot,
+        prev_target_dist) so callers that pass any of them on ROCm with
+        small batches don't hit a B mismatch inside heads that consume
+        them as features (e.g. fire-token head probe's
+        ``target_dist_slots`` feature builder). Pass-through when the
+        tensor is None or no padding was applied.
+        """
+        if tensor is None or pad_rows <= 0:
+            return tensor
+        pad_shape = (pad_rows, *tensor.shape[1:])
+        pad = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+        return torch.cat([tensor, pad], dim=0)
+
     def _forward_tensors(
         self,
         obs: np.ndarray | torch.Tensor | Dict[str, np.ndarray | torch.Tensor],
@@ -697,6 +814,8 @@ class QNNPolicy:
         hidden: np.ndarray | torch.Tensor | None = None,
         masks: Mapping[str, np.ndarray | torch.Tensor] | np.ndarray | torch.Tensor | None = None,
         target_gt: np.ndarray | torch.Tensor | None = None,
+        target_dist_slot: np.ndarray | torch.Tensor | None = None,
+        prev_target_dist: np.ndarray | torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(obs, dict):
             raise ValueError("Token policy expects dict observations")
@@ -718,22 +837,34 @@ class QNNPolicy:
         if target_gt is not None:
             target_gt_tensor = self._tensor(target_gt, dtype=torch.long)
 
-        sample = obs_tensors["self_scalars"]
+        target_dist_slot_tensor: torch.Tensor | None = None
+        if target_dist_slot is not None:
+            target_dist_slot_tensor = self._tensor(target_dist_slot, dtype=torch.float32)
+
+        prev_target_dist_tensor: torch.Tensor | None = None
+        if prev_target_dist is not None:
+            prev_target_dist_tensor = self._tensor(prev_target_dist, dtype=torch.float32)
+
+        # Use `vel` to detect flat-batch (B, 3) vs sequence (B, T, 3).
+        # The legacy obs carried `self_scalars` (B, 17) here; the native
+        # obs has per-field arrays, with vel matching the same ndim
+        # semantics (2D flat, 3D sequence).
+        sample = obs_tensors.get("vel")
+        if sample is None:
+            sample = obs_tensors["self_scalars"]  # legacy fallback
         if sample.ndim == 2:
             batch_size = int(sample.shape[0])
             padded_obs, pad_rows = self._maybe_pad_obs_batch(obs_tensors)
-            padded_hidden = hidden_tensor
-            if self.use_gru and padded_hidden is not None and pad_rows > 0:
-                pad = torch.zeros(
-                    (pad_rows, padded_hidden.shape[-1]),
-                    dtype=padded_hidden.dtype,
-                    device=padded_hidden.device,
-                )
-                padded_hidden = torch.cat([padded_hidden, pad], dim=0)
+            padded_hidden = (
+                self._pad_companion(hidden_tensor, pad_rows)
+                if self.use_gru else hidden_tensor
+            )
             features, logits, values, next_hidden, target_logits, target_query = self.model(
                 padded_obs,
                 padded_hidden,
-                target_gt=target_gt_tensor,
+                target_gt=self._pad_companion(target_gt_tensor, pad_rows),
+                target_dist_slot=self._pad_companion(target_dist_slot_tensor, pad_rows),
+                prev_target_dist=self._pad_companion(prev_target_dist_tensor, pad_rows),
             )
             if pad_rows == 0:
                 return features, logits, values, next_hidden, target_logits, target_query
@@ -756,6 +887,8 @@ class QNNPolicy:
             hidden_tensor,
             reset_mask=reset_mask_tensor,
             target_gt=target_gt_tensor,
+            target_dist_slot=target_dist_slot_tensor,
+            prev_target_dist=prev_target_dist_tensor,
         )
 
     def _optimizer(self, name: str, params: Iterable[nn.Parameter], lr: float) -> torch.optim.Optimizer:
@@ -1083,35 +1216,101 @@ class QNNPolicy:
         accuracy_components: list[torch.Tensor] = []
         valid_flat = valid_mask.reshape(-1).bool() if valid_mask is not None else None
 
-        if target_logits is not None and "target" in actions:
+        # Optional per-axis loss-keep mask sourced from the engine's
+        # op_input bits — bit i set ⇔ engine acted on the corresponding
+        # axis press this tick. The mask is ``(no press on that axis) |
+        # (op_input bit set)``, mirroring the labeler recipe at
+        # qnn.labeler.train.SequenceDataset.__getitem__. Bits:
+        #   0=fb, 1=lr, 2=ud, 3=fire, 4=impulse (weapon is held-derived,
+        #   not masked here).
+        # Off by default; trainer sets self.op_input_mask = True from
+        # BCConfig when the toggle is enabled. Requires the recollected
+        # corpus that carries act_op_input.npy — hard-fails if missing.
+        op_mask_on = bool(self.op_input_mask)
+        if op_mask_on and "op_input" not in actions:
+            raise RuntimeError(
+                "op_input_mask=True but actions['op_input'] is absent. "
+                "Recollect the corpus on a post-bit-3-fix branch (the "
+                "engine emits act_op_input.npy as part of every shard "
+                "via the BC QWD + labeler paths)."
+            )
+        op_input_flat: torch.Tensor | None = None
+        if op_mask_on:
+            op_input_flat = self._tensor(actions["op_input"], dtype=torch.long).reshape(-1)
+
+        target_loss_weight = float(weights_map.get("target", 1.0))
+        target_pid_aux_weight = float(weights_map.get("target_pid_aux", 0.0))
+        if (
+            target_logits is not None
+            and "target_dist" in actions
+            and (target_loss_weight != 0.0 or target_pid_aux_weight != 0.0)
+        ):
             target_flat = self._flatten_logits(target_logits)
-            target_label = self._flatten_targets(self._tensor(actions["target"], dtype=torch.long))
-            valid = target_label != -100
-            if valid_flat is not None:
-                valid = valid & valid_flat
+            dist_t = self._tensor(actions["target_dist"], dtype=torch.float32)
+            if dist_t.ndim == 3:
+                dist_t = dist_t.reshape(-1, dist_t.shape[-1])
+            # dist_t[:, 0] = NO_TARGET; dist_t[:, 1:] = slot probabilities.
+            present = (1.0 - dist_t[:, 0]).clamp(min=0.0)
+            slot_dist = dist_t[:, 1:]
+            # No in-policy gate. Engagement filtering is the caller's job
+            # via segment_mask (e.g. `{"act.target": {"$ne": 0}}`). Frames
+            # with present=0 are already dropped at the dataset level; what
+            # remains contributes to target loss and metrics in proportion
+            # to its present value, with the clamp(min=1e-6) in the
+            # renormalize keeping the divide numerically safe.
+            valid = (
+                valid_flat
+                if valid_flat is not None
+                else torch.ones_like(present, dtype=torch.bool)
+            )
             aux_is_real = bool(valid.any().item())
+            # Argmax of slot_dist serves as the hard label for the existing
+            # accuracy / per-slot recall diagnostics.
+            target_label = slot_dist.argmax(dim=-1)
             if aux_is_real:
-                # Focal modulation: (1 - p_t)^gamma weights hard frames (true
-                # slot != 0) higher than the 96% slot-0 majority where p_t
-                # saturates. gamma=0 reduces to vanilla CE.
-                if self.target_focal_gamma > 0.0:
-                    log_probs = F.log_softmax(target_flat[valid], dim=-1)
-                    gathered = log_probs.gather(1, target_label[valid].unsqueeze(1)).squeeze(1)
-                    p_t = gathered.exp()
-                    focal_w = (1.0 - p_t).pow(self.target_focal_gamma)
-                    aux_ce = -(focal_w * gathered).mean()
-                else:
-                    aux_ce = F.cross_entropy(target_flat[valid], target_label[valid], reduction="mean")
+                # Present-weighted soft CE: -sum_s p_slot * log_softmax(logits).
+                # slot_dist sums to `present`; renormalize so each frame's
+                # target probability mass sums to 1 before computing CE, then
+                # weight the per-frame term by `present`.
+                log_probs = F.log_softmax(target_flat[valid], dim=-1)
+                present_v = present[valid]
+                slot_target = slot_dist[valid] / present_v.clamp(min=1e-6).unsqueeze(-1)
+                per_frame_ce = -(slot_target * log_probs).sum(dim=-1)
+                aux_ce = (present_v * per_frame_ce).sum() / present_v.sum().clamp(min=1e-6)
             else:
                 aux_ce = torch.zeros((), dtype=target_flat.dtype, device=target_flat.device)
-            losses.append(aux_ce * weights_map.get("target", 1.0))
+            losses.append(aux_ce * target_loss_weight)
             loss_is_real.append(aux_is_real)
             if compute_metrics:
                 metrics["loss_target"] = aux_ce.detach()
+                metrics["target_present_mean"] = present.mean().detach()
                 if aux_is_real:
+                    # Present-weighted soft-distribution diagnostics, all
+                    # computed at frames passing segment_mask (valid_flat).
+                    # The renormalized slot_target sums to 1 per row so
+                    # these are real probability-distribution quantities.
+                    soft = F.softmax(target_flat[valid], dim=-1)
+                    # Entropy of the (renormalized) label distribution.
+                    ent_per_frame = -(slot_target.clamp(min=1e-8) * slot_target.clamp(min=1e-8).log()).sum(dim=-1)
+                    target_entropy = (present_v * ent_per_frame).sum() / present_v.sum().clamp(min=1e-6)
+                    metrics["target_entropy"] = target_entropy.detach()
+                    # KL(label || model) = NLL - entropy(label).
+                    metrics["target_kl"] = (aux_ce - target_entropy).detach()
+                    # Brier: present-weighted squared error between predicted
+                    # and renormalized label distributions.
+                    brier_per_frame = ((soft - slot_target) ** 2).sum(dim=-1)
+                    metrics["target_brier"] = (
+                        (present_v * brier_per_frame).sum() / present_v.sum().clamp(min=1e-6)
+                    ).detach()
+                    # Top-1 mass: label mass at the model's argmax slot.
                     pred = torch.argmax(target_flat, dim=1)
                     pred_v = pred[valid]
                     target_v = target_label[valid]
+                    batch_idx = torch.arange(pred_v.shape[0], device=pred_v.device)
+                    top1_mass_per_frame = slot_target[batch_idx, pred_v]
+                    metrics["target_top1_mass"] = (
+                        (present_v * top1_mass_per_frame).sum() / present_v.sum().clamp(min=1e-6)
+                    ).detach()
                     acc = (pred_v == target_v).float().mean()
                     metrics["acc_target"] = acc
                     accuracy_components.append(acc)
@@ -1156,7 +1355,7 @@ class QNNPolicy:
             # shuffles within an engagement (a former slot 0 becomes slot 1
             # ~half the time within a second).  Cosine pull between the query
             # and the static pid embedding gives identity-stable supervision.
-            pid_aux_weight = float(weights_map.get("target_pid_aux", 0.0))
+            pid_aux_weight = target_pid_aux_weight
             if (
                 pid_aux_weight > 0.0
                 and target_query is not None
@@ -1189,42 +1388,72 @@ class QNNPolicy:
         if WEAPON_HEAD in logits and WEAPON_HEAD in actions:
             weapon_logits = logits[WEAPON_HEAD].reshape(-1, WEAPON_HEAD_SIZE)
             weapon_target = self._weapon_target_from_actions(actions)
-            # No-weapon frames carry target=-100 and are skipped by CE +
-            # per-class metrics; their move/fire/look labels still train.
-            valid_weapon = weapon_target >= 0
+            # No-weapon frames carry target=-100; F.cross_entropy with
+            # ignore_index=-100 skips them on-GPU. Avoid the
+            # ``valid.any().item()`` host sync that used to gate the call —
+            # syncing per microbatch stalled the ROCm dispatch queue and
+            # cost ~10ms per step on the head-probe loop.
             if valid_flat is not None:
-                valid_weapon = valid_weapon & valid_flat
-            if bool(valid_weapon.any().item()):
-                weapon_loss = F.cross_entropy(weapon_logits[valid_weapon], weapon_target[valid_weapon], reduction="mean")
-            else:
-                weapon_loss = torch.zeros((), dtype=weapon_logits.dtype, device=weapon_logits.device)
+                weapon_target = torch.where(
+                    valid_flat, weapon_target, torch.full_like(weapon_target, -100)
+                )
+            valid_weapon = weapon_target >= 0
+            weapon_loss = F.cross_entropy(
+                weapon_logits, weapon_target, ignore_index=-100, reduction="mean",
+            )
             losses.append(weapon_loss * weights_map.get(WEAPON_HEAD, 1.0))
-            loss_is_real.append(bool(valid_weapon.any().item()))
+            # Engaged training always has at least one valid weapon frame
+            # per microbatch — skip the per-step host sync that previously
+            # checked `valid.any().item()`. If you ever train on a corpus
+            # where a microbatch could be all-no-weapon, restore the sync
+            # or switch to a reduction='sum' / clamped-divisor scheme to
+            # avoid the 0/0 → NaN in F.cross_entropy(reduction='mean').
+            loss_is_real.append(True)
             if compute_metrics:
                 metrics["loss_weapon"] = weapon_loss.detach()
                 with torch.no_grad():
+                    # Vectorized 8-class confusion matrix: 1 scatter_add
+                    # instead of an 8-iteration Python loop with ~10 tensor
+                    # ops per iteration. Cuts per-batch weapon-metric kernel
+                    # count from ~80 to ~5 — measured ~5-8s/epoch saved at
+                    # bs=4096 on this head-probe loop.
                     weapon_probs = F.softmax(weapon_logits, dim=-1)
                     weapon_pred = torch.argmax(weapon_probs, dim=-1)
-                    pred_v = weapon_pred[valid_weapon]
-                    target_v = weapon_target[valid_weapon]
-                    if target_v.numel() > 0:
-                        metrics["acc_weapon"] = (pred_v == target_v).float().mean().detach()
-                    metrics["confidence_weapon"] = weapon_probs.max(dim=-1).values.mean().detach()
-                    metrics["n_weapon_valid"] = torch.as_tensor(
-                        float(target_v.numel()), dtype=weapon_logits.dtype, device=weapon_logits.device,
+                    # Map invalid frames to a sentinel out-of-range index
+                    # so they don't land in any of the WEAPON_HEAD_SIZE rows.
+                    safe_target = torch.where(
+                        valid_weapon, weapon_target,
+                        torch.full_like(weapon_target, WEAPON_HEAD_SIZE),
                     )
+                    safe_pred = torch.where(
+                        valid_weapon, weapon_pred,
+                        torch.full_like(weapon_pred, WEAPON_HEAD_SIZE),
+                    )
+                    # Confusion matrix: rows=pred, cols=target, size (K+1)^2.
+                    # Last row/col is the "invalid" bucket and is discarded.
+                    K = WEAPON_HEAD_SIZE
+                    flat_idx = (safe_pred * (K + 1) + safe_target).long()
+                    conf = torch.zeros(
+                        (K + 1) * (K + 1), dtype=torch.float32, device=weapon_logits.device,
+                    )
+                    conf.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
+                    conf = conf.view(K + 1, K + 1)[:K, :K]  # (K, K), drop invalid bucket
+                    # Per-class tp/fp/fn: tp = diag; row sum - tp = fp; col sum - tp = fn.
+                    tp_all = conf.diagonal()
+                    fp_all = conf.sum(dim=1) - tp_all
+                    fn_all = conf.sum(dim=0) - tp_all
+                    valid_count = conf.sum()
+                    metrics["n_weapon_valid"] = valid_count.detach().to(weapon_logits.dtype)
+                    metrics["acc_weapon"] = (tp_all.sum() / valid_count.clamp(min=1.0)).detach()
+                    metrics["confidence_weapon"] = weapon_probs.max(dim=-1).values.mean().detach()
                     # Per-class precision / recall / F1 + base rate so the
                     # rare classes (axe / GL / NG / SNG together <10% of
                     # frames) don't disappear into the headline number.
-                    # Macro-F1 averages the eight per-class F1s with equal
-                    # weight regardless of frequency.
                     class_f1s = []
                     for cls_idx, cls_name in WEAPON_HEAD_CLASS_NAMES:
-                        pred_cls = pred_v == cls_idx
-                        true_cls = target_v == cls_idx
-                        tp = (pred_cls & true_cls).sum().float()
-                        fp = (pred_cls & ~true_cls).sum().float()
-                        fn = (~pred_cls & true_cls).sum().float()
+                        tp = tp_all[cls_idx]
+                        fp = fp_all[cls_idx]
+                        fn = fn_all[cls_idx]
                         metrics[f"tp_weapon_{cls_name}"] = tp.detach()
                         metrics[f"fp_weapon_{cls_name}"] = fp.detach()
                         metrics[f"fn_weapon_{cls_name}"] = fn.detach()
@@ -1234,7 +1463,9 @@ class QNNPolicy:
                         metrics[f"precision_weapon_{cls_name}"] = prec.detach()
                         metrics[f"recall_weapon_{cls_name}"] = rec.detach()
                         metrics[f"f1_weapon_{cls_name}"] = f1.detach()
-                        metrics[f"pos_rate_weapon_{cls_name}"] = true_cls.float().mean().detach()
+                        metrics[f"pos_rate_weapon_{cls_name}"] = (
+                            (tp + fn) / valid_count.clamp(min=1.0)
+                        ).detach()
                         class_f1s.append(f1)
                     metrics["f1_weapon"] = torch.stack(class_f1s).mean().detach()
 
@@ -1245,13 +1476,49 @@ class QNNPolicy:
             # are uint8[T, 3] axis class indices from the corpus loader.
             move_logits = logits[MOVE_HEAD]
             move_pred = move_logits.reshape(-1, MOVE_AXES, MOVE_AXIS_CLASSES)
-            move_target = self._tensor(
-                actions[MOVE_HEAD], dtype=torch.long
-            ).reshape(-1, MOVE_AXES)
-            move_valid = valid_flat if valid_flat is not None else torch.ones(
+            move_target_t = self._tensor(actions[MOVE_HEAD], dtype=torch.long)
+            # Distance-weighted shoulder on the ud (jump) axis. Only sensible
+            # when targets arrive in (T, B, 3) form so the conv sees a real
+            # time axis; single-step inference falls back to plain CE.
+            jump_dist_weight_flat: torch.Tensor | None = None
+            if self.jump_distance_sigma > 0.0:
+                ud_idx = MOVE_AXIS_NAMES.index("ud")
+                if move_target_t.ndim == 3:
+                    from qnn.bc.heads.loss_shaping import distance_weighted_neg_weights
+                    jump_pos_2d = (move_target_t[..., ud_idx] == MOVE_CLASS_POS).to(torch.float32)
+                    valid_2d = valid_mask.bool() if valid_mask is not None else None
+                    w_2d = distance_weighted_neg_weights(
+                        jump_pos_2d, valid_2d, self.jump_distance_sigma,
+                    )
+                    jump_dist_weight_flat = w_2d.reshape(-1)
+                elif move_target_t.ndim == 2 and "jump_distance_to_pos" in actions:
+                    # Flat batch (frame-shuffled SGD). The jump-positive mask
+                    # is derived from move[..., ud_idx] == MOVE_CLASS_POS;
+                    # the per-frame distance was precomputed at preload time.
+                    from qnn.bc.heads.loss_shaping import flat_distance_weight
+                    jump_pos_1d = (move_target_t[..., ud_idx] == MOVE_CLASS_POS).to(torch.float32)
+                    jump_d = self._tensor(actions["jump_distance_to_pos"], dtype=torch.float32).reshape(-1)
+                    jump_dist_weight_flat = flat_distance_weight(
+                        jump_d, jump_pos_1d, self.jump_distance_sigma,
+                    )
+            move_target = move_target_t.reshape(-1, MOVE_AXES)
+            base_move_valid = valid_flat if valid_flat is not None else torch.ones(
                 (move_target.shape[0],), dtype=torch.bool, device=move_target.device,
             )
-            move_is_real = bool(move_valid.any().item())
+            # Per-axis loss-keep mask. When op_input_mask is off, every
+            # axis sees the same base_move_valid (no behavior change vs
+            # the original single-mask form). When on, axis i additionally
+            # drops frames where the press was held but the engine didn't
+            # act on it: keep ⇔ (target class == NONE) | (op_input bit i set).
+            move_valid_per_axis: list[torch.Tensor] = []
+            for axis_i in range(MOVE_AXES):
+                axis_valid = base_move_valid
+                if op_mask_on and op_input_flat is not None:
+                    no_press = move_target[:, axis_i] == MOVE_CLASS_NONE
+                    op_kept = ((op_input_flat >> axis_i) & 1) != 0
+                    axis_valid = axis_valid & (no_press | op_kept)
+                move_valid_per_axis.append(axis_valid)
+            move_is_real = bool(base_move_valid.any().item())
             # ud (jump) axis is heavily imbalanced (~4% pos rate); upweight
             # the POS class via jump_pos_weight when set above 1.0.  fb/lr
             # are balanced enough that plain CE works.
@@ -1263,14 +1530,26 @@ class QNNPolicy:
                 )
             ce_per_axis = []
             for axis_i, axis_name in enumerate(MOVE_AXIS_NAMES):
-                axis_pred = move_pred[move_valid, axis_i, :]
-                axis_target = move_target[move_valid, axis_i]
-                if not move_is_real:
+                axis_valid = move_valid_per_axis[axis_i]
+                axis_pred = move_pred[axis_valid, axis_i, :]
+                axis_target = move_target[axis_valid, axis_i]
+                axis_is_real = axis_pred.shape[0] > 0
+                if not axis_is_real:
                     ce_axis = torch.zeros((), dtype=move_pred.dtype, device=move_pred.device)
                 elif axis_name == "ud":
-                    ce_axis = F.cross_entropy(
-                        axis_pred, axis_target, weight=ud_class_weight, reduction="mean",
-                    )
+                    if jump_dist_weight_flat is not None:
+                        # Per-frame CE then multiplicative distance weight,
+                        # matching the fire-head .mean() reduction so both
+                        # heads' loss magnitudes scale the same way.
+                        ce_pf = F.cross_entropy(
+                            axis_pred, axis_target,
+                            weight=ud_class_weight, reduction="none",
+                        )
+                        ce_axis = (ce_pf * jump_dist_weight_flat[axis_valid]).mean()
+                    else:
+                        ce_axis = F.cross_entropy(
+                            axis_pred, axis_target, weight=ud_class_weight, reduction="mean",
+                        )
                 else:
                     ce_axis = F.cross_entropy(axis_pred, axis_target, reduction="mean")
                 ce_per_axis.append(ce_axis)
@@ -1281,15 +1560,23 @@ class QNNPolicy:
                 metrics["loss_move"] = move_loss.detach()
                 if move_is_real:
                     with torch.no_grad():
-                        move_argmax = torch.argmax(move_pred, dim=-1)[move_valid]  # (B, 3)
-                        move_target_v = move_target[move_valid]
-                        metrics["acc_move"] = (move_argmax == move_target_v).float().mean().detach()
+                        # Per-axis argmax computed once; per-axis indexing
+                        # below selects each axis's valid frames separately
+                        # so op_input-masked axes drop their stale frames.
+                        move_argmax_all = torch.argmax(move_pred, dim=-1)  # (B, 3)
+                        per_axis_acc: list[torch.Tensor] = []
                         per_axis_macro_f1 = []
                         for axis_i, axis_name in enumerate(MOVE_AXIS_NAMES):
+                            axis_valid = move_valid_per_axis[axis_i]
                             metrics[f"loss_move_{axis_name}"] = ce_per_axis[axis_i].detach()
-                            pred_axis = move_argmax[:, axis_i]
-                            true_axis = move_target_v[:, axis_i]
-                            metrics[f"acc_move_{axis_name}"] = (pred_axis == true_axis).float().mean().detach()
+                            pred_axis = move_argmax_all[axis_valid, axis_i]
+                            true_axis = move_target[axis_valid, axis_i]
+                            if pred_axis.numel() > 0:
+                                axis_acc = (pred_axis == true_axis).float().mean()
+                            else:
+                                axis_acc = torch.zeros((), dtype=move_pred.dtype, device=move_pred.device)
+                            metrics[f"acc_move_{axis_name}"] = axis_acc.detach()
+                            per_axis_acc.append(axis_acc)
                             # Per-class precision / recall / F1 across all three
                             # classes (neg/none/pos).  Macro-F1 per axis is the
                             # honest single-axis summary that doesn't hide the
@@ -1310,20 +1597,81 @@ class QNNPolicy:
                                 metrics[f"precision_move_{axis_name}_{cls_name}"] = prec.detach()
                                 metrics[f"recall_move_{axis_name}_{cls_name}"] = rec.detach()
                                 metrics[f"f1_move_{axis_name}_{cls_name}"] = f1.detach()
-                                metrics[f"pos_rate_move_{axis_name}_{cls_name}"] = true_cls.float().mean().detach()
+                                if true_cls.numel() > 0:
+                                    metrics[f"pos_rate_move_{axis_name}_{cls_name}"] = true_cls.float().mean().detach()
+                                else:
+                                    metrics[f"pos_rate_move_{axis_name}_{cls_name}"] = torch.zeros(
+                                        (), dtype=move_pred.dtype, device=move_pred.device,
+                                    )
                                 class_f1s.append(f1)
                             macro = torch.stack(class_f1s).mean()
                             metrics[f"f1_move_{axis_name}"] = macro.detach()
                             per_axis_macro_f1.append(macro)
+                        # Equal-axes overall acc/F1 — the mean-of-per-axis
+                        # form is identical to the original ``argmax ==
+                        # target`` mean when all axes share one valid mask
+                        # (i.e. op_input_mask off), and remains
+                        # well-defined when per-axis valids differ.
+                        metrics["acc_move"] = torch.stack(per_axis_acc).mean().detach()
                         metrics["f1_move"] = torch.stack(per_axis_macro_f1).mean().detach()
 
         if FIRE_HEAD in logits and FIRE_HEAD in actions:
             fire_logits = logits[FIRE_HEAD]
-            fire_pred = fire_logits.reshape(-1)
-            fire_target = self._tensor(actions[FIRE_HEAD], dtype=torch.float32).reshape(-1)
+            fire_target_t = self._tensor(actions[FIRE_HEAD], dtype=torch.float32)
+            # Two distance-shoulder paths exist:
+            #
+            # 1. Sequence path (ndim==2, lane-packed pipeline): compute
+            #    weights via Conv1d on the (T, B) target stream so each
+            #    frame sees its time-axis neighbors.
+            # 2. Flat path (ndim==1, GPU-resident frame-shuffled SGD):
+            #    no time axis exists in the batch, so we use a
+            #    per-frame "distance to nearest positive in same episode"
+            #    that was precomputed at preload time and shipped via
+            #    actions["fire_distance_to_pos"].
+            #
+            # Both produce the same loss semantics; only the
+            # convolution/precompute boundary moves.
+            distance_weight_flat: torch.Tensor | None = None
+            if self.fire_distance_sigma > 0.0:
+                if fire_target_t.ndim == 2:
+                    from qnn.bc.heads.loss_shaping import distance_weighted_neg_weights
+                    valid_2d = valid_mask.bool() if valid_mask is not None else None
+                    w_2d = distance_weighted_neg_weights(
+                        fire_target_t, valid_2d, self.fire_distance_sigma,
+                    )
+                    distance_weight_flat = w_2d.reshape(-1)
+                elif fire_target_t.ndim == 1 and "fire_distance_to_pos" in actions:
+                    from qnn.bc.heads.loss_shaping import flat_distance_weight
+                    fire_d = self._tensor(actions["fire_distance_to_pos"], dtype=torch.float32)
+                    distance_weight_flat = flat_distance_weight(
+                        fire_d.reshape(-1), fire_target_t.reshape(-1),
+                        self.fire_distance_sigma,
+                    )
+
+            fire_pred_full = fire_logits.reshape(-1)
+            fire_target_full = fire_target_t.reshape(-1)
+            fire_dw_full = distance_weight_flat
             if valid_flat is not None:
-                fire_pred = fire_pred[valid_flat]
-                fire_target = fire_target[valid_flat]
+                fire_pred_full = fire_pred_full[valid_flat]
+                fire_target_full = fire_target_full[valid_flat]
+                if fire_dw_full is not None:
+                    fire_dw_full = fire_dw_full[valid_flat]
+            # Loss-keep mask. Off: kept == full. On: drop frames where
+            # fire was held but the engine didn't act on it (op_input
+            # bit 3 == 0 and fire_target == 1) — those are
+            # cooldown/dead-time false positives in the demo label.
+            if op_mask_on and op_input_flat is not None:
+                op_input_full = op_input_flat
+                if valid_flat is not None:
+                    op_input_full = op_input_full[valid_flat]
+                fire_keep = (fire_target_full == 0) | (((op_input_full >> 3) & 1) != 0)
+                fire_pred = fire_pred_full[fire_keep]
+                fire_target = fire_target_full[fire_keep]
+                fire_dw = fire_dw_full[fire_keep] if fire_dw_full is not None else None
+            else:
+                fire_pred = fire_pred_full
+                fire_target = fire_target_full
+                fire_dw = fire_dw_full
             fire_is_real = fire_target.numel() > 0
             # pos_weight conventionally lives in class_weights[FIRE_HEAD] (set
             # at training startup from corpus statistics: neg_count/pos_count).
@@ -1332,19 +1680,48 @@ class QNNPolicy:
                 cw = class_weights[FIRE_HEAD]
                 pos_weight = cw if isinstance(cw, torch.Tensor) else torch.as_tensor(cw, device=fire_pred.device)
             if fire_is_real:
-                fire_loss = F.binary_cross_entropy_with_logits(
-                    fire_pred, fire_target, pos_weight=pos_weight, reduction="mean",
-                )
+                # Unified path: per-frame BCE, then multiplicative weighting
+                # by (focal? * distance?). When both gamma and sigma are 0
+                # the product is all-ones and the reduction matches the
+                # original ``F.binary_cross_entropy_with_logits(..., reduction="mean")``.
+                if self.fire_focal_gamma > 0.0 or fire_dw is not None:
+                    bce = F.binary_cross_entropy_with_logits(
+                        fire_pred, fire_target, pos_weight=pos_weight, reduction="none",
+                    )
+                    weight = torch.ones_like(bce)
+                    if self.fire_focal_gamma > 0.0:
+                        # Focal BCE: down-weight easy examples by (1 - p_t)^gamma.
+                        # Optional per-class alpha (Lin et al.): alpha on
+                        # positives, (1 - alpha) on negatives.
+                        p = torch.sigmoid(fire_pred)
+                        pt = torch.where(fire_target > 0.5, p, 1.0 - p)
+                        alpha_t = torch.where(
+                            fire_target > 0.5,
+                            torch.full_like(p, self.fire_focal_alpha),
+                            torch.full_like(p, 1.0 - self.fire_focal_alpha),
+                        )
+                        weight = weight * alpha_t * (1.0 - pt).clamp(min=1e-6) ** self.fire_focal_gamma
+                    if fire_dw is not None:
+                        weight = weight * fire_dw
+                    fire_loss = (weight * bce).mean()
+                else:
+                    fire_loss = F.binary_cross_entropy_with_logits(
+                        fire_pred, fire_target, pos_weight=pos_weight, reduction="mean",
+                    )
             else:
                 fire_loss = torch.zeros((), dtype=fire_logits.dtype, device=fire_logits.device)
             losses.append(fire_loss * weights_map.get(FIRE_HEAD, 1.0))
             loss_is_real.append(fire_is_real)
             if compute_metrics:
                 metrics["loss_fire"] = fire_loss.detach()
-                if fire_is_real:
+                # Always emit headline metrics on the full subset
+                # (segment_mask only; no op_input filter). Comparable
+                # apples-to-apples against baseline runs that ran with
+                # op_input_mask=False.
+                if fire_target_full.numel() > 0:
                     with torch.no_grad():
-                        pred_pos = (torch.sigmoid(fire_pred) > 0.5)
-                        target_pos = fire_target > 0.5
+                        pred_pos = (torch.sigmoid(fire_pred_full) > 0.5)
+                        target_pos = fire_target_full > 0.5
                         tp = (pred_pos & target_pos).sum()
                         fp = (pred_pos & ~target_pos).sum()
                         fn = (~pred_pos & target_pos).sum()
@@ -1363,6 +1740,33 @@ class QNNPolicy:
                         metrics["precision_fire"] = prec.detach()
                         metrics["recall_fire"] = rec.detach()
                         metrics["f1_fire"] = (2.0 * prec * rec / f1_denom).detach()
+                # When op_input_mask is on, also emit kept-only metrics
+                # (``*_fire_masked``). These reflect the subset the loss
+                # actually trains on. Both are reported so the ablation
+                # shows the label-set change AND the model behavior on
+                # the cleaner subset.
+                if op_mask_on and fire_is_real:
+                    with torch.no_grad():
+                        pred_pos_m = (torch.sigmoid(fire_pred) > 0.5)
+                        target_pos_m = fire_target > 0.5
+                        tp_m = (pred_pos_m & target_pos_m).sum()
+                        fp_m = (pred_pos_m & ~target_pos_m).sum()
+                        fn_m = (~pred_pos_m & target_pos_m).sum()
+                        tn_m = (~pred_pos_m & ~target_pos_m).sum()
+                        metrics["tp_fire_masked"] = tp_m.detach()
+                        metrics["fp_fire_masked"] = fp_m.detach()
+                        metrics["fn_fire_masked"] = fn_m.detach()
+                        metrics["tn_fire_masked"] = tn_m.detach()
+                        n_total_m = tp_m + fp_m + fn_m + tn_m
+                        metrics["acc_fire_masked"] = ((tp_m + tn_m).float() / n_total_m.clamp(min=1)).detach()
+                        prec_denom_m = (tp_m + fp_m).clamp(min=1)
+                        rec_denom_m = (tp_m + fn_m).clamp(min=1)
+                        prec_m = tp_m.float() / prec_denom_m
+                        rec_m = tp_m.float() / rec_denom_m
+                        f1_denom_m = (prec_m + rec_m).clamp(min=1e-6)
+                        metrics["precision_fire_masked"] = prec_m.detach()
+                        metrics["recall_fire_masked"] = rec_m.detach()
+                        metrics["f1_fire_masked"] = (2.0 * prec_m * rec_m / f1_denom_m).detach()
 
         if LOOK_HEAD in logits and LOOK_HEAD in actions:
             # Magnitude-sensitive supervision: regress the raw delta_look
@@ -1467,12 +1871,36 @@ class QNNPolicy:
         # No-op when hard_target_feat is off (TargetPointer ignores target_gt
         # in soft-pool mode).
         target_gt_arr = actions.get("target") if isinstance(actions, Mapping) else None
+        # GT-distribution STE: derive a (T*B, N) renormalized slot distribution
+        # from actions["target_dist"] (T*B, 17) when present. TargetPointer
+        # uses it as the STE forward signal in training mode only; eval falls
+        # back to the soft path even when target_dist_slot is supplied (gated
+        # on self.training). Only supplied here in the training step.
+        target_dist_slot_arr = None
+        prev_target_dist_arr = None
+        if isinstance(actions, Mapping) and "target_dist" in actions:
+            td = self._tensor(actions["target_dist"], dtype=torch.float32)
+            present = (1.0 - td[..., 0]).clamp(min=1e-6)
+            target_dist_slot_arr = td[..., 1:] / present.unsqueeze(-1)
+            # prev_target_dist: shift slot_target by one along the time axis
+            # (only meaningful for sequence inputs). Zero at episode starts
+            # via reset_mask if provided; the t=0 row is also zeroed.
+            if td.ndim == 3:
+                prev_st = torch.zeros_like(target_dist_slot_arr)
+                prev_st[1:] = target_dist_slot_arr[:-1]
+                if isinstance(masks, Mapping) and "reset_mask" in masks:
+                    rm = self._tensor(masks["reset_mask"], dtype=torch.bool)
+                    if rm.ndim == 2:
+                        prev_st = prev_st.masked_fill(rm.unsqueeze(-1), 0.0)
+                prev_target_dist_arr = prev_st
         with self._autocast():
             _, logits, _, next_hidden, target_logits, target_query = self._forward_tensors(
                 obs,
                 hidden=hidden,
                 masks=masks,
                 target_gt=target_gt_arr,
+                target_dist_slot=target_dist_slot_arr,
+                prev_target_dist=prev_target_dist_arr,
             )
             valid_mask = (
                 self._tensor(masks["valid_mask"], dtype=torch.bool)
@@ -1510,11 +1938,26 @@ class QNNPolicy:
         head_loss_weights: Mapping[str, float] | None = None,
         compute_metrics: bool = True,
     ) -> Dict[str, Any]:
+        # Mirror the privileged inputs supervised_step derives from
+        # ``actions``: target_gt and a renormalized 16-slot target_dist.
+        # The canonical model is no-op for these in eval (TargetPointer
+        # gates STE on self.training) — but a model_factory-injected
+        # ablation may need them (e.g., a probe whose entire encoder
+        # pools by GT slot mass). Passing them keeps eval symmetric with
+        # training across both code paths.
+        target_gt_arr = actions.get("target") if isinstance(actions, Mapping) else None
+        target_dist_slot_arr = None
+        if isinstance(actions, Mapping) and "target_dist" in actions:
+            td = self._tensor(actions["target_dist"], dtype=torch.float32)
+            present = (1.0 - td[..., 0]).clamp(min=1e-6)
+            target_dist_slot_arr = td[..., 1:] / present.unsqueeze(-1)
         with torch.inference_mode(), self._autocast():
             _, logits, _, next_hidden, target_logits, target_query = self._forward_tensors(
                 obs,
                 hidden=hidden,
                 masks=masks,
+                target_gt=target_gt_arr,
+                target_dist_slot=target_dist_slot_arr,
             )
             valid_mask = (
                 self._tensor(masks["valid_mask"], dtype=torch.bool)
@@ -1550,30 +1993,12 @@ class QNNPolicy:
 
         meta = {
             "obs_dim": self.obs_dim,
-            "trunk_hidden": self.trunk_hidden,
-            "gru_hidden": self.gru_hidden,
-            "use_gru": self.use_gru,
-            "use_weapon_head": self.use_weapon_head,
-            "look_bypass_gru": self.look_bypass_gru,
-            "weapon_switch_confidence": self.weapon_switch_confidence,
-            "weapon_switch_margin": self.weapon_switch_margin,
+            "model": self.config.to_dict(),
             "jump_pos_weight": self.jump_pos_weight,
-            "target_focal_gamma": self.target_focal_gamma,
-            "weapon_use_gru": self.weapon_use_gru,
-            "weapon_context_from_obs": self.weapon_context_from_obs,
-            "gru_target_query": self.gru_target_query,
-            "hard_target_feat": self.hard_target_feat,
-            "weapon_in_target_query": self.weapon_in_target_query,
-            "linear_slot_prior": self.linear_slot_prior,
-            "head_bottleneck_dims": self.head_bottleneck_dims,
-            "head_use_relu": self.head_use_relu,
-            "head_activation": self.head_activation,
-            "d_model": self.d_model,
-            "head_hidden": self.head_hidden,
-            "n_heads": self.n_heads,
-            "n_layers": self.n_layers,
-            "ffn_dim": self.ffn_dim,
-            "attn_dropout": self.attn_dropout,
+            "fire_focal_gamma": self.fire_focal_gamma,
+            "fire_focal_alpha": self.fire_focal_alpha,
+            "fire_distance_sigma": self.fire_distance_sigma,
+            "jump_distance_sigma": self.jump_distance_sigma,
             "backend": "pytorch",
             "requested_device": self.device_spec.requested,
             "resolved_device": self.device_spec.resolved,
@@ -1592,68 +2017,72 @@ class QNNPolicy:
         target.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | Path, device: str = "auto") -> "QNNPolicy":
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        device: str,
+        model_factory: Callable[[int, ModelConfig], nn.Module] | None = None,
+    ) -> "QNNPolicy":
+        """Load a saved checkpoint.
+
+        ``model_factory`` mirrors the constructor hook: when None, the
+        canonical ``_CombatObjectiveNet`` is built from the saved
+        ModelConfig and strict-loaded; when set, the factory builds the
+        alternate module (e.g. a head-probe model) and the state_dict
+        is loaded into it. The caller is responsible for passing the
+        same factory used to train the checkpoint — checkpoints don't
+        embed the factory identity.
+        """
         source = Path(path)
         payload = trusted_torch_load(source, map_location="cpu")
         if not isinstance(payload, dict) or "state_dict" not in payload or "meta" not in payload:
             raise ValueError(f"Unrecognised checkpoint format: {source}")
         meta = dict(payload["meta"])
-        model = cls(
-            obs_dim=int(meta.get("obs_dim", 0)),
-            trunk_hidden=int(meta.get("d_model", meta["trunk_hidden"])),
-            gru_hidden=int(meta.get("gru_hidden", 0)),
-            use_gru=bool(meta.get("use_gru", False)),
-            use_weapon_head=bool(meta.get("use_weapon_head", False)),
-            look_bypass_gru=bool(meta.get("look_bypass_gru", False)),
-            weapon_switch_confidence=float(meta.get("weapon_switch_confidence", 0.65)),
-            weapon_switch_margin=float(meta.get("weapon_switch_margin", 0.15)),
-            jump_pos_weight=float(meta.get("jump_pos_weight", 1.0)),
-            target_focal_gamma=float(meta.get("target_focal_gamma", 0.0)),
-            weapon_use_gru=bool(meta.get("weapon_use_gru", True)),
-            # Legacy mapping: pre-refactor checkpoints used weapon_teacher_force
-            # to gate label-vs-prediction at BC training. Under the new
-            # semantics, motor heads read currently-held weapon from obs.
-            #   teacher_force=True  → trained with embed(true_slot); obs at
-            #     inference returns the same slot → context_from_obs=True
-            #   teacher_force=False → trained with softmax-blended prediction;
-            #     preserve inference behavior via context_from_obs=False
-            weapon_context_from_obs=bool(
-                meta["weapon_context_from_obs"]
-                if "weapon_context_from_obs" in meta
-                else meta.get("weapon_teacher_force", True)
-            ),
-            head_bottleneck_dim=(
-                meta["head_bottleneck_dims"]
-                if "head_bottleneck_dims" in meta
-                else int(meta.get("head_bottleneck_dim", 0))
-            ),
-            head_use_relu=bool(meta.get("head_use_relu", False)),
-            head_activation=meta.get("head_activation"),
-            gru_target_query=bool(meta.get("gru_target_query", False)),
-            hard_target_feat=bool(meta.get("hard_target_feat", False)),
-            weapon_in_target_query=bool(meta.get("weapon_in_target_query", False)),
-            linear_slot_prior=bool(meta.get("linear_slot_prior", False)),
+        if "model" not in meta:
+            from qnn.utils.checkpoint_converter import migrate_legacy_flat_meta
+            migrated = migrate_legacy_flat_meta(meta)
+            if migrated is None:
+                raise ValueError(
+                    f"Checkpoint {source} is missing the 'model' arch block "
+                    "and migrate_legacy_flat_meta did not recognize the schema."
+                )
+            meta = migrated
+        model_cfg = ModelConfig.from_dict(meta["model"])
+        policy = cls(
+            obs_dim=int(meta["obs_dim"]),
+            model=model_cfg,
+            jump_pos_weight=float(meta["jump_pos_weight"]),
+            fire_focal_gamma=float(meta["fire_focal_gamma"]),
+            fire_focal_alpha=float(meta["fire_focal_alpha"]),
+            fire_distance_sigma=float(meta["fire_distance_sigma"]),
+            jump_distance_sigma=float(meta["jump_distance_sigma"]),
             seed=0,
             device=device,
-            d_model=int(meta.get("d_model", meta["trunk_hidden"])),
-            n_heads=int(meta.get("n_heads", 2)),
-            n_layers=int(meta.get("n_layers", 2)),
-            ffn_dim=int(meta.get("ffn_dim", 256)),
-            attn_dropout=float(meta.get("attn_dropout", 0.0)),
+            model_factory=model_factory,
         )
-        from qnn.utils.checkpoint_converter import (
-            migrate_drop_action_history,
-            migrate_drop_fire_align_scalar,
-            migrate_entity_embed,
-            migrate_self_scalars,
-            migrate_v17_move_heads,
-        )
+        if model_factory is None:
+            from qnn.utils.checkpoint_converter import (
+                migrate_drop_action_history,
+                migrate_drop_fire_align_scalar,
+                migrate_drop_weapon_embed_self,
+                migrate_entity_embed,
+                migrate_self_attack_finished_scalar,
+                migrate_self_scalars,
+                migrate_v17_move_heads,
+            )
 
-        migrate_entity_embed(payload["state_dict"])
-        migrate_self_scalars(payload["state_dict"])
-        migrate_v17_move_heads(payload["state_dict"])
-        migrate_drop_action_history(payload["state_dict"])
-        migrate_drop_fire_align_scalar(payload["state_dict"])
+            migrate_entity_embed(payload["state_dict"])
+            migrate_self_scalars(payload["state_dict"])
+            migrate_self_attack_finished_scalar(payload["state_dict"])
+            migrate_v17_move_heads(payload["state_dict"])
+            migrate_drop_action_history(payload["state_dict"])
+            migrate_drop_fire_align_scalar(payload["state_dict"])
+            migrate_drop_weapon_embed_self(payload["state_dict"])
+        # When model_factory is set the saved state_dict is for the
+        # injected module (e.g. FireTokenHead), not _CombatObjectiveNet —
+        # canonical migrations don't apply and the strict-load below will
+        # use empty allow-prefixes.
         try:
             # strict=False so v17 checkpoints still load:
             #  - migrate_v17_move_heads packs split fb/lr into the unified
@@ -1667,13 +2096,19 @@ class QNNPolicy:
             #  - weapon_head / weapon_embed start fresh on v17/v20-pre-v21
             #  - trunk.gru_input_proj weight (pre-v20 mean-actors pool) is
             #    silently dropped
-            missing, unexpected = model.model.load_state_dict(payload["state_dict"], strict=False)
-            allowed_missing_prefixes = (
-                "weapon_head.", "weapon_embed.",
-            )
-            allowed_unexpected_prefixes = (
-                "trunk.gru_input_proj.",  # pre-v20: mean-actors pool projection
-            )
+            missing, unexpected = policy.model.load_state_dict(payload["state_dict"], strict=False)
+            if model_factory is None:
+                allowed_missing_prefixes: tuple[str, ...] = (
+                    "weapon_head.", "weapon_embed.",
+                )
+                allowed_unexpected_prefixes: tuple[str, ...] = (
+                    "trunk.gru_input_proj.",  # pre-v20: mean-actors pool projection
+                )
+            else:
+                # No legacy migrations for factory-built modules — they
+                # save and load their own state_dict shape.
+                allowed_missing_prefixes = ()
+                allowed_unexpected_prefixes = ()
             missing_keep = [k for k in missing if not k.startswith(allowed_missing_prefixes)]
             unexpected_keep = [k for k in unexpected if not k.startswith(allowed_unexpected_prefixes)]
             if missing_keep or unexpected_keep:
@@ -1685,8 +2120,8 @@ class QNNPolicy:
                 f"Incompatible checkpoint architecture for {source}. "
                 "This code expects the combat-objective BC policy layout."
             ) from exc
-        model.model.to(model.device)
-        return model
+        policy.model.to(policy.device)
+        return policy
 
     @classmethod
     def load_for_finetune(
@@ -1695,7 +2130,7 @@ class QNNPolicy:
         *,
         use_gru: bool,
         gru_hidden: int,
-        device: str = "auto",
+        device: str,
     ) -> "QNNPolicy":
         del use_gru, gru_hidden
         return cls.load(path, device=device)

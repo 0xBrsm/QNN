@@ -24,7 +24,7 @@ actually learning:
        --ablate everything_else keep only per-slot scalars
 
 Usage:
-    PYTHONPATH=src python -m qnn.probes.target_head_diag \
+    PYTHONPATH=src python -m qnn.labeler.probes.target_head_diag \
         --data-dir artifacts/collect/qwd \
         --ckpt    runs/probe/full_w0_15_gpu/latest.pt
 """
@@ -39,7 +39,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from qnn.probes.target_head_probe import (
+from qnn.labeler.probes.target_head_probe import (
     N_SLOTS, N_SLOT_SCALARS, TargetHeadProbe, _ChunkedDataset,
     _load_split, _to_device, _accumulate, BucketStats,
 )

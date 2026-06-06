@@ -116,6 +116,15 @@ typedef struct
 	int	weapon;		/* raw engine weapon byte: 0 = no switch this
 				 * frame, 1..8 = Quake weapon id (axe..lightning)
 				 * consumed as an impulse by the runtime engine. */
+	int	op_input;	/* per-axis op mask of the usercmd this tick:
+				 * bit i set ⇔ press on axis i AND engine
+				 * acted on it. bit0=fb, bit1=lr, bit2=ud,
+				 * bit3=fire, bit4=impulse. Bits 5..7 reserved.
+				 * Packed by QNN_PackOpInput on both BC QWD
+				 * (action.op_input) and labeler (LOBS byte)
+				 * paths; the trainer's op_input_mask toggle
+				 * consumes it to drop held-but-ignored frames
+				 * from each head's loss subset. */
 } qnn_action_t;
 
 typedef struct
@@ -248,6 +257,110 @@ typedef struct {
 } qnn_mover_state_t;
 
 void QNN_PhysInit(void);
+
+/* QC VM driver (qnn_progs.c) — initializes the server-side QuakeC
+ * interpreter against qwprogs.dat for sanitize-mode predicate
+ * evaluation.  Optional; only used when the labeler collect is run
+ * with --sanitize-inputs.  Returns false if progs.dat load fails. */
+qboolean QNN_ProgsInit(void);
+void     QNN_ProgsSmokeTest(void);
+
+/* Per-tick predicate eval.  Run the real QC ImpulseCommands dispatcher
+ * against a freshly-populated edict with the supplied state and return
+ * the post-call value of self.weapon as an IT_* item flag (1, 2, 4, 8,
+ * 16, 32, 64, 4096).  Dispatches to W_ChangeWeapon for impulses 1..8 and
+ * to CycleWeaponCommand / CycleWeaponReverseCommand for 10 / 12; 9 (cheat)
+ * and 11 (serverflags) are passed through but don't flip self.weapon
+ * during normal play.  Returns 0 if the player is dead, the impulse is
+ * outside 1..12, or the VM isn't initialized.  Compare the returned
+ * post-weapon item flag against QNN_ImpulseToItemFlag(weapon_id) to
+ * detect a transition.  Args are passed individually because the
+ * snapshot type lives in this header which qnn_progs.c can't include
+ * without pulling client-side stubs that conflict with the real
+ * server-side edict_t. */
+int QNN_ProgsEvalWeaponImpulse(
+	int health, int items_owned,
+	int ammo_shells, int ammo_nails, int ammo_rockets, int ammo_cells,
+	int weapon_id, int impulse);
+
+/* Operative weapon-impulse predicate with persistent self.weapon
+ * state across calls.  Returns 1 iff this tick's impulse caused
+ * self.weapon to flip (= an actual press event); 0 otherwise.
+ *
+ * Maintains qnn_progs_self_weapon internally — defeats the
+ * snapshot.weapon_id reliable-channel lag artifact where sticky cmd
+ * impulses produced spurious repeat-fire ops during the lag window.
+ * Syncs to snapshot_weapon_id on detected server-forced switches
+ * (pickup auto-select, ammo-out W_BestWeapon, respawn).  Caller may
+ * pass impulse=0 to drive sync without invoking QC. */
+int QNN_ProgsEvalWeaponImpulseOperative(
+	int health, int items_owned,
+	int ammo_shells, int ammo_nails, int ammo_rockets, int ammo_cells,
+	int snapshot_weapon_id, int impulse);
+
+/* impulse byte (1..8) -> IT_* item flag.  Returns 0 for impulses 9..12
+ * (which don't map to a single weapon — cycle/cheat/serverflags). */
+int QNN_ImpulseToItemFlag(int impulse);
+
+/* Per-tick W_Attack predicate.  Runs the real QC W_WeaponFrame against
+ * an injected edict at server-time = tick / tick_hz.  Returns 1 iff
+ * self.attack_finished was advanced (= W_Attack actually fired this
+ * tick).  Caller must invoke once per native tick where button0 might
+ * be pressed so the persistent attack_finished state stays correct
+ * across cooldown windows.  Returns 0 on dead player, invalid weapon,
+ * VM not inited, or when the cooldown gate / no-ammo branch rejects.
+ *
+ * State: a single static float persists between calls and is reset on
+ * each QNN_ProgsInit (= once per demo). */
+int QNN_ProgsEvalAttack(
+	int tick, int tick_hz,
+	int health, int items_owned,
+	int ammo_shells, int ammo_nails, int ammo_rockets, int ammo_cells,
+	int weapon_id, int button0_pressed);
+
+/* Per-tick PlayerJump predicate.  Returns 1 iff PlayerJump's success
+ * branch ran (cleared FL_JUMPRELEASED → played the jump sound).
+ * Persists FL_JUMPRELEASED across calls so the anti-pogo gate is
+ * honored — reset to true on each QNN_ProgsInit.  Caller invokes once
+ * per native tick with the current usercmd button2 state (1=pressing
+ * jump, 0=not). */
+int QNN_ProgsEvalJump(
+	int tick, int tick_hz,
+	int health, int grounded, int waterlevel, int button2_pressed);
+
+/* Native-frame remainder of the QC-tracked attack_finished cooldown at
+ * the given (tick, tick_hz).  0 = engine will process the next fire
+ * this tick; >0 = engine will reject (and queue) presses for that many
+ * frames.  Reads qnn_progs_attack_finished, which W_Attack writes on
+ * every successful fire.  Replaces the labeler's earlier hand-coded
+ * k_fire_cd_native[9] table. */
+int QNN_ProgsGetAttackCdRemaining(int tick, int tick_hz);
+
+/* QWD-side per-cmd operative-predicate driver (engine-specific impl
+ * in qw/qnn_qwd_collect.c, declared here so common labeler-collect
+ * code can call it without pulling qw/* headers).  Single pass through
+ * the cmd window: runs the QC W_WeaponFrame fire predicate per cmd
+ * (advancing attack_finished state) and aggregates the raw usercmd
+ * bytes for the per-tick cmd block.  Jump operativeness lives in
+ * QNN_QwdEvalPmoveJump (pmove-driven), not here. */
+void QNN_QwdEvalOperativePerCmd(
+	const qnn_snapshot_t *snapshot,
+	int *out_op_fire,
+	int *out_fmove,
+	int *out_smove,
+	int *out_umove,
+	int *out_buttons,
+	int *out_impulse);
+
+/* Per-cmd pmove driver for jump operativeness.  Iterates the cmd
+ * window and calls PlayerMove() per cmd against pmove globals seeded
+ * from the snapshot; returns 1 iff any cmd in this tick's window
+ * triggered the patched JumpButton() success branch (270 z-impulse).
+ * Replaces the K-gated QC PlayerJump predicate — frame-exact press
+ * attribution at cmd granularity, no snapshot.grounded lag artifact.
+ * Maintains pmove.oldbuttons across calls via qwd_state for cross-
+ * tick anti-pogo. */
+int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot);
 void QNN_PhysSetupMovers(const qnn_mover_state_t *movers, int count);
 void QNN_PhysSetupPlayers(const vec3_t *origins, int count);
 void QNN_PhysBestCandidate(
@@ -273,48 +386,75 @@ void QNN_EmitTick(FILE *out, const uint8_t *obs, const qnn_action_t *action,
 	int tick, int steps, int tick_hz, uint16_t flags);
 
 /* LOBS (Labeler OBS): slim per-native-tick stream for labeler training /
- * apply.  32-byte fixed-size frame, no obs buffer overhead.  Used only
- * when qnn_runtime.labeler_mode is set; the worker writes LOBS instead
- * of QOBS so the labeler reader is decoupled from the BC obs schema.
+ * apply.  Fixed-size frame, no obs buffer overhead.  Used only when
+ * qnn_runtime.labeler_mode is set; the worker writes LOBS instead of
+ * QOBS so the labeler reader is decoupled from the BC obs schema.
+ *
+ * Wire layout puts two parallel columns side-by-side per tick:
+ *   cmd_*    — aggregated raw usercmd bytes the player sent
+ *   op_input — strict per-axis op mask of that usercmd
+ * Training-keep mask is derived consumer-side as
+ * `no_press_axis | op_input_bit_axis` per axis.
  *
  * Wire layout (little-endian, all fields contiguous):
  *   "LOBS"            4 bytes magic
  *   tick              u32        4
  *   tick_hz           u32        4
- *   flags             u16        2  (reserved, currently 0)
- *   pos_delta_vel[3]  fp16       6  (body-frame, normalized by QNN_VELOCITY_SCALE)
- *   movement_id       u8         1
- *   view_delta[3]     fp16       6  (per-tick cur_forward dot anchor_basis)
- *   c_rule_fire       u8         1  (engine-side sound+ammo fire detection)
- *   c_rule_jump       u8         1
- *   move_packed       u8         1  (fb | lr<<2 | ud<<4, target)
- *   target_valid_mask u8         1  (per-axis engine-effective bits;
+ *   flags             u16        2  (bit1=done; bits else reserved)
+ *   pos_delta_vel[3]  fp16       6  (body-frame velocity, normalized
+ *                                    by QNN_VELOCITY_SCALE — obs feature)
+ *   movement_id       u8         1  (0=gnd / 1=air / 2..=water — obs)
+ *   cmd_angles[3]     int16      6  (usercmd: pitch/yaw/roll, encoded
+ *                                    as deg × 65536/360 — matches QW
+ *                                    MSG_WriteAngle16)
+ *   cmd_move[3]       int16      6  (usercmd: forwardmove/sidemove/
+ *                                    upmove in raw QW units, aggregated
+ *                                    across the cmd window: mean for
+ *                                    fb/lr; jump-canonical-or-most-
+ *                                    negative for ud)
+ *   cmd_buttons       u8         1  (usercmd: bits OR'd across cmd
+ *                                    window — bit 0 fire, bit 1 jump
+ *                                    button2, bits 2..7 mod-specific)
+ *   cmd_impulse       u8         1  (usercmd: last non-zero impulse in
+ *                                    cmd window — matches sv_user.c
+ *                                    overwrite semantics)
+ *   op_input          u8         1  (strict per-axis op mask of the
+ *                                    cmd_* fields.  bit i = 1 iff the
+ *                                    player pressed axis i AND the
+ *                                    engine acted on it this tick.
  *                                    bit0=fb, bit1=lr, bit2=ud,
- *                                    bit3=fire, bit4=weapon (held);
- *                                    bits5..7 reserved.  See
- *                                    src/demo/sanitize.py for the
- *                                    rule definitions this mirrors.)
- *   usercmd_fire      u8         1  (true press signal: cmd-window-OR'd
- *                                    action_label.fire on QWD,
- *                                    MVD-inferred fire on real MVD)
- *   weapon_id         u8         1  (held-weapon byte 1..8 = axe..LG, 0
- *                                    if no weapon held — observable
- *                                    every alive frame from server-side
- *                                    STAT_ACTIVEWEAPON)
+ *                                    bit3=fire, bit4=impulse.  Dead
+ *                                    frames = 0x00.  Trainer derives
+ *                                    keep mask as no_press | op_bit.)
+ *   weapon_id         u8         1  (server-held weapon byte 1..8, 0
+ *                                    if none — obs.  Lags impulses by
+ *                                    the cmd-pipeline delay.)
+ *   c_rule_fire       u8         1  (sound-derived: 1 iff a weapon-fire
+ *                                    PHS sound for the self entity was
+ *                                    multicast in this snapshot.  Same
+ *                                    generator MVD inference uses at
+ *                                    apply time, so train-time and
+ *                                    apply-time feature distributions
+ *                                    match.)
+ *   c_rule_jump       u8         1  (sound-derived: 1 iff a self-entity
+ *                                    plyrjmp8.wav PHS multicast landed
+ *                                    in this snapshot.  Sparse one-tick
+ *                                    -per-event — no hold extension.)
  *                              ---
- *                              33 bytes/tick
+ *                              39 bytes/tick (4 magic + 10 header + 25 payload)
  */
 void QNN_EmitLabelerTick(FILE *out,
 	int tick, int tick_hz, uint16_t flags,
 	const float pos_delta_vel[3],     /* body-frame, pre-normalized */
 	int movement_id,
-	const float view_delta[3],
-	int c_rule_fire,
-	int c_rule_jump,
-	uint8_t move_packed,
-	uint8_t target_valid_mask,
-	uint8_t usercmd_fire,
-	uint8_t weapon_id);
+	const int16_t cmd_angles[3],
+	const int16_t cmd_move[3],
+	uint8_t cmd_buttons,
+	uint8_t cmd_impulse,
+	uint8_t op_input,
+	uint8_t weapon_id,
+	uint8_t c_rule_fire,
+	uint8_t c_rule_jump);
 
 /* Shared tick-emission state for collect workers (NQ + QW).
  * Handles the two-level buffer (obs delay + 3-frame jitter filter on

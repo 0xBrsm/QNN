@@ -35,6 +35,7 @@ _TEMPLATE_DIRS = {
     "ppo": Path(__file__).resolve().parent.parent / "ppo" / "templates",
     "pbt": Path(__file__).resolve().parent.parent / "ppo" / "templates",
     "optuna": Path(__file__).resolve().parent.parent / "ppo" / "templates",
+    "head_probe": Path(__file__).resolve().parent.parent / "bc" / "heads" / "templates",
 }
 
 
@@ -56,7 +57,7 @@ def _template_dir_for_mode(mode: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Initialize a training run directory")
     parser.add_argument("--name", required=True, help="Run directory name")
-    parser.add_argument("--mode", required=True, choices=["bc", "ppo", "pbt", "optuna"], help="Training mode")
+    parser.add_argument("--mode", required=True, choices=["bc", "ppo", "pbt", "optuna", "head_probe"], help="Training mode")
     parser.add_argument("--resume", choices=["true", "false"], help="Override run.json resume")
     parser.add_argument("--description", help="Override run.json description")
     parser.add_argument("--checkpoint-path", help="Override run.json checkpoint_path")
@@ -67,6 +68,7 @@ def main() -> None:
     parser.add_argument("--machine", help="Path to machine.json (overrides template)")
     parser.add_argument("--model", help="Path to model.json (overrides template)")
     parser.add_argument("--eval", help="Path to eval.json (overrides template)")
+    parser.add_argument("--probe", help="Path to probe.json (overrides template; head_probe mode)")
     args = parser.parse_args()
 
     template_dir = _template_dir_for_mode(args.mode)

@@ -21,7 +21,7 @@ Per-frame features (flat):
 Multiclass LightGBM with class weighting (slot 0 down-weighted).
 
 Usage:
-    PYTHONPATH=src python -m qnn.probes.target_head_gbt \
+    PYTHONPATH=src python -m qnn.labeler.probes.target_head_gbt \
         --data-dir artifacts/collect/qwd \
         --output runs/probe/gbt_default \
         --mode default --n-train 500000 --n-estimators 300
@@ -39,7 +39,7 @@ from pathlib import Path
 import numpy as np
 
 from qnn.vocab import MAX_TOKEN_OBJECTS, TOKEN_ACTOR
-from qnn.probes.target_head_probe import (
+from qnn.labeler.probes.target_head_probe import (
     N_SLOTS, N_SLOT_SCALARS, N_SELF_SCALARS, N_TYPE_VOCAB, N_WEAPON_VOCAB,
     _Shard, _load_split, _enemy_flag,
 )

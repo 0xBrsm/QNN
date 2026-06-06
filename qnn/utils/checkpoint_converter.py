@@ -33,7 +33,7 @@ from qnn.schema import (
     SPATIAL_SCALAR_DIM,
     SPATIAL_TOKEN_COUNT,
 )
-from qnn.model.policy import QNNPolicy
+from qnn.model.policy import ModelConfig, QNNPolicy
 from qnn.utils.io import trusted_torch_load
 from qnn.vocab import ENTITY_IDS
 
@@ -55,7 +55,8 @@ def _is_sf_checkpoint(payload: Dict[str, Any]) -> bool:
 def bc_to_sf(
     bc_path: str | Path,
     sf_model: torch.nn.Module,
-    device: str = "cpu",
+    *,
+    device: str,
 ) -> Dict[str, Any]:
     """Copy weights from a BC/PPO checkpoint into an SF model state dict."""
     bc_policy = QNNPolicy.load(str(bc_path), device=device)
@@ -72,18 +73,12 @@ def bc_to_sf(
 
 def sf_to_qnn(
     sf_checkpoint_path: str | Path,
+    *,
     obs_dim: int,
-    trunk_hidden: int,
-    gru_hidden: int,
-    use_gru: bool,
-    d_model: int,
-    n_heads: int,
-    n_layers: int,
-    ffn_dim: int,
-    attn_dropout: float,
-    device: str = "cpu",
+    model: "ModelConfig",
+    device: str,
 ) -> QNNPolicy:
-    """Load an SF checkpoint and return an QNNPolicy with copied weights."""
+    """Load an SF checkpoint and return a QNNPolicy with copied weights."""
     payload = trusted_torch_load(str(sf_checkpoint_path), map_location="cpu")
     if not _is_sf_checkpoint(payload):
         raise ValueError(
@@ -94,16 +89,10 @@ def sf_to_qnn(
 
     bc_policy = QNNPolicy(
         obs_dim=obs_dim,
-        trunk_hidden=trunk_hidden,
-        gru_hidden=gru_hidden,
-        use_gru=use_gru and gru_hidden > 0,
+        model=model,
+        jump_pos_weight=1.0,
         seed=0,
         device=device,
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        ffn_dim=ffn_dim,
-        attn_dropout=attn_dropout,
     )
     bc_state = bc_policy.model.state_dict()
 
@@ -240,6 +229,131 @@ from qnn.schema import OBS_SCHEMA
 _OBS_SHAPES = OBS_SCHEMA
 
 
+def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Translate a pre-ModelConfig flat checkpoint meta into the modern nested format.
+
+    Pre-ModelConfig checkpoints stored architecture as a flat top-level dict
+    (`d_model`, `gru_hidden`, `look_bypass_gru`, ...). Modern ``QNNPolicy.load``
+    expects ``meta["model"]`` to be a ModelConfig-shaped sub-dict and requires
+    ``jump_pos_weight`` at the top level. Two flavors are recognized:
+
+    - **v22** (move_categorical=False fields like ``target_bypass_gru``/
+      ``readout`` absent; ``head_bottleneck_dims`` plural present): direct
+      field copy with sensible defaults for post-v22-only flags.
+    - **v17** (``target_bypass_gru`` / ``move_categorical`` / ``readout``
+      present; no weapon head trained): bare-Linear heads, weapon head
+      disabled (ONNX wrapper substitutes constant weapon_logits).
+
+    Returns the rewritten meta dict, or ``None`` if the input is already in
+    modern form (i.e. ``meta["model"]`` is present) or doesn't look like a
+    recognized legacy schema.
+
+    Limitations:
+    - For v17: synthesized weapon_logits are constant zeros at export.
+    - ``jump_pos_weight`` / ``fire_focal_gamma`` defaults are inert at
+      inference but won't match training-time values.
+    """
+    if "model" in meta:
+        return None
+    required = ("d_model", "n_heads", "n_layers", "ffn_dim", "attn_dropout",
+                "use_gru", "gru_hidden", "look_bypass_gru")
+    if any(k not in meta for k in required):
+        return None
+
+    is_v17 = "target_bypass_gru" in meta or "move_categorical" in meta or "readout" in meta
+
+    if is_v17:
+        model_cfg = {
+            "d_model":                  int(meta["d_model"]),
+            "n_heads":                  int(meta["n_heads"]),
+            "n_layers":                 int(meta["n_layers"]),
+            "ffn_dim":                  int(meta["ffn_dim"]),
+            "attn_dropout":             float(meta["attn_dropout"]),
+            "use_gru":                  bool(meta["use_gru"]),
+            "gru_hidden":               int(meta["gru_hidden"]),
+            # v17 had no weapon head — state_dict migration allow-lists
+            # weapon_head.* / weapon_embed.* as missing keys at load time.
+            "use_weapon_head":          False,
+            "weapon_switch_confidence": 0.5,
+            "weapon_switch_margin":     0.0,
+            "weapon_use_gru":           False,
+            "weapon_context_from_obs":  False,
+            "look_bypass_gru":          bool(meta["look_bypass_gru"]),
+            # v17's target_bypass_gru=True maps to gru_target_query=False
+            # (target_pointer queries with self_readout, not gru_flat).
+            "gru_target_query":         False,
+            "hard_target_feat":         False,
+            "weapon_in_target_query":   False,
+            "linear_slot_prior":        False,
+            "gt_dist_target_feat":      False,
+            "prev_target_in_query":     False,
+            # Required by invariant even when use_weapon_head=False
+            # (weapon_head module isn't built so the value is inert).
+            "weapon_use_self_readout":  True,
+            "self_weapon_embed_in_self": False,
+            "head_bottleneck_dim":      0,
+            "head_activation":          "none",
+        }
+        return {
+            "obs_dim":          int(meta.get("obs_dim", 0)),
+            "jump_pos_weight":  1.0,
+            "fire_focal_gamma": 0.0,
+            "fire_focal_alpha": 0.5,
+            "model":            model_cfg,
+        }
+
+    # v22 schema: most modern fields already present, only the post-v22
+    # additions (target-pointer flavors, weapon_use_self_readout) need
+    # synthesized defaults. v22 stored head_bottleneck_dims (plural) — the
+    # current ModelConfig.from_dict expects singular head_bottleneck_dim.
+    bottleneck = meta.get("head_bottleneck_dims") or meta.get("head_bottleneck_dim")
+    if isinstance(bottleneck, dict):
+        head_bottleneck_dim: Any = {k: int(v) for k, v in bottleneck.items()}
+    elif bottleneck is not None:
+        head_bottleneck_dim = int(bottleneck)
+    else:
+        head_bottleneck_dim = 0
+
+    model_cfg = {
+        "d_model":                   int(meta["d_model"]),
+        "n_heads":                   int(meta["n_heads"]),
+        "n_layers":                  int(meta["n_layers"]),
+        "ffn_dim":                   int(meta["ffn_dim"]),
+        "attn_dropout":              float(meta["attn_dropout"]),
+        "use_gru":                   bool(meta["use_gru"]),
+        "gru_hidden":                int(meta["gru_hidden"]),
+        "use_weapon_head":           bool(meta.get("use_weapon_head", True)),
+        "weapon_switch_confidence":  float(meta.get("weapon_switch_confidence", 0.65)),
+        "weapon_switch_margin":      float(meta.get("weapon_switch_margin", 0.15)),
+        "weapon_use_gru":            bool(meta.get("weapon_use_gru", True)),
+        "weapon_context_from_obs":   bool(meta.get("weapon_context_from_obs", False)),
+        "look_bypass_gru":           bool(meta["look_bypass_gru"]),
+        "gru_target_query":          False,
+        "hard_target_feat":          False,
+        "weapon_in_target_query":    False,
+        "linear_slot_prior":         False,
+        "gt_dist_target_feat":       False,
+        "prev_target_in_query":      False,
+        # Historical default (true, true) — weapon head trained with
+        # cat(gru_flat, self_readout, target_feat) selector.
+        "weapon_use_self_readout":   True,
+        "self_weapon_embed_in_self": False,
+        "head_bottleneck_dim":       head_bottleneck_dim,
+        "head_activation":           str(meta.get("head_activation", "relu")),
+    }
+    return {
+        "obs_dim":             int(meta.get("obs_dim", 0)),
+        "jump_pos_weight":     float(meta.get("jump_pos_weight", 1.0)),
+        "fire_focal_gamma":    float(meta.get("fire_focal_gamma", 0.0)),
+        # fire_focal_alpha=0.5 is neutral (equivalent to no class
+        # rebalancing); safe migration default for pre-toggle ckpts.
+        "fire_focal_alpha":    float(meta.get("fire_focal_alpha", 0.5)),
+        "fire_distance_sigma": float(meta.get("fire_distance_sigma", 0.0)),
+        "jump_distance_sigma": float(meta.get("jump_distance_sigma", 0.0)),
+        "model":               model_cfg,
+    }
+
+
 def migrate_v17_move_heads(state: Dict[str, torch.Tensor]) -> bool:
     """Fold v17's split move_fb_head + move_lr_head into the v20 unified move_head.
 
@@ -322,6 +436,29 @@ def migrate_drop_fire_align_scalar(state: Dict[str, torch.Tensor]) -> bool:
     return migrated
 
 
+def migrate_drop_weapon_embed_self(state: Dict[str, torch.Tensor]) -> bool:
+    """Strip the dedicated `weapon_embed_self` table from v24-era checkpoints.
+
+    v24 added a separate impulse-indexed `tokenizer.weapon_embed_self`
+    Embedding(WEAPON_HEAD_SIZE+1, d_model) for the current-held-weapon
+    contribution on the self token.  That contribution now routes through
+    the shared `entity_embed` (weapons live at rows 3..10 by design — see
+    qnn.vocab), so the dedicated table is no longer instantiated.
+
+    Deletes the stale key so load_state_dict(strict=True) doesn't trip
+    on an unexpected param.  Returns True iff a deletion ran.  The held-
+    weapon representation is bootstrapped from entity_embed's already-
+    trained weapon rows (learned from world weapon tokens), so no warm-
+    init copy is needed.
+    """
+    migrated = False
+    for key in list(state.keys()):
+        if key.endswith("weapon_embed_self.weight"):
+            del state[key]
+            migrated = True
+    return migrated
+
+
 def migrate_drop_action_history(state: Dict[str, torch.Tensor]) -> bool:
     """Strip the action_history tokenizer pieces from pre-rip-out checkpoints.
 
@@ -387,6 +524,55 @@ def _expanded_self_scalar_vector(tensor: torch.Tensor) -> torch.Tensor:
         ],
         dim=0,
     )
+
+
+def _pad_self_scalar_weight_for_attack_finished(tensor: torch.Tensor) -> torch.Tensor:
+    """Append a zero column for the new attack_finished scalar at slot 16.
+
+    Pre-c38a5a26 checkpoints have self_proj input dim 16; commit c38a5a26
+    added attack_finished as slot 16, bumping SELF_SCALAR_DIM 16 → 17.
+    Zero-padding the column means the migrated model treats that input as
+    dead weight (semantically: trained without that signal), so forward
+    outputs are unchanged for the same observation.
+    """
+    zeros = torch.zeros(
+        (tensor.shape[0], 1), dtype=tensor.dtype, device=tensor.device,
+    )
+    return torch.cat([tensor, zeros], dim=1)
+
+
+def migrate_self_attack_finished_scalar(
+    state: Dict[str, torch.Tensor], optimizer: Dict[str, Any] | None = None,
+) -> bool:
+    """Pad pre-c38a5a26 self_proj weights from 16 → 17 input dims."""
+    migrated = False
+    param_keys = [
+        key for key in state
+        if not key.startswith("obs_normalizer.") and not key.startswith("returns_normalizer.")
+    ]
+    for idx, key in enumerate(param_keys):
+        tensor = state[key]
+        if not (key.endswith("self_proj.weight") and tensor.ndim == 2 and tensor.shape[1] == 16):
+            continue
+        state[key] = _pad_self_scalar_weight_for_attack_finished(tensor)
+        migrated = True
+
+        if optimizer is not None and idx in optimizer.get("state", {}):
+            opt_entry = optimizer["state"][idx]
+            for buf_key in ("exp_avg", "exp_avg_sq"):
+                if buf_key in opt_entry and hasattr(opt_entry[buf_key], "shape"):
+                    buf = opt_entry[buf_key]
+                    if buf.ndim == 2 and buf.shape[1] == 16:
+                        opt_entry[buf_key] = _pad_self_scalar_weight_for_attack_finished(buf)
+                        migrated = True
+
+    for key, tensor in list(state.items()):
+        if ".self_scalars." in key and hasattr(tensor, "shape") and tensor.shape == torch.Size([16]):
+            zeros = torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
+            state[key] = torch.cat([tensor, zeros], dim=0)
+            migrated = True
+
+    return migrated
 
 
 def migrate_self_scalars(state: Dict[str, torch.Tensor], optimizer: Dict[str, Any] | None = None) -> bool:
@@ -659,15 +845,11 @@ def main() -> None:
     to_qnn.add_argument("sf_path", help="Input SF checkpoint .pth")
     to_qnn.add_argument("output_path", help="Output .pth path for QNNPolicy")
     to_qnn.add_argument("--obs-dim", type=int, required=True)
-    to_qnn.add_argument("--trunk-hidden", type=int, required=True)
-    to_qnn.add_argument("--gru-hidden", type=int, required=True)
-    to_qnn.add_argument("--use-gru", choices=["true", "false"], required=True)
-    to_qnn.add_argument("--d-model", type=int, required=True)
-    to_qnn.add_argument("--n-heads", type=int, required=True)
-    to_qnn.add_argument("--n-layers", type=int, required=True)
-    to_qnn.add_argument("--ffn-dim", type=int, required=True)
-    to_qnn.add_argument("--action-history-tokens", type=int, required=True)
-    to_qnn.add_argument("--attn-dropout", type=float, required=True)
+    to_qnn.add_argument(
+        "--model-json",
+        required=True,
+        help="Path to a model.json (ModelConfig-compatible) describing the SF model's arch.",
+    )
     to_qnn.add_argument("--device", default="cpu")
 
     args = parser.parse_args()
@@ -678,18 +860,13 @@ def main() -> None:
         print(f"Saved SF-format warm-start checkpoint: {ckpt}")
 
     elif args.cmd == "sf-to-qnn":
+        with open(args.model_json, "r", encoding="utf-8") as f:
+            model_cfg = ModelConfig.from_dict(json.load(f))
         policy = sf_to_qnn(
             sf_checkpoint_path=args.sf_path,
             obs_dim=args.obs_dim,
-            trunk_hidden=args.trunk_hidden,
-            gru_hidden=args.gru_hidden,
-            use_gru=str(args.use_gru).lower() == "true",
+            model=model_cfg,
             device=args.device,
-            d_model=args.d_model,
-            n_heads=args.n_heads,
-            n_layers=args.n_layers,
-            ffn_dim=args.ffn_dim,
-            attn_dropout=args.attn_dropout,
         )
         policy.save(args.output_path)
         print(f"Saved QNNPolicy checkpoint: {args.output_path}")
@@ -716,55 +893,57 @@ def is_sf_checkpoint(path: str | Path) -> bool:
 
 def load_sf_checkpoint_as_qnn(
     path: str | Path,
-    device: str = "cpu",
-    model_config: dict | None = None,
+    *,
+    device: str,
+    model_config: "dict | ModelConfig | None" = None,
 ) -> "QNNPolicy":
-    """Convert an SF checkpoint to a QNNPolicy in-memory."""
+    """Convert an SF checkpoint to a QNNPolicy in-memory.
+
+    ``model_config`` is a ``ModelConfig`` (or model.json-style dict, which
+    is converted via ``ModelConfig.from_dict``). When omitted, a sidecar
+    JSON next to ``path`` with the same structure as a QNN checkpoint
+    meta block is read; the sidecar must contain a ``"model"`` field plus
+    ``"obs_dim"``.
+    """
     import json as _json
 
     p = Path(path)
-    sidecar = p.with_suffix(".json")
-    if sidecar.exists():
+    if model_config is None:
+        sidecar = p.with_suffix(".json")
+        if not sidecar.exists():
+            raise RuntimeError(
+                f"SF checkpoint requires either a sidecar JSON ({sidecar}) or model_config"
+            )
         meta = _json.loads(sidecar.read_text(encoding="utf-8"))
         if not isinstance(meta, dict):
             raise RuntimeError(f"SF checkpoint sidecar must be a JSON object: {sidecar}")
-    elif model_config is not None:
-        meta = dict(model_config)
-        meta.setdefault("obs_dim", OBS_DIM)
+        if "model" not in meta or "obs_dim" not in meta:
+            raise RuntimeError(
+                f"SF checkpoint sidecar must contain 'obs_dim' and 'model' fields: {sidecar}"
+            )
+        obs_dim = int(meta["obs_dim"])
+        model = ModelConfig.from_dict(meta["model"])
     else:
-        raise RuntimeError(
-            f"SF checkpoint requires either a sidecar JSON ({sidecar}) or model_config"
-        )
-
-    required_keys = (
-        "obs_dim", "trunk_hidden", "gru_hidden", "use_gru",
-        "d_model", "n_heads", "n_layers", "ffn_dim", "attn_dropout",
-    )
-    missing = [key for key in required_keys if key not in meta]
-    if missing:
-        raise RuntimeError(
-            f"SF checkpoint sidecar is missing architecture fields ({', '.join(missing)}): {sidecar}"
+        obs_dim = OBS_DIM
+        model = (
+            model_config
+            if isinstance(model_config, ModelConfig)
+            else ModelConfig.from_dict(model_config)
         )
 
     return sf_to_qnn(
         sf_checkpoint_path=p,
-        obs_dim=int(meta["obs_dim"]),
-        trunk_hidden=int(meta["trunk_hidden"]),
-        gru_hidden=int(meta["gru_hidden"]),
-        use_gru=bool(meta["use_gru"]),
+        obs_dim=obs_dim,
+        model=model,
         device=device,
-        d_model=int(meta["d_model"]),
-        n_heads=int(meta["n_heads"]),
-        n_layers=int(meta["n_layers"]),
-        ffn_dim=int(meta["ffn_dim"]),
-        attn_dropout=float(meta["attn_dropout"]),
     )
 
 
 def load_checkpoint(
     path: str | Path,
-    device: str = "cpu",
-    model_config: dict | None = None,
+    *,
+    device: str,
+    model_config: "dict | ModelConfig | None" = None,
 ) -> "QNNPolicy":
     """Load a checkpoint in either QNN or SF format."""
     if is_sf_checkpoint(path):

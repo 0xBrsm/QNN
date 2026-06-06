@@ -35,6 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from qnn.actions import MOVE_CLASS_NONE
 from .model import (
     CORE_FEAT_DIM,
     FeatureSpec,
@@ -109,14 +110,14 @@ class TrainConfig:
     resume:       Path | None = None    # checkpoint to resume from (e.g., latest.pt)
     smooth_target: int = 0              # majority-vote window over move target (0/1 = off)
     predict_ud:   bool = False          # add a third head for ud (jump press)
-    # When set, per-tick targets are CE-masked using the engine-effective
-    # bitmask sidecar (`obs/target_valid_mask`) emitted by the C worker.
-    # Bit i of the mask corresponds to axis i in {fb, lr, ud, fire,
-    # weapon_switch}; a 0 bit means the press at that tick had no
+    # When set, per-tick targets are CE-masked using the operative-input
+    # bitmask sidecar (`obs/op_input`) emitted by the C worker.  Bit i of
+    # the mask corresponds to axis i in {fb, lr, ud, fire, weapon_switch};
+    # a 0 bit means the player's input on that axis at that tick had no
     # observable engine effect (e.g., jump-while-airborne, fire-in-
     # cooldown) and the target is replaced with ignore_index=-100 so CE
-    # skips it.  Silently no-op for shards collected before
-    # LOBS_FRAME_SIZE = 31 (no mask available — falls through unmodified).
+    # skips it.  Silently no-op for shards that don't carry the sidecar
+    # (older formats — falls through unmodified).
     sanitize_targets: bool = False
 
 
@@ -131,12 +132,14 @@ class _EpisodeView:
     move:             np.ndarray
     c_rule_fire:      np.ndarray | None
     c_rule_jump:      np.ndarray | None
+    weapon_id:        np.ndarray | None
     gbt_probs:        np.ndarray | None
-    # Per-tick engine-effective bitmask emitted by the C worker (bit0=fb,
-    # bit1=lr, bit2=ud, bit3=fire, bit4=weapon_switch).  Optional; older
-    # shards collected with LABELER_FRAME_SIZE=30 won't have this array
-    # and the trainer falls back to no masking even with --sanitize-targets.
-    target_valid_mask: np.ndarray | None
+    # Per-tick operative-input bitmask emitted by the C worker (bit0=fb,
+    # bit1=lr, bit2=ud, bit3=fire, bit4=weapon_switch).  1 = engine acted
+    # on this axis's input this tick (keep in loss); 0 = no-op (drop).
+    # Optional; older shards won't carry the sidecar and the trainer
+    # falls back to no masking even with --sanitize-targets.
+    op_input: np.ndarray | None
     n_frames:         int
 
 
@@ -159,8 +162,10 @@ def _load_split(split_dir: Path) -> list[_EpisodeView]:
                 if "c_rule_fire" in obs else None)
         jump = (np.load(split_dir / obs["c_rule_jump"], mmap_mode="r")
                 if "c_rule_jump" in obs else None)
-        tvm  = (np.load(split_dir / obs["target_valid_mask"], mmap_mode="r")
-                if "target_valid_mask" in obs else None)
+        wid  = (np.load(split_dir / obs["weapon_id"], mmap_mode="r")
+                if "weapon_id" in obs else None)
+        opi  = (np.load(split_dir / obs["op_input"], mmap_mode="r")
+                if "op_input" in obs else None)
         # GBT stacking probs are an optional sidecar written by
         # scripts/gbt_oof_stack.py.  Path convention: same prefix as the
         # other obs arrays, suffix `_obs_gbt_probs.npy`.
@@ -184,8 +189,9 @@ def _load_split(split_dir: Path) -> list[_EpisodeView]:
                 move            =move[start:stop],
                 c_rule_fire     =fire[start:stop] if fire is not None else None,
                 c_rule_jump     =jump[start:stop] if jump is not None else None,
+                weapon_id       =wid[start:stop]  if wid  is not None else None,
                 gbt_probs       =gbt[start:stop]  if gbt  is not None else None,
-                target_valid_mask=tvm[start:stop] if tvm  is not None else None,
+                op_input        =opi[start:stop] if opi  is not None else None,
                 n_frames        =stop - start,
             ))
             start = stop
@@ -272,6 +278,7 @@ class ChunkedDataset(Dataset):
             ep.look[start:end],
             c_rule_fire=ep.c_rule_fire[start:end] if ep.c_rule_fire is not None else None,
             c_rule_jump=ep.c_rule_jump[start:end] if ep.c_rule_jump is not None else None,
+            weapon_id  =ep.weapon_id[start:end]   if ep.weapon_id  is not None else None,
             gbt_probs  =ep.gbt_probs[start:end]   if ep.gbt_probs   is not None else None,
             spec=self.spec,
         )
@@ -294,22 +301,31 @@ class ChunkedDataset(Dataset):
         else:
             ud = None
 
-        # Engine-effectiveness mask: per-tick bits emitted by the C
-        # worker.  When --sanitize-targets is set and the sidecar exists,
-        # replace ineffective-press targets with -100 so CE skips them.
-        # The labeler isn't penalized for failing to predict presses
-        # that have no observable kinematic effect (engine-rejected jumps,
-        # in-cooldown fires).  When the sidecar is missing this is a no-op.
-        if self.sanitize_targets and ep.target_valid_mask is not None:
-            mask = np.asarray(ep.target_valid_mask[start:end], dtype=np.uint8)
-            fb_ok = torch.from_numpy(((mask & 0x01) != 0).astype(np.bool_))
-            lr_ok = torch.from_numpy(((mask & 0x02) != 0).astype(np.bool_))
+        # Strict op_input + press-detection sanitize.  op_input now reports
+        # only "press AND engine acted on it" per axis, so no-press frames
+        # have bit 0 — but those are legitimate training data (the "none"
+        # class).  Keep per axis: (no press) OR (op_input bit set).  Press
+        # detection comes from the already-decoded move classes (1 = none,
+        # 0/2 = press).
+        if self.sanitize_targets and ep.op_input is not None:
+            mask = np.asarray(ep.op_input[start:end], dtype=np.uint8)
+            fb_cls = decoded[:, 0]
+            lr_cls = decoded[:, 1]
+            fb_no_press = (fb_cls == MOVE_CLASS_NONE)
+            lr_no_press = (lr_cls == MOVE_CLASS_NONE)
+            fb_keep = fb_no_press | ((mask & 0x01) != 0)
+            lr_keep = lr_no_press | ((mask & 0x02) != 0)
+            fb_ok = torch.from_numpy(fb_keep.astype(np.bool_))
+            lr_ok = torch.from_numpy(lr_keep.astype(np.bool_))
             fb[:valid_len] = torch.where(fb_ok, fb[:valid_len],
                                          torch.full_like(fb[:valid_len], -100))
             lr[:valid_len] = torch.where(lr_ok, lr[:valid_len],
                                          torch.full_like(lr[:valid_len], -100))
             if self.with_ud:
-                ud_ok = torch.from_numpy(((mask & 0x04) != 0).astype(np.bool_))
+                ud_cls = decoded[:, 2]
+                ud_no_press = (ud_cls == MOVE_CLASS_NONE)
+                ud_keep = ud_no_press | ((mask & 0x04) != 0)
+                ud_ok = torch.from_numpy(ud_keep.astype(np.bool_))
                 ud[:valid_len] = torch.where(ud_ok, ud[:valid_len],
                                              torch.full_like(ud[:valid_len], -100))
 
@@ -502,8 +518,8 @@ def train(cfg: TrainConfig) -> None:
         saved_spec = ckpt.get("feat_spec")
         if saved_spec is not None:
             cur_spec = asdict(cfg.feat_spec)
-            for k in ("is_firing", "is_jumping", "use_baseline",
-                      "use_baseline_skip", "use_gbt_stack",
+            for k in ("is_firing", "is_jumping", "use_weapon_id",
+                      "use_baseline", "use_baseline_skip", "use_gbt_stack",
                       "clip_velocity", "baseline_skip_axes"):
                 if saved_spec.get(k) != cur_spec.get(k):
                     raise ValueError(
@@ -700,19 +716,23 @@ def main() -> None:
                     help="Include c_rule_fire as input feature (requires it in collect output)")
     ap.add_argument("--use-jump",   action="store_true",
                     help="Include c_rule_jump as input feature (requires it in collect output)")
+    ap.add_argument("--use-weapon-id", action="store_true",
+                    help="One-hot the server-held weapon_id (9 dims: 0=none, "
+                         "1..8 = axe..LG) and append to the trunk input.")
     ap.add_argument("--sanitize-targets", action="store_true",
                     help="Replace per-tick targets with ignore_index=-100 on "
-                         "ticks where the press had no observable engine "
-                         "effect (engine-rejected jump-while-airborne, "
+                         "ticks where the player's input on that axis was "
+                         "a no-op (engine-rejected jump-while-airborne, "
                          "fire-in-cooldown, etc.).  Uses the per-axis "
-                         "`obs/target_valid_mask` bitmask emitted by the C "
-                         "worker (LOBS bit0=fb, bit1=lr, bit2=ud).  No-op "
-                         "for shards collected before LABELER_FRAME_SIZE=31.")
+                         "`obs/op_input` bitmask emitted by the C worker "
+                         "(LOBS bit0=fb, bit1=lr, bit2=ud; 1=keep, 0=drop). "
+                         "No-op for shards that don't carry the sidecar.")
     args = ap.parse_args()
 
     spec = FeatureSpec(
         is_firing=args.use_fire,
         is_jumping=args.use_jump,
+        use_weapon_id=args.use_weapon_id,
         use_baseline=args.use_baseline,
         use_baseline_skip=args.use_baseline_skip,
         baseline_skip_axes=args.baseline_skip_axes,
