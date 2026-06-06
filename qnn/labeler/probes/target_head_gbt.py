@@ -1,24 +1,24 @@
-"""GBT probe for target slot prediction.
+"""GBT probe for target idx prediction.
 
 Two modes:
 
-  --mode default   Standard slot ordering preserved. Direct comparison to
+  --mode default   Standard idx ordering preserved. Direct comparison to
                    the TCN probe. Tests whether a non-temporal flat-feature
                    GBT can match the TCN's per-frame signal (since the TCN
                    ablation showed temporal context contributes little).
 
-  --mode randomize Per-frame random permutation of the 16 slot positions
-                   (target re-mapped). Breaks the engine's slot-0 prior so
-                   the only available signal is per-slot features. Measures
-                   how much of the "97.5% slot-0 baseline" was the engine's
-                   ordering vs. the per-slot feature signal itself.
+  --mode randomize Per-frame random permutation of the 16 idx positions
+                   (target re-mapped). Breaks the engine's idx-0 prior so
+                   the only available signal is per-idx features. Measures
+                   how much of the "97.5% idx-0 baseline" was the engine's
+                   ordering vs. the per-idx feature signal itself.
 
 Per-frame features (flat):
-  16 slots × 19 scalars + 16 type ids (one-hot) + 16 enemy flags
+  16 indices × 19 scalars + 16 type ids (one-hot) + 16 enemy flags
     + 16 self scalars + 3 movement one-hot + 16 weapon one-hot
     + 3 look + 1 fire
 
-Multiclass LightGBM with class weighting (slot 0 down-weighted).
+Multiclass LightGBM with class weighting (idx 0 down-weighted).
 
 Usage:
     PYTHONPATH=src python -m qnn.labeler.probes.target_head_gbt \
@@ -40,7 +40,7 @@ import numpy as np
 
 from qnn.vocab import MAX_TOKEN_OBJECTS, TOKEN_ACTOR
 from qnn.labeler.probes.target_head_probe import (
-    N_SLOTS, N_SLOT_SCALARS, N_SELF_SCALARS, N_TYPE_VOCAB, N_WEAPON_VOCAB,
+    N_INDICES, N_IDX_SCALARS, N_SELF_SCALARS, N_TYPE_VOCAB, N_WEAPON_VOCAB,
     _Shard, _load_split, _enemy_flag,
 )
 
@@ -50,28 +50,28 @@ _ACTOR_TEAM_OFFSET = 16
 @dataclass
 class FeatureMatrix:
     X: np.ndarray            # (N, F) float32
-    y: np.ndarray            # (N,)   int   target slot (0..15)
-    target_was_zero: np.ndarray  # (N,) bool — was the *original* (pre-permute) target slot 0
+    y: np.ndarray            # (N,)   int   target idx (0..15)
+    target_was_zero: np.ndarray  # (N,) bool — was the *original* (pre-permute) target idx 0
     feature_names: list[str]
 
 
-_TEAM_SCALAR_OFFSET = 16  # team scalar index inside the 19-d per-slot vector
+_TEAM_SCALAR_OFFSET = 16  # team scalar index inside the 19-d per-idx vector
 
 
 def _flat_feature_names(drop_masks: bool = False) -> list[str]:
     names: list[str] = []
-    n_slot_scal = N_SLOT_SCALARS - (1 if drop_masks else 0)
-    for s in range(N_SLOTS):
-        for k in range(N_SLOT_SCALARS):
+    n_idx_scal = N_IDX_SCALARS - (1 if drop_masks else 0)
+    for s in range(N_INDICES):
+        for k in range(N_IDX_SCALARS):
             if drop_masks and k == _TEAM_SCALAR_OFFSET:
                 continue
-            names.append(f"slot{s:02d}_scal{k:02d}")
+            names.append(f"idx{s:02d}_scal{k:02d}")
     if not drop_masks:
-        for s in range(N_SLOTS):
-            names.append(f"slot{s:02d}_enemy")
-        for s in range(N_SLOTS):
+        for s in range(N_INDICES):
+            names.append(f"idx{s:02d}_enemy")
+        for s in range(N_INDICES):
             for t in range(N_TYPE_VOCAB):
-                names.append(f"slot{s:02d}_type{t:02d}")
+                names.append(f"idx{s:02d}_type{t:02d}")
     for k in range(N_SELF_SCALARS):
         names.append(f"self_scal{k:02d}")
     for t in range(3):
@@ -80,7 +80,7 @@ def _flat_feature_names(drop_masks: bool = False) -> list[str]:
         names.append(f"self_weapon{w:02d}")
     for k in range(3):
         names.append(f"look{k}")
-    names.append("fire")
+    names.append("attack")
     return names
 
 
@@ -94,14 +94,14 @@ def _build_flat_features(
 ) -> FeatureMatrix:
     """Build a flat feature matrix from a list of shards.
 
-    If randomize=True, per-frame random permutation of the 16 slot positions
-    is applied to both features and target slot.
+    If randomize=True, per-frame random permutation of the 16 idx positions
+    is applied to both features and target idx.
 
-    If drop_masks=True, removes all features that explicitly identify a slot
+    If drop_masks=True, removes all features that explicitly identify a idx
     as enemy or actor:
-      - per-slot enemy flag
-      - per-slot type one-hot
-      - per-slot team scalar (offset 16 in entity_scalars_raw)
+      - per-idx enemy flag
+      - per-idx type one-hot
+      - per-idx team scalar (offset 16 in entity_scalars_raw)
     """
     Xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
@@ -128,7 +128,7 @@ def _build_flat_features(
         et_raw = np.asarray(sh.entity_types[valid], dtype=np.int64)    # (n,16)
 
         # Apply token_mask if present on this shard: zero scalars, set
-        # types to -1, and skip rows whose target slot got masked out.
+        # types to -1, and skip rows whose target idx got masked out.
         if sh.token_keep is not None:
             keep_chunk = np.asarray(sh.token_keep[valid], dtype=bool)
             drop = ~keep_chunk
@@ -136,8 +136,8 @@ def _build_flat_features(
                 es = es.copy(); es[drop] = 0.0
                 et_raw = et_raw.copy(); et_raw[drop] = -1
                 rows = np.arange(et_raw.shape[0])
-                slot_idx = np.clip(tgt[valid], 0, N_SLOTS - 1)
-                still_valid = (tgt[valid] == -100) | (et_raw[rows, slot_idx] != -1)
+                idx_idx = np.clip(tgt[valid], 0, N_INDICES - 1)
+                still_valid = (tgt[valid] == -100) | (et_raw[rows, idx_idx] != -1)
                 if not still_valid.all():
                     es = es[still_valid]
                     et_raw = et_raw[still_valid]
@@ -158,14 +158,14 @@ def _build_flat_features(
         was_zero = (y == 0)
 
         if randomize:
-            perm = np.argsort(rng.random((n, N_SLOTS)), axis=1)  # (n,16) permutations
-            # Apply to per-slot arrays.
+            perm = np.argsort(rng.random((n, N_INDICES)), axis=1)  # (n,16) permutations
+            # Apply to per-idx arrays.
             row_idx = np.arange(n)[:, None]
             es = es[row_idx, perm]
             et = et[row_idx, perm]
             en = en[row_idx, perm]
-            # Map target slot through the permutation: new_slot[old_slot] = pos
-            # of old_slot in perm. perm[i, new_slot] = old_slot, so we need the
+            # Map target idx through the permutation: new_idx[old_idx] = pos
+            # of old_idx in perm. perm[i, new_idx] = old_idx, so we need the
             # inverse permutation.
             inv = np.argsort(perm, axis=1)
             y = inv[row_idx[:, 0], y]
@@ -179,7 +179,7 @@ def _build_flat_features(
         weapon_oh[np.arange(n), wi] = 1.0
 
         if drop_masks:
-            # Drop team scalar from per-slot scalars; drop enemy flag and type one-hot.
+            # Drop team scalar from per-idx scalars; drop enemy flag and type one-hot.
             es_kept = np.delete(es, _TEAM_SCALAR_OFFSET, axis=-1)  # (n, 16, 18)
             feat = np.concatenate([
                 es_kept.reshape(n, -1),  # (n, 16*18)
@@ -190,9 +190,9 @@ def _build_flat_features(
                 fr[:, None],             # (n, 1)
             ], axis=1).astype(np.float32)
         else:
-            # One-hot for types (16-way per slot).
-            type_oh = np.zeros((n, N_SLOTS, N_TYPE_VOCAB), dtype=np.float32)
-            type_oh[np.arange(n)[:, None], np.arange(N_SLOTS)[None, :], et] = 1.0
+            # One-hot for types (16-way per idx).
+            type_oh = np.zeros((n, N_INDICES, N_TYPE_VOCAB), dtype=np.float32)
+            type_oh[np.arange(n)[:, None], np.arange(N_INDICES)[None, :], et] = 1.0
             feat = np.concatenate([
                 es.reshape(n, -1),       # (n, 16*19)
                 en,                       # (n, 16)
@@ -228,11 +228,11 @@ def _eval(
     y_proba: np.ndarray,
     target_was_zero: np.ndarray,
 ) -> dict:
-    """Bucket eval based on the ORIGINAL (pre-randomization) target slot.
+    """Bucket eval based on the ORIGINAL (pre-randomization) target idx.
 
-      bucket A: original target was slot 0 (engine and labeler agreed before
+      bucket A: original target was idx 0 (engine and labeler agreed before
                  randomization). These are the trivial/easy cases.
-      bucket B: original target was slot != 0 (engine and labeler disagreed
+      bucket B: original target was idx != 0 (engine and labeler disagreed
                  before randomization).
     """
     n = y_true.shape[0]
@@ -252,7 +252,7 @@ def _eval(
     curve = {}
     for tau in taus:
         # In default mode, "override" means model picks non-zero and crosses tau.
-        # In randomized mode, the slot-0 prior is meaningless; just report
+        # In randomized mode, the idx-0 prior is meaningless; just report
         # acc-at-tau (predict-as-model when confident, else "don't know").
         confident = argmax_p >= tau
         # Acc among confident predictions.
@@ -288,7 +288,7 @@ def _eval(
 def _train_gbt(
     X_train: np.ndarray, y_train: np.ndarray,
     X_val: np.ndarray, y_val: np.ndarray,
-    slot0_weight: float,
+    idx0_weight: float,
     n_estimators: int,
     num_leaves: int,
     learning_rate: float,
@@ -296,18 +296,18 @@ def _train_gbt(
 ):
     import lightgbm as lgb
 
-    # Per-sample weight: slot0 -> slot0_weight, else 1.0.
-    w_train = np.where(y_train == 0, slot0_weight, 1.0).astype(np.float32)
+    # Per-sample weight: idx0 -> idx0_weight, else 1.0.
+    w_train = np.where(y_train == 0, idx0_weight, 1.0).astype(np.float32)
 
     # Use early stopping on val multi-logloss for sanity.
     print(f"training lightgbm: {X_train.shape[0]:,} train, {X_val.shape[0]:,} val, "
-          f"{X_train.shape[1]} features, {N_SLOTS} classes")
+          f"{X_train.shape[1]} features, {N_INDICES} classes")
 
     train_ds = lgb.Dataset(X_train, label=y_train, weight=w_train)
     val_ds   = lgb.Dataset(X_val,   label=y_val,   reference=train_ds)
     params = {
         "objective": "multiclass",
-        "num_class": N_SLOTS,
+        "num_class": N_INDICES,
         "metric": "multi_logloss",
         "num_leaves": num_leaves,
         "learning_rate": learning_rate,
@@ -345,8 +345,8 @@ def main() -> None:
     p.add_argument("--n-estimators", type=int, default=300)
     p.add_argument("--num-leaves", type=int, default=63)
     p.add_argument("--learning-rate", type=float, default=0.1)
-    p.add_argument("--slot0-weight", type=float, default=0.15,
-                   help="per-sample weight on slot-0 training rows (1.0 for randomize mode)")
+    p.add_argument("--idx0-weight", type=float, default=0.15,
+                   help="per-sample weight on idx-0 training rows (1.0 for randomize mode)")
     p.add_argument("--max-shards-train", type=int, default=None)
     p.add_argument("--max-shards-val", type=int, default=None)
     p.add_argument("--seed", type=int, default=17)
@@ -362,11 +362,11 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     randomize = (args.mode == "randomize")
     if randomize:
-        # Slot-0 weighting doesn't apply when the slot index is randomized.
-        args.slot0_weight = 1.0
+        # Idx-0 weighting doesn't apply when the idx index is randomized.
+        args.idx0_weight = 1.0
 
     print(f"mode={args.mode}  no_masks={args.no_masks}  seed={args.seed}  "
-          f"n_train={args.n_train}  slot0_weight={args.slot0_weight}  "
+          f"n_train={args.n_train}  idx0_weight={args.idx0_weight}  "
           f"n_estimators={args.n_estimators}")
 
     t0 = time.time()
@@ -401,7 +401,7 @@ def main() -> None:
     # Target distribution sanity.
     for name, fm in [("train", fm_train), ("val", fm_val)]:
         u, c = np.unique(fm.y, return_counts=True)
-        top = ", ".join(f"slot{int(uu)}={int(cc)} ({100*cc/fm.y.size:.2f}%)"
+        top = ", ".join(f"idx{int(uu)}={int(cc)} ({100*cc/fm.y.size:.2f}%)"
                         for uu, cc in zip(u[:5], c[:5]))
         print(f"  {name} target dist (top 5): {top}")
 
@@ -409,7 +409,7 @@ def main() -> None:
     t0 = time.time()
     booster = _train_gbt(
         fm_train.X, fm_train.y, fm_val.X, fm_val.y,
-        slot0_weight=args.slot0_weight,
+        idx0_weight=args.idx0_weight,
         n_estimators=args.n_estimators,
         num_leaves=args.num_leaves,
         learning_rate=args.learning_rate,

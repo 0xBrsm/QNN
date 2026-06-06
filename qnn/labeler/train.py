@@ -331,7 +331,7 @@ class ChunkedDataset(Dataset):
 
         if self.spec.use_baseline_skip:
             # Baseline one-hot (fb, lr) computed from velocity, fed as a
-            # separate input that bypasses the trunk.
+            # separate input that bypasses the encoder.
             from .model import _baseline_classes_from_vel, BASELINE_EPS, BASELINE_DIM
             baseline_classes = _baseline_classes_from_vel(
                 np.asarray(ep.self_velocity[start:end], dtype=np.float32),
@@ -655,7 +655,7 @@ def main() -> None:
                     choices=["both", "fb", "lr", "ud"],
                     help="Which axis to train.  'both' = fb+lr (and ud if "
                          "--predict-ud).  'fb'/'lr'/'ud' = single-axis loss "
-                         "for separate-trunk runs.")
+                         "for separate-encoder runs.")
     ap.add_argument("--clip-velocity", action="store_true",
                     help="Clip body-frame velocity to ±1.0 (suppress server-"
                          "snapshot spike outliers that produce normalized vel "
@@ -698,8 +698,8 @@ def main() -> None:
     ap.add_argument("--use-baseline-skip", action="store_true",
                     help="Feed the per-frame sign(velocity) baseline as a "
                          "skip-connection at the output head (logits = "
-                         "trunk + identity*baseline_one_hot) instead of "
-                         "concatenating it into the trunk input.  Trunk "
+                         "encoder + identity*baseline_one_hot) instead of "
+                         "concatenating it into the encoder input.  Encoder "
                          "sees only the 9 core features and learns the "
                          "residual from the baseline.")
     ap.add_argument("--baseline-skip-init-scale", type=float, default=3.0,
@@ -711,14 +711,14 @@ def main() -> None:
                     help="Which axes get the baseline skip-connection (only "
                          "applies when --use-baseline-skip is on).  'fb_lr' "
                          "(default): both axes.  'lr': lr only (fb head is "
-                         "trunk-only).  'fb': fb only.")
+                         "encoder-only).  'fb': fb only.")
     ap.add_argument("--use-fire",   action="store_true",
                     help="Include c_rule_fire as input feature (requires it in collect output)")
     ap.add_argument("--use-jump",   action="store_true",
                     help="Include c_rule_jump as input feature (requires it in collect output)")
     ap.add_argument("--use-weapon-id", action="store_true",
                     help="One-hot the server-held weapon_id (9 dims: 0=none, "
-                         "1..8 = axe..LG) and append to the trunk input.")
+                         "1..8 = axe..LG) and append to the encoder input.")
     ap.add_argument("--sanitize-targets", action="store_true",
                     help="Replace per-tick targets with ignore_index=-100 on "
                          "ticks where the player's input on that axis was "

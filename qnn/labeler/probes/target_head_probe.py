@@ -1,27 +1,27 @@
 """Standalone causal probe for the BC target head.
 
-Isolates the target-prediction problem from the full BC trunk: can a model
-predict the opt3-labeler's per-frame slot choice from *causal* observations
-alone, closing the ~2.5% labeler-vs-engine-slot-0 gap?
+Isolates the target-prediction problem from the full BC encoder: can a model
+predict the opt3-labeler's per-frame idx choice from *causal* observations
+alone, closing the ~2.5% labeler-vs-engine-idx-0 gap?
 
 Inputs (per frame):
-  - per-slot scalars (16, 19) — rel/dist/vel/path/eta/facing/recency etc.
-  - per-slot type id (16,) — embedded
-  - per-slot enemy flag (16,) — derived from team scalar
+  - per-idx scalars (16, 19) — rel/dist/vel/path/eta/facing/recency etc.
+  - per-idx type id (16,) — embedded
+  - per-idx enemy flag (16,) — derived from team scalar
   - self scalars (16,)
   - self movement id (3-way one-hot)
   - self weapon id (embedded)
   - action context: look (3) + fire (1)
 
 Architecture:
-  - per-slot per-frame MLP (no time mixing) -> per-slot embedding (32)
-  - flatten per-slot embeddings + concat global features -> frame vector
-  - causal TCN (left-pad only) over time -> 16-way slot logits per frame
+  - per-idx per-frame MLP (no time mixing) -> per-idx embedding (32)
+  - flatten per-idx embeddings + concat global features -> frame vector
+  - causal TCN (left-pad only) over time -> 16-way idx logits per frame
 
 Loss: CE with ignore_index=-100.
 Eval is bucketed:
-  - bucket A: target == engine slot 0 (trivial, ~97.5% of labeled frames)
-  - bucket B: target != engine slot 0 (the interesting ~2.5%)
+  - bucket A: target == engine idx 0 (trivial, ~97.5% of labeled frames)
+  - bucket B: target != engine idx 0 (the interesting ~2.5%)
 
 Usage:
     PYTHONPATH=src python -m qnn.labeler.probes.target_head_probe \
@@ -50,8 +50,8 @@ from qnn.vocab import MAX_TOKEN_OBJECTS, TOKEN_ACTOR
 _ACTOR_TEAM_OFFSET = 16
 _TEAM_TEAMMATE_VALUE = 1.0
 
-N_SLOTS = MAX_TOKEN_OBJECTS         # 16
-N_SLOT_SCALARS = 19
+N_INDICES = MAX_TOKEN_OBJECTS         # 16
+N_IDX_SCALARS = 19
 N_SELF_SCALARS = 16
 N_TYPE_VOCAB = 16                   # token types fit easily here
 N_WEAPON_VOCAB = 16                 # quake weapon ids fit easily here
@@ -86,7 +86,7 @@ class CausalConv1d(nn.Module):
 class TargetHeadProbe(nn.Module):
     def __init__(
         self,
-        slot_embed_dim: int = 32,
+        idx_embed_dim: int = 32,
         type_embed_dim: int = 4,
         weapon_embed_dim: int = 8,
         channels: int = 128,
@@ -98,16 +98,16 @@ class TargetHeadProbe(nn.Module):
         self.type_embed = nn.Embedding(N_TYPE_VOCAB, type_embed_dim)
         self.weapon_embed = nn.Embedding(N_WEAPON_VOCAB, weapon_embed_dim)
 
-        slot_input_dim = N_SLOT_SCALARS + type_embed_dim + 1  # +1 enemy flag
-        self.slot_mlp = nn.Sequential(
-            nn.Linear(slot_input_dim, slot_embed_dim),
+        idx_input_dim = N_IDX_SCALARS + type_embed_dim + 1  # +1 enemy flag
+        self.idx_mlp = nn.Sequential(
+            nn.Linear(idx_input_dim, idx_embed_dim),
             nn.GELU(),
-            nn.Linear(slot_embed_dim, slot_embed_dim),
+            nn.Linear(idx_embed_dim, idx_embed_dim),
         )
 
-        # Per-frame feature: per-slot embeddings flattened + self + action
+        # Per-frame feature: per-idx embeddings flattened + self + action
         frame_input_dim = (
-            N_SLOTS * slot_embed_dim
+            N_INDICES * idx_embed_dim
             + N_SELF_SCALARS
             + 3                    # self_movement_id one-hot
             + weapon_embed_dim
@@ -130,7 +130,7 @@ class TargetHeadProbe(nn.Module):
             ]
         self.tcn = nn.Sequential(*layers)
 
-        self.head = nn.Linear(channels, N_SLOTS)
+        self.head = nn.Linear(channels, N_INDICES)
 
         self._kernel_size = kernel_size
         self._n_layers = n_layers
@@ -142,29 +142,29 @@ class TargetHeadProbe(nn.Module):
 
     def forward(
         self,
-        slot_scalars: torch.Tensor,    # (B, T, 16, 19)
-        slot_types: torch.Tensor,      # (B, T, 16)        long
-        slot_enemy: torch.Tensor,      # (B, T, 16)
+        idx_scalars: torch.Tensor,    # (B, T, 16, 19)
+        idx_types: torch.Tensor,      # (B, T, 16)        long
+        idx_enemy: torch.Tensor,      # (B, T, 16)
         self_scalars: torch.Tensor,    # (B, T, 16)
         movement_oh: torch.Tensor,     # (B, T, 3)
         weapon_id: torch.Tensor,       # (B, T)            long
         look: torch.Tensor,            # (B, T, 3)
         fire: torch.Tensor,            # (B, T)
     ) -> torch.Tensor:
-        B, T = slot_scalars.shape[:2]
+        B, T = idx_scalars.shape[:2]
 
-        slot_t_emb = self.type_embed(slot_types)                              # (B,T,16,Et)
-        slot_in = torch.cat(
-            [slot_scalars, slot_t_emb, slot_enemy.unsqueeze(-1)], dim=-1
+        idx_t_emb = self.type_embed(idx_types)                              # (B,T,16,Et)
+        idx_in = torch.cat(
+            [idx_scalars, idx_t_emb, idx_enemy.unsqueeze(-1)], dim=-1
         )                                                                      # (B,T,16,S+Et+1)
-        slot_emb = self.slot_mlp(slot_in)                                     # (B,T,16,Es)
-        slot_flat = slot_emb.reshape(B, T, -1)                                # (B,T,16*Es)
+        idx_emb = self.idx_mlp(idx_in)                                     # (B,T,16,Es)
+        idx_flat = idx_emb.reshape(B, T, -1)                                # (B,T,16*Es)
 
         weap_emb = self.weapon_embed(weapon_id)                               # (B,T,Ew)
         fire_in = fire.unsqueeze(-1).float()                                  # (B,T,1)
 
         frame = torch.cat(
-            [slot_flat, self_scalars, movement_oh, weap_emb, look, fire_in],
+            [idx_flat, self_scalars, movement_oh, weap_emb, look, fire_in],
             dim=-1,
         )                                                                      # (B,T,F)
 
@@ -190,7 +190,7 @@ class _Shard:
     fire:           np.ndarray   # (T,)      uint8
     target:         np.ndarray   # (T,)      int64
     episode_lengths: list[int]
-    # Per-slot keep mask derived from the configured token_mask predicate,
+    # Per-idx keep mask derived from the configured token_mask predicate,
     # or None if no masking is configured.  Stored at load time so the
     # per-chunk slice in __getitem__ is a cheap boolean index.
     token_keep:     "np.ndarray | None" = None
@@ -213,7 +213,7 @@ def _load_split(
         mid = np.load(split_dir / f"{tag}_obs_self_movement_id.npy", mmap_mode="r")
         wid = np.load(split_dir / f"{tag}_obs_self_weapon_id.npy", mmap_mode="r")
         look = np.load(split_dir / f"{tag}_act_look.npy", mmap_mode="r")
-        fire = np.load(split_dir / f"{tag}_act_fire.npy", mmap_mode="r")
+        fire = np.load(split_dir / f"{tag}_act_attack.npy", mmap_mode="r")
         target = np.load(split_dir / f"{tag}_act_target.npy", mmap_mode="r")
 
         token_keep = None
@@ -280,9 +280,9 @@ class _ChunkedDataset(Dataset):
         e = s + valid_len
         L = self.chunk_len
 
-        slot_scalars = torch.zeros(L, N_SLOTS, N_SLOT_SCALARS, dtype=torch.float32)
-        slot_types   = torch.zeros(L, N_SLOTS, dtype=torch.long)
-        slot_enemy   = torch.zeros(L, N_SLOTS, dtype=torch.float32)
+        idx_scalars = torch.zeros(L, N_INDICES, N_IDX_SCALARS, dtype=torch.float32)
+        idx_types   = torch.zeros(L, N_INDICES, dtype=torch.long)
+        idx_enemy   = torch.zeros(L, N_INDICES, dtype=torch.float32)
         self_scalars = torch.zeros(L, N_SELF_SCALARS, dtype=torch.float32)
         movement_oh  = torch.zeros(L, 3, dtype=torch.float32)
         weapon_id    = torch.zeros(L, dtype=torch.long)
@@ -300,7 +300,7 @@ class _ChunkedDataset(Dataset):
         tg = np.asarray(sh.target[s:e], dtype=np.int64)
 
         # Apply token_mask if configured: zero out scalars and types on
-        # rejected slots, and clear targets that pointed into them.
+        # rejected indices, and clear targets that pointed into them.
         if sh.token_keep is not None:
             keep = sh.token_keep[s:e]                       # (chunk_T, 16) bool
             drop = ~keep
@@ -308,21 +308,21 @@ class _ChunkedDataset(Dataset):
                 es = es.copy(); es[drop] = 0.0
                 et_raw = et_raw.copy(); et_raw[drop] = -1
                 rows = np.arange(et_raw.shape[0])
-                slot_idx = np.clip(tg, 0, N_SLOTS - 1)
-                masked_target = (tg != -100) & (et_raw[rows, slot_idx] == -1)
+                idx_idx = np.clip(tg, 0, N_INDICES - 1)
+                masked_target = (tg != -100) & (et_raw[rows, idx_idx] == -1)
                 if masked_target.any():
                     tg = tg.copy()
                     tg[masked_target] = -100
 
-        # Enemy flag derived from (possibly masked) per-slot scalars +
-        # types, so it stays consistent with the rest of the per-slot
+        # Enemy flag derived from (possibly masked) per-idx scalars +
+        # types, so it stays consistent with the rest of the per-idx
         # feature vector.
         en = _enemy_flag(et_raw.astype(np.int8), es).astype(np.float32)
         et = et_raw.clip(0, N_TYPE_VOCAB - 1)
 
-        slot_scalars[:valid_len] = torch.from_numpy(es)
-        slot_types[:valid_len]   = torch.from_numpy(et)
-        slot_enemy[:valid_len]   = torch.from_numpy(en)
+        idx_scalars[:valid_len] = torch.from_numpy(es)
+        idx_types[:valid_len]   = torch.from_numpy(et)
+        idx_enemy[:valid_len]   = torch.from_numpy(en)
         self_scalars[:valid_len] = torch.from_numpy(ss)
         movement_oh[:valid_len, 0] = torch.from_numpy((mi == 0).astype(np.float32))
         movement_oh[:valid_len, 1] = torch.from_numpy((mi == 1).astype(np.float32))
@@ -333,14 +333,14 @@ class _ChunkedDataset(Dataset):
         target[:valid_len]       = torch.from_numpy(tg)
 
         return {
-            "slot_scalars": slot_scalars,
-            "slot_types":   slot_types,
-            "slot_enemy":   slot_enemy,
+            "idx_scalars": idx_scalars,
+            "idx_types":   idx_types,
+            "idx_enemy":   idx_enemy,
             "self_scalars": self_scalars,
             "movement_oh":  movement_oh,
             "weapon_id":    weapon_id,
             "look":         look,
-            "fire":         fire,
+            "attack":         fire,
             "target":       target,
         }
 
@@ -351,11 +351,11 @@ class _ChunkedDataset(Dataset):
 class BucketStats:
     n: int = 0
     correct: int = 0
-    # predicted == 0 frequency (the strict-engine baseline matches slot 0)
+    # predicted == 0 frequency (the strict-engine baseline matches idx 0)
     pred_zero: int = 0
     # how often label == 0 (sanity)
     label_zero: int = 0
-    # full confusion of {label_slot -> pred_slot} counts for the labels
+    # full confusion of {label_idx -> pred_idx} counts for the labels
     # that actually occur in the bucket; key is (label, pred).
     confusion: dict = None
 
@@ -424,12 +424,12 @@ class TrainConfig:
     max_shards_val: int | None = None
     seed: int = 17
     # Class-imbalance handling. 97.5% of labeled frames have target=0, so
-    # vanilla CE collapses to "always predict 0". Down-weight slot 0 to push
+    # vanilla CE collapses to "always predict 0". Down-weight idx 0 to push
     # the model to actually predict the 2.5% disagreement cases.
-    slot0_weight: float = 0.05
+    idx0_weight: float = 0.05
     autocast_dtype: str = "bf16"  # "bf16" | "fp16" | "fp32"
-    # Optional per-slot mask predicate (qnn.bc.token_filter).  Applied at
-    # shard load time; rejected slots are zeroed in the feature build.
+    # Optional per-idx mask predicate (qnn.bc.token_filter).  Applied at
+    # shard load time; rejected indices are zeroed in the feature build.
     token_mask: "dict | None" = None
 
 
@@ -461,9 +461,9 @@ def _run_eval(model: TargetHeadProbe, loader: DataLoader,
                 enabled=(device.type == "cuda")
             ):
                 logits = model(
-                    batch["slot_scalars"], batch["slot_types"], batch["slot_enemy"],
+                    batch["idx_scalars"], batch["idx_types"], batch["idx_enemy"],
                     batch["self_scalars"], batch["movement_oh"],
-                    batch["weapon_id"], batch["look"], batch["fire"],
+                    batch["weapon_id"], batch["look"], batch["attack"],
                 )
             logits = logits.float()
             pred = logits.argmax(dim=-1)
@@ -478,7 +478,7 @@ def _run_eval(model: TargetHeadProbe, loader: DataLoader,
             pr = pred[mask]
             pp = argmax_p[mask]
             for tau in taus:
-                # Override slot 0 only when argmax!=0 AND confidence>=tau.
+                # Override idx 0 only when argmax!=0 AND confidence>=tau.
                 override = (pr != 0) & (pp >= tau)
                 policy_pred = torch.where(override, pr, torch.zeros_like(pr))
                 is_a = tg == 0
@@ -537,9 +537,9 @@ def train(cfg: TrainConfig) -> None:
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     cfg.output.mkdir(parents=True, exist_ok=True)
 
-    class_weights = torch.ones(N_SLOTS, dtype=torch.float32, device=device)
-    class_weights[0] = cfg.slot0_weight
-    print(f"class weights: slot0={cfg.slot0_weight}, slot1..15=1.0")
+    class_weights = torch.ones(N_INDICES, dtype=torch.float32, device=device)
+    class_weights[0] = cfg.idx0_weight
+    print(f"class weights: idx0={cfg.idx0_weight}, idx1..15=1.0")
 
     autocast_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
                        "fp32": torch.float32}[cfg.autocast_dtype]
@@ -560,12 +560,12 @@ def train(cfg: TrainConfig) -> None:
             with torch.amp.autocast(device_type=device.type,
                                      dtype=autocast_dtype, enabled=use_autocast):
                 logits = model(
-                    batch["slot_scalars"], batch["slot_types"], batch["slot_enemy"],
+                    batch["idx_scalars"], batch["idx_types"], batch["idx_enemy"],
                     batch["self_scalars"], batch["movement_oh"],
-                    batch["weapon_id"], batch["look"], batch["fire"],
+                    batch["weapon_id"], batch["look"], batch["attack"],
                 )                                            # (B,T,16)
                 loss = F.cross_entropy(
-                    logits.reshape(-1, N_SLOTS),
+                    logits.reshape(-1, N_INDICES),
                     target.reshape(-1),
                     ignore_index=-100,
                     weight=class_weights,
@@ -585,8 +585,8 @@ def train(cfg: TrainConfig) -> None:
         all_, a, b, curve = _run_eval(model, val_loader, device)
         elapsed = time.time() - t_ep
         baseline_b = 100.0 * b.pred_zero / max(b.n, 1)  # what % of B did model predict 0?
-        # Per-label-slot breakdown of bucket B: how often does the model
-        # nail each non-zero slot vs collapse it back to slot 0?
+        # Per-label-idx breakdown of bucket B: how often does the model
+        # nail each non-zero idx vs collapse it back to idx 0?
         b_per_label = {}
         for (lt, lp), c in b.confusion.items():
             d = b_per_label.setdefault(lt, {"n": 0, "right": 0, "to_zero": 0})
@@ -609,7 +609,7 @@ def train(cfg: TrainConfig) -> None:
             f"{elapsed:.1f}s"
         )
         print(f"  bucket B per-label: {per_label_str}")
-        print(f"  threshold policy (override slot 0 when argmax!=0 and p>=tau):")
+        print(f"  threshold policy (override idx 0 when argmax!=0 and p>=tau):")
         print(f"    {'tau':>5}  {'A_acc%':>7}  {'B_acc%':>7}  {'overall%':>8}  "
               f"{'overrides':>10}  {'override_acc%':>12}")
         for tau, rec in curve.items():
@@ -660,8 +660,8 @@ def main() -> None:
     p.add_argument("--max-shards-train", type=int, default=None)
     p.add_argument("--max-shards-val",   type=int, default=None)
     p.add_argument("--seed", type=int, default=17)
-    p.add_argument("--slot0-weight", type=float, default=0.05,
-                   help="CE weight on the dominant slot 0 class (down-weight to expose 2.5% minority)")
+    p.add_argument("--idx0-weight", type=float, default=0.05,
+                   help="CE weight on the dominant idx 0 class (down-weight to expose 2.5% minority)")
     p.add_argument("--autocast-dtype", type=str, default="bf16",
                    choices=["bf16", "fp16", "fp32"])
     p.add_argument("--token-mask", type=str, default=None,
@@ -686,7 +686,7 @@ def main() -> None:
         max_shards_train=args.max_shards_train if args.max_shards_train is not None else args.max_shards,
         max_shards_val=args.max_shards_val if args.max_shards_val is not None else args.max_shards,
         seed=args.seed,
-        slot0_weight=args.slot0_weight,
+        idx0_weight=args.idx0_weight,
         autocast_dtype=args.autocast_dtype,
         token_mask=token_mask,
     )

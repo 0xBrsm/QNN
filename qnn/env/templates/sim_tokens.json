@@ -30,8 +30,8 @@
     {"index": 8, "kind": "spatial", "sector": "Ground_State","dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
     {"index": 9, "kind": "spatial", "sector": "Ceiling_State","dir": [0,0,0],"nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
 
-    {"index": 10, "kind": "action_history", "tick_back": 2, "move": [0,0,0], "look": [1,0,0], "fire": 0, "switch_norm": 0.0},
-    {"index": 11, "kind": "action_history", "tick_back": 1, "move": [0,0,0], "look": [1,0,0], "fire": 0, "switch_norm": 0.0},
+    {"index": 10, "kind": "action_history", "tick_back": 2, "move": [0,0,0], "look": [1,0,0], "attack": 0, "switch_norm": 0.0},
+    {"index": 11, "kind": "action_history", "tick_back": 1, "move": [0,0,0], "look": [1,0,0], "attack": 0, "switch_norm": 0.0},
 
     {"index": 12, "kind": "entity", "type": "actor", "subject": "NONE", "modality": "NONE", "player_id": 0, "half_extents": [0,0,0], "rel": [0,0,0], "vel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "facing": 0, "team": 0, "score": 0, "recency": 0, "events": []},
     {"index": 13, "kind": "entity", "type": "actor", "subject": "NONE", "modality": "NONE", "player_id": 0, "half_extents": [0,0,0], "rel": [0,0,0], "vel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "facing": 0, "team": 0, "score": 0, "recency": 0, "events": []},

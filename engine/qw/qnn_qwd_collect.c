@@ -88,16 +88,33 @@ static struct
 	vec3_t		pmove_prev_simvel;
 	qboolean	pmove_prev_sim_inited;
 	/* op_fire captured from the per-cmd predicate call inside
-	 * QNN_QwdExtractAction's cmd-window loop. QwdInferEmitAction reads
-	 * this to pack action->op_input bit 3 without re-advancing the QC
-	 * VM. Only valid when set by the same-tick QwdExtractAction call;
-	 * QwdInferEmitAction inherits the value implicitly via the
-	 * QwdExtractAction call that happens inside it. */
+	 * QNN_QwdExtractAction's cmd-window loop. Read by
+	 * QwdPackInputMask to set input_mask bit 0 (attack) without
+	 * re-advancing the QC VM. Only valid when set by the same-tick
+	 * QwdExtractAction call; QwdBuildActionLabel inherits the value
+	 * implicitly via the QwdExtractAction call that happens inside
+	 * it. */
 	int		last_op_fire;
-	/* Last nonzero impulse byte seen anywhere in the cmd window — used
-	 * by QwdPackOpInput as the input to ProgsEvalWeaponImpulseOperative
-	 * for op_input bit 4. Matches the labeler-mode aggregation. */
+	/* Last nonzero impulse byte seen anywhere in the cmd window. The
+	 * BC QWD path doesn't pack impulse-feasibility into input_mask
+	 * (impulse is the weapon-switch byte, not an axis); kept here
+	 * because the labeler path's separate LOBS bit uses it. */
 	int		last_impulse_any;
+	/* Per-tick aggregated press signals captured from the cmd window
+	 * so QwdPackInputMask can read them without re-iterating. Jump
+	 * and upmove are kept distinct here (vs collapsed into the
+	 * legacy op_input ud bit). */
+	int		last_jump_press_any;	/* any cmd had buttons & BUTTON_JUMP */
+	int		last_upmove_pos_any;	/* any cmd had upmove > 0 (swim up) */
+	/* QC predicate state at the START of QwdExtractAction's per-cmd
+	 * loop — i.e. BEFORE this tick's fire (if any) advances cooldown.
+	 * QwdPackInputMask reads this so its synthetic feasibility check
+	 * answers "could a press fire AT THE BEGINNING of this tick" not
+	 * "could a press fire NEXT tick after this tick's fire already
+	 * advanced the cooldown" (the previous off-by-one — input_mask
+	 * was capturing post-loop state, anti-correlated with demo press
+	 * on engine-fired ticks). */
+	float		pre_loop_attack_finished;
 } qwd_state;
 
 void QNN_QwdCollectReset(void)
@@ -234,7 +251,7 @@ void QNN_QwdEvalOperativePerCmd(
  * Returns 1 iff any cmd in the current native tick's cmd window
  * triggered pmove's ground-jump success branch (270 z-impulse +
  * onground 0→-1). */
-int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot)
+int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot, int synth_button2)
 {
 	int window_start;
 	int window_end;
@@ -242,6 +259,18 @@ int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot)
 	int i;
 	int op_jump = 0;
 	qnn_pmove_save_t save;
+	/* Synthetic-press carry-state save/restore.  Pure-feasibility mode
+	 * forces button2=1 every cmd and so contaminates pmove_oldbuttons
+	 * (anti-pogo state) and pmove_prev_simorg/simvel (next-tick seed).
+	 * Snapshot the four fields BEFORE the synthetic loop, restore
+	 * after — leaves real-jump label path's state untouched. */
+	int saved_pmove_oldbuttons = qwd_state.pmove_oldbuttons;
+	qboolean saved_pmove_oldbuttons_inited = qwd_state.pmove_oldbuttons_inited;
+	vec3_t saved_pmove_prev_simorg;
+	vec3_t saved_pmove_prev_simvel;
+	qboolean saved_pmove_prev_sim_inited = qwd_state.pmove_prev_sim_inited;
+	VectorCopy(qwd_state.pmove_prev_simorg, saved_pmove_prev_simorg);
+	VectorCopy(qwd_state.pmove_prev_simvel, saved_pmove_prev_simvel);
 
 	if (!snapshot)
 		return 0;
@@ -355,21 +384,45 @@ int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot)
 	{
 		int seq = (window_start + i) & UPDATE_MASK;
 		pmove.cmd = cl.frames[seq].cmd;
+		if (synth_button2)
+		{
+			/* Force button2 high; PlayerMove's JumpButton reads
+			 * pmove.cmd.buttons & 2. Anti-pogo (oldbuttons & 2)
+			 * still applies — that's exactly what feasibility
+			 * means: if the demo was already holding button2 last
+			 * tick, the engine will NOT fire a new jump even if
+			 * we press now, so feasibility=0 in that frame. */
+			pmove.cmd.buttons |= 2;
+		}
 		qnn_pmove_jump_fired = 0;
 		PlayerMove();
 		if (qnn_pmove_jump_fired)
 			op_jump = 1;
 	}
 
-	/* Carry pmove.oldbuttons forward — that's the anti-pogo state
-	 * the next tick's first cmd needs to see. */
-	qwd_state.pmove_oldbuttons = pmove.oldbuttons;
+	if (synth_button2)
+	{
+		/* Restore the carry state captured before the synthetic loop.
+		 * The real-jump label path's per-tick state must not see the
+		 * "we just held button2 the whole window" residue. */
+		qwd_state.pmove_oldbuttons = saved_pmove_oldbuttons;
+		qwd_state.pmove_oldbuttons_inited = saved_pmove_oldbuttons_inited;
+		VectorCopy(saved_pmove_prev_simorg, qwd_state.pmove_prev_simorg);
+		VectorCopy(saved_pmove_prev_simvel, qwd_state.pmove_prev_simvel);
+		qwd_state.pmove_prev_sim_inited = saved_pmove_prev_sim_inited;
+	}
+	else
+	{
+		/* Carry pmove.oldbuttons forward — that's the anti-pogo state
+		 * the next tick's first cmd needs to see. */
+		qwd_state.pmove_oldbuttons = pmove.oldbuttons;
 
-	/* Capture engine's predicted state (post this tick's cmds in
-	 * cl.simorg/simvel) as the seed for the next call. */
-	VectorCopy(cl.simorg, qwd_state.pmove_prev_simorg);
-	VectorCopy(cl.simvel, qwd_state.pmove_prev_simvel);
-	qwd_state.pmove_prev_sim_inited = true;
+		/* Capture engine's predicted state (post this tick's cmds in
+		 * cl.simorg/simvel) as the seed for the next call. */
+		VectorCopy(cl.simorg, qwd_state.pmove_prev_simorg);
+		VectorCopy(cl.simvel, qwd_state.pmove_prev_simvel);
+		qwd_state.pmove_prev_sim_inited = true;
+	}
 
 	QNN_PmoveRestore(&save);
 	return op_jump;
@@ -383,7 +436,10 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 	int n;
 	int i;
 	int fire_any;
-	int jump_any;
+	int jump_press_any;	/* buttons & BUTTON_JUMP set in any cmd */
+	int upmove_pos_any;	/* upmove > 0 in any cmd (swim up) */
+	int jump_any;		/* jump_press_any OR upmove_pos_any — drives
+				 * the unified ud-pos press bit in action->move. */
 	long forward_sum;
 	long side_sum;
 	int last_upmove;
@@ -395,9 +451,17 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 	int grounded_effective = snapshot ? (snapshot->grounded ? 1 : 0) : 0;
 
 	QNN_ClearAction(action);
-	/* Stash slots read by QNN_QwdPackOpInput run from QwdInferEmitAction. */
+	/* Stash slots read by QNN_QwdPackInputMask run from QwdBuildActionLabel. */
 	qwd_state.last_op_fire = 0;
 	qwd_state.last_impulse_any = 0;
+	/* Snapshot cooldown state BEFORE the per-cmd loop runs (and possibly
+	 * advances it by firing this tick). QwdPackInputMask uses this so
+	 * its bit-0 feasibility check answers "could press fire AT START of
+	 * this tick" — which AND'd with the demo press gives the correct
+	 * engine-fired-this-tick label. Without this snapshot, PackInputMask
+	 * saw post-loop state and bit 0 ended up anti-correlated with the
+	 * demo press on the very ticks the engine actually fired. */
+	qwd_state.pre_loop_attack_finished = QNN_ProgsGetAttackFinished();
 
 	window_end = cls.netchan.outgoing_sequence;
 	if (window_end <= 0)
@@ -415,6 +479,8 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 		n = UPDATE_BACKUP;
 
 	fire_any = 0;
+	jump_press_any = 0;
+	upmove_pos_any = 0;
 	jump_any = 0;
 	forward_sum = 0;
 	side_sum = 0;
@@ -432,6 +498,13 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 
 		if (cmd->buttons & 1)
 			fire_any = 1;
+		/* Split jump button from upmove > 0 so input_mask can record
+		 * them on distinct bits. jump_any (used to derive the unified
+		 * ud-pos press bit) stays as OR of the two. */
+		if (cmd->buttons & 2)
+			jump_press_any = 1;
+		if (cmd->upmove > 0)
+			upmove_pos_any = 1;
 		if ((cmd->buttons & 2) || cmd->upmove > 0)
 			jump_any = 1;
 		forward_sum += (long)cmd->forwardmove;
@@ -456,8 +529,8 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 		/* Advance the QC predicate VM per-cmd in NON-labeler mode only.
 		 * In non-labeler mode this side-effect drives the BC self_token
 		 * attack_finished scalar via QNN_ProgsGetAttackCdRemaining in
-		 * QNN_SelfEmitToken, AND captures op_fire_any so QwdPackOpInput
-		 * can populate action->op_input bit 3 without re-advancing.
+		 * QNN_SelfEmitToken, AND captures op_fire_any so QwdPackInputMask
+		 * can populate action->input_mask bit 0 without re-advancing.
 		 * In LABELER mode the same per-cmd loop runs a SECOND time
 		 * inside QNN_QwdEvalOperativePerCmd — running it here too would
 		 * double-advance qnn_progs_attack_finished and pre-reject every
@@ -476,12 +549,14 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 				op_fire_any = 1;
 		}
 	}
-	/* Stash for QNN_QwdPackOpInput (called once per tick from
-	 * QwdInferEmitAction). The stash is overwritten by each
-	 * QwdExtractAction call; the value seen by QwdPackOpInput is the
-	 * one set by the QwdInferEmitAction-internal call. */
+	/* Stash for QNN_QwdPackInputMask (called once per tick from
+	 * QwdBuildActionLabel). The stash is overwritten by each
+	 * QwdExtractAction call; the value seen by QwdPackInputMask is
+	 * the one set by the QwdBuildActionLabel-internal call. */
 	qwd_state.last_op_fire = op_fire_any;
 	qwd_state.last_impulse_any = impulse_any;
+	qwd_state.last_jump_press_any = jump_press_any;
+	qwd_state.last_upmove_pos_any = upmove_pos_any;
 
 	/* Resolve the impulse byte to a concrete 1..8 weapon id, gated
 	 * on ownership for direct selects.  Server-side cmd dispatch
@@ -499,22 +574,34 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 			impulse_target = last_nonzero_impulse;
 	}
 
-	/* Average move across the window: each cmd is integrated over
-	 * native_dt by the recorder's kbutton_t; averaging N cmds gives
-	 * the integrated displacement a single 50ms cmd would represent —
-	 * which is what a 20fps policy needs to learn to emit.  Server-
-	 * side, our policy's one 50ms cmd runs as ONE physics sub-step,
-	 * so the label should match that one-cmd intent. */
-	action->move[0] = QNN_Clamp((float)forward_sum / (n * QNN_SV_MAXSPEED), -1.0f, 1.0f);
-	action->move[1] = QNN_Clamp((float)side_sum / (n * QNN_SV_MAXSPEED), -1.0f, 1.0f);
-	action->fire = fire_any;
+	/* Average move across the window, threshold at the Python compaction
+	 * boundary (MOVE_AXIS_THRESHOLD = 0.1) so the press byte matches
+	 * the on-disk representation a downstream loader expects.  Each cmd
+	 * is integrated over native_dt by the recorder's kbutton_t; averaging
+	 * N cmds gives the integrated displacement a single 50ms cmd would
+	 * represent — which is what a 20fps policy needs to learn to emit. */
+	{
+		float fb_avg = QNN_Clamp((float)forward_sum / (n * QNN_SV_MAXSPEED), -1.0f, 1.0f);
+		float lr_avg = QNN_Clamp((float)side_sum    / (n * QNN_SV_MAXSPEED), -1.0f, 1.0f);
+		int fb_neg = (fb_avg < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		int fb_pos = (fb_avg >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		int lr_neg = (lr_avg < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		int lr_pos = (lr_avg >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		/* up-pos bit unifies any jump intent (BUTTON_JUMP or swim-up
+		 * upmove>0) — preserves the legacy ud_class label semantics.
+		 * up-neg bit captures swim-down (upmove<0). */
+		int up_pos = jump_any ? 1 : 0;
+		int up_neg = (last_upmove < 0) ? 1 : 0;
+		action->move = QNN_PackInputMask(
+			/*alive=*/1,
+			fb_neg, fb_pos,
+			lr_neg, lr_pos,
+			up_neg, up_pos,
+			/*jump_act=*/jump_press_any,
+			/*attack_act=*/fire_any);
+	}
 
-	if (jump_any)
-		action->move[2] = QNN_SV_JUMP_SPEED / QNN_SV_MAXSPEED;
-	else if (last_upmove < 0)
-		action->move[2] = QNN_Clamp((float)last_upmove / QNN_SV_MAXSPEED, -1.0f, 0.0f);
-
-	/* action->weapon is filled by QNN_QwdInferEmitAction using the
+	/* action->weapon is filled by QNN_QwdBuildActionLabel using the
 	 * snapshot's weapon_id (server-state at the same point in the tick
 	 * the obs sees) plus the impulse_target returned here.  Keeping
 	 * extraction pure (no qwd_state, no snapshot dependency) ensures
@@ -522,7 +609,7 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 	return impulse_target;
 }
 
-void QNN_QwdInferEmitAction(qnn_action_t *action,
+void QNN_QwdBuildActionLabel(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot)
 {
 	int impulse_target = QNN_QwdExtractAction(action, snapshot);
@@ -571,57 +658,116 @@ void QNN_QwdInferEmitAction(qnn_action_t *action,
 	 * from snapshot->weapon_id for pre-signon frames. */
 
 	QNN_FillLookAndSwitch(action, snapshot);
-	QNN_QwdPackOpInput(action, snapshot);
+	QNN_QwdPackInputMask(action, snapshot);
 }
 
-/* Pack the per-axis op_input mask onto action->op_input.
+/* Pack action->input_mask — pure-feasibility per-axis mask the trainer
+ * consumes when input_mask=true. "Would the engine accept this axis if
+ * the player pressed AT THE START of this tick?" — no AND with the demo's
+ * actual press. State is captured PRE-loop (before this tick's fire
+ * advances cooldown) via qwd_state.pre_loop_attack_finished, so bit 0
+ * AND demo_press cleanly recovers the engine-fired-this-tick label.
  *
- *   bit0 = fb       : forward_sum != 0 (aggregated cmd_move.fb)
- *   bit1 = lr       : side_sum != 0    (aggregated cmd_move.lr)
- *   bit2 = ud       : jump_any AND pmove ground-jump op,
- *                     OR swim-down AND in-water
- *   bit3 = fire     : fire_any AND QC W_WeaponFrame op
- *   bit4 = impulse  : impulse_any != 0 AND QC ImpulseCommands op
+ * Layout (see QNN_PackInputMask):
  *
- * Reads op_fire and the aggregated impulse byte from qwd_state (stashed
- * by the same-tick QwdExtractAction call). Calls QwdEvalPmoveJump and
- * ProgsEvalWeaponImpulseOperative directly — those have per-tick state
- * that must advance exactly once per tick, so this function must run
- * exactly once per tick (from QwdInferEmitAction).
+ *   bit 0    = attack feasibility : would QC W_Attack fire if button0=1
+ *                                   at START of this tick? (cooldown
+ *                                   expired AND held weapon has ammo)
+ *   bits 1-2 = forward feasibility: both bits set whenever alive —
+ *                                   pmove always processes fmove on
+ *                                   ground / in air / in water.
+ *   bits 3-4 = side    feasibility: same — always 11 when alive.
+ *   bits 5-6 = up      feasibility: 11 when in water (swim up & down
+ *                                   both feasible), 00 otherwise.
+ *   bit 7    = jump    feasibility: would pmove ground-jump fire if
+ *                                   button2=1 each cmd? (depends on
+ *                                   onground + anti-pogo + dead state)
  *
- * Press bits are derived from the action's already-filled move/fire
- * fields, which encode the same fb/lr/ud/fire press semantics as the
- * labeler's raw cmd_move/cmd_buttons inspection (zero ⇔ no press,
- * action->move[2] > 0 ⇔ jump intent, < 0 ⇔ swim-down). */
-void QNN_QwdPackOpInput(qnn_action_t *action,
+ * Trainer side then computes the engine-outcome label as
+ * (feasibility_bit & demo_press_bit) per axis; the schema decouples
+ * "engine state" from "what the player did" so the trainer can reason
+ * about both independently.
+ *
+ * Honest tradeoff: fb/lr feasibility carries no info (always 1) under
+ * pure-feasibility semantics — the bits stay in the layout for schema
+ * consistency across axes. attack and jump are where the bits matter.
+ *
+ * Implementation:
+ *   - Attack feasibility: save the persistent qnn_progs_attack_finished,
+ *     call QNN_ProgsEvalAttack with button0=1 (existing predicate runs
+ *     ammo/weapon checks), restore the saved value so the real per-cmd
+ *     loop's state isn't contaminated. The predicate's own re-zeroing
+ *     of self.* per call means per-snapshot ammo state is fresh.
+ *   - Jump feasibility: QwdEvalPmoveJump with synth_button2=1, which
+ *     saves/restores its own pmove carry state internally.
+ *
+ * Must run exactly once per tick (from QwdBuildActionLabel) — same
+ * cadence requirement as the previous engine-act version. */
+void QNN_QwdPackInputMask(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot)
 {
-	int op_jump;
-	int op_impulse;
+	int op_jump_feasible;
+	int op_attack_feasible;
+	int in_water;
+	int held_weapon;
+	float saved_attack_finished;
 
 	if (action == NULL || snapshot == NULL)
 		return;
 	if (snapshot->health <= 0)
 	{
-		action->op_input = 0;
+		action->input_mask = 0;
 		return;
 	}
 
-	op_jump = QNN_QwdEvalPmoveJump(snapshot);
-	op_impulse = QNN_ProgsEvalWeaponImpulseOperative(
-		snapshot->health, snapshot->items_owned,
-		snapshot->ammo_shells, snapshot->ammo_nails,
-		snapshot->ammo_rockets, snapshot->ammo_cells,
-		snapshot->weapon_id, qwd_state.last_impulse_any);
+	in_water = (snapshot->waterlevel >= 2);
+	held_weapon = snapshot->weapon_id;
 
-	action->op_input = QNN_PackOpInput(
+	/* Attack feasibility via the existing QC predicate.
+	 *
+	 * Two state-management requirements:
+	 *  (a) The synthetic call here must use PRE-loop cooldown as its
+	 *      baseline so bit 0 means "could press fire at START of this
+	 *      tick" — which AND'd with the demo press recovers the
+	 *      engine-fired-this-tick label. Without this, the per-cmd
+	 *      loop in QwdExtractAction has already advanced cooldown by
+	 *      this tick's fire, and bit 0 collapses to "could press fire
+	 *      NEXT tick" — anti-correlated with demo press on exactly
+	 *      the ticks the engine actually fired.
+	 *  (b) After the synthetic call we must restore the POST-loop value
+	 *      so downstream code (next tick's per-cmd loop, BC self_token
+	 *      attack_finished readout) sees the real engine state.
+	 *
+	 * We snapshot the post-loop value, switch to the pre-loop value
+	 * for the eval, restore the post-loop value when done. */
+	saved_attack_finished = QNN_ProgsGetAttackFinished();
+	QNN_ProgsSetAttackFinished(qwd_state.pre_loop_attack_finished);
+	op_attack_feasible = 0;
+	if (held_weapon >= 1 && held_weapon <= 8)
+	{
+		op_attack_feasible = QNN_ProgsEvalAttack(
+			qnn_runtime.tick,
+			qnn_runtime.fixed_tick_hz,
+			snapshot->health, snapshot->items_owned,
+			snapshot->ammo_shells, snapshot->ammo_nails,
+			snapshot->ammo_rockets, snapshot->ammo_cells,
+			held_weapon, /*button0=*/1);
+	}
+	QNN_ProgsSetAttackFinished(saved_attack_finished);
+
+	/* Jump feasibility via pmove with synthetic button2=1; the helper
+	 * internally save/restores its persistent carry state. */
+	op_jump_feasible = QNN_QwdEvalPmoveJump(snapshot, /*synth_button2=*/1);
+
+	/* fb/lr: always feasible — pmove processes fmove/smove in every
+	 * physics branch (ground, air, water). Set BOTH direction bits to
+	 * signal "either direction is engine-accepted right now". */
+	action->input_mask = QNN_PackInputMask(
 		1,
-		(action->move[0] != 0.0f),
-		(action->move[1] != 0.0f),
-		(action->move[2] > 0.0f),
-		(action->move[2] < 0.0f),
-		action->fire ? 1 : 0,
-		(snapshot->waterlevel >= 2),
-		op_jump, qwd_state.last_op_fire, op_impulse,
-		qwd_state.last_impulse_any != 0);
+		/*fb_act_neg=*/1, /*fb_act_pos=*/1,
+		/*lr_act_neg=*/1, /*lr_act_pos=*/1,
+		/*up_act_neg=*/in_water ? 1 : 0,
+		/*up_act_pos=*/in_water ? 1 : 0,
+		op_jump_feasible,
+		op_attack_feasible);
 }

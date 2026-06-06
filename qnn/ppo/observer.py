@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sample_factory.algo.runners.runner import Runner
 
 from sample_factory.algo.runners.runner import AlgoObserver
-from signal_slot.signal_slot import EventLoopObject
+from signal_idx.signal_idx import EventLoopObject
 
 log = logging.getLogger(__name__)
 

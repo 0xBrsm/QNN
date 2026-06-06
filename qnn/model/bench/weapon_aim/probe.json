@@ -1,0 +1,8 @@
+{
+  "head": "weapon_aim",
+  "d_model": 64,
+  "self_weapon_embed_in_self": false,
+  "bottleneck": 32,
+  "activation": "gelu",
+  "variant": "weapon_aim"
+}

@@ -400,11 +400,11 @@ class DemoProbe:
 def _final_frags(frag_updates: list[Dict[str, object]]) -> Dict[int, int]:
     latest: Dict[int, int] = {}
     for row in frag_updates:
-        slot = row.get("player_slot")
+        idx = row.get("player_idx")
         frags = row.get("frags")
-        if not isinstance(slot, int) or not isinstance(frags, int):
+        if not isinstance(idx, int) or not isinstance(frags, int):
             continue
-        latest[int(slot)] = int(frags)
+        latest[int(idx)] = int(frags)
     return latest
 
 
@@ -510,24 +510,24 @@ def parse_demo_metadata(
                     reader.string()
                     continue
                 if cmd == SVC_UPDATENAME:
-                    slot = reader.byte()
+                    idx = reader.byte()
                     name = reader.string()
                     if name:
-                        player_names[int(slot)] = name
-                        maxclients = max(maxclients, int(slot) + 1)
+                        player_names[int(idx)] = name
+                        maxclients = max(maxclients, int(idx) + 1)
                     continue
                 if cmd == SVC_UPDATEFRAGS:
-                    slot = reader.byte()
+                    idx = reader.byte()
                     frags = reader.short()
                     frag_updates.append(
                         {
-                            "player_slot": int(slot),
+                            "player_idx": int(idx),
                             "frags": int(frags),
                             "message_index": int(message_index),
                             "time_s": float(current_time),
                         }
                     )
-                    maxclients = max(maxclients, int(slot) + 1)
+                    maxclients = max(maxclients, int(idx) + 1)
                     continue
                 if cmd == SVC_CLIENTDATA:
                     skip_clientdata(reader)
@@ -536,10 +536,10 @@ def parse_demo_metadata(
                     reader.short()
                     continue
                 if cmd == SVC_UPDATECOLORS:
-                    slot = reader.byte()
+                    idx = reader.byte()
                     colors = reader.byte()
-                    player_colors[int(slot)] = int(colors)
-                    maxclients = max(maxclients, int(slot) + 1)
+                    player_colors[int(idx)] = int(colors)
+                    maxclients = max(maxclients, int(idx) + 1)
                     continue
                 if cmd == SVC_PARTICLE:
                     skip_particle(reader)
@@ -629,9 +629,9 @@ def parse_demo_metadata(
 
 
 def _player_count(meta: DemoMetadata) -> int:
-    named_slots = len([name for name in meta.player_names.values() if name])
-    max_slot = max(meta.player_names.keys(), default=-1) + 1
-    inferred = max(max_slot, named_slots)
+    named_indices = len([name for name in meta.player_names.values() if name])
+    max_idx = max(meta.player_names.keys(), default=-1) + 1
+    inferred = max(max_idx, named_indices)
     return int(max(0, inferred))
 
 
@@ -641,16 +641,16 @@ def _frag_rate(meta: DemoMetadata) -> float:
     return float(len(meta.frag_updates)) / max(meta.duration_s, 1e-6)
 
 
-def _active_frag_slots(meta: DemoMetadata) -> set[int]:
+def _active_frag_indices(meta: DemoMetadata) -> set[int]:
     active: set[int] = set()
     for row in meta.frag_updates:
-        slot = row.get("player_slot")
+        idx = row.get("player_idx")
         frags = row.get("frags")
-        if not isinstance(slot, int) or not isinstance(frags, int):
+        if not isinstance(idx, int) or not isinstance(frags, int):
             continue
         if frags == 0 or frags <= -90:
             continue
-        active.add(int(slot))
+        active.add(int(idx))
     return active
 
 
@@ -666,7 +666,7 @@ def classify_competitive(meta: DemoMetadata, *, source_prior: str | None = None)
     team_cvar = meta.teamplay
     text_flags = meta.text_flags
     frag_activity = frag_rate >= 0.01 or frag_count >= 8
-    active_fraggers = _active_frag_slots(meta)
+    active_fraggers = _active_frag_indices(meta)
     explicit_team_text = any(
         bool(text_flags.get(flag))
         for flag in (

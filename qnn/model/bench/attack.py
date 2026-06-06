@@ -1,7 +1,7 @@
 """Fire-head probe: flat-feature MLP loss / metrics / HeadSpec.
 
-Binary BCE on ``act.fire``. Default features include privileged
-``target_dist_slots`` (the 16-slot GT distribution the BC trainer
+Binary BCE on ``act.attack``. Default features include privileged
+``target_probs_indices`` (the 16-idx GT distribution the BC trainer
 already passes alongside the obs) and target-pooled actor rel/vel —
 answers "how well can fire be predicted from per-frame state when the
 right target is known."
@@ -19,36 +19,36 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from qnn.bc.heads.flat import FlatFeatureHead
-from qnn.bc.heads.spec import (
+from qnn.model.bench.flat import FlatFeatureHead
+from qnn.model.bench.spec import (
     HeadBuildResult,
     HeadLossSpec,
     HeadSpec,
     neutral_model_config,
 )
-from qnn.model.policy import ModelConfig
+from qnn.model.network import ModelConfig
 
 
-def fire_bce_loss(
+def attack_bce_loss(
     logits: torch.Tensor,       # (B, 1)
-    fire_target: torch.Tensor,  # (B,) {0, 1}
+    attack_target: torch.Tensor,  # (B,) {0, 1}
     pos_weight: float = 1.0,
 ) -> torch.Tensor:
     pw = torch.tensor([pos_weight], dtype=logits.dtype, device=logits.device)
     return F.binary_cross_entropy_with_logits(
-        logits.squeeze(-1), fire_target.float(), pos_weight=pw,
+        logits.squeeze(-1), attack_target.float(), pos_weight=pw,
     )
 
 
-def fire_metrics(
+def attack_metrics(
     logits: torch.Tensor,
-    fire_target: torch.Tensor,
+    attack_target: torch.Tensor,
 ) -> dict[str, float]:
     """f1 / precision / recall / pos_rate / acc / confidence, BC-style keys."""
     with torch.no_grad():
         probs = torch.sigmoid(logits.squeeze(-1))
         pred = (probs >= 0.5).long()
-        target = fire_target.long()
+        target = attack_target.long()
         tp = ((pred == 1) & (target == 1)).float().sum()
         fp = ((pred == 1) & (target == 0)).float().sum()
         fn = ((pred == 0) & (target == 1)).float().sum()
@@ -59,26 +59,26 @@ def fire_metrics(
         acc = float((pred == target).float().mean().item())
         conf = float(probs.mean().item())
     return {
-        "f1_fire": f1,
-        "precision_fire": prec,
-        "recall_fire": rec,
-        "pos_rate_fire": pos_rate,
-        "acc_fire": acc,
-        "confidence_fire": conf,
+        "f1_attack": f1,
+        "precision_attack": prec,
+        "recall_attack": rec,
+        "pos_rate_attack": pos_rate,
+        "acc_attack": acc,
+        "confidence_attack": conf,
     }
 
 
 def _required(probe: Mapping[str, Any], key: str) -> Any:
     if key not in probe:
         raise RuntimeError(
-            f"probe.json must define {key!r} for head=fire "
-            "(no Python-level defaults — see qnn.bc.heads.templates)."
+            f"probe.json must define {key!r} for head=attack "
+            "(no Python-level defaults — see qnn.model.bench.templates)."
         )
     return probe[key]
 
 
-def _build_fire(probe: Mapping[str, Any]) -> HeadBuildResult:
-    """Build the flat-feature fire probe from probe.json. All keys required.
+def _build_attack(probe: Mapping[str, Any]) -> HeadBuildResult:
+    """Build the flat-feature attack probe from probe.json. All keys required.
 
     Reads:
       hidden (int), n_hidden_layers (int), dropout (float),
@@ -86,7 +86,7 @@ def _build_fire(probe: Mapping[str, Any]) -> HeadBuildResult:
       width, inert here but required so probe.json reflects the full
       surface area), self_weapon_embed_in_self (bool — likewise inert
       under the flat-feature path but kept on the probe schema for
-      symmetry with fire_token).
+      symmetry with attack_preattn).
     """
     hidden = int(_required(probe, "hidden"))
     n_hidden_layers = int(_required(probe, "n_hidden_layers"))
@@ -94,7 +94,7 @@ def _build_fire(probe: Mapping[str, Any]) -> HeadBuildResult:
     raw_names = _required(probe, "feature_names")
     if not isinstance(raw_names, list) or len(raw_names) == 0:
         raise RuntimeError(
-            "probe.json.feature_names must be a non-empty list for head=fire"
+            "probe.json.feature_names must be a non-empty list for head=attack"
         )
     feature_names = tuple(str(s) for s in raw_names)
     d_model = int(_required(probe, "d_model"))
@@ -108,7 +108,7 @@ def _build_fire(probe: Mapping[str, Any]) -> HeadBuildResult:
         del obs_dim, model_cfg
         return FlatFeatureHead(
             feature_names=feature_names,
-            output_route="fire",
+            output_route="attack",
             hidden=hidden,
             n_hidden_layers=n_hidden_layers,
             dropout=dropout,
@@ -117,10 +117,10 @@ def _build_fire(probe: Mapping[str, Any]) -> HeadBuildResult:
     return model_config, factory
 
 
-FIRE = HeadSpec(
-    name="fire_flat",
+ATTACK = HeadSpec(
+    name="attack_flat",
     # Principled "now" feature set per the user's framing: enemy
-    # position (privileged via target_dist_slots), current weapon,
+    # position (privileged via target_probs_indices), current weapon,
     # ammo, and cooldown — the four things fire actually needs. Look is
     # omitted because target_pooled_rel is in view-relative coords (engine
     # transforms rel via player_view_angles), so (1,0,0) already means
@@ -134,17 +134,17 @@ FIRE = HeadSpec(
         "self_weapon_one_hot",
         "self_ammo",
         "self_attack_finished",
-        "target_dist_slots",
+        "target_probs_indices",
         "target_pooled_rel",
         "target_pooled_vel",
     ),
     loss=HeadLossSpec(
-        loss_fn=fire_bce_loss,
-        metrics_fn=fire_metrics,
-        label_key="fire",
+        loss_fn=attack_bce_loss,
+        metrics_fn=attack_metrics,
+        label_key="attack",
         output_dim=1,
-        selection_metric="f1_fire",
+        selection_metric="f1_attack",
         selection_lower_is_better=False,
     ),
-    build=_build_fire,
+    build=_build_attack,
 )

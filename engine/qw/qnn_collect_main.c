@@ -88,7 +88,7 @@ static void QNN_BuildAllRefs(void)
  * upmove, buttons, impulse, angles).  The cmd-window walker that
  * aggregates these into a single emit-rate action label lives in
  * src/engine/qw/qnn_qwd_collect.c.  See QNN_QwdExtractAction /
- * QNN_QwdInferEmitAction.
+ * QNN_QwdBuildActionLabel.
  */
 
 
@@ -730,14 +730,15 @@ static int QNN_HandleCollect(const char *line)
 			 * write-only across this function, so the only effect of
 			 * calling QwdExtractAction here was advancing
 			 * qnn_progs_attack_finished a second time within the same
-			 * tick — QwdInferEmitAction (line below) internally calls
+			 * tick — QwdBuildActionLabel (line below) internally calls
 			 * QwdExtractAction once per tick already, and the per-cmd
 			 * loop's QNN_ProgsEvalAttack on the second call saw the
 			 * just-set future attack_finished and rejected every
 			 * fire, leaving qwd_state.last_op_fire = 0 in the stash
-			 * QwdPackOpInput reads. Result: op_input bit 3 never set
-			 * across the BC QWD corpus. Same failure mode commit
-			 * 4c7c9b4d fixed for the labeler path. */
+			 * QwdPackInputMask reads. Result: input_mask bit 0
+			 * (attack) never set across the BC QWD corpus. Same
+			 * failure mode commit 4c7c9b4d fixed for the labeler
+			 * path. */
 			if (!snapshot.done)
 			{
 				if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
@@ -747,7 +748,7 @@ static int QNN_HandleCollect(const char *line)
 
 			/* Emit-time action label.  QWD path is a pure usercmd-byte
 			 * decoder (action.weapon written canonically inside
-			 * QNN_QwdInferEmitAction); MVD path runs inference. */
+			 * QNN_QwdBuildActionLabel); MVD path runs inference. */
 			if (!snapshot.done)
 			{
 				if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
@@ -763,20 +764,16 @@ static int QNN_HandleCollect(const char *line)
 						QNN_MvdInferEmitMove(
 							&snapshot.action_label,
 							&snapshot, phys_dt);
-						qnn_runtime.prev_move[0] = snapshot.action_label.move[0];
-						qnn_runtime.prev_move[1] = snapshot.action_label.move[1];
-						qnn_runtime.prev_move[2] = snapshot.action_label.move[2];
+						qnn_runtime.prev_move = snapshot.action_label.move;
 					}
 					else
 					{
-						snapshot.action_label.move[0] = qnn_runtime.prev_move[0];
-						snapshot.action_label.move[1] = qnn_runtime.prev_move[1];
-						snapshot.action_label.move[2] = qnn_runtime.prev_move[2];
+						snapshot.action_label.move = qnn_runtime.prev_move;
 					}
 				}
 				else
 				{
-					QNN_QwdInferEmitAction(
+					QNN_QwdBuildActionLabel(
 						&snapshot.action_label,
 						&snapshot);
 				}
@@ -808,15 +805,12 @@ static int QNN_HandleCollect(const char *line)
 				if (qnn_runtime.force_mvd_emit && !cls.mvdplayback)
 				{
 					filter_snapshot = snapshot;
-					QNN_QwdInferEmitAction(&filter_snapshot.action_label,
+					QNN_QwdBuildActionLabel(&filter_snapshot.action_label,
 						&snapshot);
 					emit_out = QNN_EmitFilter(&filter_snapshot);
 					if (snapshot.health <= 0)
 					{
-						snapshot.action_label.fire = 1;
-						snapshot.action_label.move[0] = 0.0f;
-						snapshot.action_label.move[1] = 0.0f;
-						snapshot.action_label.move[2] = 0.0f;
+						snapshot.action_label.move = 0x01; /* bit 0 = attack press */
 					}
 				}
 				else

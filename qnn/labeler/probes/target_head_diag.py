@@ -4,24 +4,24 @@ Loads a checkpoint and answers two questions about what the probe is
 actually learning:
 
   1. Modality vs lookahead split — for each bucket B frame (labeler chose
-     a pid != engine slot 0), classify it as:
+     a pid != engine idx 0), classify it as:
        MODALITY:  labeler's pid is in obs at this frame AND its recency > 0.
                   Engine could not have it as sticky because of the
                   SIGHT/PROXIMITY filter. The causal signal is present.
        LOOKAHEAD: labeler's pid recency = 0 (in SIGHT now) but engine
-                  slot 0 is a different pid. The label is justified by a
+                  idx 0 is a different pid. The label is justified by a
                   future fire that a causal model cannot see.
      Reports probe accuracy in each split.
 
   2. Feature ablation — re-evaluate while zeroing out one feature group
      at a time, to identify which signal carries the probe's gains:
-       --ablate recency         zero out per-slot recency scalar (offset 18)
-       --ablate rel             zero out per-slot rel vector (offset 3..5)
+       --ablate recency         zero out per-idx recency scalar (offset 18)
+       --ablate rel             zero out per-idx rel vector (offset 3..5)
        --ablate look            zero out the look vector
        --ablate fire            zero out the fire flag
        --ablate self_scalars    zero out the self scalar block
-       --ablate slot_enemy      zero out the enemy mask
-       --ablate everything_else keep only per-slot scalars
+       --ablate idx_enemy      zero out the enemy mask
+       --ablate everything_else keep only per-idx scalars
 
 Usage:
     PYTHONPATH=src python -m qnn.labeler.probes.target_head_diag \
@@ -40,7 +40,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from qnn.labeler.probes.target_head_probe import (
-    N_SLOTS, N_SLOT_SCALARS, TargetHeadProbe, _ChunkedDataset,
+    N_INDICES, N_IDX_SCALARS, TargetHeadProbe, _ChunkedDataset,
     _load_split, _to_device, _accumulate, BucketStats,
 )
 
@@ -67,7 +67,7 @@ def _eval_split(
     """Run inference and report:
        - argmax accuracy on bucket A / B
        - bucket B split into MODALITY vs LOOKAHEAD by inspecting per-frame
-         features (recency on the labeled slot).
+         features (recency on the labeled idx).
     """
     abl = set(ablations or [])
 
@@ -91,32 +91,32 @@ def _eval_split(
         for batch in loader:
             batch = _to_device(batch, device)
 
-            slot_scalars = batch["slot_scalars"].clone()  # (B,T,16,19)
+            idx_scalars = batch["idx_scalars"].clone()  # (B,T,16,19)
             self_scalars = batch["self_scalars"].clone()
-            slot_enemy   = batch["slot_enemy"].clone()
+            idx_enemy   = batch["idx_enemy"].clone()
             look         = batch["look"].clone()
-            fire         = batch["fire"].clone()
+            fire         = batch["attack"].clone()
 
             # Apply ablations.
             if "recency" in abl:
-                slot_scalars[..., RECENCY_OFFSET] = 0
+                idx_scalars[..., RECENCY_OFFSET] = 0
             if "rel" in abl:
-                slot_scalars[..., REL_OFFSET:REL_OFFSET + REL_LEN] = 0
+                idx_scalars[..., REL_OFFSET:REL_OFFSET + REL_LEN] = 0
             if "self_scalars" in abl:
                 self_scalars[...] = 0
-            if "slot_enemy" in abl:
-                slot_enemy[...] = 0
+            if "idx_enemy" in abl:
+                idx_enemy[...] = 0
             if "look" in abl:
                 look[...] = 0
-            if "fire" in abl:
+            if "attack" in abl:
                 fire[...] = 0
-            if "slot_scalars" in abl:
-                slot_scalars[...] = 0
+            if "idx_scalars" in abl:
+                idx_scalars[...] = 0
 
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16,
                                     enabled=(device.type == "cuda")):
                 logits = model(
-                    slot_scalars, batch["slot_types"], slot_enemy,
+                    idx_scalars, batch["idx_types"], idx_enemy,
                     self_scalars, batch["movement_oh"],
                     batch["weapon_id"], look, fire,
                 )
@@ -127,17 +127,17 @@ def _eval_split(
             target = batch["target"]
             _accumulate(allb, a, b, target, pred)
 
-            # Sub-bucket the bucket B frames by recency of the labeled slot.
+            # Sub-bucket the bucket B frames by recency of the labeled idx.
             mask = target != -100
             tg = target[mask]
             pr = pred[mask]
             pp = probs.gather(-1, pred.unsqueeze(-1)).squeeze(-1)[mask]
-            # slot_scalars[mask, lbl_slot, RECENCY_OFFSET] gives recency for the
-            # labeled slot. We need to index the labeled slot at each frame.
+            # idx_scalars[mask, lbl_idx, RECENCY_OFFSET] gives recency for the
+            # labeled idx. We need to index the labeled idx at each frame.
             # ss has shape (B, T, 16, 19); apply mask -> (N, 16, 19)
-            ss_masked = batch["slot_scalars"][mask]
+            ss_masked = batch["idx_scalars"][mask]
             lbl_rec = ss_masked.gather(
-                1, tg.view(-1, 1, 1).expand(-1, 1, N_SLOT_SCALARS)
+                1, tg.view(-1, 1, 1).expand(-1, 1, N_IDX_SCALARS)
             ).squeeze(1)[:, RECENCY_OFFSET]
 
             is_b = tg != 0
@@ -243,8 +243,8 @@ def main() -> None:
 
     # Single-feature ablations.
     for ablation in [
-        ["recency"], ["rel"], ["look"], ["fire"],
-        ["self_scalars"], ["slot_enemy"], ["slot_scalars"],
+        ["recency"], ["rel"], ["look"], ["attack"],
+        ["self_scalars"], ["idx_enemy"], ["idx_scalars"],
     ]:
         _eval_split(model, val_loader, device,
                     f"ablate {','.join(ablation)}", ablations=ablation)

@@ -43,7 +43,7 @@ def _validate_warm_start_arch(init_ckpt: str, ppo_cfg: dict[str, Any]) -> None:
     if not init_ckpt or not Path(init_ckpt).exists():
         return
     arch_keys = (
-        "trunk_hidden", "gru_hidden", "use_gru", "d_model", "n_heads",
+        "encoder_hidden", "gru_hidden", "use_gru", "d_model", "n_heads",
         "n_layers", "ffn_dim", "attn_dropout",
     )
     try:
@@ -54,7 +54,7 @@ def _validate_warm_start_arch(init_ckpt: str, ppo_cfg: dict[str, Any]) -> None:
     if isinstance(payload, dict):
         if "meta" in payload and isinstance(payload["meta"], dict):
             meta = payload["meta"]
-        elif "trunk_hidden" in payload:
+        elif "encoder_hidden" in payload:
             meta = payload
     if meta is None:
         return
@@ -150,7 +150,7 @@ def run_training_job(
         init_checkpoint=init_checkpoint,
         init_checkpoints=ppo_cfg.get("init_ckpts"),
         resume=resume,
-        trunk_hidden=int(require_cfg_value(ppo_cfg, "trunk_hidden", "PPO config")),
+        encoder_hidden=int(require_cfg_value(ppo_cfg, "encoder_hidden", "PPO config")),
         gru_hidden=int(require_cfg_value(ppo_cfg, "gru_hidden", "PPO config")),
         use_gru=bool(require_cfg_value(ppo_cfg, "use_gru", "PPO config")),
         d_model=int(require_cfg_value(ppo_cfg, "d_model", "PPO config")),
@@ -195,7 +195,7 @@ def run_training_job(
         best_dir.mkdir(parents=True, exist_ok=True)
         qnn_ckpt_path = best_dir / "best_model.pth"
         try:
-            from qnn.model.policy import ModelConfig
+            from qnn.model.network import ModelConfig
             obs_dim = (
                 int(require_cfg_value(ppo_cfg, "obs_dim", "PPO config"))
                 if "obs_dim" in ppo_cfg

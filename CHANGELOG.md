@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.20.0
+
+### Added
+
+- `qnn.model` package: `Network`, `MoveHead`/`LookHead`/`AttackHead`/`WeaponHead`, `Temporal`, `TransformerEncoder`, and `TargetPointer` extracted from `policy.py` as composable components, with dataclass I/O and a reshape-once `Network.forward`
+- Slot-configurable `Network` with an `Off` sentinel, plus `PreAttnEncoder` and `GTTargetPointer` for component-slot ablations; `qnn.model.testing` harness
+- Self-token redesign: self split into state/arsenal/motion subtokens with a CLS readout
+- `input_mask` per-axis engine-act byte (jump vs upmove split); residual-on-geometric-prior `AttackHead` (mirrors the look head); `hit_test` C primitive + ctypes/torch port as an attack-prior mode
+- One BC training platform behind `train_on_batches` with two data pipelines — GPU-resident and chunked streaming — plus `parallel_prefetch_iter`
+
+### Changed
+
+- `fire` → `attack` end-to-end (action axis, heads, locals) to match QW `button0` / `BUTTON_ATTACK`
+- `Tokenizer` → `ObsEmbedding`, `TokenizedFeatureEncoder` → `PreAttnEncoder`, `trunk` → `encoder`, `*_token` → `*_preattn`; `target_dist` → `target_probs`, `slot` → `idx`
+- `op_input` → `input_mask` (1 = operative), now pure feasibility with no demo-press AND-gate; `microbatch_size` → `batch_size` (fails loudly on the old name)
+- BC heads/probes refactored to `Network` slot overrides; `qnn.bc.components` → `qnn.model.bench`, alternate slot inputs to `qnn.model.bench.inputs`
+
+### Removed
+
+- `ModelConfig.from_dict` back-compat defaults; attack-prior back-compat from the live load path; prior modes stripped from the canonical `AttackHead` (moved to `bench/attack_prior/`); dead labeler-v2 hard-label code
+
+### Fixed
+
+- Checkpoint converter loads pre-rename v23 BC checkpoints; `@dataclass(slots=True)` restored after the over-broad `slot` → `idx` rename
+- `input_mask` attack-feasibility off-by-one; `qnn_action_t` shrunk to 16 bytes (single press byte mirrors `input_mask`)
+
 ## 0.19.0
 
 ### Added
@@ -74,13 +100,13 @@
 - Token spec v9 → v11; entity vocab 42 → 44 with SHOTGUN/SUPER_SHOTGUN and NAILGUN/SUPER_NAILGUN as distinct rows, weapons renumbered into Quake impulse order (ids 3-10) so SG/SSG and NG/SNG embed rows sit adjacent
 - `self_scalars` 14 → 16; `entity_stream` offset shifts back to byte 564 (action_history wire region removed); max obs ~2389B
 - `move` action: continuous float[3] → 3 categorical axes (fb/lr/ud) × 3 classes {neg, none, pos}. Engine still receives float[3] in {-1, 0, +1}; on-disk corpus stores 6-bit packed uint8
-- Trunk returns a tuple `(self_readout, target_feat, target_logits, target_query)` instead of a single tensor; downstream heads consume `target_feat` directly. GRU input remains `self_readout` (the in-branch `linear(cat(self_readout, mean(actors)))` experiment lost to `gru_input_self_only=True` and was baked out)
+- Encoder returns a tuple `(self_readout, target_feat, target_logits, target_query)` instead of a single tensor; downstream heads consume `target_feat` directly. GRU input remains `self_readout` (the in-branch `linear(cat(self_readout, mean(actors)))` experiment lost to `gru_input_self_only=True` and was baked out)
 - Corpus on-disk action format: packed `move` uint8, fp16 `look`, raw engine `weapon` byte (no-weapon frames carry 0 and are masked from CE)
 
 ### Removed
 
 - `recall_0..3` heads and recall wire bytes; `qnn_store[].mem` kept dormant as a revival hook
-- `action_history` ripped from wire, schema, and Tokenizer end-to-end; checkpoint converter keeps `migrate_drop_action_history` to strip pre-rip-out weights
+- `action_history` ripped from wire, schema, and ObsEmbedding end-to-end; checkpoint converter keeps `migrate_drop_action_history` to strip pre-rip-out weights
 - 5-slot `switch` head end-to-end (replaced by direct-impulse `weapon`)
 
 ## 0.16.0
@@ -284,7 +310,7 @@
 ### Changed
 - Final BC model form: 2-layer transformer (d_model 64, 1 head, FFN 256), self-readout, GRU temporal core, 2 action history tokens
 - Full sequential episode training with GRU carry-forward, per-chunk gradient accumulation, and TBPTT
-- Ablation phases 1–6: 2 action tokens win (+72%), GRU redundant with action tokens, trunk sizing and focal loss evaluated
+- Ablation phases 1–6: 2 action tokens win (+72%), GRU redundant with action tokens, encoder sizing and focal loss evaluated
 - Cosine LR decay, regression-based stopping on MAE sum, resumable checkpoints with NAS archival
 
 ### Added
@@ -333,7 +359,7 @@
 ## 0.3.0
 
 ### Added
-- Transformer encoder with tokenized self/object/spatial trunk and CLS pooling
+- Transformer encoder with tokenized self/object/spatial encoder and CLS pooling
 - Identity vocabulary, token observation packer, 4-signal PvP reward
 - Sample Factory APPO integration, autotune harness, sound capture
 - Token bridge/protocol, demo worker, semantic vocabulary

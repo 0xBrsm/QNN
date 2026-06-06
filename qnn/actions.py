@@ -35,7 +35,7 @@ ENGINE-FACING (ActionLabels):
                   [1, 0, 0] = no turn.
 
   fire    int     0 = not firing, 1 = firing.
-  switch  int     0 = no switch, 1-6 = weapon slot.
+  switch  int     0 = no switch, 1-6 = weapon idx.
 
 TRAINING-FACING (on-disk corpus):
 
@@ -56,7 +56,7 @@ TRAINING-FACING (on-disk corpus):
                       No-weapon frames stay in the corpus so move/fire/look
                       labels still train; the 8-class weapon head masks
                       them out of its CE loss via ignore_index=-100.
-                      The engine-facing `switch` slot 0-6 is derived from
+                      The engine-facing `switch` idx 0-6 is derived from
                       the weapon head's argmax at inference time; it is
                       not stored on disk.
 """
@@ -103,7 +103,7 @@ MOVE_AXIS_THRESHOLD = 0.1
 ACTION_HEADS = {
     "move": MOVE_AXES * MOVE_AXIS_CLASSES,  # 9 logits → reshape (3 axes, 3 classes)
     "look": 3,
-    "fire": 2,
+    "attack": 2,
     "weapon": WEAPON_ACTION_SIZE,
 }
 CONTINUOUS_ACTION_HEADS = frozenset({"look"})
@@ -111,7 +111,7 @@ CONTINUOUS_ACTION_HEADS = frozenset({"look"})
 # Deterministic head ordering (Python 3.7+ dict preserves insertion order).
 # Shared by checkpoint_converter and other modules that need a canonical order.
 HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
-DISCRETE_ACTION_HEADS = frozenset({"move", "fire", "weapon"})
+DISCRETE_ACTION_HEADS = frozenset({"move", "attack", "weapon"})
 
 
 def clamp_weapon(value: int) -> int:
@@ -232,7 +232,7 @@ def normalized_action_features(action: Mapping[str, object]) -> List[float]:
         float(labels.look[0]),
         float(labels.look[1]),
         float(labels.look[2]),
-        float(labels.fire),
+        float(labels.attack),
         float(labels.weapon) / float(WEAPON_ACTION_SIZE - 1),  # class 0..7 → [0, 1]
     ]
 
@@ -241,7 +241,7 @@ def normalized_action_features(action: Mapping[str, object]) -> List[float]:
 class ActionLabels:
     move: tuple[float, float, float] = (0.0, 0.0, 0.0)
     look: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    fire: int = 0
+    attack: int = 0
     weapon: int = 0
 
     @classmethod
@@ -252,7 +252,7 @@ class ActionLabels:
         action = cls(
             move=move,
             look=look,
-            fire=int(payload.get("fire", 0)),
+            attack=int(payload.get("attack", 0)),
             weapon=clamp_weapon(int(payload.get("weapon", 0))),
         )
         action.validate()
@@ -262,8 +262,8 @@ class ActionLabels:
         for value in (*self.move, *self.look):
             if float(value) < -1.0 or float(value) > 1.0:
                 raise ValueError("continuous action values must be in [-1, 1]")
-        if self.fire < 0 or self.fire >= ACTION_HEADS["fire"]:
-            raise ValueError(f"fire out of range [0, {ACTION_HEADS['fire']})")
+        if self.attack < 0 or self.attack >= ACTION_HEADS["attack"]:
+            raise ValueError(f"attack out of range [0, {ACTION_HEADS['attack']})")
         # weapon is the engine impulse byte 0..8 (0 = no impulse,
         # 1..8 = axe..lightning).  ACTION_HEADS["weapon"]=8 is the
         # PPO model class count; the impulse range is 1..8 plus the
@@ -275,7 +275,7 @@ class ActionLabels:
         return {
             "move": [float(self.move[0]), float(self.move[1]), float(self.move[2])],
             "look": [float(self.look[0]), float(self.look[1]), float(self.look[2])],
-            "fire": int(self.fire),
+            "attack": int(self.attack),
             "weapon": int(self.weapon),
         }
 
@@ -289,7 +289,7 @@ def flatten_action(action: Mapping[str, object]) -> List[float]:
         float(labels.look[0]),
         float(labels.look[1]),
         float(labels.look[2]),
-        float(labels.fire),
+        float(labels.attack),
         float(labels.weapon),
     ]
 
@@ -300,7 +300,7 @@ def action_from_list(values: Sequence[float]) -> Dict[str, object]:
     payload: Dict[str, object] = {
         "move": [float(values[0]), float(values[1]), float(values[2])],
         "look": [float(values[3]), float(values[4]), float(values[5])],
-        "fire": int(round(float(values[6]))),
+        "attack": int(round(float(values[6]))),
         "weapon": int(round(float(values[7]))),
     }
     return ActionLabels.from_dict(payload).to_dict()

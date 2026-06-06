@@ -34,8 +34,8 @@ carries the value:
 - Spatial ``dir[3]`` unit vectors — **i8** with ~1/127 precision.
 - Categorical IDs — **u8** (vocab fits in <256).
 - ``cl.items`` — **i32**, matches Quake's ``int items``.
-- ``act_target_dist`` — NOT on disk. Recomputed at training start
-  from obs+actions by ``qnn.bc.train._compute_target_dist`` (~3 µs/frame
+- ``act_target_probs`` — NOT on disk. Recomputed at training start
+  from obs+actions by ``qnn.bc.train._compute_target_probs`` (~3 µs/frame
   CPU, ~25s for an 8M-frame corpus). Decouples LabelerConfig from the
   cache fingerprint.
 
@@ -61,13 +61,13 @@ deviate, and why:
 
 3. **half_extents (u8 saturating)** vs engine's float bbox half-sizes.
    Saturates at 255 raw units. Why: players/items/most movers are
-   <128; saves 3 B/slot × 16 slots = 48 B/frame; rare custom-map
+   <128; saves 3 B/idx × 16 indices = 48 B/frame; rare custom-map
    movers >255 get clipped but the model's response to "huge mover"
    is indistinguishable above that anyway.
 
 4. **dist removed entirely** from the wire (was a redundant field
    alongside rel). Recomputed by the dequantizer via
-   ``|rel| / DIST_SCALE``. Zero precision loss; saves 2 B/slot.
+   ``|rel| / DIST_SCALE``. Zero precision loss; saves 2 B/idx.
 
 5. **item amount (u8 saturating, model-side normalized)** vs engine's
    raw ``e->amount`` (int, max value 200). Wire carries raw u8;
@@ -77,13 +77,13 @@ deviate, and why:
    of MAX_HEALTH/MAX_ARMOR/per-weapon-ammo-bonus tables, single source
    of truth for normalization stays in this file.
 
-6. **act_target_dist NOT on disk at all** — the target labeler is
+6. **act_target_probs NOT on disk at all** — the target labeler is
    ~3 µs/frame and runs deterministically on (obs, actions, config).
    We recompute it once at training start instead of caching, which
    decouples LabelerConfig from the cache fingerprint and avoids any
    lossy on-disk compression of the multi-hot tail. ~25s startup
    overhead for an 8M-frame corpus, negligible against multi-hour
-   training. See ``qnn.bc.train._compute_target_dist``.
+   training. See ``qnn.bc.train._compute_target_probs``.
 
 7. **act_move (u8 packed: move + fire)** vs engine's
    ``(forwardmove/sidemove/upmove i16 × 3, buttons.bit0 fire)``. We
@@ -106,7 +106,7 @@ deviate, and why:
    instead of i8 (~0.5° step at unit length would be visible in
    smoothness).
 
-9. **Synthesized fields not in any Quake protocol slot**:
+9. **Synthesized fields not in any Quake protocol idx**:
    ``attack_finished`` (QC self.attack_finished cooldown, our f16
    seconds), ``self_movement_id`` (composite ground/air/water-level
    we synthesize), entity ``eta``/``recency``/``regen``/``facing``/
@@ -136,7 +136,7 @@ QW ``usercmd_t`` has 7 fields. What we carry, drop, or transform:
                             conflates ground-jump with
                             water-swim-up (upmove>0). See
                             project_labeler_fire_jump_drift memory.
-                            Slot reserved at act_move bit 7 for a
+                            Idx reserved at act_move bit 7 for a
                             future fix.
   impulse 1..8       — captured as act_weapon (u8).
   impulse 9, 10..    — DROPPED. Quake's `impulse 9` is a cheat;
@@ -181,7 +181,7 @@ DIST_SCALE         = 1000.0      # canonical world-unit normalization (entity re
 # Native Quake/QW bit positions from vendor/quake/QW/progs/defs.qc.
 # Wire stores cl.items as u32 to match svc_updatestatlong(STAT_ITEMS)
 # exactly. The model's SelfDequantizer extracts the bits below into
-# the categorical IDs the Tokenizer's embedding lookups consume.
+# the categorical IDs the ObsEmbedding's embedding lookups consume.
 
 IT_SHOTGUN          = 1 <<  0
 IT_SUPER_SHOTGUN    = 1 <<  1
@@ -223,7 +223,7 @@ MOVEMENT_WATER_HIGH = 4  # waterlevel==3: submerged
 
 @dataclass(frozen=True)
 class Field:
-    """One scalar or vector slot in the wire / cache layout.
+    """One scalar or vector idx in the wire / cache layout.
 
     Attributes:
         name:       Wire field name. Also the npy filename suffix in
@@ -331,7 +331,7 @@ SELF_FIELDS: Tuple[Field, ...] = (
         scale=None, transform="embedding",
         source="STAT_ACTIVEWEAPON → mapped to ENTITY_IDS subject "
                "(AXE..LIGHTNING block). Categorical, fed to "
-               "Tokenizer.entity_embed sharing rows with world-"
+               "ObsEmbedding.entity_embed sharing rows with world-"
                "entity weapons.",
     ),
     Field(
@@ -340,7 +340,7 @@ SELF_FIELDS: Tuple[Field, ...] = (
         scale=None, transform="embedding",
         source="Composite from player_state.waterlevel and "
                "pmove.onground: 0=ground, 1=air, 2/3/4=water "
-               "low/mid/submerged. Fed to Tokenizer.movement_embed.",
+               "low/mid/submerged. Fed to ObsEmbedding.movement_embed.",
     ),
     Field(
         name="self_items",
@@ -348,7 +348,7 @@ SELF_FIELDS: Tuple[Field, ...] = (
         scale=None, transform="bitfield",
         source="cl.items raw bitfield — mirrors Quake's `int items` "
                "(see vendor/quake/WinQuake/client.h:158) and the "
-               "svc_updatestatlong(STAT_ITEMS) protocol slot. "
+               "svc_updatestatlong(STAT_ITEMS) protocol idx. "
                "SelfDequantizer extracts: 7 weapon-owned flags "
                "(sg..lg) and axe, armor_type_id (from IT_ARMOR1/2/3 "
                "mask), and 4 powerup IDs (INVIS/PENT/SUIT/QUAD). "
@@ -358,13 +358,25 @@ SELF_FIELDS: Tuple[Field, ...] = (
                "PyTorch's patchy u32 dispatch — bit-AND semantics "
                "are identical.",
     ),
+    Field(
+        name="view_pitch",
+        dtype=np.int8, shape=(),
+        scale=1.0, transform=None,
+        source="snapshot.player_view_angles[0] (engine pitch in "
+               "degrees) divided by 90 on the engine side, packed "
+               "as i8. Engine clamps pitch to ±70° in "
+               "CL_AdjustAngles so the i8 range is comfortable. "
+               "Feeds the model's self.motion subtoken; replaces "
+               "the pitch signal that used to live implicitly in "
+               "the 9 spatial sectors' dir vectors.",
+    ),
 )
 
 
 SELF_BLOCK_BYTES: int = sum(f.bytes_per_frame for f in SELF_FIELDS)
-# Computed at import time; expect 20 bytes:
+# Computed at import time; expect 21 bytes:
 #   health 1 + effective_armor 1 + ammo×4 4 + vel 6 + attack_finished 2
-#   + weapon_id 1 + movement_id 1 + items 4 = 20
+#   + weapon_id 1 + movement_id 1 + items 4 + view_pitch 1 = 21
 
 
 # ── Spatial block ────────────────────────────────────────────────
@@ -484,7 +496,7 @@ SPATIAL_BLOCK_BYTES: int = SPATIAL_TOKEN_COUNT * sum(f.bytes_per_frame for f in 
 # The dataloader reads each batch row's variable-length data and
 # pads to max-token-count-in-batch at collation time. This is the
 # only padding that exists — there is no on-disk padding to a global
-# 16-slot maximum. PyTorch's nn.MultiheadAttention requires
+# 16-idx maximum. PyTorch's nn.MultiheadAttention requires
 # rectangular batch tensors; the batch-time pad is forced by that.
 #
 # Savings vs the legacy fixed (rows, 16, 19) f16 layout (~608 B per
@@ -499,7 +511,7 @@ ENTITY_COMMON_FIELDS: Tuple[Field, ...] = (
         dtype=np.int8, shape=(),
         scale=None, transform=None,
         source="Token type tag (TOKEN_PROJECTILE=0, TOKEN_ACTOR=1, "
-               "TOKEN_ITEM=2, TOKEN_MOVER=3). -1 for empty slot in "
+               "TOKEN_ITEM=2, TOKEN_MOVER=3). -1 for empty idx in "
                "dense cache.",
     ),
     Field(
@@ -520,7 +532,7 @@ ENTITY_COMMON_FIELDS: Tuple[Field, ...] = (
         name="player_id",
         dtype=np.uint8, shape=(),
         scale=None, transform="embedding",
-        source="ACTOR only — entity slot index for player identity. "
+        source="ACTOR only — entity idx index for player identity. "
                "0 for non-actor tokens. Fed to player_embed.",
     ),
     Field(
@@ -535,7 +547,7 @@ ENTITY_COMMON_FIELDS: Tuple[Field, ...] = (
         dtype=np.uint8, shape=(4,),
         scale=None, transform="embedding",
         source="ACTION_IDS — FIRE/JUMP/PAIN/etc. that this entity "
-               "emitted recently. Fed to action_embed. Slots past "
+               "emitted recently. Fed to action_embed. Indices past "
                "event_count are zero.",
     ),
     Field(
@@ -565,7 +577,7 @@ _F_HALF_EXTENTS = Field(
            "DM doors and lifts are typically <128. **Saturates at 255** "
            "— affects only unusually large movers (custom-map trains "
            "or skybox-spanning movers), which are rare in DM. Saved "
-           "3 B/slot × 16 slots = 48 B/frame vs i16; acceptable "
+           "3 B/idx × 16 indices = 48 B/frame vs i16; acceptable "
            "given the model's response to 'huge mover' is "
            "indistinguishable above ~255 units anyway.",
 )
@@ -580,7 +592,7 @@ _F_REL = Field(
 # Note: no _F_DIST. The C side computed `dist = |rel|` and stored
 # both for convenience. On disk we drop the redundant magnitude and
 # have the dequantizer compute it via `torch.linalg.norm(rel, dim=-1)`.
-# Same information, 2 B/slot × 16 slots = 32 B/frame saved, zero
+# Same information, 2 B/idx × 16 indices = 32 B/frame saved, zero
 # precision loss.
 _F_VEL = Field(
     name="vel",
@@ -758,7 +770,7 @@ ENTITY_SCALAR_BYTES: dict[str, int] = {
 # obs in the sharded cache (act_*.npy files). Included here so the
 # normalization spec is in one place.
 #
-# act_target_dist is the dominant cost: today 17 × f32 = 68 B/frame
+# act_target_probs is the dominant cost: today 17 × f32 = 68 B/frame
 # and 94% one-hot empirically. The native encoding stores top-1 plus
 # an optional top-2 (idx, weight) entry, since 99%+ of rows fit in
 # the (idx, idx2, w2) triple.
@@ -768,14 +780,13 @@ ACTION_FIELDS: Tuple[Field, ...] = (
         name="act_move",
         dtype=np.uint8, shape=(),
         scale=None, transform="bitfield",
-        source="Packed 3-axis movement + fire trigger in a single byte: "
-               "bits 0-1 = fb class {neg=0,none=1,pos=2}, bits 2-3 = lr "
-               "class, bits 4-5 = ud class, bit 6 = fire (BUTTON_ATTACK), "
-               "bit 7 reserved (future jump slot — currently 0). See "
-               "qnn.bc.collect:_compact_action_arrays. The loader in "
-               "qnn.bc.train splits this back into (T, 3) move axis "
-               "classes and a (T,) fire stream so the heads see the same "
-               "shape they always did.",
+        source="Packed action byte — bit layout mirrors input_mask: "
+               "bit 0 = attack press, bits 1-2 = fb neg/pos, bits 3-4 = "
+               "lr neg/pos, bits 5-6 = ud neg/pos (bit 6 unified: swim-up "
+               "OR jump), bit 7 = explicit jump press (diagnostic). See "
+               "qnn.bc.collect:_compact_action_arrays. Loader in "
+               "qnn.bc.train splits back into (T, 3) move axis classes "
+               "and (T,) attack / jump streams.",
     ),
     Field(
         name="act_weapon",
@@ -793,9 +804,9 @@ ACTION_FIELDS: Tuple[Field, ...] = (
                "aim precision; i8 = 0.008 step would be ~0.5° at typical "
                "view distances which is noticeable in look smoothness.",
     ),
-    # act_target_dist was a sparse (T, 3) u8 encoding of the labeler's
+    # act_target_probs was a sparse (T, 3) u8 encoding of the labeler's
     # (T, 17) f32 distribution. Now recomputed at training start from
-    # obs+actions by qnn.bc.train._compute_target_dist instead of being
+    # obs+actions by qnn.bc.train._compute_target_probs instead of being
     # baked into the cache. Decouples LabelerConfig from the cache
     # fingerprint (tune labeler without recollect) and eliminates the
     # sparse-truncation calibration drift on multi-hot rows.
@@ -803,7 +814,7 @@ ACTION_FIELDS: Tuple[Field, ...] = (
 
 ACTION_BLOCK_BYTES: int = sum(f.bytes_per_frame for f in ACTION_FIELDS)
 # Expected: 1 (move+fire) + 1 (weapon) + 6 (look) = 8 bytes
-# (was 11 with sparse target_dist; 12 before fire was packed into move;
+# (was 11 with sparse target_probs; 12 before fire was packed into move;
 # ~86 B in the original float32 layout: 1+1+1+6+68).
 
 
@@ -812,10 +823,10 @@ ACTION_BLOCK_BYTES: int = sum(f.bytes_per_frame for f in ACTION_FIELDS)
 # note above); the padded figure below is only a worst-case sanity
 # bound, not the actual disk footprint.
 
-_ENTITY_SLOT_BYTES_PADDED = sum(f.bytes_per_frame for f in ENTITY_COMMON_FIELDS) + max(
+_ENTITY_IDX_BYTES_PADDED = sum(f.bytes_per_frame for f in ENTITY_COMMON_FIELDS) + max(
     ENTITY_SCALAR_BYTES.values()
 )
-ENTITY_BLOCK_BYTES_PADDED: int = 16 * _ENTITY_SLOT_BYTES_PADDED  # worst-case bound
+ENTITY_BLOCK_BYTES_PADDED: int = 16 * _ENTITY_IDX_BYTES_PADDED  # worst-case bound
 
 # Per-frame budget vs today's ~1169 B f16 cache:
 #   self    20 B  (was 42)

@@ -16,10 +16,10 @@
   "gru_target_query": true,
   "hard_target_feat": false,
   "weapon_in_target_query": true,
-  "linear_slot_prior": false,
+  "linear_idx_prior": false,
   "gt_dist_target_feat": false,
   "prev_target_in_query": false,
-  "self_weapon_embed_in_self": true,
-  "head_bottleneck_dim": {"move": 128, "look": 128, "fire": 128, "weapon": 128},
+  "self_weapon_embed_in_self": false,
+  "head_bottleneck_dim": {"move": 128, "look": 128, "attack": 128, "weapon": 128},
   "head_activation": "gelu"
 }

@@ -20,15 +20,31 @@ services:
       # OMP_NUM_THREADS=1 via monkey-patch in train.py, while learner and
       # inference workers keep their default thread counts for peak throughput.
     volumes:
+      # HOST_WORKSPACE is the canonical env (set by the devcontainer). For
+      # worktree-based code edits the user can override HOST_CODE to point
+      # at a worktree's host path; HOST_DATA stays at the unified data
+      # root (assets/, artifacts/, vendor/). Both default to
+      # HOST_WORKSPACE so unconfigured launches behave exactly as before.
       - type: bind
-        source: ${HOST_WORKSPACE:?Set HOST_WORKSPACE to the host repo path}
+        source: ${HOST_CODE:-${HOST_WORKSPACE:?Set HOST_WORKSPACE to the host repo path}}
         target: /workspace
+      # Overlay flat-file data dirs from HOST_DATA. Defaults to
+      # HOST_WORKSPACE so they live in the same place by default.
+      - type: bind
+        source: ${HOST_DATA:-${HOST_WORKSPACE}}/assets
+        target: /workspace/assets
+      - type: bind
+        source: ${HOST_DATA:-${HOST_WORKSPACE}}/artifacts
+        target: /workspace/artifacts
+      - type: bind
+        source: ${HOST_DATA:-${HOST_WORKSPACE}}/vendor
+        target: /workspace/vendor
       - type: bind
         source: ${WSL_LIBDXCORE_PATH:-/usr/lib/wsl/lib/libdxcore.so}
         target: /usr/lib/libdxcore.so
         read_only: true
       - type: bind
-        source: ${WSL_LIBROCDXG_PATH:-${HOST_WORKSPACE:?Set HOST_WORKSPACE to the host repo path}/vendor/rocdxg/librocdxg.so.1.2.0}
+        source: ${WSL_LIBROCDXG_PATH:-${HOST_DATA:-${HOST_WORKSPACE}}/vendor/rocdxg/librocdxg.so.1.2.0}
         target: /usr/lib/librocdxg.so
         read_only: true
       - type: volume

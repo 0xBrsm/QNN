@@ -55,7 +55,7 @@ class FeatureSpec:
     is_jumping:        bool = False
     use_weapon_id:     bool = False   # one-hot of server-held weapon (9 dims)
     use_baseline:      bool = False   # per-frame sign(velocity) baseline concatenated into input
-    use_baseline_skip: bool = False   # baseline bypasses trunk and adds directly to output logits
+    use_baseline_skip: bool = False   # baseline bypasses encoder and adds directly to output logits
     # When use_baseline_skip is set, restrict the skip to specific axes.
     # Empty means both fb and lr.  Values: "fb", "lr", "fb_lr".
     baseline_skip_axes: str = "fb_lr"
@@ -208,11 +208,11 @@ class MoveLabeler(nn.Module):
 
     If ``use_baseline_skip`` is set, the model expects a baseline kwarg to
     forward (per-frame one-hot of the deterministic sign-of-velocity rule
-    for fb and lr).  Trunk logits are added to a learned linear projection
+    for fb and lr).  Encoder logits are added to a learned linear projection
     of the baseline, so the model starts by trusting the rule and the
-    trunk only has to learn the residual.  Baseline projections are
+    encoder only has to learn the residual.  Baseline projections are
     initialized to the identity (3x3) so logits at init equal the
-    baseline's one-hot — a strong prior the trunk can pull away from.
+    baseline's one-hot — a strong prior the encoder can pull away from.
     """
 
     def __init__(
@@ -243,12 +243,12 @@ class MoveLabeler(nn.Module):
                 nn.Dropout(p_drop),
             ]
             in_ch = channels
-        self.trunk = nn.Sequential(*layers)
+        self.encoder = nn.Sequential(*layers)
         self.head_fb = nn.Linear(channels, N_CLASSES)
         self.head_lr = nn.Linear(channels, N_CLASSES)
         self.predict_ud = predict_ud
         if predict_ud:
-            # Jump head — shares the trunk with fb/lr.  ud truth comes from
+            # Jump head — shares the encoder with fb/lr.  ud truth comes from
             # bits 4-5 of move_packed (usercmd.upmove > 0 → ud=pos=jump press).
             self.head_ud = nn.Linear(channels, N_CLASSES)
 
@@ -281,7 +281,7 @@ class MoveLabeler(nn.Module):
         If skip_fb or skip_lr is active, ``baseline`` must be (B, T, 6) =
         fb one-hot (3) concatenated with lr one-hot (3).
         """
-        h = self.trunk(x.transpose(1, 2)).transpose(1, 2)
+        h = self.encoder(x.transpose(1, 2)).transpose(1, 2)
         fb_logits = self.head_fb(h)
         lr_logits = self.head_lr(h)
         if self.skip_fb or self.skip_lr:

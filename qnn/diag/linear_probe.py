@@ -1,13 +1,13 @@
-"""Linear-probe per head: how separable are the trunk-side features?
+"""Linear-probe per head: how separable are the encoder-side features?
 
 Trains a single linear classifier (logistic regression) on frozen head-input
 features and reports macro F1. Compare to the full trained head's F1 from
 ``bc_history.json`` to answer:
 
-  - If probe F1 ≈ trained-head F1 → the trunk is already producing
+  - If probe F1 ≈ trained-head F1 → the encoder is already producing
     head-separable features; the head's nonlinearity adds little.
   - If trained-head F1 ≫ probe F1 → the head's bottleneck+ReLU is doing
-    real (non-linear) work the trunk doesn't.
+    real (non-linear) work the encoder doesn't.
 
 Memory note: full-corpus probe was previously too slow (~2hr). Default here
 is 1 train shard / 1 val shard for speed; pass ``--max-train-shards N``
@@ -47,7 +47,7 @@ def extract_head_input_features(
     Returns (features dict, labels dict) keyed by head name.
     Labels are unified per-head: discretised move axes, fire {0,1}, weapon class.
     """
-    captures: dict[str, list[np.ndarray]] = {"move": [], "look": [], "fire": [], "weapon": []}
+    captures: dict[str, list[np.ndarray]] = {"move": [], "look": [], "attack": [], "weapon": []}
     move_lab: list[np.ndarray] = []
     fire_lab: list[np.ndarray] = []
     weapon_lab: list[np.ndarray] = []
@@ -58,7 +58,7 @@ def extract_head_input_features(
         return hook
 
     handles = []
-    for name in ("move", "look", "fire", "weapon"):
+    for name in ("move", "look", "attack", "weapon"):
         head = getattr(policy.model, f"{name}_head", None)
         if head is None:
             continue
@@ -76,9 +76,9 @@ def extract_head_input_features(
             }
             policy._forward_tensors(obs_t)
             move_lab.append(np.asarray(ep["actions"]["move"]))
-            fire_lab.append(np.asarray(ep["actions"]["fire"]))
-            if "weapon_slot" in ep["actions"]:
-                weapon_lab.append(np.asarray(ep["actions"]["weapon_slot"]))
+            fire_lab.append(np.asarray(ep["actions"]["attack"]))
+            if "weapon_idx" in ep["actions"]:
+                weapon_lab.append(np.asarray(ep["actions"]["weapon_idx"]))
             elif "weapon" in ep["actions"]:
                 weapon_lab.append(np.asarray(ep["actions"]["weapon"]))
             frames_seen += n
@@ -94,7 +94,7 @@ def extract_head_input_features(
 
     labels: dict[str, np.ndarray] = {
         "move": np.concatenate(move_lab, axis=0) if move_lab else np.empty((0, 3), dtype=np.int64),
-        "fire": np.concatenate(fire_lab, axis=0) if fire_lab else np.empty((0,), dtype=np.int64),
+        "attack": np.concatenate(fire_lab, axis=0) if fire_lab else np.empty((0,), dtype=np.int64),
     }
     if weapon_lab:
         labels["weapon"] = np.concatenate(weapon_lab, axis=0)
@@ -162,11 +162,11 @@ def linear_probe_report(
         if axis_f1s:
             out["move_macro"] = float(np.mean(axis_f1s))
 
-    if train_labels["fire"].size and val_labels["fire"].size:
+    if train_labels["attack"].size and val_labels["attack"].size:
         try:
-            out["fire"] = fit_linear_probe(
-                train_feats["fire"], train_labels["fire"].astype(int),
-                val_feats["fire"], val_labels["fire"].astype(int),
+            out["attack"] = fit_linear_probe(
+                train_feats["attack"], train_labels["attack"].astype(int),
+                val_feats["attack"], val_labels["attack"].astype(int),
                 multi_class=False,
             )
         except Exception as e:  # noqa: BLE001

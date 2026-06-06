@@ -277,7 +277,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     if "linear_probe" in report:
         lp = report["linear_probe"]
-        lines.append("## Linear probe (frozen-trunk → linear classifier)\n")
+        lines.append("## Linear probe (frozen-encoder → linear classifier)\n")
         lines.append("Compare to trained-head F1: gap = how much the head's nonlinearity is doing.\n")
         for k, v in lp.items():
             if isinstance(v, float):

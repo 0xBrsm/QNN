@@ -1,14 +1,14 @@
 """Target-head probe: flat-feature MLP loss / metrics / HeadSpec.
 
-Soft-CE on the labeler's 17-dim ``target_dist`` (NO_TARGET in column 0
-+ 16 slot probabilities). Same math as the target branch in
+Soft-CE on the labeler's 17-dim ``target_probs`` (NO_TARGET in column 0
++ 16 idx probabilities). Same math as the target branch in
 ``qnn.model.policy._compute_head_losses_and_metrics``, written
 standalone here so the probe doesn't drag in the BC policy module.
 
 The model is a generic ``FlatFeatureHead`` whose 16-dim output flows
-through the BC forward contract's ``target_logits`` slot — the
+through the BC forward contract's ``target_logits`` idx — the
 canonical target soft-CE path then computes the loss against
-``actions["target_dist"]`` unchanged.
+``actions["target_probs"]`` unchanged.
 """
 
 from __future__ import annotations
@@ -19,62 +19,62 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from qnn.bc.heads.flat import FlatFeatureHead
-from qnn.bc.heads.spec import (
+from qnn.model.bench.flat import FlatFeatureHead
+from qnn.model.bench.spec import (
     HeadBuildResult,
     HeadLossSpec,
     HeadSpec,
     neutral_model_config,
 )
 from qnn.bc.target_labeler import NO_TARGET_INDEX
-from qnn.model.policy import ModelConfig
+from qnn.model.network import ModelConfig
 
 
 def target_soft_ce_loss(
     logits: torch.Tensor,       # (B, 16)
-    target_dist: torch.Tensor,  # (B, 17) full GT with NO_TARGET col 0
+    target_probs: torch.Tensor,  # (B, 17) full GT with NO_TARGET col 0
 ) -> torch.Tensor:
     """Present-weighted soft-CE — mirror of qnn.model.policy soft-CE branch.
 
-    Renormalize per-frame slot mass to 1, present-weight the per-frame
+    Renormalize per-frame idx mass to 1, present-weight the per-frame
     cross-entropy, no in-policy gate (segment_mask is the only filter).
     """
-    present = (1.0 - target_dist[:, NO_TARGET_INDEX]).clamp(min=0.0)
-    slot_dist = target_dist[:, 1:]
+    present = (1.0 - target_probs[:, NO_TARGET_INDEX]).clamp(min=0.0)
+    idx_dist = target_probs[:, 1:]
     log_probs = F.log_softmax(logits, dim=-1)
-    slot_target = slot_dist / present.clamp(min=1e-6).unsqueeze(-1)
-    per_frame_ce = -(slot_target * log_probs).sum(dim=-1)
+    idx_target = idx_dist / present.clamp(min=1e-6).unsqueeze(-1)
+    per_frame_ce = -(idx_target * log_probs).sum(dim=-1)
     return (present * per_frame_ce).sum() / present.sum().clamp(min=1e-6)
 
 
 def target_metrics(
     logits: torch.Tensor,
-    target_dist: torch.Tensor,
+    target_probs: torch.Tensor,
 ) -> dict[str, float]:
     """Returns BC's target_* metric keys + acc_target / balanced_acc_target."""
     with torch.no_grad():
-        present = (1.0 - target_dist[:, NO_TARGET_INDEX]).clamp(min=0.0)
-        slot_dist = target_dist[:, 1:]
+        present = (1.0 - target_probs[:, NO_TARGET_INDEX]).clamp(min=0.0)
+        idx_dist = target_probs[:, 1:]
         log_probs = F.log_softmax(logits, dim=-1)
         soft = F.softmax(logits, dim=-1)
-        slot_target = slot_dist / present.clamp(min=1e-6).unsqueeze(-1)
+        idx_target = idx_dist / present.clamp(min=1e-6).unsqueeze(-1)
 
-        per_frame_ce = -(slot_target * log_probs).sum(dim=-1)
+        per_frame_ce = -(idx_target * log_probs).sum(dim=-1)
         nll = (present * per_frame_ce).sum() / present.sum().clamp(min=1e-6)
-        ent_per_frame = -(slot_target.clamp(min=1e-8) * slot_target.clamp(min=1e-8).log()).sum(dim=-1)
+        ent_per_frame = -(idx_target.clamp(min=1e-8) * idx_target.clamp(min=1e-8).log()).sum(dim=-1)
         entropy = (present * ent_per_frame).sum() / present.sum().clamp(min=1e-6)
-        brier_per_frame = ((soft - slot_target) ** 2).sum(dim=-1)
+        brier_per_frame = ((soft - idx_target) ** 2).sum(dim=-1)
         brier = (present * brier_per_frame).sum() / present.sum().clamp(min=1e-6)
 
         pred = logits.argmax(dim=-1)
-        target_label = slot_dist.argmax(dim=-1)
+        target_label = idx_dist.argmax(dim=-1)
         batch_idx = torch.arange(pred.shape[0], device=pred.device)
-        top1_mass = (present * slot_target[batch_idx, pred]).sum() / present.sum().clamp(min=1e-6)
+        top1_mass = (present * idx_target[batch_idx, pred]).sum() / present.sum().clamp(min=1e-6)
 
         acc = (pred == target_label).float().mean()
         recalls: list[float] = []
-        n_slots = logits.shape[-1]
-        for s in range(n_slots):
+        n_indices = logits.shape[-1]
+        for s in range(n_indices):
             true_s = (target_label == s)
             if bool(true_s.any().item()):
                 tp = ((pred == s) & true_s).float().sum()
@@ -97,7 +97,7 @@ def _required(probe: Mapping[str, Any], key: str) -> Any:
     if key not in probe:
         raise RuntimeError(
             f"probe.json must define {key!r} for head=target "
-            "(no Python-level defaults — see qnn.bc.heads.templates)."
+            "(no Python-level defaults — see qnn.model.bench.templates)."
         )
     return probe[key]
 
@@ -142,7 +142,7 @@ def _build_target(probe: Mapping[str, Any]) -> HeadBuildResult:
 
 TARGET = HeadSpec(
     name="target",
-    # Per-frame inputs only; target IS the label so target_dist features
+    # Per-frame inputs only; target IS the label so target_probs features
     # are excluded. The pre-refactor default included ``look`` (the
     # next-frame action label), which the canonical BC supervised loop
     # doesn't pass to the model. Substituted with ``self_velocity``
@@ -157,7 +157,7 @@ TARGET = HeadSpec(
     loss=HeadLossSpec(
         loss_fn=target_soft_ce_loss,
         metrics_fn=target_metrics,
-        label_key="target_dist",
+        label_key="target_probs",
         output_dim=16,
         selection_metric="target_kl",
         selection_lower_is_better=True,

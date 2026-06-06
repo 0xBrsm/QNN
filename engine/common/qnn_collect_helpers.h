@@ -149,7 +149,7 @@ typedef struct
 	/* Previous candidate direction for continuity bias. */
 	int		prev_fwd_sign;
 	int		prev_strafe_sign;
-	float		prev_move[3];
+	uint8_t		prev_move;
 	FILE		*store_dump;
 	qnn_tick_emit_state_t tick_emit;
 	/* Frame filter counters. */
@@ -225,7 +225,7 @@ void QNN_FillLookAndSwitch(qnn_action_t *action,
 
 /* Pack the per-axis op_input mask given press bits + per-axis op
  * predicate results.  Single source of truth used by both the BC
- * QwdInferEmitAction path (action->op_input on the QOBS wire) and the
+ * QwdBuildActionLabel path (action->op_input on the QOBS wire) and the
  * labeler LOBS emit (LOBS payload op_input byte).
  *
  *   bit0 = fb       : fb_press
@@ -242,5 +242,39 @@ uint8_t QNN_PackOpInput(
 	int in_water,
 	int op_jump, int op_fire, int op_impulse,
 	int has_impulse);
+
+/* Pack the 8-bit per-axis input-mask byte (input_mask field on
+ * qnn_action_t). Under pure-feasibility semantics each bit answers
+ * "would the engine accept this axis press right now?" with no AND
+ * against the demo's actual cmd. Bit layout:
+ *
+ *   bit 0     = attack feasibility : W_Attack would fire if button0=1
+ *                                    (cooldown expired AND ammo present)
+ *   bit 1     = forward neg        : engine accepts -fmove this tick
+ *   bit 2     = forward pos        : engine accepts +fmove this tick
+ *                                    (pmove processes fmove in every
+ *                                    branch — under pure feasibility
+ *                                    bits 1 and 2 are both 1 whenever
+ *                                    alive; the schema keeps the slots
+ *                                    for consistency with up/jump)
+ *   bit 3     = side neg
+ *   bit 4     = side pos
+ *   bit 5     = up neg (swim down) : 1 in water, else 0
+ *   bit 6     = up pos (swim up)   : 1 in water, else 0
+ *   bit 7     = jump feasibility   : pmove ground-jump would fire if
+ *                                    button2=1 (depends on onground +
+ *                                    anti-pogo + alive state)
+ *
+ * Both direction bits may be set simultaneously — for fb/lr that's the
+ * normal case under feasibility semantics.
+ *
+ * Dead frames (alive=0) return 0x00. */
+uint8_t QNN_PackInputMask(
+	int alive,
+	int fb_act_neg,  int fb_act_pos,
+	int lr_act_neg,  int lr_act_pos,
+	int up_act_neg,  int up_act_pos,
+	int jump_act,
+	int attack_act);
 
 #endif /* QNN_COLLECT_HELPERS_H */

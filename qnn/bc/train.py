@@ -23,13 +23,10 @@ import torch
 
 from qnn import filter_dsl
 from qnn.vocab import MAX_TOKEN_OBJECTS, TOKEN_ACTOR
-from qnn.bc.class_weights import fire_class_weights
+from qnn.bc.class_weights import attack_class_weights
 from qnn.schema import OBS_DIM
-from qnn.model.policy import (
-    HEAD_LOSS_WEIGHTS,
-    ModelConfig,
-    QNNPolicy,
-)
+from qnn.model.network import ModelConfig
+from qnn.model.policy import HEAD_LOSS_WEIGHTS, QNNPolicy
 from qnn.utils.io import write_json
 from qnn.utils.repro import set_global_seed, write_experiment_manifest
 
@@ -69,32 +66,29 @@ class BCConfig:
     # Performance tuning (sourced from machine.json).
     pin_memory: bool
     prefetch: int
-    microbatch_size: int
     snapshot_interval: int
     # When true (and the model has no recurrence), bypass the
-    # prefetch + lane-packing pipeline and run training/val on
-    # GPU-resident concatenated tensors. Eliminates the per-batch
-    # mmap → collate → host→device copy that dominates wall time
-    # for tiny memoryless head probes. No effect on full BC trunk
-    # runs (use_gru / non-trivial sequence_length triggers fallback).
-    preload_to_gpu: bool
+    # streaming=False: preload the whole corpus to device once (default;
+    # the unified-memory APU win — no host duplicate of the GPU tensors).
+    # streaming=True: lazy mmap reads per batch from shard files.
+    streaming: bool
     dtype: str                 # "fp32" | "bf16" | "fp16"
     step_report_interval_seconds: int
-    fire_pos_weight_override: float  # >0 overrides auto-computed neg/pos ratio for fire BCE
-    fire_focal_gamma: float          # >0 swaps fire BCE for focal BCE with this gamma; 0 disables
+    attack_pos_weight_override: float  # >0 overrides auto-computed neg/pos ratio for attack BCE
+    attack_focal_gamma: float          # >0 swaps attack BCE for focal BCE with this gamma; 0 disables
     # Lin et al. per-class focal prefactor: alpha on positives,
-    # (1 - alpha) on negatives. Active only when fire_focal_gamma > 0;
+    # (1 - alpha) on negatives. Active only when attack_focal_gamma > 0;
     # 0.5 is neutral. See QNNPolicy.__init__.
-    fire_focal_alpha: float
-    # >0 enables distance-weighted BCE on the fire head: per-frame loss
+    attack_focal_alpha: float
+    # >0 enables distance-weighted BCE on the attack head: per-frame loss
     # weight = 1 - gaussian-of-distance-to-nearest-true-fire so wrong-by-
     # one-frame FPs cost a small fraction of wrong-by-100-frames FPs.
     # Tune from the FP timing histogram (~3 at 20 Hz is a sensible
     # starting point; see scripts/analysis/fire_fp_timing.py). 0 disables.
-    fire_distance_sigma: float
+    attack_distance_sigma: float
     jump_pos_weight: float          # >1.0 upweights POS class on move ud-axis CE
     jump_pos_weight_end: float      # >0 linearly decays jump_pos_weight epoch-wise; -1 disables
-    # Same Gaussian shoulder as fire_distance_sigma, applied to the
+    # Same Gaussian shoulder as attack_distance_sigma, applied to the
     # ud-axis (jump) CE. Jumps are also a sparse press-or-not decision
     # with human timing noise, so the same shaping is appropriate;
     # expect a different sigma than fire because jump bursts are shorter
@@ -104,27 +98,41 @@ class BCConfig:
     # action/obs arrays plus derived scalars (see _flatten_episode_arrays).
     # None / empty = no masking. Example:
     # {"act.target": {"$ne": 0}} = combat-only training (drops frames
-    # with zero target mass; act.target = 1 - target_dist[:, 0]).
+    # with zero target mass; act.target = 1 - target_probs[:, 0]).
     segment_mask: "dict | None"
-    # Per-slot predicate over entity token fields. Slots where the
+    # Per-idx predicate over entity token fields. Indices where the
     # predicate evaluates to False have their entity arrays zeroed
-    # (positions preserved). Target mass on hidden slots is folded
+    # (positions preserved). Target mass on hidden indices is folded
     # into NO_TARGET so the target head is never trained toward a
     # token the model cannot see.
     token_mask: "dict | None"
-    # When true, augment each head's loss-keep with `(no press on axis) |
-    # (op_input bit set)`, dropping frames where the demo held a press
-    # but the engine didn't act on it (cooldown / dead-time /
-    # weapon-switch hold). Requires the recollected corpus that carries
-    # act_op_input.npy. See QNNPolicy._compute_head_losses_and_metrics.
-    op_input_mask: bool
+    # When true, swap each head's label from the raw demo button
+    # (`usercmd`) to the engine outcome
+    # (`act = max(usercmd − infeasibility_mask, 0)`). Decodes the
+    # per-axis bits of actions["input_mask"] (packed by
+    # QNN_PackInputMask on the C side):
+    #   bit 0    = attack            → fire label
+    #   bits 1-2 = forward 3-class   → fb axis label
+    #   bits 3-4 = side    3-class   → lr axis label
+    #   bits 5-6 = up      3-class   ─┐ collapsed into the ud axis:
+    #   bit 7    = jump              ─┘ jump | up-pos → POS, up-neg → NEG
+    # No keep mask is needed downstream — the label is the engine
+    # outcome by construction, so there's a single ``f1_attack`` (no
+    # masked variant). Requires the recollected corpus that carries
+    # act_input_mask.npy. See QNNPolicy._compute_head_losses_and_metrics.
+    input_mask: bool
     # Expected collection identity (qnn.collection_fingerprint). Empty =
     # log-only mode.
     collection_fingerprint: str
 
 
-from qnn.bc.loop import MidEpochState as _MidEpochState, PrecomputedEpisode as _PrecomputedEpisode, run_epoch as _run_precomputed_supervised
-from qnn.bc.supervised_loop import preload_episodes_to_gpu as _preload_episodes_to_gpu, run_epoch_gpu_resident as _run_epoch_gpu_resident
+from qnn.bc.loop import (
+    MidEpochState as _MidEpochState,
+    PrecomputedEpisode as _PrecomputedEpisode,
+    make_resident_source as _make_resident_source,
+    make_streaming_source as _make_streaming_source,
+    run_epoch as _run_epoch,
+)
 
 
 def _selection_score(metrics: Mapping[str, float]) -> float:
@@ -142,14 +150,14 @@ def _selection_score(metrics: Mapping[str, float]) -> float:
     # Look: cos_sim ranges in [-1, 1]; convert to a "1 - cos" error in [0, 2].
     look_err = 1.0 - float(metrics.get("cos_sim_look", 1.0))
     # Fire: F1 ranges in [0, 1]; convert to a "1 - f1" error in [0, 1].
-    fire_f1 = float(metrics.get("f1_fire_global", metrics.get("f1_fire", 1.0)))
-    fire_err = 1.0 - fire_f1
+    attack_f1 = float(metrics.get("f1_attack", 1.0))
+    attack_err = 1.0 - attack_f1
     # Weapon: macro-F1 across 8 classes — equal weight regardless of
     # frequency so rare-weapon failures don't disappear into the dominant
     # rocket-launcher class.
     weapon_f1 = float(metrics.get("f1_weapon_global", metrics.get("f1_weapon", 1.0)))
     weapon_err = 1.0 - weapon_f1
-    return target_error + move_err + look_err + fire_err + weapon_err
+    return target_error + move_err + look_err + attack_err + weapon_err
 
 
 def _train_eval_schedule(
@@ -202,37 +210,69 @@ def _train_eval_schedule(
 def _unpack_move_axes(packed: np.ndarray) -> np.ndarray:
     """Expand the on-disk packed move byte to (T, 3) uint8 axis class indices.
 
-    The collector packs three 3-class axis indices (each in {0=neg, 1=none,
-    2=pos}) into bits 0-1 (fb), 2-3 (lr), 4-5 (ud) of a single uint8.
-    Bit 6 carries fire and is extracted separately by ``_unpack_fire_bit``.
-    Materializes a fresh array (no longer mmap-backed) — fine because action
-    labels are tiny relative to obs.
+    The packed byte mirrors the input_mask layout (one bit per direction):
+
+      bit 0 = attack press
+      bit 1 = fb neg            bit 2 = fb pos
+      bit 3 = lr neg            bit 4 = lr pos
+      bit 5 = ud neg            bit 6 = ud pos (unified: swim-up OR jump)
+      bit 7 = jump press (explicit, diagnostic)
+
+    Each axis returns a 3-class label in {0=neg, 1=none, 2=pos}:
+      class = 1 + (pos_bit) - (neg_bit)
+    Both bits cleared → class=1 (none); only neg → 0; only pos → 2.
+    Both set (shouldn't happen for honest demos) → also 1.
+
+    Attack and jump are extracted separately by ``_unpack_attack_bit`` and
+    ``_unpack_jump_bit``. Materializes a fresh array (no longer mmap-backed)
+    — fine because action labels are tiny relative to obs.
     """
     arr = np.asarray(packed, dtype=np.uint8)
     if arr.ndim != 1:
         raise ValueError(f"expected (T,) packed move, got shape {arr.shape}")
-    fb = (arr      ) & 0x3
-    lr = (arr >> 2 ) & 0x3
-    ud = (arr >> 4 ) & 0x3
+    one = np.uint8(1)
+    fb_neg = (arr >> 1) & one
+    fb_pos = (arr >> 2) & one
+    lr_neg = (arr >> 3) & one
+    lr_pos = (arr >> 4) & one
+    ud_neg = (arr >> 5) & one
+    ud_pos = (arr >> 6) & one
+    fb = (one + fb_pos - fb_neg).astype(np.uint8)
+    lr = (one + lr_pos - lr_neg).astype(np.uint8)
+    ud = (one + ud_pos - ud_neg).astype(np.uint8)
     return np.ascontiguousarray(np.stack([fb, lr, ud], axis=-1))
 
 
-def _unpack_fire_bit(packed: np.ndarray) -> np.ndarray:
-    """Extract the fire bit (bit 6) from the packed move byte.
+def _unpack_attack_bit(packed: np.ndarray) -> np.ndarray:
+    """Extract the attack bit (bit 0) from the packed move byte.
 
-    Returns a (T,) uint8 in {0, 1}. The heads consume fire as a (T,)
+    Returns a (T,) uint8 in {0, 1}. The heads consume attack as a (T,)
     binary stream; this synthesizes it from the move byte that the
     collector packs in qnn.bc.collect._compact_action_arrays.
     """
     arr = np.asarray(packed, dtype=np.uint8)
     if arr.ndim != 1:
         raise ValueError(f"expected (T,) packed move, got shape {arr.shape}")
-    return np.ascontiguousarray((arr >> 6) & 0x1)
+    return np.ascontiguousarray(arr & 0x1)
+
+
+def _unpack_jump_bit(packed: np.ndarray) -> np.ndarray:
+    """Extract the explicit jump press bit (bit 7) from the packed move byte.
+
+    Diagnostic / debug signal. The model's ud-axis class label keeps the
+    legacy unified behavior (jump-press OR swim-up → ud_pos); this is the
+    standalone ground-jump indicator for analysis paths that need to tell
+    swim-up from jump.
+    """
+    arr = np.asarray(packed, dtype=np.uint8)
+    if arr.ndim != 1:
+        raise ValueError(f"expected (T,) packed move, got shape {arr.shape}")
+    return np.ascontiguousarray((arr >> 7) & 0x1)
 
 
 # Hoisted to avoid per-episode import-statement lookup × 44k calls.
 from qnn.bc.target_labeler import (
-    label_enemy_target_distribution as _LABEL_TARGETS,
+    label_enemy_target_probs as _LABEL_TARGETS,
     DEFAULT_LABELER_CONFIG as _LABELER_DEFAULT_CONFIG,
 )
 
@@ -250,7 +290,7 @@ def _densify_obs_for_labeler(obs_padded: dict[str, np.ndarray]) -> dict[str, np.
       - ``entity_ids[:, :, {1=modality, 2=player_id}]``
       - ``entity_types``
 
-    Non-actor entity slots are left as zero — the labeler masks to
+    Non-actor entity indices are left as zero — the labeler masks to
     ``entity_types == TOKEN_ACTOR`` before reading any scalar offset, so
     the projectile/item/mover branches of the full dequantizer would be
     discarded anyway. Skipping them here saves ~600s of load time on
@@ -263,7 +303,7 @@ def _densify_obs_for_labeler(obs_padded: dict[str, np.ndarray]) -> dict[str, np.
     et = np.asarray(obs_padded["entity_types"]).astype(np.int64, copy=False)
     N = et.shape[1]
 
-    # self_scalars: labeler reads only slot 0 (_SELF_HEALTH_OFFSET).
+    # self_scalars: labeler reads only idx 0 (_SELF_HEALTH_OFFSET).
     self_scalars = np.zeros((T, 17), dtype=np.float32)
     self_scalars[:, 0] = health.astype(np.float32) / en.MAX_HEALTH
 
@@ -274,7 +314,7 @@ def _densify_obs_for_labeler(obs_padded: dict[str, np.ndarray]) -> dict[str, np.
     #   [7:10]  vel           / MAX_VELOCITY
     #   [16]    team
     #   [18]    recency       / TIME_SCALE
-    # Non-actor slots are zeroed; labeler masks them out anyway.
+    # Non-actor indices are zeroed; labeler masks them out anyway.
     entity_scalars = np.zeros((T, N, 19), dtype=np.float32)
     half = np.asarray(obs_padded["entity_half_extents"]).astype(np.float32) / en.DIST_SCALE
     rel  = np.asarray(obs_padded["entity_rel"]).astype(np.float32) / en.DIST_SCALE
@@ -290,7 +330,7 @@ def _densify_obs_for_labeler(obs_padded: dict[str, np.ndarray]) -> dict[str, np.
         entity_scalars[..., 16]   = np.where(actor_mask, team,    0.0)
         entity_scalars[..., 18]   = np.where(actor_mask, recency, 0.0)
 
-    # entity_ids: labeler reads slots 1 (modality) and 2 (player_id).
+    # entity_ids: labeler reads indices 1 (modality) and 2 (player_id).
     entity_ids = np.stack([
         np.asarray(obs_padded["entity_subject_id"]).astype(np.int64, copy=False),
         np.asarray(obs_padded["entity_modality_id"]).astype(np.int64, copy=False),
@@ -305,13 +345,13 @@ def _densify_obs_for_labeler(obs_padded: dict[str, np.ndarray]) -> dict[str, np.
     }
 
 
-def _compute_target_dist(
+def _compute_target_probs(
     obs_padded: dict[str, np.ndarray],
     actions: dict[str, np.ndarray],
 ) -> np.ndarray:
     """Run the target labeler on a padded-native episode.
 
-    Returns ``(T, TARGET_DIST_CLASSES) float32`` — same output the
+    Returns ``(T, TARGET_PROBS_CLASSES) float32`` — same output the
     collector used to bake into the cache. Recomputing at training
     start (a) decouples labeler config from the wire format
     (fingerprint stays stable when you tune LabelerConfig), and (b)
@@ -322,11 +362,11 @@ def _compute_target_dist(
     one-time startup overhead, amortized across the whole run.
     """
     from qnn.bc.target_labeler import (
-        label_enemy_target_distribution,
+        label_enemy_target_probs,
         DEFAULT_LABELER_CONFIG,
     )
     legacy_obs = _densify_obs_for_labeler(obs_padded)
-    return label_enemy_target_distribution(
+    return label_enemy_target_probs(
         legacy_obs, actions, config=DEFAULT_LABELER_CONFIG,
     )
 
@@ -383,7 +423,7 @@ def _flatten_episode_arrays(obs: dict, actions: dict) -> dict[str, Any]:
     flat: dict[str, Any] = {}
     for head, arr in actions.items():
         flat[f"act.{head}"] = arr
-        if head == "target_dist" and isinstance(arr, np.ndarray) and arr.ndim == 2:
+        if head == "target_probs" and isinstance(arr, np.ndarray) and arr.ndim == 2:
             # Per-frame engagement scalar (= 1 - P(NO_TARGET)) so segment_mask
             # can express the no-engagement filter as `{"act.target":
             # {"$ne": 0}}` without column-indexing in filter_dsl.
@@ -419,7 +459,7 @@ def _flatten_token_arrays(obs: Mapping[str, np.ndarray]) -> dict[str, Any]:
         "modality": np.asarray(obs["entity_modality_id"]),
         "pid": np.asarray(obs["entity_player_id"]),
         "subject": np.asarray(obs["entity_subject_id"]),
-        # Historical token masks used route_idx for slot-identity-like
+        # Historical token masks used route_idx for idx-identity-like
         # filtering. Native v1 stores subject id in this position; keep
         # the alias so old configs fail less mysteriously.
         "route_idx": np.asarray(obs["entity_subject_id"]),
@@ -452,25 +492,25 @@ def _mask_token_array(key: str, arr: np.ndarray, keep: np.ndarray) -> np.ndarray
     return out
 
 
-def _mask_target_dist_for_tokens(
-    target_dist: np.ndarray,
+def _mask_target_probs_for_tokens(
+    target_probs: np.ndarray,
     indptr: np.ndarray,
     keep: np.ndarray | None,
 ) -> np.ndarray:
     if keep is None:
-        return np.asarray(target_dist)
-    td = np.asarray(target_dist, dtype=np.float32).copy()
+        return np.asarray(target_probs)
+    td = np.asarray(target_probs, dtype=np.float32).copy()
     rows = td.shape[0]
     counts = (indptr[1:rows + 1] - indptr[:rows]).astype(np.int64, copy=False)
     if counts.sum() == 0:
         return td
     row_idx = np.repeat(np.arange(rows, dtype=np.int64), counts)
-    slot_idx = np.arange(keep.shape[0], dtype=np.int64) - np.repeat(indptr[:rows], counts)
-    drop = (~keep) & (slot_idx < (td.shape[1] - 1))
+    idx_idx = np.arange(keep.shape[0], dtype=np.int64) - np.repeat(indptr[:rows], counts)
+    drop = (~keep) & (idx_idx < (td.shape[1] - 1))
     if not np.any(drop):
         return td
     moved_rows = row_idx[drop]
-    moved_cols = slot_idx[drop] + 1
+    moved_cols = idx_idx[drop] + 1
     moved = np.zeros(rows, dtype=td.dtype)
     np.add.at(moved, moved_rows, td[moved_rows, moved_cols])
     td[moved_rows, moved_cols] = 0.0
@@ -522,11 +562,50 @@ _NATIVE_TOKEN_INDEXED_OBS_FIELDS = frozenset({
     "entity_amount", "entity_regen", "entity_state",
 })
 
-# Sentinel for empty entity slots in the padded (T, MAX_TOKEN_OBJECTS,
-# ...) materialization. -1 in entity_types matches the Tokenizer's
+# GROUND sector index in spatial_dir's (T, 9, 3) layout — set in
+# qnn.vocab.SPATIAL_SECTOR_IDS as "Ground_State". The C-side
+# QNN_BuildGroundSpatial projects world-down (0,0,-1) into the view
+# frame, which by AngleVectors math is exactly (sin(pitch), 0,
+# -cos(pitch)) — see src/engine/common/qnn_spatial.c:175-181. So the
+# i8 spatial_dir[:, 7, 0] column already encodes sin(view_pitch).
+_GROUND_SECTOR_IDX = 7
+
+
+def _inject_view_pitch_from_spatial_dir(
+    obs_arrays: dict[str, "np.ndarray"],
+) -> dict[str, "np.ndarray"]:
+    """Backfill view_pitch from spatial_dir for legacy shards.
+
+    Pre-self-split corpora don't carry a dedicated view_pitch field.
+    Recover it from spatial_dir[GROUND, 0] = sin(pitch) (i8 quant
+    against 127), reproject to the (deg / 90) × 127 i8 quantization
+    that the new wire emits and the SelfDequantizer consumes. Cheap
+    enough to do once at shard open — engine clamps pitch to ±70°, so
+    sin → arcsin round-trip stays inside the i8 range with sub-degree
+    error.
+
+    Idempotent: if the shard already has view_pitch (fresh collect with
+    the new emit), pass through unchanged.
+    """
+    if "view_pitch" in obs_arrays:
+        return obs_arrays
+    spatial_dir = obs_arrays.get("spatial_dir")
+    if spatial_dir is None:
+        return obs_arrays  # nothing to derive from; defer to caller's error
+    sin_p = np.asarray(spatial_dir[:, _GROUND_SECTOR_IDX, 0], dtype=np.float32) / 127.0
+    np.clip(sin_p, -1.0, 1.0, out=sin_p)
+    # arcsin → normalize by π/2 (equivalent to deg / 90) → i8 quant.
+    pitch_norm = np.arcsin(sin_p) * (2.0 / np.pi)
+    view_pitch = np.round(pitch_norm * 127.0).clip(-127, 127).astype(np.int8)
+    out = dict(obs_arrays)
+    out["view_pitch"] = view_pitch
+    return out
+
+# Sentinel for empty entity indices in the padded (T, MAX_TOKEN_OBJECTS,
+# ...) materialization. -1 in entity_types matches the ObsEmbedding's
 # `entity_mask = (entity_types == TOKEN_ACTOR)` semantics; the
-# Tokenizer key-padding mask flips on non-actor types so the
-# transformer simply ignores empty slots.
+# ObsEmbedding key-padding mask flips on non-actor types so the
+# transformer simply ignores empty indices.
 _ENTITY_TYPES_EMPTY_SENTINEL = -1
 
 
@@ -543,8 +622,8 @@ def _materialize_padded_entity(
     not a re-write of the shard.
 
     ``entity_count`` (T,) drives the per-row valid-prefix; trailing
-    slots are zeroed (``entity_types`` gets -1 sentinels so the
-    Tokenizer's actor-only mask works unchanged).
+    indices are zeroed (``entity_types`` gets -1 sentinels so the
+    ObsEmbedding's actor-only mask works unchanged).
     """
     counts = obs.get("entity_count")
     if counts is None:
@@ -553,14 +632,14 @@ def _materialize_padded_entity(
     T = counts_np.shape[0]
     indptr_local = np.concatenate([[0], np.cumsum(counts_np)])
     # Build a single (T, n_max) gather index that's reused across every
-    # token-indexed field. valid[t, j] iff slot j is occupied for row t.
-    # gather_idx points at flat[0] for invalid slots — the result is
+    # token-indexed field. valid[t, j] iff idx j is occupied for row t.
+    # gather_idx points at flat[0] for invalid indices — the result is
     # masked back out via np.where before being returned, so the bogus
     # read is harmless.
-    slots = np.arange(n_max, dtype=np.int64)
+    indices = np.arange(n_max, dtype=np.int64)
     counts_clamped = np.minimum(counts_np, n_max)
-    valid = slots[None, :] < counts_clamped[:, None]
-    gather_idx = np.where(valid, indptr_local[:T, None] + slots[None, :], 0)
+    valid = indices[None, :] < counts_clamped[:, None]
+    gather_idx = np.where(valid, indptr_local[:T, None] + indices[None, :], 0)
 
     out = dict(obs)
     for key in list(obs.keys()):
@@ -569,13 +648,13 @@ def _materialize_padded_entity(
         flat = np.asarray(obs[key])
         fill = _ENTITY_TYPES_EMPTY_SENTINEL if key == "entity_types" else 0
         if flat.shape[0] == 0:
-            # Empty episode (no tokens across any row). All slots
+            # Empty episode (no tokens across any row). All indices
             # invalid; skip the gather, emit a fill-only tensor.
             out[key] = np.full((T, n_max) + flat.shape[1:], fill, dtype=flat.dtype)
             continue
         padded = flat[gather_idx]  # (T, n_max, *per_token_shape)
         # Broadcast the (T, n_max) mask up to padded's rank so np.where
-        # zeros (or sentinels) the trailing invalid slots.
+        # zeros (or sentinels) the trailing invalid indices.
         if padded.ndim > 2:
             mask = valid.reshape(valid.shape + (1,) * (padded.ndim - 2))
         else:
@@ -611,14 +690,14 @@ def _pad_entity_batch(
     # values index into the unpadded[key] arrays' contiguous token range.
     indptr_slice = indptr[row_start:row_end + 1]
     counts = (indptr_slice[1:] - indptr_slice[:-1]).astype(np.int64, copy=False)
-    slots = np.arange(n_max, dtype=np.int64)
+    indices = np.arange(n_max, dtype=np.int64)
     counts_clamped = np.minimum(counts, n_max)
-    valid = slots[None, :] < counts_clamped[:, None]
+    valid = indices[None, :] < counts_clamped[:, None]
     # Absolute per-row token start into the unpadded[key] arrays.
     # ``indptr`` is the per-episode cumulative entity_count, so
     # indptr_slice[:-1] points at the first valid token for each row.
     row_starts = indptr_slice[:-1].astype(np.int64, copy=False)
-    gather_idx = np.where(valid, row_starts[:, None] + slots[None, :], 0)
+    gather_idx = np.where(valid, row_starts[:, None] + indices[None, :], 0)
 
     out: dict[str, np.ndarray] = {}
     for key, flat in unpadded_obs.items():
@@ -661,7 +740,7 @@ def _load_precomputed(
     No ``segment_mask`` keeps each episode as one ``segment_idx=0``
     trajectory. ``segment_mask`` and ``token_mask`` both use the
     shared training filter DSL; native-v1 caches supply cached
-    ``target_dist`` so common action masks do not rerun the labeler.
+    ``target_probs`` so common action masks do not rerun the labeler.
     """
     manifest = json.loads((cache_dir / "manifest.json").read_text())
     if not isinstance(manifest, dict) or manifest.get("format") != "sharded_v1":
@@ -689,7 +768,7 @@ def _load_precomputed(
     shards = manifest.get("shards", [])
 
     required = set(required_actions)
-    required.add("target_dist")
+    required.add("target_probs")
     _validate_loader_options(cache_dir, shards, segment_mask, token_mask, required)
 
     shard_args = []
@@ -1052,14 +1131,14 @@ def _process_shard_work_count_only(
     }
     if "move" in action_arrays:
         refs = _filter_referenced_keys(segment_mask)
-        if "act.move" in refs or "act.fire" in refs:
+        if "act.move" in refs or "act.attack" in refs:
             move_packed = action_arrays["move"]
             action_arrays["move"] = _unpack_move_axes(move_packed)
-            action_arrays["fire"] = _unpack_fire_bit(move_packed)
+            action_arrays["attack"] = _unpack_attack_bit(move_packed)
     shard_indptr = _build_indptr(obs_arrays["entity_count"])
     keep = _token_keep_mask(obs_arrays, token_mask)
-    action_arrays["target_dist"] = _mask_target_dist_for_tokens(
-        action_arrays["target_dist"], shard_indptr, keep,
+    action_arrays["target_probs"] = _mask_target_probs_for_tokens(
+        action_arrays["target_probs"], shard_indptr, keep,
     )
     segments = _shard_segments(
         shard, fallback_idx_start, obs_arrays, action_arrays, shard_indptr, segment_mask,
@@ -1097,6 +1176,7 @@ def _process_shard_work(
         key: np.load(cache_dir / fname, mmap_mode="r")
         for key, fname in shard["obs"].items()
     }
+    obs_arrays = _inject_view_pitch_from_spatial_dir(obs_arrays)
     # PyTorch CPU lacks index_copy_ for uint16/uint32, which the
     # chunked-prefetch path uses for lane-packed batch staging. The
     # GPU-resident path is unaffected (it uses index_select). Upcast
@@ -1115,7 +1195,7 @@ def _process_shard_work(
     if "move" in action_arrays:
         move_packed = action_arrays["move"]
         action_arrays["move"] = _unpack_move_axes(move_packed)
-        action_arrays["fire"] = _unpack_fire_bit(move_packed)
+        action_arrays["attack"] = _unpack_attack_bit(move_packed)
     for arr in obs_arrays.values():
         _madvise_sequential(arr)
     for arr in action_arrays.values():
@@ -1125,8 +1205,8 @@ def _process_shard_work(
     shard_indptr = _build_indptr(obs_arrays["entity_count"])
     keep = _token_keep_mask(obs_arrays, token_mask)
     if keep is not None:
-        action_arrays["target_dist"] = _mask_target_dist_for_tokens(
-            action_arrays["target_dist"], shard_indptr, keep,
+        action_arrays["target_probs"] = _mask_target_probs_for_tokens(
+            action_arrays["target_probs"], shard_indptr, keep,
         )
     segments = _shard_segments(
         shard, fallback_idx_start, obs_arrays, action_arrays, shard_indptr, segment_mask,
@@ -1260,8 +1340,8 @@ def run_behavior_cloning(
 
     ``model_factory`` is the same hook ``QNNPolicy.__init__`` takes; pass
     one to swap in an ablation module (e.g. a per-head probe from
-    ``qnn.bc.heads``) without forking the trainer. When ``None`` the
-    canonical ``_CombatObjectiveNet`` is built from ``config.model``.
+    ``qnn.model.bench``) without forking the trainer. When ``None`` the
+    canonical ``Network`` is built from ``config.model``.
 
     Fine-tuning from a seed checkpoint ignores ``model_factory`` because
     ``QNNPolicy.load`` reconstructs the saved architecture; passing both
@@ -1310,11 +1390,11 @@ def run_behavior_cloning(
     required_actions_set: set[str] = set()
     if config.model.use_weapon_head and head_loss_weights.get("weapon", 1.0) > 0.0:
         required_actions_set.add("weapon")
-    # op_input is required only when the trainer-side mask is enabled;
-    # corpora without it (pre-emission) still train cleanly when the
-    # toggle is off.
-    if config.op_input_mask:
-        required_actions_set.add("op_input")
+    # input_mask is required only when the input_mask toggle is enabled
+    # (label switches to engine outcome). Corpora without it (pre-
+    # emission) still train cleanly when the toggle is off.
+    if config.input_mask:
+        required_actions_set.add("input_mask")
     required_actions = frozenset(required_actions_set)
 
     print(f"  [bc] Loading training data: {train_cache}")
@@ -1322,24 +1402,22 @@ def run_behavior_cloning(
         print(f"  [bc] segment_mask: {config.segment_mask}")
     if config.token_mask:
         print(f"  [bc] token_mask: {config.token_mask}")
-    train_episodes = _load_precomputed(
-        train_cache, required_actions=required_actions,
-        segment_mask=config.segment_mask,
-        token_mask=config.token_mask,
-    )
-    val_episodes = _load_precomputed(
-        val_cache, required_actions=required_actions,
-        segment_mask=config.segment_mask,
-        token_mask=config.token_mask,
-    ) if val_cache.exists() else []
-
-    sample_counts = {
-        "train": sum(ep.n_samples for ep in train_episodes),
-        "val": sum(ep.n_samples for ep in val_episodes),
-    }
-
-    if sample_counts["train"] <= 0:
-        raise RuntimeError("No training samples available")
+    if bool(config.streaming):
+        # Streaming mode: no host RAM materialization. Episodes live as
+        # mmap-backed EpisodeRef metadata; per-batch gather reads shards.
+        train_episodes: list = []
+        val_episodes: list = []
+    else:
+        train_episodes = _load_precomputed(
+            train_cache, required_actions=required_actions,
+            segment_mask=config.segment_mask,
+            token_mask=config.token_mask,
+        )
+        val_episodes = _load_precomputed(
+            val_cache, required_actions=required_actions,
+            segment_mask=config.segment_mask,
+            token_mask=config.token_mask,
+        ) if val_cache.exists() else []
 
     # Configure mixed-precision autocast via the env var that QNNPolicy reads.
     os.environ["QNN_AUTOCAST_DTYPE"] = config.dtype
@@ -1359,68 +1437,74 @@ def run_behavior_cloning(
             obs_dim=obs_dim,
             model=config.model,
             jump_pos_weight=config.jump_pos_weight,
-            fire_focal_gamma=config.fire_focal_gamma,
-            fire_focal_alpha=config.fire_focal_alpha,
-            fire_distance_sigma=config.fire_distance_sigma,
+            attack_focal_gamma=config.attack_focal_gamma,
+            attack_focal_alpha=config.attack_focal_alpha,
+            attack_distance_sigma=config.attack_distance_sigma,
             jump_distance_sigma=config.jump_distance_sigma,
             seed=config.seed,
             device=config.device,
             model_factory=model_factory,
         )
-    # op_input_mask is a training-time toggle, not a ModelConfig field —
+    # input_mask is a training-time toggle, not a ModelConfig field —
     # set after construction so the same checkpoint can be retrained
     # either way (and so seed_checkpoint resumes pick up the run's
-    # current config rather than the seed run's).
-    model.op_input_mask = bool(config.op_input_mask)
+    # current config rather than the seed run's). When true, the head's
+    # label is the engine outcome (act = max(usercmd − mask, 0)); when
+    # false, the label is the raw demo button (usercmd).
+    model.input_mask = bool(config.input_mask)
 
-    weights = fire_class_weights(
-        train_episodes,
-        head_loss_weights=head_loss_weights,
-        override=float(config.fire_pos_weight_override),
-        device=model.device,
-    )
-
-    # GPU-resident fast path: precompute concat tensors per obs/action key
-    # once and feed them to run_epoch_gpu_resident. Only safe for memoryless
-    # models (no GRU); falls back to the prefetch+plan pipeline otherwise.
-    _gpu_train_obs: Dict[str, "torch.Tensor"] = {}
-    _gpu_train_actions: Dict[str, "torch.Tensor"] = {}
-    _gpu_val_obs: Dict[str, "torch.Tensor"] = {}
-    _gpu_val_actions: Dict[str, "torch.Tensor"] = {}
-    _use_gpu_resident = (
-        bool(config.preload_to_gpu)
-        and not bool(getattr(config.model, "use_gru", False))
-        and int(config.sequence_length) == 0
-    )
-    if _use_gpu_resident:
+    # Build the Source. streaming=False (default) preloads the whole corpus
+    # to device once — the unified-memory APU win, no host duplicate. Drop
+    # the host-side numpy arrays unconditionally after preload.
+    # streaming=True keeps shard mmaps lazy and pads/dequants per batch.
+    _t0 = _time.monotonic()
+    if bool(config.streaming):
+        print(f"  [bc] streaming=true: lazy mmap reads from {train_cache}")
+        train_source = _make_streaming_source(
+            train_cache, model.device,
+            segment_mask=config.segment_mask, token_mask=config.token_mask,
+            prefetch_depth=max(2, int(config.prefetch)),
+        )
+        val_source = (
+            _make_streaming_source(
+                val_cache, model.device,
+                segment_mask=config.segment_mask, token_mask=config.token_mask,
+                prefetch_depth=max(2, int(config.prefetch)),
+            ) if val_cache.exists()
+            else _make_resident_source([], model.device)
+        )
+    else:
         print(
-            f"  [bc] preload_to_gpu=true: concatenating "
+            f"  [bc] preload: concatenating "
             f"{sum(ep.n_samples for ep in train_episodes)} train + "
             f"{sum(ep.n_samples for ep in val_episodes)} val frames to {model.device}"
         )
-        _t0 = _time.monotonic()
-        _gpu_train_obs, _gpu_train_actions = _preload_episodes_to_gpu(
-            train_episodes, model.device
-        )
-        _gpu_val_obs, _gpu_val_actions = _preload_episodes_to_gpu(
-            val_episodes, model.device
-        )
-        print(f"  [bc] preload done in {_time.monotonic() - _t0:.1f}s")
-        # On Strix-Halo-class unified-memory APUs, CPU and "VRAM" share
-        # the same pool. Holding the per-episode numpy arrays alongside
-        # the GPU-resident tensors doubles the working set. Drop the
-        # CPU side now that gpu_obs/gpu_actions own the data —
-        # provided we won't need to re-run a CPU pass for train_eval.
-        if config.train_eval_interval == 0:
-            for _ep in train_episodes:
-                _ep.obs = {}
-                _ep.actions = {}
-            for _ep in val_episodes:
-                _ep.obs = {}
-                _ep.actions = {}
-            import gc as _gc
-            _gc.collect()
-            print(f"  [bc] released CPU episode arrays (train_eval_interval=0)")
+        train_source = _make_resident_source(train_episodes, model.device)
+        val_source = _make_resident_source(val_episodes, model.device)
+        # Drop host episode arrays — train_source owns the data on device now.
+        for _ep in train_episodes:
+            _ep.obs = {}
+            _ep.actions = {}
+        for _ep in val_episodes:
+            _ep.obs = {}
+            _ep.actions = {}
+        import gc as _gc
+        _gc.collect()
+    print(f"  [bc] source ready in {_time.monotonic() - _t0:.1f}s")
+
+    sample_counts = {
+        "train": train_source.n_total_rows,
+        "val": val_source.n_total_rows,
+    }
+    if sample_counts["train"] <= 0:
+        raise RuntimeError("No training samples available")
+    weights = attack_class_weights(
+        train_source,
+        head_loss_weights=head_loss_weights,
+        override=float(config.attack_pos_weight_override),
+        device=model.device,
+    )
+    _train_eval_n_eps = len(val_source.episodes)
 
     # Parse per-head loss weights from JSON string if provided.
     hlw: Dict[str, float] | None = None
@@ -1620,70 +1704,40 @@ def run_behavior_cloning(
             print(f"  [bc] LR={_active_lr:.6f}")
 
         _t_train_start = _time.monotonic()
-        if _use_gpu_resident:
-            train_metrics = _run_epoch_gpu_resident(
-                model,
-                _gpu_train_obs,
-                _gpu_train_actions,
-                batch_size=config.batch_size,
-                class_weights=weights,
-                lr=_active_lr,
-                rng=rng,
-                max_grad_norm=config.max_grad_norm,
-                head_loss_weights=hlw,
-            )
-        else:
-            train_metrics = _run_precomputed_supervised(
-                model,
-                train_episodes,
-                batch_size=config.batch_size,
-                sequence_length=config.sequence_length,
-                class_weights=weights,
-                lr=_active_lr,
-                rng=rng,
-                max_grad_norm=config.max_grad_norm,
-                tbptt_limit=config.tbptt_limit,
-                head_loss_weights=hlw,
-                step_callback=_on_step,
-                report_every=_report_every,
-                report_interval_seconds=float(_step_report_interval),
-                pin_memory=config.pin_memory,
-                prefetch=config.prefetch,
-                microbatch_size=config.microbatch_size,
-                save_state_callback=_save_mid_epoch,
-                snapshot_interval=_MID_EPOCH_SAVE_INTERVAL,
-                resume_state=_mid_epoch_resume,
-            )
-        # Mid-epoch state consumed — don't reuse on next epoch.
+        train_metrics = _run_epoch(
+            model,
+            train_source,
+            batch_size=config.batch_size,
+            sequence_length=config.sequence_length,
+            tbptt_limit=config.tbptt_limit,
+            class_weights=weights,
+            lr=_active_lr,
+            rng=rng,
+            max_grad_norm=config.max_grad_norm,
+            head_loss_weights=hlw,
+            step_callback=_on_step,
+            report_every=_report_every,
+            report_interval_seconds=float(_step_report_interval),
+            save_state_callback=_save_mid_epoch,
+            snapshot_interval=_MID_EPOCH_SAVE_INTERVAL,
+            resume_state=_mid_epoch_resume,
+        )
         _mid_epoch_resume = None
         _t_train_end = _time.monotonic()
-        # Restore optimizer state on first epoch after resume.
         if _resume_optimizer_state is not None:
             bc_opt = model._optimizers.get("bc")
             if bc_opt is not None:
                 bc_opt.load_state_dict(_resume_optimizer_state)
                 _resume_optimizer_state = None
         _t_val_start = _time.monotonic()
-        if _use_gpu_resident:
-            val_metrics = _run_epoch_gpu_resident(
-                model,
-                _gpu_val_obs,
-                _gpu_val_actions,
-                batch_size=config.batch_size,
-                head_loss_weights=hlw,
-            )
-        else:
-            val_metrics = _run_precomputed_supervised(
-                model,
-                val_episodes,
-                batch_size=config.batch_size,
-                sequence_length=config.sequence_length,
-                tbptt_limit=config.tbptt_limit,
-                head_loss_weights=hlw,
-                pin_memory=config.pin_memory,
-                prefetch=config.prefetch,
-                microbatch_size=config.microbatch_size,
-            )
+        val_metrics = _run_epoch(
+            model,
+            val_source,
+            batch_size=config.batch_size,
+            sequence_length=config.sequence_length,
+            tbptt_limit=config.tbptt_limit,
+            head_loss_weights=hlw,
+        )
         _t_val_only_end = _time.monotonic()
         train_proxy_sum, train_proxy_gap, train_eval_reasons = _train_eval_schedule(
             epoch,
@@ -1698,21 +1752,22 @@ def run_behavior_cloning(
         train_eval_metrics: Dict[str, float] = {}
         train_eval_sum: float | None = None
         _train_eval_secs = 0.0
-        train_eval_ran = bool(val_episodes) and bool(train_eval_reasons)
+        train_eval_ran = val_source.n_total_rows > 0 and bool(train_eval_reasons)
         if train_eval_ran:
             # Clean train eval (model.eval mode, no dropout) on a train subset
             # only when scheduled or when proxy metrics suggest a gap issue.
             _t_train_eval_start = _time.monotonic()
-            train_eval_metrics = _run_precomputed_supervised(
+            # Reuse the train source by truncating to the first len(val_episodes)
+            # episodes — works for both resident and streaming sources.
+            train_eval_source = train_source.head(_train_eval_n_eps)
+            train_eval_metrics = _run_epoch(
                 model,
-                train_episodes[:len(val_episodes)],
+                train_eval_source,
                 batch_size=config.batch_size,
                 sequence_length=config.sequence_length,
                 tbptt_limit=config.tbptt_limit,
                 head_loss_weights=hlw,
-                pin_memory=config.pin_memory,
-                prefetch=config.prefetch,
-            )
+                )
             _train_eval_secs = _time.monotonic() - _t_train_eval_start
             train_eval_sum = _selection_score(train_eval_metrics)
         _t_val_end = _time.monotonic()
@@ -1740,7 +1795,7 @@ def run_behavior_cloning(
             "acc_target",
             "f1_move", "f1_move_fb", "f1_move_lr", "f1_move_ud",
             "cos_sim_look",
-            "f1_fire",
+            "f1_attack",
             "f1_weapon",
         )
         mae_str = "  ".join(
@@ -1918,16 +1973,13 @@ def run_behavior_cloning(
     if best_epoch < 0:
         model.save(output / "bc_best_model.pth")
 
-    # Free the training model + optimizer state + the GPU-resident TRAIN
+    # Free the training model + optimizer state + the device-resident TRAIN
     # tensors before we load the best checkpoint for the final val pass.
     # Without this, we briefly hold (training model + final_model + train
-    # data + val data) all on GPU, and the val forward's activation
-    # allocation OOMs — especially when 2-3 trainers are sharing the GPU.
-    # Keep _gpu_val_obs/_gpu_val_actions: they'll be reused below.
+    # data + val data) all on device, and the val forward's activation
+    # allocation OOMs. The val source is reused below.
     del model
-    if _use_gpu_resident:
-        _gpu_train_obs.clear()
-        _gpu_train_actions.clear()
+    train_source.release_device_tensors()
     import gc as _gc
     _gc.collect()
     if torch.cuda.is_available():
@@ -1937,29 +1989,15 @@ def run_behavior_cloning(
         output / "bc_best_model.pth", device=config.device, model_factory=model_factory,
     )
 
-    # Route the final val through whichever path produced the training
-    # data — if we preloaded to GPU, use the resident path (cheap reuse
-    # of _gpu_val_obs; no second mmap+collate). Otherwise fall back to
-    # the lane-packed val.
-    if val_episodes:
-        if _use_gpu_resident:
-            final_val_metrics = _run_epoch_gpu_resident(
-                final_model,
-                _gpu_val_obs,
-                _gpu_val_actions,
-                batch_size=config.batch_size,
-                head_loss_weights=hlw,
-            )
-        else:
-            final_val_metrics = _run_precomputed_supervised(
-                final_model,
-                val_episodes,
-                batch_size=config.batch_size,
-                sequence_length=config.sequence_length,
-                tbptt_limit=config.tbptt_limit,
-                pin_memory=config.pin_memory,
-                prefetch=config.prefetch,
-            )
+    if val_source.n_total_rows > 0:
+        final_val_metrics = _run_epoch(
+            final_model,
+            val_source,
+            batch_size=config.batch_size,
+            sequence_length=config.sequence_length,
+            tbptt_limit=config.tbptt_limit,
+            head_loss_weights=hlw,
+        )
     else:
         final_val_metrics = {"loss": 0.0}
 
@@ -2066,14 +2104,13 @@ def _eval_only(run_dir: Path, data_dir: Path | None, device: str, batch_size: in
     val_episodes = _load_precomputed(val_cache)
     print(f"  val episodes: {len(val_episodes)}")
 
-    metrics = _run_precomputed_supervised(
+    source = _make_resident_source(val_episodes, model.device)
+    metrics = _run_epoch(
         model,
-        val_episodes,
+        source,
         batch_size=batch_size,
         sequence_length=0,
         tbptt_limit=tbptt,
-        pin_memory=False,
-        prefetch=0,
     )
 
     print("\n--- val metrics ---")

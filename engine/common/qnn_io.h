@@ -36,7 +36,7 @@
  *  widths follow src/qnn/engine_norm.py exactly; the model-side
  *  dequantizers (qnn.model.dequant) divide by the scale factors below.
  *
- *  SELF BLOCK (20 B):
+ *  SELF BLOCK (21 B):
  *     0   1   health             u8
  *     1   1   effective_armor    u8   (= round(raw_armor × type_factor))
  *     2   1   ammo_shells        u8
@@ -48,6 +48,8 @@
  *    14   1   self_weapon_id     u8
  *    15   1   self_movement_id   u8
  *    16   4   self_items         u32        raw cl.items bitfield
+ *    20   1   view_pitch         i8         pitch_deg / 90, range ~[-1, 1]
+ *                                            (Quake pitch engine-clamped ±70°)
  *
  *  SPATIAL BLOCK (135 B = field-major across 9 sectors):
  *    Layout: for each field, all 9 sectors' values laid out
@@ -113,7 +115,7 @@
  *   recomputes |rel| / DIST_SCALE.
  */
 
-#define QNN_OBS_SELF_BLOCK_BYTES         20
+#define QNN_OBS_SELF_BLOCK_BYTES         21
 #define QNN_OBS_SPATIAL_PER_SECTOR_BYTES 15
 #define QNN_OBS_SPATIAL_BLOCK_BYTES (QNN_OBS_SPATIAL_COUNT * QNN_OBS_SPATIAL_PER_SECTOR_BYTES)
 
@@ -132,6 +134,7 @@
 #define QNN_OBS_OFF_SELF_WEAPON_ID       14
 #define QNN_OBS_OFF_SELF_MOVEMENT_ID     15
 #define QNN_OBS_OFF_SELF_ITEMS           16
+#define QNN_OBS_OFF_SELF_VIEW_PITCH      20
 
 /* QNN_OBS_BUFFER_SIZE (4096) is defined in qnn.h (shared with tick-emit
  * state). The new layout occupies far less than 4096 B even with
@@ -320,6 +323,7 @@ typedef struct
 	int      weapon_id;          /* 0..8 impulse-form */
 	int      movement_id;        /* 0=ground/1=air/2..4=water */
 	int32_t  items;              /* raw cl.items bitfield (Quake's `int items`) */
+	float    view_pitch;         /* pitch normalized to ~[-1, 1] (deg / 90) */
 } qnn_self_token_t;
 
 typedef struct

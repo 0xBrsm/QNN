@@ -16,7 +16,8 @@ Public submodules:
     qnn.diag.participation — PR + dead-unit + fire-rate stats on head bottlenecks
     qnn.diag.attention     — per-attention-head entropy, similarity, ablation
     qnn.diag.pruning       — per-neuron pruning sensitivity (slow, opt-in)
-    qnn.diag.linear_probe  — frozen-trunk → linear classifier (slow, opt-in)
+    qnn.diag.linear_probe  — frozen-encoder → linear classifier (slow, opt-in)
+    qnn.diag.cls_regression — Ridge regression: CLS readout → obs scalars, R² per scalar
     qnn.diag.report        — aggregator → markdown + JSON
     qnn.diag.cli           — entry point: ``python -m qnn.diag --checkpoint …``
 """

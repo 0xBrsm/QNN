@@ -25,3 +25,13 @@ int QNN_ProgsGetAttackCdRemaining(int tick, int tick_hz)
 	(void)tick_hz;
 	return 0;
 }
+
+float QNN_ProgsGetAttackFinished(void)
+{
+	return 0.0f;
+}
+
+void QNN_ProgsSetAttackFinished(float value)
+{
+	(void)value;
+}

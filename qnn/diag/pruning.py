@@ -6,7 +6,7 @@ measure the resulting val-loss delta. Sort by impact: top of the list is
 direct measure of per-neuron contribution.
 
 Cost note: O(n_neurons × val_episodes). For each head's 128-d bottleneck:
-512 evaluations on 2-4 episodes is a few minutes on CPU. For trunk layers
+512 evaluations on 2-4 episodes is a few minutes on CPU. For encoder layers
 (thousands of neurons), prefer ``top_k_pruning`` which prunes the K
 smallest-weight-norm neurons at once and measures.
 """
@@ -131,11 +131,12 @@ def head_bottleneck_pruning_summary(
     output dim). Returns per-head summary including the cumulative curve.
     """
     out: dict[str, dict] = {}
-    for head_name in ("move_head", "look_head", "fire_head", "weapon_head"):
-        head = getattr(policy.model, head_name, None)
-        if not isinstance(head, nn.Sequential) or len(head) < 1 or not isinstance(head[0], nn.Linear):
+    for head_name in ("move_head", "look_head", "attack_head", "weapon_head"):
+        component = getattr(policy.model, head_name, None)
+        mlp = getattr(component, "mlp", None) if component is not None else None
+        if not isinstance(mlp, nn.Sequential) or len(mlp) < 1 or not isinstance(mlp[0], nn.Linear):
             continue
-        target = f"{head_name}.0"
+        target = f"{head_name}.mlp.0"
         rows = per_neuron_pruning_sensitivity(policy, val_episodes, target=target)
         cum = cumulative_pruning_curve(rows)
         # Find K such that top-K explain 90% of impact

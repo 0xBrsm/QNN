@@ -65,7 +65,7 @@
  * Hidden (1): hidden.
  *
  * Total: 11 + 11 + 20 + 1 = 43. */
-#define QNN_ONNX_N_OBS_INPUTS  42
+#define QNN_ONNX_N_OBS_INPUTS  43
 #define QNN_ONNX_N_INPUTS      (QNN_ONNX_N_OBS_INPUTS + 1)
 #define QNN_ONNX_N_OUTPUTS      5
 
@@ -125,6 +125,7 @@ struct qnn_onnx_ctx
 	uint8_t  self_weapon_id;
 	uint8_t  self_movement_id;
 	int32_t  self_items;
+	int8_t   self_view_pitch;
 
 	/* ── Spatial block scratch (B=1, N=9, per-field native) ── */
 	int8_t   spatial_dir          [QNN_SPATIAL_TOKEN_COUNT][3];
@@ -412,6 +413,7 @@ static void pack_scratch(qnn_onnx_ctx_t *ctx, const qnn_tick_result_t *r)
 	ctx->self_weapon_id       = (uint8_t)self->weapon_id;
 	ctx->self_movement_id     = (uint8_t)self->movement_id;
 	ctx->self_items           = self->items;
+	ctx->self_view_pitch      = QNN_QuantizeI8(self->view_pitch);
 
 	/* ---- Spatial block ---- */
 	for (i = 0; i < QNN_SPATIAL_TOKEN_COUNT; ++i) {
@@ -473,6 +475,7 @@ static const qnn_onnx_input_def_t QNN_ONNX_INPUTS[QNN_ONNX_N_OBS_INPUTS] = {
 	{ "self_weapon_id",       _OFFS(self_weapon_id),       {1}, 1, _SIZE_OF(self_weapon_id),       ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },
 	{ "self_movement_id",     _OFFS(self_movement_id),     {1}, 1, _SIZE_OF(self_movement_id),     ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },
 	{ "self_items",           _OFFS(self_items),           {1}, 1, _SIZE_OF(self_items),           ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 },
+	{ "view_pitch",           _OFFS(self_view_pitch),      {1}, 1, _SIZE_OF(self_view_pitch),      ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 },
 
 	/* ── Spatial block (11 inputs, all shape (1, 9, …)) ───── */
 	{ "spatial_dir",          _OFFS(spatial_dir),          {1, QNN_SPATIAL_TOKEN_COUNT, 3}, 3, _SIZE_OF(spatial_dir),          ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 },
@@ -516,7 +519,7 @@ static const char *QNN_ONNX_INPUT_NAMES[QNN_ONNX_N_INPUTS] = {
 	"self_health", "self_effective_armor",
 	"self_ammo_shells", "self_ammo_nails", "self_ammo_rockets", "self_ammo_cells",
 	"self_vel", "self_attack_finished",
-	"self_weapon_id", "self_movement_id", "self_items",
+	"self_weapon_id", "self_movement_id", "self_items", "view_pitch",
 	"spatial_dir", "spatial_nearest_dist", "spatial_mean_dist",
 	"spatial_openness", "spatial_clearance", "spatial_traversable", "spatial_dropoff",
 	"spatial_solid_frac", "spatial_water_frac", "spatial_slime_frac", "spatial_lava_frac",
@@ -575,24 +578,39 @@ static void qnn_onnx_decode(const qnn_onnx_ctx_t *ctx, int self_weapon_id, qnn_a
 	float maxv, sumexp, top1_prob, top2_prob, confidence, margin;
 	int current_class, desired_class, chosen_class;
 
-	/* ---- move: 3 axes × 3 classes; argmax per axis; engine value = class - 1 ---- */
-	for (axis = 0; axis < 3; ++axis) {
-		const float *row = &ctx->move_logits[axis * 3];
-		best = 0;
-		best_v = row[0];
-		for (c = 1; c < 3; ++c) {
-			if (row[c] > best_v) { best_v = row[c]; best = c; }
+	/* ---- move: 3 axes × 3 classes; argmax per axis; encoded as the
+	 * press byte's per-axis neg/pos bits.  attack bit OR'd in below. ---- */
+	{
+		int axis_signs[3] = {0, 0, 0};
+		int fb_neg, fb_pos, lr_neg, lr_pos, up_neg, up_pos, attack_bit;
+		for (axis = 0; axis < 3; ++axis) {
+			const float *row = &ctx->move_logits[axis * 3];
+			best = 0;
+			best_v = row[0];
+			for (c = 1; c < 3; ++c) {
+				if (row[c] > best_v) { best_v = row[c]; best = c; }
+			}
+			axis_signs[axis] = best - 1;   /* class 0,1,2 → -1, 0, +1 */
 		}
-		out->move[axis] = (float)(best - 1);   /* class 0,1,2 → -1, 0, +1 */
+		fb_neg = axis_signs[0] < 0 ? 1 : 0;
+		fb_pos = axis_signs[0] > 0 ? 1 : 0;
+		lr_neg = axis_signs[1] < 0 ? 1 : 0;
+		lr_pos = axis_signs[1] > 0 ? 1 : 0;
+		up_neg = axis_signs[2] < 0 ? 1 : 0;
+		up_pos = axis_signs[2] > 0 ? 1 : 0;
+		p_fire = 1.0f / (1.0f + expf(-ctx->fire_logit));
+		attack_bit = (p_fire > 0.5f) ? 1 : 0;
+		out->move = QNN_PackInputMask(
+			/*alive=*/1,
+			fb_neg, fb_pos, lr_neg, lr_pos,
+			up_neg, up_pos,
+			/*jump_act=*/up_pos,
+			/*attack_act=*/attack_bit);
 	}
 
 	/* ---- look: already a unit vector; clamp for fp noise ---- */
 	for (i = 0; i < 3; ++i)
 		out->look[i] = qnn_onnx_clampf(ctx->look[i], -1.0f, 1.0f);
-
-	/* ---- fire: sigmoid threshold ---- */
-	p_fire = 1.0f / (1.0f + expf(-ctx->fire_logit));
-	out->fire = (p_fire > 0.5f) ? 1 : 0;
 
 	/* ---- weapon: sticky controller (softmax top-2 + conf/margin gate) ---- */
 	qnn_onnx_top2(ctx->weapon_logits, QNN_ONNX_WEAPON_CLASSES,

@@ -14,13 +14,13 @@ class QuakeConcatRNNCore(ModelCore):
     cat(self, h_t, target_feat).
 
     The encoder emits three d_model summaries:
-      * ``self_readout`` — transformer self-token readout ("the now")
+      * ``cls_readout`` — transformer self-token readout ("the now")
       * ``pool``         — self + mean(actors) projection, fed to the GRU
       * ``target_feat``  — attention-pooled entity feature for head conditioning
 
-    The core routes pool through the GRU and passes self_readout and
+    The core routes pool through the GRU and passes cls_readout and
     target_feat through unchanged.  Action heads downstream read
-    cat(self_readout, h_t, target_feat).
+    cat(cls_readout, h_t, target_feat).
     """
 
     def __init__(self, cfg, input_size: int):
@@ -65,10 +65,10 @@ class QuakeConcatRNNCore(ModelCore):
                 head_output.unsorted_indices,
             )
         elif is_batched_sequence:
-            self_readout, pool, target_feat = self._split(head_output)
+            cls_readout, pool, target_feat = self._split(head_output)
             core_input = pool
         else:
-            self_readout, pool, target_feat = self._split(head_output)
+            cls_readout, pool, target_feat = self._split(head_output)
             core_input = pool.unsqueeze(0)
 
         if self.rnn_num_layers > 1:
@@ -92,9 +92,9 @@ class QuakeConcatRNNCore(ModelCore):
                 core_output.unsorted_indices,
             )
         elif is_batched_sequence:
-            fused = torch.cat([self_readout, core_output, target_feat], dim=-1)
+            fused = torch.cat([cls_readout, core_output, target_feat], dim=-1)
         else:
-            fused = torch.cat([self_readout, core_output.squeeze(0), target_feat], dim=1)
+            fused = torch.cat([cls_readout, core_output.squeeze(0), target_feat], dim=1)
 
         if self.rnn_num_layers > 1:
             new_rnn_states = new_rnn_states.permute(1, 0, 2)

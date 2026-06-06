@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from signal_slot.signal_slot import EventLoop, EventLoopProcess, TightLoop, signal
+from signal_idx.signal_idx import EventLoop, EventLoopProcess, TightLoop, signal
 
 from sample_factory.algo.sampling.non_batched_sampling import NonBatchedVectorEnvRunner
 from sample_factory.algo.sampling.rollout_worker import (

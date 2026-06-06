@@ -1,9 +1,9 @@
 """HeadSpec / HeadLossSpec dataclasses — shared types for per-head modules.
 
-Each per-head file (``qnn.bc.heads.target``, ``qnn.bc.heads.fire``,
-``qnn.bc.heads.fire_token``, …) constructs its own ``HeadSpec`` and
-registers it in ``qnn.bc.heads.heads.HEADS``. The runner in
-``qnn.bc.heads.runner`` reads the spec to wire the head into the
+Each per-head file (``qnn.model.bench.target``, ``qnn.model.bench.attack``,
+``qnn.model.bench.attack_preattn``, …) constructs its own ``HeadSpec`` and
+registers it in ``qnn.model.bench.heads.HEADS``. The runner in
+``qnn.model.bench.runner`` reads the spec to wire the head into the
 canonical BC training pipeline via ``QNNPolicy``'s ``model_factory``
 hook — head probes share BC's shard loader, supervised loop,
 checkpointing, and history. No parallel pipeline.
@@ -18,7 +18,7 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 
-from qnn.model.policy import ModelConfig
+from qnn.model.network import ModelConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +29,7 @@ class HeadLossSpec:
     (BCE for fire, soft-CE for target, multi-axis CE for move, …).
     ``metrics_fn(logits, labels) -> dict[str, float]`` — returns
     metrics under the same key names BC training uses
-    (``acc_target``, ``balanced_acc_target``, ``f1_fire`` …) so probe
+    (``acc_target``, ``balanced_acc_target``, ``f1_attack`` …) so probe
     JSON diffs cleanly against BC ``bc_history.json``.
     """
     loss_fn: Callable[..., torch.Tensor]
@@ -59,11 +59,11 @@ def neutral_model_config(
     d_model: int,
     self_weapon_embed_in_self: bool,
 ) -> ModelConfig:
-    """A ``ModelConfig`` with every trunk/GRU/head BC flag disabled.
+    """A ``ModelConfig`` with every encoder/GRU/head BC flag disabled.
 
     Head probes call ``QNNPolicy`` via ``model_factory=...``, which
-    means ``_CombatObjectiveNet.__init__`` — the only consumer of
-    trunk/GRU dimensions — is never invoked. The policy layer still
+    means ``Network.__init__`` — the only consumer of
+    encoder/GRU dimensions — is never invoked. The policy layer still
     reads policy-relevant flags (``use_gru``, ``use_weapon_head``, …),
     so those need to be False for the probe to make sense. Numeric
     fields (``ffn_dim``, ``n_layers``, …) are inert under the factory
@@ -91,11 +91,11 @@ def neutral_model_config(
         gru_target_query=False,
         hard_target_feat=False,
         weapon_in_target_query=False,
-        linear_slot_prior=False,
+        linear_idx_prior=False,
         gt_dist_target_feat=False,
         prev_target_in_query=False,
         self_weapon_embed_in_self=bool(self_weapon_embed_in_self),
-        head_bottleneck_dim={"move": 0, "look": 0, "fire": 0, "weapon": 0},
+        head_bottleneck_dim={"move": 0, "look": 0, "attack": 0, "weapon": 0},
         head_activation="none",
     )
 
@@ -113,7 +113,7 @@ class HeadSpec:
     ``default_features`` is a legacy hook retained for the flat-feature
     heads (``fire`` / ``target``) so their builders can look up the
     default per-frame feature list when probe.json doesn't override it.
-    Tokenized heads (``fire_token``) leave it empty.
+    Pre-attention heads (``attack_preattn``) leave it empty.
     """
     name: str
     loss: HeadLossSpec

@@ -1,103 +1,25 @@
-"""Chunked supervised loop for BC.
+"""Supervised BC trainer.
 
-The inner machinery behind :func:`qnn.bc.loop.run_epoch`: data carriers
-(``PrecomputedEpisode``, ``MidEpochState``), the kernel-page-drop helpers
-that keep mmap'd training data from blowing up the page cache, and the
-batched, GRU-aware ``_run_batched`` driver that walks every episode.
-``run_epoch`` itself stays in :mod:`qnn.bc.loop` as a thin orchestration
-shim that picks ``chunk_size`` and dispatches.
+Two data pipelines (resident vs streaming), one training platform.
+:class:`Source` carries device-resident or lazy tensors plus episode
+metadata; :func:`run_epoch` picks lane-packed batches when the model is
+recurrent and frame-shuffled batches otherwise, and feeds both to
+:func:`train_on_batches`.
 """
 
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Any, Dict
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, Protocol
 
-import ctypes
 import heapq
-import os
 
 import numpy as np
 import torch
 
 from qnn.model.policy import QNNPolicy
-
-# --- madvise page-drop for mmap'd training data ---
-_libc = ctypes.CDLL("libc.so.6", use_errno=True)
-_libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-_libc.madvise.restype = ctypes.c_int
-_libc.posix_fadvise.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int]
-_libc.posix_fadvise.restype = ctypes.c_int
-_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-_MADV_DONTNEED = 4
-_POSIX_FADV_DONTNEED = 4
-
-
-def _dontneed_pages(arr: np.ndarray) -> None:
-    """Tell the kernel to immediately drop pages backing this array.
-
-    Called after mmap'd training data has been copied into a pinned
-    buffer, so the file-backed pages are no longer needed.  Without
-    this, the page cache grows to the full corpus size (~71 GB) and
-    starves the WSL2 host.
-    """
-    nbytes = arr.nbytes
-    if nbytes == 0:
-        return
-    addr = arr.ctypes.data
-    aligned = addr & ~(_PAGE_SIZE - 1)
-    _libc.madvise(aligned, nbytes + (addr - aligned), _MADV_DONTNEED)
-
-
-def _root_memmap(arr: np.ndarray) -> np.memmap | None:
-    current = arr
-    root: np.memmap | None = current if isinstance(current, np.memmap) else None
-    while True:
-        base = getattr(current, "base", None)
-        if isinstance(base, np.memmap):
-            root = base
-            current = base
-            continue
-        break
-    return root
-
-
-def _drop_file_cache(
-    arr: np.ndarray,
-    fd_cache: dict[str, int],
-) -> None:
-    """Ask the kernel to evict the file-backed cache range for this memmap slice.
-
-    On WSL2 + Docker Desktop, MADV_DONTNEED on the mapped pages alone can still
-    leave the host-visible file cache ballooned near the corpus size.  Pair it
-    with POSIX_FADV_DONTNEED on the backing file range so the kernel can drop
-    those cache pages more directly.
-    """
-    filename = getattr(arr, "filename", None)
-    if not filename:
-        return
-    root = _root_memmap(arr)
-    if root is None:
-        return
-    root_addr = root.ctypes.data
-    byte_delta = arr.ctypes.data - root_addr
-    if byte_delta < 0:
-        return
-    file_offset = int(getattr(root, "offset", 0)) + int(byte_delta)
-    length = int(arr.nbytes)
-    if length <= 0:
-        return
-    fd = fd_cache.get(filename)
-    if fd is None:
-        try:
-            fd = os.open(filename, os.O_RDONLY)
-        except OSError:
-            return
-        fd_cache[filename] = fd
-    _libc.posix_fadvise(fd, file_offset, length, _POSIX_FADV_DONTNEED)
 
 _RAW_SUM_METRIC_PREFIXES = (
     "n_", "correct_", "l1_sum_", "tp_", "fp_", "fn_", "target_pos_", "pred_pos_", "pred_target_",
@@ -159,63 +81,6 @@ class PrecomputedEpisode:
         return out
 
 
-# Batch madvise/fadvise per (cursor, key): accumulate consumed rows and
-# fire one syscall per THRESHOLD bytes instead of one per chunk.
-_ADVISE_BATCH_BYTES = 32 * 1024 * 1024
-
-
-@dataclass(slots=True)
-class _EpisodeCursor:
-    episode: PrecomputedEpisode
-    start: int = 0
-    hidden: torch.Tensor | None = None
-    advised_obs: dict[str, int] = field(default_factory=dict)
-    advised_act: dict[str, int] = field(default_factory=dict)
-
-
-# Page-drop hint machinery is opt-in. The default-off behavior is safe;
-# enabling it requires running on a build where every episode array
-# really is a file-backed memmap (and not, e.g., a heap copy returned
-# by a ProcessPoolExecutor worker whose ``.base`` chain numpy may
-# reconstruct inconsistently — that path has been observed to segfault
-# inside ``_root_memmap`` during end-of-epoch flush). The optimization
-# was designed for the load-time mmap walk; with the chunked-prefetch
-# path operating on potentially-non-memmap arrays returned through
-# pickle, leave it off until the underlying ``.base`` chain instability
-# is root-caused (see project_bc_collect_status). The kernel reclaims
-# clean file-cache pages under pressure regardless.
-_PAGEDROP_ENABLED = bool(int(os.environ.get("QNN_BC_PAGEDROP", "0") or 0))
-
-
-def _maybe_advise_range(
-    arr: np.ndarray,
-    tracker: dict[str, int],
-    key: str,
-    consumed_end: int,
-    fd_cache: dict[str, int],
-    *,
-    force: bool = False,
-) -> None:
-    if not _PAGEDROP_ENABLED:
-        return
-    prev = tracker.get(key, 0)
-    if consumed_end <= prev:
-        return
-    pending = arr[prev:consumed_end]
-    if not force and pending.nbytes < _ADVISE_BATCH_BYTES:
-        return
-    # Only issue page-drop hints for true file-backed memmaps. Dynamic labels
-    # are ordinary heap ndarrays; MADV_DONTNEED
-    # on anonymous pages can zero their contents and silently corrupt the
-    # in-memory supervision signal across epochs.
-    if _root_memmap(arr) is None:
-        tracker[key] = consumed_end
-        return
-    _dontneed_pages(pending)
-    _drop_file_cache(pending, fd_cache)
-    tracker[key] = consumed_end
-
-
 def _flush_tensor_dict(tensors: dict[str, torch.Tensor]) -> dict[str, float]:
     """Single GPU→CPU sync for a dict of 0-d tensors via stack + tolist."""
     if not tensors:
@@ -223,15 +88,6 @@ def _flush_tensor_dict(tensors: dict[str, torch.Tensor]) -> dict[str, float]:
     keys = list(tensors.keys())
     vals = torch.stack([tensors[k] for k in keys]).tolist()
     return dict(zip(keys, vals))
-
-
-def _flush_cursor_advise(cursor: _EpisodeCursor, fd_cache: dict[str, int]) -> None:
-    if not _PAGEDROP_ENABLED:
-        return
-    for key, arr in cursor.episode.obs.items():
-        _maybe_advise_range(arr, cursor.advised_obs, key, arr.shape[0], fd_cache, force=True)
-    for head, arr in cursor.episode.actions.items():
-        _maybe_advise_range(arr, cursor.advised_act, head, arr.shape[0], fd_cache, force=True)
 
 
 def _stable_binary_metrics_from_counts(
@@ -351,9 +207,9 @@ def _stable_weapon_metrics_from_counts(result: Dict[str, float]) -> None:
 
 def _stable_target_metrics_from_counts(result: Dict[str, float]) -> None:
     classes = sorted(
-        int(k[len("tp_target_slot_"):])
+        int(k[len("tp_target_idx_"):])
         for k in result
-        if k.startswith("tp_target_slot_")
+        if k.startswith("tp_target_idx_")
     )
     if not classes:
         return
@@ -364,40 +220,34 @@ def _stable_target_metrics_from_counts(result: Dict[str, float]) -> None:
         result["acc_target"] = correct / total
 
     recalls: list[float] = []
-    for slot in classes:
-        tp = float(result.get(f"tp_target_slot_{slot}", 0.0))
-        fp = float(result.get(f"fp_target_slot_{slot}", 0.0))
-        fn = float(result.get(f"fn_target_slot_{slot}", 0.0))
-        support = float(result.get(f"n_target_slot_{slot}", 0.0))
-        pred_count = float(result.get(f"pred_target_slot_{slot}", 0.0))
+    for idx in classes:
+        tp = float(result.get(f"tp_target_idx_{idx}", 0.0))
+        fp = float(result.get(f"fp_target_idx_{idx}", 0.0))
+        fn = float(result.get(f"fn_target_idx_{idx}", 0.0))
+        support = float(result.get(f"n_target_idx_{idx}", 0.0))
+        pred_count = float(result.get(f"pred_target_idx_{idx}", 0.0))
         precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
         recall = tp / support if support > 0.0 else 0.0
         f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0
         if support > 0.0:
             recalls.append(recall)
-        result[f"precision_target_slot_{slot}"] = precision
-        result[f"recall_target_slot_{slot}"] = recall
-        result[f"f1_target_slot_{slot}"] = f1
-        result[f"pos_rate_target_slot_{slot}"] = support / total if total > 0.0 else 0.0
-        result[f"pred_rate_target_slot_{slot}"] = pred_count / total if total > 0.0 else 0.0
+        result[f"precision_target_idx_{idx}"] = precision
+        result[f"recall_target_idx_{idx}"] = recall
+        result[f"f1_target_idx_{idx}"] = f1
+        result[f"pos_rate_target_idx_{idx}"] = support / total if total > 0.0 else 0.0
+        result[f"pred_rate_target_idx_{idx}"] = pred_count / total if total > 0.0 else 0.0
 
     if recalls:
         result["balanced_acc_target"] = float(sum(recalls) / len(recalls))
-    result["acc_target_slot0_baseline"] = (
-        float(result.get("n_target_slot_0", 0.0)) / total if total > 0.0 else 0.0
+    result["acc_target_idx0_baseline"] = (
+        float(result.get("n_target_idx_0", 0.0)) / total if total > 0.0 else 0.0
     )
     _stable_binary_metrics_from_counts(result, prefix="target_nonzero")
 
 
 def _apply_stable_epoch_metrics(result: Dict[str, float]) -> None:
-    if "tp_fire" in result and "fp_fire" in result and "fn_fire" in result:
-        _stable_binary_metrics_from_counts(result, prefix="fire")
-    if (
-        "tp_fire_masked" in result
-        and "fp_fire_masked" in result
-        and "fn_fire_masked" in result
-    ):
-        _stable_binary_metrics_from_counts(result, prefix="fire_masked")
+    if "tp_attack" in result and "fp_attack" in result and "fn_attack" in result:
+        _stable_binary_metrics_from_counts(result, prefix="attack")
     _stable_target_metrics_from_counts(result)
     _stable_weapon_metrics_from_counts(result)
 
@@ -434,7 +284,8 @@ class MidEpochState:
 
 @dataclass(slots=True)
 class _LaneItem:
-    cursor: _EpisodeCursor
+    ep_idx: int
+    episode: PrecomputedEpisode
     lane: int
     lane_start: int
 
@@ -457,761 +308,130 @@ class _PackedChunkPlan:
     active_lanes: int
     dst_indices: np.ndarray
     reset_indices: np.ndarray
-    compact_order: np.ndarray
+    # Device-staged views, filled in once at plan-build time so per-batch
+    # gather isn't paying a fresh H→D transfer for these tensors.
+    dst_indices_d: torch.Tensor | None = None
+    reset_indices_d: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
-class _PreparedChunkBatch:
-    plan: _PackedChunkPlan
+class Batch:
+    """One trainer-ready batch handed to :func:`train_on_batches`.
+
+    The producer owns where tensors come from (GPU-resident slice, prefetched
+    pinned-host copy, etc.) and any per-batch state (hidden, masks, lane
+    scaling). ``on_step`` is the producer's post-step hook: called with the
+    metrics dict and ``stepped`` (True iff the trainer's accumulator just
+    flushed). Producers use it to propagate ``_next_hidden`` and run
+    optimizer-step-aligned bookkeeping (mid-epoch checkpoints, reporting).
+    """
     obs: dict[str, torch.Tensor]
     actions: dict[str, torch.Tensor]
-    masks: dict[str, torch.Tensor]
+    rows: int
+    hidden: torch.Tensor | None = None
+    masks: dict[str, torch.Tensor] | None = None
+    loss_scale: float = 1.0
+    compute_metrics: bool = True
+    on_step: Any = None
 
 
-def _run_batched(
-    model: QNNPolicy,
+class Source(Protocol):
+    """Interface :func:`run_epoch` consumes.
+
+    Two concrete implementations:
+      - :class:`ResidentSource` (built by :func:`make_resident_source`):
+        the whole corpus lives in device tensors; gather is ``index_select``.
+      - :class:`StreamingSource` (built by :func:`make_streaming_source`):
+        shards live on disk as mmaps; gather reads, pads, dequantizes, and
+        transfers on demand.
+
+    ``prefetch_depth`` is the in-flight batch queue cap; ``n_workers`` is
+    the size of the parallel-gather thread pool. Resident leaves both at 0
+    (gather is on-device ``index_select`` — nothing to parallelize across
+    workers); streaming sets ``n_workers>=2`` so the host-bound shard read
+    + token-pad work for batch N+k can overlap with the GPU step for
+    batch N.
+    """
+    device: torch.device
+    episodes: Sequence[Any]
+    episode_offsets: np.ndarray
+    prefetch_depth: int
+    n_workers: int
+
+    @property
+    def n_total_rows(self) -> int: ...
+    def gather(self, indices: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]: ...
+    def attack_pos_neg_counts(self) -> tuple[int, int]: ...
+    def release_device_tensors(self) -> None: ...
+    def head(self, n_episodes: int) -> "Source": ...
+
+
+@dataclass(slots=True)
+class ResidentSource:
+    """Device-resident concrete :class:`Source`.
+
+    ``obs``/``actions`` are pre-concatenated, padded, dequantized device
+    tensors. Built once at startup by :func:`make_resident_source`.
+    """
+    obs: dict[str, torch.Tensor]
+    actions: dict[str, torch.Tensor]
+    episodes: list[PrecomputedEpisode]
+    episode_offsets: np.ndarray
+    device: torch.device
+    prefetch_depth: int = 0
+    n_workers: int = 0
+
+    @property
+    def n_total_rows(self) -> int:
+        return int(self.episode_offsets[-1])
+
+    def gather(self, indices: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        return (
+            {k: v.index_select(0, indices) for k, v in self.obs.items()},
+            {k: v.index_select(0, indices) for k, v in self.actions.items()},
+        )
+
+    def attack_pos_neg_counts(self) -> tuple[int, int]:
+        f = self.actions.get("attack")
+        if f is None:
+            return 0, 0
+        pos = int((f > 0).sum().item())
+        return pos, int(f.numel() - pos)
+
+    def release_device_tensors(self) -> None:
+        self.obs.clear()
+        self.actions.clear()
+
+    def head(self, n_episodes: int) -> "ResidentSource":
+        """View of the first ``n_episodes`` episodes; shares device tensors."""
+        return ResidentSource(
+            obs=self.obs,
+            actions=self.actions,
+            episodes=self.episodes[:n_episodes],
+            episode_offsets=self.episode_offsets[:n_episodes + 1],
+            device=self.device,
+            prefetch_depth=self.prefetch_depth,
+            n_workers=self.n_workers,
+        )
+
+
+def make_resident_source(
     episodes: Sequence[PrecomputedEpisode],
-    batch_size: int,
-    chunk_size: int,
-    *,
-    class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
-    lr: float | None = None,
-    rng: np.random.Generator | None = None,
-    max_grad_norm: float = 1.0,
-    head_loss_weights: Mapping[str, float] | None = None,
-    step_callback: Any | None = None,
-    report_every: int = 0,
-    report_interval_seconds: float = 0.0,
-    pin_memory: bool = True,
-    prefetch: int,
-    microbatch_size: int = 0,
-    save_state_callback: Any | None = None,
-    snapshot_interval: int = 0,
-    resume_state: MidEpochState | None = None,
-) -> Dict[str, float]:
-    _empty: Dict[str, float] = {"loss": 0.0, "accuracy": 0.0, "n_rows": 0.0}
-    if not episodes:
-        return _empty
-
-    training = class_weights is not None and lr is not None
-    if training:
-        model.model.train()
-    else:
-        model.model.eval()
-
-    accum_target = max(1, int(batch_size))
-    microbatch_target = min(accum_target, int(microbatch_size)) if microbatch_size > 0 else accum_target
-    device_type = model.device.type if isinstance(model.device, torch.device) else str(model.device)
-    use_pinned_host = device_type != "cpu" and bool(pin_memory)
-    prefetch_depth = max(0, int(prefetch))
-    use_prefetch = prefetch_depth > 0
-    fd_cache: dict[str, int] = {}
-
-    if resume_state is not None and resume_state.ep_order is not None:
-        ep_order = [int(i) for i in resume_state.ep_order]
-    else:
-        ep_order = sorted(range(len(episodes)), key=lambda idx: episodes[idx].sort_key)
-        if rng is not None:
-            ep_order = [ep_order[int(i)] for i in rng.permutation(len(ep_order))]
-        ep_order = _apply_global_length_bucketing(ep_order, episodes)
-
-    total_rows = 0
-    total_metric_rows = 0  # rows from sample steps only — denom for MAE/acc
-    # Tensor-resident running sums; keep on GPU until epoch end / report boundary.
-    total_loss_t: torch.Tensor | None = None
-    total_accuracy_t: torch.Tensor | None = None
-    raw_metric_totals_t: Dict[str, torch.Tensor] = {}
-    averaged_metric_totals_t: Dict[str, torch.Tensor] = {}
-    accum_count = 0.0
-
-    opt_steps = 0
-    grad_norm_sum_t: torch.Tensor | None = None
-    grad_norm_max_t: torch.Tensor | None = None
-    grad_norm_n = 0
-    import time as _time
-    import os as _os
-    # QNN_PROFILE_STEPS=N → time data-wait vs apply (forward+backward+opt) for
-    # the first N optimizer steps, print decomposition, then continue normally.
-    # Synchronizes the GPU around `_apply_prepared_batch` so the GPU compute
-    # actually finishes inside the measured window. Adds per-step sync overhead
-    # only while profiling.
-    _profile_steps_target = int(_os.environ.get("QNN_PROFILE_STEPS", "0") or 0)
-    _profile_skip_target = int(_os.environ.get("QNN_PROFILE_SKIP", "100") or 0)
-    _prof_active = _profile_steps_target > 0 and training
-    if _prof_active:
-        print(f"  [bc] profiling enabled: skip {_profile_skip_target} steps, measure next {_profile_steps_target}", flush=True)
-    _prof_seen = 0          # total opt steps observed
-    _prof_n = 0             # steps actually counted (after warmup skip)
-    _prof_t_wait = 0.0
-    _prof_t_apply = 0.0
-    _prof_window_start = 0.0  # wall start of the measured window
-    _last_save_time = _time.monotonic()
-    # Allow the first training batch in each epoch to compute/report metrics
-    # immediately so short ablation runs do not end up with empty train stats.
-    _last_report_time = _time.monotonic() - max(float(report_interval_seconds), 0.0)
-    _report_rows = 0
-    _report_metric_rows = 0
-    _report_loss_t: torch.Tensor | None = None
-    _report_avg_totals_t: Dict[str, torch.Tensor] = {}
-    _report_raw_totals_t: Dict[str, torch.Tensor] = {}
-
-    if training:
-        model.bc_zero_grad()
-
-    ordered_cursors = [_EpisodeCursor(episode=episodes[idx]) for idx in ep_order]
-    action_names = list(episodes[0].actions.keys())
-    lane_hidden = (
-        torch.zeros((microbatch_target, model.gru_hidden), dtype=torch.float32, device=model.device)
-        if model.use_gru
-        else None
-    )
-    next_plan = 0
-
-    # Per-batch dequant on GPU. Chunked obs is staged on pinned host as
-    # native engine widths (uint8 / int16 / uint32 / float16). The model
-    # expects the legacy dequantized layout (``self_scalars``,
-    # ``spatial_scalars``, ``entity_scalars_raw``, plus id tensors). The
-    # GPU-resident path runs these once at preload because everything
-    # fits in VRAM; the chunked path streams batches, so we run the
-    # dequant lazily per batch on the (already-on-GPU) tensors. The
-    # dequantizers are idempotent and short-circuit when the legacy
-    # keys are present, so they're safe to call unconditionally.
-    _native_to_dequant: tuple = ()
-    if any(k in episodes[0].obs for k in ("health", "vel", "self_items")):
-        from qnn.model.dequant import (
-            SelfDequantizer, SpatialDequantizer, EntityDequantizer,
-        )
-        _native_to_dequant = (
-            SelfDequantizer().to(model.device).eval(),
-            SpatialDequantizer().to(model.device).eval(),
-            EntityDequantizer().to(model.device).eval(),
-        )
-
-    def _move_and_dequant(obs_cpu: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Pinned-host obs → on-GPU dequantized obs.
-
-        Native fields arrive as (T, B, ...) for sequence chunks. The
-        dequantizers operate on rank-1 batch shapes (or rank-2 like
-        ``(B, K)``), so we flatten the leading (T, B) → (T*B,) before
-        dequant and reshape back. New keys produced by the dequantizers
-        are emitted at (T, B, ...) shape so downstream model code keys
-        off the sequence rank correctly.
-        """
-        # Async H→D copy. Pinned host buffers + non_blocking=True lets
-        # the next dispatch queue stage overlap with the transfer.
-        gpu_obs = {k: v.to(model.device, non_blocking=True) for k, v in obs_cpu.items()}
-        if not _native_to_dequant:
-            return gpu_obs
-        # Detect (T, B, ...) vs (B, ...) layout from a known row-indexed
-        # field. ``health`` is (T, B) when chunked, (B,) when flat.
-        ref = gpu_obs.get("health")
-        if ref is not None and ref.ndim >= 2:
-            T = int(ref.shape[0])
-            B = int(ref.shape[1])
-            TB = T * B
-            flat: dict[str, torch.Tensor] = {}
-            for k, v in gpu_obs.items():
-                # Token-indexed and row-indexed fields share leading
-                # (T, B) dims; flatten to (T*B, *tail).
-                flat[k] = v.reshape(TB, *v.shape[2:])
-            for mod in _native_to_dequant:
-                flat = mod(flat)
-            # Reshape back. Original native keys keep their (T, B, ...)
-            # shape; newly-added dequant keys go from (T*B, *) → (T, B, *).
-            out: dict[str, torch.Tensor] = {}
-            for k, v in flat.items():
-                if k in gpu_obs:
-                    out[k] = v.reshape(gpu_obs[k].shape)
-                else:
-                    out[k] = v.reshape(T, B, *v.shape[1:])
-            return out
-        # Flat (B, ...) layout — dequant in place.
-        for mod in _native_to_dequant:
-            gpu_obs = mod(gpu_obs)
-        return gpu_obs
-
-    if resume_state is not None:
-        next_plan = resume_state.next_episode
-        opt_steps = resume_state.opt_steps
-        total_rows = resume_state.total_rows
-        total_loss_t = torch.tensor(float(resume_state.total_loss), device=model.device)
-        if lane_hidden is not None:
-            for lane_idx, _cursor_start, cursor_hidden in resume_state.active_hiddens:
-                if 0 <= lane_idx < microbatch_target and cursor_hidden is not None:
-                    lane_hidden[lane_idx].copy_(cursor_hidden.to(model.device))
-
-    def _build_packed_plans() -> list[_PackedChunkPlan]:
-        lane_lengths = [0] * microbatch_target
-        lane_items: list[list[_LaneItem]] = [[] for _ in range(microbatch_target)]
-        lane_heap = [(0, idx) for idx in range(microbatch_target)]
-        heapq.heapify(lane_heap)
-        for cursor in ordered_cursors:
-            if cursor.episode.n_samples <= 0:
-                continue
-            lane_length, lane = heapq.heappop(lane_heap)
-            item = _LaneItem(cursor=cursor, lane=lane, lane_start=lane_length)
-            lane_items[lane].append(item)
-            lane_lengths[lane] = lane_length + cursor.episode.n_samples
-            heapq.heappush(lane_heap, (lane_lengths[lane], lane))
-
-        total_length = max(lane_lengths, default=0)
-        n_chunks = (total_length + chunk_size - 1) // chunk_size
-        chunk_slices: list[list[_PackedSlice]] = [[] for _ in range(n_chunks)]
-        chunk_rows = [0] * n_chunks
-        for lane in range(microbatch_target):
-            for item in lane_items[lane]:
-                item_start = item.lane_start
-                item_end = item_start + item.cursor.episode.n_samples
-                first_chunk = item_start // chunk_size
-                last_chunk = (item_end - 1) // chunk_size
-                for chunk_idx in range(first_chunk, last_chunk + 1):
-                    chunk_start = chunk_idx * chunk_size
-                    start = max(chunk_start, item_start)
-                    end = min(chunk_start + chunk_size, item_end)
-                    length = end - start
-                    chunk_rows[chunk_idx] += length
-                    chunk_slices[chunk_idx].append(_PackedSlice(
-                        item=item,
-                        src_start=start - item_start,
-                        dst_start=start - chunk_start,
-                        length=length,
-                        reset=start == item_start,
-                    ))
-
-        plans: list[_PackedChunkPlan] = []
-        for chunk_idx, valid_rows in enumerate(chunk_rows):
-            if valid_rows:
-                slices = tuple(chunk_slices[chunk_idx])
-                dst_indices = np.empty((valid_rows,), dtype=np.int64)
-                reset_indices: list[int] = []
-                cursor = 0
-                for sl in slices:
-                    base = sl.dst_start * microbatch_target + sl.item.lane
-                    end = cursor + sl.length
-                    dst_indices[cursor:end] = base + (
-                        np.arange(sl.length, dtype=np.int64) * microbatch_target
-                    )
-                    cursor = end
-                    if sl.reset:
-                        reset_indices.append(base)
-                plans.append(_PackedChunkPlan(
-                    slices=slices,
-                    length=chunk_size,
-                    batch_size=microbatch_target,
-                    valid_rows=valid_rows,
-                    active_lanes=len({sl.item.lane for sl in slices}),
-                    dst_indices=dst_indices,
-                    reset_indices=np.asarray(reset_indices, dtype=np.int64),
-                    compact_order=np.argsort(dst_indices, kind="stable"),
-                ))
-        return plans
-
-    packed_plans = _build_packed_plans()
-    if next_plan >= len(packed_plans):
-        return _empty
-
-    # Streaming-pad config for token-indexed entity fields. Episodes
-    # stored in the native layout carry these as ``(total_tokens, ...)``
-    # mmap views plus a per-episode ``entity_indptr``; the per-batch
-    # buffer must still allocate the padded ``(L, B, n_max, ...)`` shape
-    # the EntityDequantizer + tokenizer downstream consume. The pad
-    # itself is run inside ``_prepare_prefetched_batch``.
-    from qnn.bc.train import (
-        _NATIVE_TOKEN_INDEXED_OBS_FIELDS as _TOK_FIELDS,
-        _ENTITY_TYPES_EMPTY_SENTINEL as _TOK_EMPTY,
-    )
-    from qnn.vocab import MAX_TOKEN_OBJECTS as _MAX_TOK
-    # Decision is per-load: a single load_precomputed call produces
-    # either all-unpadded (entity_indptr set) or all-padded episodes,
-    # never a mix. Inspect the first episode that has any obs to settle
-    # the buffer shape.
-    _streaming_pad = (
-        episodes[0].entity_indptr is not None
-        if episodes else False
-    )
-
-    def _padded_per_token_shape(key: str, arr: np.ndarray) -> tuple[int, ...]:
-        # Token-indexed unpadded: arr.shape == (total_tokens, *tail).
-        # Padded buffer needs (n_max, *tail).
-        if _streaming_pad and key in _TOK_FIELDS:
-            return (_MAX_TOK,) + tuple(arr.shape[1:])
-        return tuple(arr.shape[1:])
-
-    # Pinned slots: one per in-flight batch plus one being consumed.
-    # prefetch_depth batches can be staged at once.
-    num_prefetch_slots = max(2, prefetch_depth + 1) if use_prefetch else 2
-    obs_buffer_slots = []
-    for _slot_i in range(num_prefetch_slots):
-        slot = {
-            key: torch.empty(
-                (chunk_size, microbatch_target,
-                 *_padded_per_token_shape(key, episodes[0].obs[key])),
-                dtype=torch.from_numpy(np.empty((), dtype=episodes[0].obs[key].dtype)).dtype,
-                pin_memory=use_pinned_host,
-            )
-            for key in episodes[0].obs
-        }
-        obs_buffer_slots.append(slot)
-    action_buffer_slots = []
-    for _ in range(num_prefetch_slots):
-        slot = {
-            head: torch.empty(
-                (chunk_size, microbatch_target, *episodes[0].actions[head].shape[1:]),
-                dtype=torch.from_numpy(np.empty((), dtype=episodes[0].actions[head].dtype)).dtype,
-                pin_memory=use_pinned_host,
-            )
-            for head in action_names
-        }
-        action_buffer_slots.append(slot)
-    mask_buffer_slots = [
-        {
-            "valid_mask": torch.empty((chunk_size, microbatch_target), dtype=torch.bool, pin_memory=use_pinned_host),
-            "reset_mask": torch.empty((chunk_size, microbatch_target), dtype=torch.bool, pin_memory=use_pinned_host),
-        }
-        for _ in range(num_prefetch_slots)
-    ]
-
-    def _prepare_prefetched_batch(slot_idx: int, plan: _PackedChunkPlan) -> _PreparedChunkBatch:
-        for slot in obs_buffer_slots[slot_idx].values():
-            slot.zero_()
-        for slot in action_buffer_slots[slot_idx].values():
-            slot.zero_()
-        masks = mask_buffer_slots[slot_idx]
-        masks["valid_mask"].zero_()
-        masks["reset_mask"].zero_()
-        dst_index = torch.from_numpy(plan.dst_indices)
-
-        # Streaming-pad precompute: per slice, capture the token-axis
-        # gather plan (row_starts into the episode's unpadded flat
-        # array + the valid mask) so each token-indexed key reuses the
-        # same indices across all 20 keys.
-        slice_pad_plans: list[tuple[np.ndarray, np.ndarray] | None] = []
-        if _streaming_pad:
-            slots_v = np.arange(_MAX_TOK, dtype=np.int64)
-            for sl in plan.slices:
-                ep = sl.item.cursor.episode
-                if ep.entity_indptr is None:
-                    slice_pad_plans.append(None)
-                    continue
-                rs = sl.src_start
-                re = sl.src_start + sl.length
-                ip = ep.entity_indptr[rs:re + 1]
-                counts = (ip[1:] - ip[:-1]).astype(np.int64, copy=False)
-                counts_clamped = np.minimum(counts, _MAX_TOK)
-                valid = slots_v[None, :] < counts_clamped[:, None]
-                row_starts = ip[:-1].astype(np.int64, copy=False)
-                gather_idx = np.where(valid, row_starts[:, None] + slots_v[None, :], 0)
-                slice_pad_plans.append((gather_idx, valid))
-
-        obs_batch: dict[str, torch.Tensor] = {}
-        for key in episodes[0].obs:
-            dst = obs_buffer_slots[slot_idx][key][:plan.length, :plan.batch_size]
-            is_token = _streaming_pad and key in _TOK_FIELDS
-            if is_token:
-                # entity_types drives the EntityDequantizer's per-slot
-                # mask (mask_actor = entity_types == TOKEN_ACTOR), so it
-                # MUST carry the -1 sentinel for invalid slots. Every
-                # other token-indexed field is gated by that mask on
-                # the GPU side — invalid-slot garbage gets overwritten
-                # with zero by torch.where. So we skip the per-key
-                # np.where mask for non-entity_types fields and just
-                # let flat[gather_idx] populate the buffer.
-                needs_mask = (key == "entity_types")
-                fill = _TOK_EMPTY if needs_mask else 0
-                chunks = []
-                for sl, pad_plan in zip(plan.slices, slice_pad_plans):
-                    ep = sl.item.cursor.episode
-                    flat = np.asarray(ep.obs[key])
-                    if pad_plan is None:
-                        chunks.append(flat[sl.src_start:sl.src_start + sl.length])
-                        continue
-                    gather_idx, valid = pad_plan
-                    if flat.shape[0] == 0:
-                        block = np.full((sl.length, _MAX_TOK) + flat.shape[1:], fill, dtype=flat.dtype)
-                    elif needs_mask:
-                        padded = flat[gather_idx]
-                        if padded.ndim > 2:
-                            mask = valid.reshape(valid.shape + (1,) * (padded.ndim - 2))
-                        else:
-                            mask = valid
-                        block = np.where(mask, padded, np.asarray(fill, dtype=padded.dtype))
-                    else:
-                        # Garbage at invalid slots is acceptable — the
-                        # EntityDequantizer's per-type torch.where on
-                        # GPU overwrites with the scalars buffer's
-                        # zero-init for non-actor / non-emit slots.
-                        block = flat[gather_idx]
-                    chunks.append(block)
-            else:
-                chunks = [
-                    np.asarray(sl.item.cursor.episode.obs[key][sl.src_start:sl.src_start + sl.length])
-                    for sl in plan.slices
-                ]
-            if chunks:
-                src = chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
-                flat_dst = dst.reshape(plan.length * plan.batch_size, *dst.shape[2:])
-                flat_dst.index_copy_(0, dst_index, torch.from_numpy(src))
-            if not is_token:
-                for sl in plan.slices:
-                    arr = sl.item.cursor.episode.obs[key]
-                    _maybe_advise_range(arr, sl.item.cursor.advised_obs, key, sl.src_start + sl.length, fd_cache)
-            obs_batch[key] = dst
-        act_batch: dict[str, torch.Tensor] = {}
-        for head in action_names:
-            dst = action_buffer_slots[slot_idx][head][:plan.length, :plan.batch_size]
-            chunks = [
-                np.asarray(sl.item.cursor.episode.actions[head][sl.src_start:sl.src_start + sl.length])
-                for sl in plan.slices
-            ]
-            if chunks:
-                src = chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
-                flat_dst = dst.reshape(plan.length * plan.batch_size, *dst.shape[2:])
-                flat_dst.index_copy_(0, dst_index, torch.from_numpy(src))
-            for sl in plan.slices:
-                arr = sl.item.cursor.episode.actions[head]
-                _maybe_advise_range(arr, sl.item.cursor.advised_act, head, sl.src_start + sl.length, fd_cache)
-            act_batch[head] = dst
-        flat_valid = masks["valid_mask"].reshape(plan.length * plan.batch_size)
-        flat_valid.index_fill_(0, dst_index, True)
-        if plan.reset_indices.size:
-            flat_reset = masks["reset_mask"].reshape(plan.length * plan.batch_size)
-            flat_reset.index_fill_(0, torch.from_numpy(plan.reset_indices), True)
-        return _PreparedChunkBatch(
-            plan=plan,
-            obs=obs_batch,
-            actions=act_batch,
-            masks={key: value[:plan.length, :plan.batch_size] for key, value in masks.items()},
-        )
-
-    def _accumulate_sum(dct: Dict[str, torch.Tensor], key: str, val: torch.Tensor) -> None:
-        v = val.detach()
-        if key in dct:
-            dct[key].add_(v)
-        else:
-            dct[key] = v.clone()
-
-    def _accumulate_weighted(dct: Dict[str, torch.Tensor], key: str, val: torch.Tensor, rows: int) -> None:
-        v = val.detach() * rows
-        if key in dct:
-            dct[key].add_(v)
-        else:
-            dct[key] = v.clone()
-
-    def _record_metrics(metrics: Dict[str, Any], rows: int) -> None:
-        nonlocal total_rows, total_metric_rows, total_loss_t, total_accuracy_t
-        total_rows += rows
-        loss_t = metrics["loss"].detach()
-        if total_loss_t is None:
-            total_loss_t = torch.zeros_like(loss_t)
-        total_loss_t.add_(loss_t * rows)
-        has_sampled_metrics = any(k.startswith(_AVERAGED_METRIC_PREFIXES) for k in metrics)
-        if not has_sampled_metrics:
-            return
-        total_metric_rows += rows
-        acc_t = metrics["accuracy"].detach() if isinstance(metrics["accuracy"], torch.Tensor) else torch.tensor(float(metrics["accuracy"]), device=loss_t.device)
-        if total_accuracy_t is None:
-            total_accuracy_t = torch.zeros_like(acc_t)
-        total_accuracy_t.add_(acc_t * rows)
-        for key, val in metrics.items():
-            if key in {"loss", "accuracy", "_next_hidden"}:
-                continue
-            if not isinstance(val, torch.Tensor):
-                continue
-            if key.startswith(_RAW_SUM_METRIC_PREFIXES):
-                _accumulate_sum(raw_metric_totals_t, key, val)
-            elif key.startswith(_AVERAGED_METRIC_PREFIXES):
-                _accumulate_weighted(averaged_metric_totals_t, key, val, rows)
-
-    def _maybe_step_optimizer(metrics: Dict[str, Any], rows: int, chunk_units: float, plan_index: int) -> None:
-        nonlocal accum_count, opt_steps, _report_rows, _report_metric_rows, _report_loss_t, _last_save_time, _last_report_time
-        nonlocal grad_norm_sum_t, grad_norm_max_t, grad_norm_n
-        accum_count += chunk_units
-        if not training or accum_count < accum_target:
-            return
-        if max_grad_norm > 0:
-            # Keep the returned norm on-GPU — syncing it (float/.item) every
-            # opt step drains the dispatch queue and starves the backward.
-            _gn = torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_grad_norm).detach()
-            if grad_norm_sum_t is None:
-                grad_norm_sum_t = torch.zeros_like(_gn)
-                grad_norm_max_t = torch.zeros_like(_gn)
-            grad_norm_sum_t.add_(_gn)
-            torch.maximum(grad_norm_max_t, _gn, out=grad_norm_max_t)
-            grad_norm_n += 1
-        model.bc_step()
-        model.bc_zero_grad()
-        accum_count = 0.0
-        opt_steps += 1
-
-        # Mid-epoch state save at optimizer-step boundaries.
-        # snapshot_interval is in seconds (wall clock).
-        if save_state_callback and snapshot_interval > 0:
-            _now = _time.monotonic()
-            if _now - _last_save_time >= snapshot_interval:
-                _last_save_time = _now
-                active_hiddens = [
-                    (lane_idx, 0, lane_hidden[lane_idx].clone())
-                    for lane_idx in range(microbatch_target)
-                    if lane_hidden is not None
-                ]
-                # One sync for snapshot persistence — every 15s by default.
-                total_loss_float = float(total_loss_t.item()) if total_loss_t is not None else 0.0
-                save_state_callback(MidEpochState(
-                    next_episode=plan_index + 1,
-                    opt_steps=opt_steps,
-                    active_hiddens=active_hiddens,
-                    total_rows=total_rows,
-                    total_loss=total_loss_float,
-                    ep_order=ep_order,
-                ))
-
-        if step_callback and report_every > 0:
-            _report_rows += rows
-            loss_t = metrics["loss"].detach()
-            if _report_loss_t is None:
-                _report_loss_t = torch.zeros_like(loss_t)
-            _report_loss_t.add_(loss_t * rows)
-            has_sampled_metrics = any(k.startswith(_AVERAGED_METRIC_PREFIXES) for k in metrics)
-            if has_sampled_metrics:
-                _report_metric_rows += rows
-                for key, val in metrics.items():
-                    if not isinstance(val, torch.Tensor):
-                        continue
-                    if key.startswith(_AVERAGED_METRIC_PREFIXES):
-                        _accumulate_weighted(_report_avg_totals_t, key, val, rows)
-                    elif key.startswith(_RAW_SUM_METRIC_PREFIXES):
-                        _accumulate_sum(_report_raw_totals_t, key, val)
-
-            # Gate sync on BOTH step count and wall-clock interval — lets us
-            # keep accumulating on GPU without paying for a sync every step.
-            step_ready = opt_steps % report_every == 0
-            time_ready = (report_interval_seconds <= 0) or (_time.monotonic() - _last_report_time >= report_interval_seconds)
-            if step_ready and time_ready:
-                _last_report_time = _time.monotonic()
-                rd = max(_report_rows, 1)
-                md = max(_report_metric_rows, 1)
-                # Single GPU→CPU sync for all report metrics.
-                pending: Dict[str, torch.Tensor] = {"loss": _report_loss_t}
-                pending.update({k: v for k, v in _report_avg_totals_t.items()})
-                pending.update({k: v for k, v in _report_raw_totals_t.items()})
-                synced = _flush_tensor_dict(pending)
-                step_metrics: Dict[str, Any] = {"n_rows": float(_report_rows), "opt_step": opt_steps}
-                step_metrics["loss"] = synced["loss"] / rd
-                for key in _report_avg_totals_t:
-                    step_metrics[key] = synced[key] / md
-                for key in _report_raw_totals_t:
-                    step_metrics[key] = synced[key]
-                step_callback(step_metrics)
-                _report_rows = 0
-                _report_metric_rows = 0
-                _report_loss_t = None
-                _report_avg_totals_t.clear()
-                _report_raw_totals_t.clear()
-
-    def _apply_prepared_batch(prepared: _PreparedChunkBatch, plan_index: int) -> None:
-        nonlocal lane_hidden
-        plan = prepared.plan
-        hidden_batch = lane_hidden
-        # Transfer pinned-host obs/actions/masks to GPU and dequantize
-        # native fields in one pass. The dequant must run after the H→D
-        # copy because Tokenizer / heads read the legacy keys directly
-        # (e.g. ``self_scalars`` in qnn.bc.heads.fire_token.forward) and
-        # would otherwise see only the native uint8 / int16 inputs.
-        gpu_obs = _move_and_dequant(prepared.obs)
-        gpu_actions = {
-            k: v.to(model.device, non_blocking=True) for k, v in prepared.actions.items()
-        }
-        gpu_masks = {
-            k: v.to(model.device, non_blocking=True) for k, v in prepared.masks.items()
-        }
-        # Sample full metrics once per report window during training — the
-        # rest of the time we skip MAE/stat computation entirely to keep the
-        # GPU dispatch queue deep and utilization high.  For eval we always
-        # compute because val-epoch metrics are the output.
-        if training:
-            now = _time.monotonic()
-            sample = (report_interval_seconds <= 0) or (now - _last_report_time >= report_interval_seconds)
-            metrics = model.supervised_step(
-                gpu_obs,
-                gpu_actions,
-                class_weights,
-                lr=lr,
-                hidden=hidden_batch,
-                masks=gpu_masks,
-                accumulate_only=True,
-                head_loss_weights=head_loss_weights,
-                loss_scale=float(plan.active_lanes),
-                compute_metrics=sample,
-            )
-        else:
-            metrics = model.evaluate_supervised(
-                gpu_obs,
-                gpu_actions,
-                hidden=hidden_batch,
-                masks=gpu_masks,
-                head_loss_weights=head_loss_weights,
-            )
-
-        next_hidden = metrics.pop("_next_hidden", None)
-        if next_hidden is not None and lane_hidden is not None:
-            lane_hidden.copy_(next_hidden.detach())
-
-        rows = plan.valid_rows
-        _record_metrics(metrics, rows)
-        _maybe_step_optimizer(metrics, rows, float(plan.active_lanes), plan_index)
-
-    try:
-        if use_prefetch:
-            # N-ahead prefetch pipeline. Plans are already deterministic; the
-            # worker only copies fixed ranges into fixed slots.
-            with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
-                pending: deque[tuple[int, Future[_PreparedChunkBatch]]] = deque()
-                slot_counter = 0
-                submit_idx = next_plan
-
-                # Prime the pipeline with up to prefetch_depth plans.
-                while len(pending) < prefetch_depth and submit_idx < len(packed_plans):
-                    slot = slot_counter % num_prefetch_slots
-                    slot_counter += 1
-                    pending.append((
-                        submit_idx,
-                        prefetch_executor.submit(_prepare_prefetched_batch, slot, packed_plans[submit_idx]),
-                    ))
-                    submit_idx += 1
-
-                while pending:
-                    plan_idx, future = pending.popleft()
-                    # Profiling: time wait + apply, but only AFTER skipping
-                    # warmup steps (page faults, JIT, cache cold). Skip is
-                    # measured in optimizer steps observed so far.
-                    _measure = _prof_active and (_prof_seen >= _profile_skip_target) and (_prof_n < _profile_steps_target)
-                    if _measure:
-                        _t0 = _time.monotonic()
-                        prepared = future.result()
-                        _prof_t_wait += _time.monotonic() - _t0
-                    else:
-                        prepared = future.result()
-                    # Top up before applying so the loader stays busy while
-                    # the main thread runs forward+backward on GPU.
-                    if len(pending) < prefetch_depth and submit_idx < len(packed_plans):
-                        slot = slot_counter % num_prefetch_slots
-                        slot_counter += 1
-                        pending.append((
-                            submit_idx,
-                            prefetch_executor.submit(_prepare_prefetched_batch, slot, packed_plans[submit_idx]),
-                        ))
-                        submit_idx += 1
-
-                    if _measure:
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        _t0 = _time.monotonic()
-                        _apply_prepared_batch(prepared, plan_idx)
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        _prof_t_apply += _time.monotonic() - _t0
-                        if _prof_n == 0:
-                            _prof_window_start = _t0  # wall start of measured window
-                        _prof_n += 1
-                        if _prof_n == _profile_steps_target:
-                            _total = _time.monotonic() - _prof_window_start
-                            print(
-                                f"  [bc] step timing (n={_prof_n} after {_profile_skip_target} warmup steps): "
-                                f"wait_data={_prof_t_wait*1000/_prof_n:.3f}ms  "
-                                f"apply={_prof_t_apply*1000/_prof_n:.3f}ms  "
-                                f"wall_total={_total*1000/_prof_n:.3f}ms  "
-                                f"wait_frac={_prof_t_wait/_total*100:.1f}%  "
-                                f"apply_frac={_prof_t_apply/_total*100:.1f}%",
-                                flush=True,
-                            )
-                    else:
-                        _apply_prepared_batch(prepared, plan_idx)
-                    _prof_seen += 1
-        else:
-            for plan_idx in range(next_plan, len(packed_plans)):
-                prepared = _prepare_prefetched_batch(0, packed_plans[plan_idx])
-                _apply_prepared_batch(prepared, plan_idx)
-
-        if training and accum_count > 0:
-            if max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_grad_norm)
-            model.bc_step()
-            opt_steps += 1
-            accum_count = 0.0
-
-        denom = max(total_rows, 1)
-        metric_denom = max(total_metric_rows, 1)
-        # Single GPU→CPU sync at epoch end — everything that was accumulated on GPU.
-        pending: Dict[str, torch.Tensor] = {}
-        if total_loss_t is not None:
-            pending["loss"] = total_loss_t
-        if total_accuracy_t is not None:
-            pending["accuracy"] = total_accuracy_t
-        pending.update(raw_metric_totals_t)
-        pending.update(averaged_metric_totals_t)
-        if grad_norm_sum_t is not None:
-            pending["__grad_norm_sum"] = grad_norm_sum_t
-            pending["__grad_norm_max"] = grad_norm_max_t
-        synced = _flush_tensor_dict(pending)
-        result: Dict[str, float] = {
-            "loss": synced.get("loss", 0.0) / denom,
-            "accuracy": synced.get("accuracy", 0.0) / metric_denom,
-            "n_rows": float(total_rows),
-            "opt_steps": float(opt_steps),
-        }
-        for key in raw_metric_totals_t:
-            result[key] = synced[key]
-        for key in averaged_metric_totals_t:
-            result[key] = synced[key] / metric_denom
-        if grad_norm_n > 0:
-            result["grad_norm_mean"] = synced["__grad_norm_sum"] / grad_norm_n
-            result["grad_norm_max"] = synced["__grad_norm_max"]
-        _apply_stable_epoch_metrics(result)
-        return result
-    finally:
-        for cursor in ordered_cursors:
-            _flush_cursor_advise(cursor, fd_cache)
-        for fd in fd_cache.values():
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-# ── GPU-resident fast path ───────────────────────────────────────
-#
-# Bypasses the prefetch + lane-packing pipeline above. Used when
-# preload_to_gpu=true is set in machine.json AND the model has no
-# recurrence. Concatenates every episode's obs/action arrays into
-# per-key GPU tensors once at startup, then each epoch loops over
-# shuffled frame indices with index_select — no CPU collate, no
-# host→device copy per batch. Produces the same metric dict shape
-# as ``_run_batched`` so downstream history/checkpoint code is
-# unchanged.
-
-
-def preload_episodes_to_gpu(
-    episodes: Sequence["PrecomputedEpisode"],
     device: torch.device,
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Concatenate all episodes' obs and action arrays onto ``device``.
+) -> ResidentSource:
+    """Build a device-resident :class:`Source` from precomputed episodes.
 
-    Returns ``(gpu_obs, gpu_actions)`` where each dict's tensors are
-    contiguous along frame axis 0. Per-key dtype is preserved from the
-    source npy arrays (already bf16/uint8/int8 in the cache).
-
-    Token-indexed obs fields need a ``(N_total_frames, MAX_TOKEN_OBJECTS,
-    ...)`` padded layout for the GPU-resident path. ``_load_precomputed``
-    produces sub-episodes that already view a single global per-key
-    buffer (post-filter rows / tokens, concatenated across all shards),
-    so we can pad once globally — one ``_pad_entity_batch`` call per
-    token-indexed key over the full corpus — instead of looping per
-    episode. For episodes that pre-date the global-buffer layout
-    (``entity_indptr is None``), the obs is already padded and the
-    per-episode path stays the same.
+    Concatenates per-key obs/action arrays onto ``device``, pads
+    token-indexed obs fields to ``MAX_TOKEN_OBJECTS`` once globally,
+    and pre-dequantizes legacy keys. Returns a :class:`ResidentSource`
+    with ``episode_offsets`` computed alongside.
     """
     if not episodes:
-        return {}, {}
+        return ResidentSource(
+            obs={}, actions={}, episodes=[],
+            episode_offsets=np.zeros(1, dtype=np.int64),
+            device=device,
+        )
     from qnn.vocab import MAX_TOKEN_OBJECTS as _MAX_TOKEN_OBJECTS
     from qnn.bc.train import (
         _NATIVE_TOKEN_INDEXED_OBS_FIELDS as _TOK_FIELDS,
@@ -1303,7 +523,7 @@ def preload_episodes_to_gpu(
     # float obs the policy / heads / target_labeler internals consume
     # (self_scalars, spatial_scalars, entity_scalars_raw, entity_ids,
     # plus the categorical id keys). Doing this ONCE at preload — vs.
-    # every batch in the Tokenizer — eliminates per-batch dequant
+    # every batch in the ObsEmbedding — eliminates per-batch dequant
     # latency and per-batch allocation churn.
     #
     # Trade-off: ~2× VRAM on the entity block (float32 vs native int)
@@ -1330,17 +550,17 @@ def preload_episodes_to_gpu(
     # convolution to a one-time precompute per episode and store the
     # per-frame distance alongside the binary target. The training
     # step does a pointwise weight = 1 - exp(-d²/(2σ²)) at the sampled
-    # frames (see qnn.bc.heads.loss_shaping.flat_distance_weight).
+    # frames (see qnn.bc.loss_shaping.flat_distance_weight).
     #
     # fire is a 0/1 byte; we read it directly.
     # jump-positive is derived from move (ud-axis == MOVE_CLASS_POS == 2);
     # we compute it on the fly per episode and store under a dedicated key
     # so policy.py can pick it up without touching MOVE_HEAD encoding.
-    from qnn.bc.heads.loss_shaping import per_frame_distance_to_pos
+    from qnn.bc.loss_shaping import per_frame_distance_to_pos
 
-    if "fire" in episodes[0].actions:
-        gpu_actions["fire_distance_to_pos"] = _concat_arrays([
-            per_frame_distance_to_pos(np.asarray(ep.actions["fire"]).reshape(-1))
+    if "attack" in episodes[0].actions:
+        gpu_actions["attack_distance_to_pos"] = _concat_arrays([
+            per_frame_distance_to_pos(np.asarray(ep.actions["attack"]).reshape(-1))
             for ep in episodes
         ])
     if "move" in episodes[0].actions:
@@ -1355,111 +575,495 @@ def preload_episodes_to_gpu(
             jump_pos_arrays.append(per_frame_distance_to_pos(jump_pos))
         gpu_actions["jump_distance_to_pos"] = _concat_arrays(jump_pos_arrays)
 
-    return gpu_obs, gpu_actions
+    offsets = np.empty(len(episodes) + 1, dtype=np.int64)
+    offsets[0] = 0
+    for i, ep in enumerate(episodes):
+        offsets[i + 1] = offsets[i] + ep.n_samples
+    return ResidentSource(
+        obs=gpu_obs,
+        actions=gpu_actions,
+        episodes=list(episodes),
+        episode_offsets=offsets,
+        device=device,
+    )
 
 
-def run_epoch_gpu_resident(
-    model: "QNNPolicy",
-    gpu_obs: dict[str, torch.Tensor],
-    gpu_actions: dict[str, torch.Tensor],
-    batch_size: int,
+class StreamingSource:
+    """Disk-streaming concrete :class:`Source`.
+
+    Holds open mmap views of shard files and reads only the rows each
+    batch needs. Token-indexed obs fields are padded per-batch via the
+    vectorized :func:`_pad_entity_batch` helper; legacy keys (``health``,
+    ``vel``, ``self_items`` family) are dequantized on-device per batch.
+    Per-frame distance arrays (used by distance-weighted BCE on fire/jump)
+    are precomputed once at construction and kept on device — cheap
+    (~30 MB each for an 8M-row corpus) and lets per-batch ``gather_actions``
+    stay a single ``index_select``.
+
+    Per-batch path (lane-packed batches → mostly-contiguous-per-shard
+    indices):
+      1. CPU: sort indices by (shard_idx, row_in_shard).
+      2. CPU: per shard, vectorized fancy-index of row-indexed obs +
+         vectorized token pad of token-indexed obs.
+      3. GPU: ``to(device)`` + dequant chain.
+    The shard-sort keeps mmap reads sequential per touched shard, so the
+    OS page cache stays effective.
+    """
+
+    def __init__(
+        self,
+        ll: Any,  # qnn.bc.streaming_source.StreamingSource (avoid import cycle in annotation)
+        device: torch.device,
+        *,
+        prefetch_depth: int = 4,
+        n_workers: int = 1,
+    ) -> None:
+        self._ll = ll
+        self.device = device
+        self.episodes: list[Any] = list(ll.episodes)
+        self.prefetch_depth = int(prefetch_depth)
+        self.n_workers = int(n_workers)
+
+        offsets = np.empty(len(self.episodes) + 1, dtype=np.int64)
+        offsets[0] = 0
+        for i, ep in enumerate(self.episodes):
+            offsets[i + 1] = offsets[i] + ep.n_samples
+        self.episode_offsets = offsets
+
+        # Pre-extract shard_idx + row_start per episode for vectorized lookup
+        # in _resolve_indices.
+        self._ep_shard_idx = np.array([ep.shard_idx for ep in self.episodes], dtype=np.int64)
+        self._ep_shard_row_start = np.array([ep.row_start for ep in self.episodes], dtype=np.int64)
+
+        if not self.episodes:
+            self._obs_keys: list[str] = []
+            self._tok_obs_keys: list[str] = []
+            self._row_obs_keys: list[str] = []
+            self._action_keys: list[str] = []
+            self._needs_dequant = False
+        else:
+            from qnn.bc.train import _NATIVE_TOKEN_INDEXED_OBS_FIELDS as _TOK_FIELDS
+            view = self._open_shard(int(self.episodes[0].shard_idx))
+            self._obs_keys = list(view.obs.keys())
+            self._tok_obs_keys = [k for k in self._obs_keys if k in _TOK_FIELDS]
+            self._row_obs_keys = [k for k in self._obs_keys if k not in _TOK_FIELDS]
+            self._action_keys = list(view.actions.keys())
+            self._needs_dequant = any(k in view.obs for k in ("health", "vel", "self_items"))
+        self._dequant_chain: tuple = ()
+
+        # Precompute per-frame distance arrays once at startup. These live
+        # on device and avoid per-batch convolution work.
+        self._attack_dist: torch.Tensor | None = None
+        self._jump_dist: torch.Tensor | None = None
+        if self.episodes:
+            self._precompute_distances()
+
+    def _open_shard(self, shard_idx: int):
+        """``open_shard`` wrapper that lazily unpacks the packed ``move`` byte.
+
+        The on-disk format stores ``move`` as a 1-D ``uint8`` array with the
+        FB/LR/UD axes plus the fire bit packed together. Training needs the
+        unpacked ``(T, 3)`` axis tensor and a separate ``fire`` byte; the
+        resident path's loader does this at shard import. For streaming, we
+        defer until first access — once per shard per thread, then cached
+        in the (mutable) ``ShardView``.
+        """
+        view = self._ll.open_shard(shard_idx)
+        if "move" in view.actions and "attack" not in view.actions:
+            move_raw = view.actions["move"]
+            if np.asarray(move_raw).ndim == 1:
+                from qnn.bc.train import _unpack_move_axes, _unpack_attack_bit
+                actions = dict(view.actions)
+                actions["move"] = _unpack_move_axes(move_raw)
+                actions["attack"] = _unpack_attack_bit(move_raw)
+                view.actions = actions
+        return view
+
+    def _precompute_distances(self) -> None:
+        from qnn.bc.loss_shaping import per_frame_distance_to_pos
+        has_fire = "attack" in self._action_keys
+        has_move = "move" in self._action_keys
+        if not (has_fire or has_move):
+            return
+        fire_parts: list[np.ndarray] = []
+        jump_parts: list[np.ndarray] = []
+        any_fire = False
+        any_move = False
+        for ep in self.episodes:
+            view = self._open_shard(int(ep.shard_idx))
+            row_lo = int(ep.row_start)
+            row_hi = int(ep.row_end)
+            if "attack" in view.actions:
+                any_fire = True
+                fire = np.asarray(view.actions["attack"][row_lo:row_hi]).reshape(-1)
+                fire_parts.append(per_frame_distance_to_pos(fire))
+            if "move" in view.actions:
+                any_move = True
+                move = np.asarray(view.actions["move"][row_lo:row_hi])
+                ud = move[..., 2] if move.ndim >= 2 else move
+                jump_pos = (ud == 2).astype(np.float32)
+                jump_parts.append(per_frame_distance_to_pos(jump_pos))
+        if any_fire:
+            self._attack_dist = torch.from_numpy(np.concatenate(fire_parts, axis=0)).to(self.device)
+        if any_move:
+            self._jump_dist = torch.from_numpy(np.concatenate(jump_parts, axis=0)).to(self.device)
+
+    def _ensure_dequant(self) -> None:
+        if not self._needs_dequant or self._dequant_chain:
+            return
+        from qnn.model.dequant import (
+            SelfDequantizer, SpatialDequantizer, EntityDequantizer,
+        )
+        self._dequant_chain = (
+            SelfDequantizer().to(self.device).eval(),
+            SpatialDequantizer().to(self.device).eval(),
+            EntityDequantizer().to(self.device).eval(),
+        )
+
+    @property
+    def n_total_rows(self) -> int:
+        return int(self.episode_offsets[-1])
+
+    def attack_pos_neg_counts(self) -> tuple[int, int]:
+        """One-pass scan of fire columns across shards. Returns ``(pos, neg)``.
+
+        Equivalent to iterating ``ep.actions["attack"]`` in the resident path
+        but reads directly from shard mmaps so streaming runs don't need to
+        materialize the host-side episode arrays.
+        """
+        pos = 0
+        neg = 0
+        for ep in self.episodes:
+            view = self._open_shard(int(ep.shard_idx))
+            lo, hi = int(ep.row_start), int(ep.row_end)
+            if "attack" in view.actions:
+                arr = np.asarray(view.actions["attack"][lo:hi]).reshape(-1)
+            elif "move" in view.actions:
+                from qnn.bc.train import _unpack_attack_bit
+                arr = _unpack_attack_bit(view.actions["move"][lo:hi]).reshape(-1)
+            else:
+                continue
+            p = int((arr > 0).sum())
+            pos += p
+            neg += int(arr.shape[0]) - p
+        return pos, neg
+
+    def _resolve_indices(self, indices_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Map global row indices to (shard, row_in_shard) and group by shard.
+
+        Returns ``(shards_uniq, group_starts, rows_sorted, dst_order)``:
+        ``rows_sorted`` is ``row_in_shard`` sorted by ``(shard_idx, row_in_shard)``
+        for sequential mmap reads; ``dst_order`` is the argsort permutation
+        back to original ordering.
+        """
+        ep_idx_per_row = np.searchsorted(self.episode_offsets[1:], indices_np, side="right")
+        shards_per_row = self._ep_shard_idx[ep_idx_per_row]
+        row_in_shard = (
+            self._ep_shard_row_start[ep_idx_per_row]
+            + (indices_np - self.episode_offsets[ep_idx_per_row])
+        )
+        sort_key = shards_per_row.astype(np.int64) * (np.int64(1) << 32) + row_in_shard
+        order = np.argsort(sort_key, kind="stable")
+        shards_sorted = shards_per_row[order]
+        rows_sorted = row_in_shard[order]
+        shards_uniq, group_starts = np.unique(shards_sorted, return_index=True)
+        group_starts = np.append(group_starts, len(indices_np))
+        return shards_uniq, group_starts, rows_sorted, order
+
+    def gather(self, indices: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Gather obs + actions for ``indices`` in one pass over the layout.
+
+        Resolves shard groups once (shared by obs and actions), then for each
+        touched shard does one fancy-index read per key. Token-indexed obs
+        are padded inline. Output keys for actions include the precomputed
+        ``attack_distance_to_pos`` / ``jump_distance_to_pos`` slices when those
+        signals were detected at construction.
+        """
+        indices_np = indices.detach().cpu().numpy().astype(np.int64, copy=False)
+        n_rows = len(indices_np)
+        if n_rows == 0:
+            return (
+                {k: torch.empty(0, device=self.device) for k in self._obs_keys},
+                {k: torch.empty(0, device=self.device) for k in self._action_keys},
+            )
+
+        from qnn.bc.train import (
+            _ENTITY_TYPES_EMPTY_SENTINEL as _TOK_EMPTY,
+        )
+        from qnn.vocab import MAX_TOKEN_OBJECTS as _MAX_TOK
+
+        shards_uniq, group_starts, rows_sorted, order = self._resolve_indices(indices_np)
+
+        obs_out: dict[str, np.ndarray] = {}
+        act_out: dict[str, np.ndarray] = {}
+        for gi in range(len(shards_uniq)):
+            shard_idx = int(shards_uniq[gi])
+            s, e = int(group_starts[gi]), int(group_starts[gi + 1])
+            shard_rows = rows_sorted[s:e]
+            dst_positions = order[s:e]
+            view = self._open_shard(shard_idx)
+            for key in self._row_obs_keys:
+                arr = view.obs[key]
+                if key not in obs_out:
+                    obs_out[key] = np.empty((n_rows, *arr.shape[1:]), dtype=arr.dtype)
+                obs_out[key][dst_positions] = arr[shard_rows]
+            if view.indptr is not None and self._tok_obs_keys:
+                tok_layout = self._token_layout(view.indptr, shard_rows, _MAX_TOK)
+                for key in self._tok_obs_keys:
+                    arr = view.obs[key]
+                    fill = _TOK_EMPTY if key == "entity_types" else 0
+                    if key not in obs_out:
+                        obs_out[key] = np.full((n_rows, _MAX_TOK, *arr.shape[1:]), fill, dtype=arr.dtype)
+                    obs_out[key][dst_positions] = self._pad_token_block(arr, tok_layout, view.token_keep, fill)
+            for key in self._action_keys:
+                arr = view.actions[key]
+                if key not in act_out:
+                    act_out[key] = np.empty((n_rows, *arr.shape[1:]), dtype=arr.dtype)
+                act_out[key][dst_positions] = arr[shard_rows]
+
+        obs_t = {k: self._to_device(v) for k, v in obs_out.items()}
+        act_t = {k: self._to_device(v) for k, v in act_out.items()}
+        self._ensure_dequant()
+        if self._dequant_chain:
+            with torch.no_grad():
+                for mod in self._dequant_chain:
+                    obs_t = mod(obs_t)
+        if self._attack_dist is not None:
+            act_t["attack_distance_to_pos"] = self._attack_dist.index_select(0, indices)
+        if self._jump_dist is not None:
+            act_t["jump_distance_to_pos"] = self._jump_dist.index_select(0, indices)
+        return obs_t, act_t
+
+    def _to_device(self, v: np.ndarray) -> torch.Tensor:
+        # uint16/uint32 don't have CPU index_copy_ in torch — upcast at the
+        # device-transfer boundary (cheap, only on the per-batch slice).
+        if v.dtype in (np.uint16, np.uint32):
+            v = v.astype(np.int32, copy=False)
+        return torch.from_numpy(v).to(self.device, non_blocking=True)
+
+    @staticmethod
+    def _token_layout(indptr: np.ndarray, shard_rows: np.ndarray, max_tok: int) -> tuple[np.ndarray, np.ndarray]:
+        """Shared ``gather_idx`` + ``valid`` mask for token-pad of these shard rows."""
+        rs = indptr[shard_rows].astype(np.int64, copy=False)
+        re = indptr[shard_rows + 1].astype(np.int64, copy=False)
+        counts = np.minimum(re - rs, max_tok).astype(np.int64, copy=False)
+        indices = np.arange(max_tok, dtype=np.int64)
+        valid = indices[None, :] < counts[:, None]
+        gather_idx = np.where(valid, rs[:, None] + indices[None, :], 0)
+        return gather_idx, valid
+
+    @staticmethod
+    def _pad_token_block(
+        flat: np.ndarray,
+        layout: tuple[np.ndarray, np.ndarray],
+        token_keep: np.ndarray | None,
+        fill: int,
+    ) -> np.ndarray:
+        gather_idx, valid = layout
+        if flat.shape[0] == 0:
+            return np.full((gather_idx.shape[0], gather_idx.shape[1], *flat.shape[1:]), fill, dtype=flat.dtype)
+        if token_keep is not None:
+            valid = valid & token_keep[gather_idx].astype(bool, copy=False)
+        padded = flat[gather_idx]
+        mask = valid.reshape(valid.shape + (1,) * (padded.ndim - 2)) if padded.ndim > 2 else valid
+        return np.where(mask, padded, np.asarray(fill, dtype=padded.dtype))
+
+    def release_device_tensors(self) -> None:
+        """Free device tensors held by this streaming source.
+
+        Mirrors :meth:`ResidentSource.release_device_tensors`. Called
+        between training and final-val to keep the unified-memory pool
+        from holding train-side state during a separate val pass.
+        """
+        self._attack_dist = None
+        self._jump_dist = None
+        self._dequant_chain = ()
+
+    def head(self, n_episodes: int) -> "StreamingSource":
+        """View of the first ``n_episodes`` episodes; shares shard mmaps,
+        dequant chain, and (truncated views of) precomputed distance arrays.
+        """
+        view = StreamingSource.__new__(StreamingSource)
+        view._ll = self._ll
+        view.device = self.device
+        view.episodes = list(self.episodes[:n_episodes])
+        view.prefetch_depth = self.prefetch_depth
+        view.n_workers = self.n_workers
+        view.episode_offsets = self.episode_offsets[:n_episodes + 1].copy()
+        view._ep_shard_idx = self._ep_shard_idx[:n_episodes]
+        view._ep_shard_row_start = self._ep_shard_row_start[:n_episodes]
+        view._obs_keys = self._obs_keys
+        view._tok_obs_keys = self._tok_obs_keys
+        view._row_obs_keys = self._row_obs_keys
+        view._action_keys = self._action_keys
+        view._needs_dequant = self._needs_dequant
+        view._dequant_chain = self._dequant_chain
+        n_rows_head = int(view.episode_offsets[-1])
+        view._attack_dist = self._attack_dist[:n_rows_head] if self._attack_dist is not None else None
+        view._jump_dist = self._jump_dist[:n_rows_head] if self._jump_dist is not None else None
+        return view
+
+
+def make_streaming_source(
+    cache_dir: Any,
+    device: torch.device,
     *,
+    segment_mask: dict | None = None,
+    token_mask: dict | None = None,
+    prefetch_depth: int = 4,
+    n_workers: int = 1,
+) -> StreamingSource:
+    """Build a :class:`StreamingSource` from a sharded BC cache directory."""
+    from qnn.bc.streaming_source import StreamingSource as _LowLevel
+    ll = _LowLevel.from_cache_dir(cache_dir, segment_mask=segment_mask, token_mask=token_mask)
+    return StreamingSource(ll, device, prefetch_depth=prefetch_depth, n_workers=n_workers)
+
+
+def parallel_prefetch_iter(
+    prep_gen: Iterable[Callable[[], Any]],
+    *,
+    n_workers: int,
+    depth: int,
+) -> Iterable[Any]:
+    """Run ``prep_gen`` callables in a thread pool; yield results in submission order.
+
+    The batcher generators yield zero-arg closures (``Callable[[], Batch]``).
+    This wraps the iteration so:
+      - up to ``depth`` callables are in-flight at once,
+      - ``n_workers`` threads share that in-flight set (so a slow gather
+        doesn't block faster ones from making progress),
+      - the consumer still sees Batches in original order.
+
+    On a streaming source this is where the win lives: while the GPU runs
+    forward+backward on batch N, ``n_workers`` threads are already running
+    the mmap-read + token-pad + H→D for batches N+1 through N+depth. Most
+    of that work releases the GIL (numpy + torch.from_numpy.to(device)),
+    so threading actually parallelizes.
+
+    Falls back to inline iteration when ``depth<=0`` or ``n_workers<=0``.
+    """
+    if depth <= 0 or n_workers <= 0:
+        for prep in prep_gen:
+            yield prep()
+        return
+
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=n_workers)
+    in_flight: deque = deque()
+
+    def _submit_next() -> bool:
+        try:
+            prep = next(prep_iter)
+        except StopIteration:
+            return False
+        in_flight.append(pool.submit(prep))
+        return True
+
+    prep_iter = iter(prep_gen)
+    try:
+        for _ in range(depth):
+            if not _submit_next():
+                break
+        while in_flight:
+            fut = in_flight.popleft()
+            try:
+                result = fut.result()
+            except BaseException:
+                # Cancel pending work and re-raise.
+                for f in in_flight:
+                    f.cancel()
+                raise
+            _submit_next()
+            yield result
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def train_on_batches(
+    model: "QNNPolicy",
+    batches: Iterable[Batch],
+    *,
+    training: bool,
     class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     lr: float | None = None,
-    rng: np.random.Generator | None = None,
     max_grad_norm: float = 1.0,
     head_loss_weights: Mapping[str, float] | None = None,
+    accum_target: float = 1.0,
+    initial: Mapping[str, Any] | None = None,
 ) -> Dict[str, float]:
-    """One epoch over GPU-resident tensors.
+    """Train or eval over an iterable of :class:`Batch` objects.
 
-    Equivalent semantics to ``_run_batched`` for memoryless models
-    (no GRU, ``sequence_length`` ignored). Caller picks training vs
-    eval by passing ``class_weights`` + ``lr`` or omitting both.
+    Data-source-agnostic: the caller owns where tensors live and how they
+    are ordered/sequenced. This function handles forward+backward, grad
+    clip, optimizer step (with optional accumulation), and metric
+    aggregation. ``initial`` may seed ``total_rows``/``total_loss``/
+    ``opt_steps`` for mid-epoch resume.
     """
-    if not gpu_obs:
-        return {"loss": 0.0, "accuracy": 0.0, "n_rows": 0.0}
-
-    training = class_weights is not None and lr is not None
-    if training:
-        model.model.train()
-    else:
-        model.model.eval()
-
-    # Shuffle frame indices for training; sequential for eval.
-    n_frames = int(next(iter(gpu_obs.values())).shape[0])
-    if training and rng is not None:
-        perm = rng.permutation(n_frames)
-        indices = torch.from_numpy(perm).to(model.device)
-    else:
-        indices = torch.arange(n_frames, device=model.device)
-
     import time as _time
+
+    model.model.train() if training else model.model.eval()
+    if training:
+        model.bc_zero_grad()
     _t_start = _time.monotonic()
 
-    bs = max(1, int(batch_size))
-    total_rows = 0
-    total_loss_t: torch.Tensor | None = None
+    total_rows = int(initial["total_rows"]) if initial and "total_rows" in initial else 0
+    opt_steps = int(initial["opt_steps"]) if initial and "opt_steps" in initial else 0
+    total_loss_t: torch.Tensor | None = (
+        torch.tensor(float(initial["total_loss"]), device=model.device)
+        if initial and "total_loss" in initial else None
+    )
     raw_sum_totals: Dict[str, torch.Tensor] = {}
     avg_totals: Dict[str, torch.Tensor] = {}
     metric_rows = 0
-    opt_steps = 0
+    accum_count = 0.0
     grad_norm_sum_t: torch.Tensor | None = None
     grad_norm_max_t: torch.Tensor | None = None
     grad_norm_n = 0
 
-    for start in range(0, n_frames, bs):
-        end = min(start + bs, n_frames)
-        idx = indices[start:end]
-        rows = end - start
-
-        batch_obs = {k: v.index_select(0, idx) for k, v in gpu_obs.items()}
-        batch_actions = {k: v.index_select(0, idx) for k, v in gpu_actions.items()}
-
+    for b in batches:
         if training:
             metrics = model.supervised_step(
-                batch_obs,
-                batch_actions,
-                class_weights,
-                lr=lr,
-                accumulate_only=True,
+                b.obs, b.actions, class_weights,
+                lr=lr, accumulate_only=True,
                 head_loss_weights=head_loss_weights,
-                loss_scale=1.0,
-                compute_metrics=True,
+                loss_scale=b.loss_scale,
+                hidden=b.hidden, masks=b.masks,
+                compute_metrics=b.compute_metrics,
             )
-            if max_grad_norm > 0:
-                _gn = torch.nn.utils.clip_grad_norm_(
-                    model.model.parameters(), max_grad_norm
-                ).detach()
-                if grad_norm_sum_t is None:
-                    grad_norm_sum_t = torch.zeros_like(_gn)
-                    grad_norm_max_t = torch.zeros_like(_gn)
-                grad_norm_sum_t.add_(_gn)
-                torch.maximum(grad_norm_max_t, _gn, out=grad_norm_max_t)
-                grad_norm_n += 1
-            model.bc_step()
-            model.bc_zero_grad()
-            opt_steps += 1
+            accum_count += b.loss_scale
+            stepped = accum_count >= accum_target
+            if stepped:
+                if max_grad_norm > 0:
+                    _gn = torch.nn.utils.clip_grad_norm_(
+                        model.model.parameters(), max_grad_norm
+                    ).detach()
+                    if grad_norm_sum_t is None:
+                        grad_norm_sum_t = torch.zeros_like(_gn)
+                        grad_norm_max_t = torch.zeros_like(_gn)
+                    grad_norm_sum_t.add_(_gn)
+                    torch.maximum(grad_norm_max_t, _gn, out=grad_norm_max_t)
+                    grad_norm_n += 1
+                model.bc_step()
+                model.bc_zero_grad()
+                opt_steps += 1
+                accum_count = 0.0
         else:
             metrics = model.evaluate_supervised(
-                batch_obs,
-                batch_actions,
+                b.obs, b.actions,
+                hidden=b.hidden, masks=b.masks,
                 head_loss_weights=head_loss_weights,
             )
+            stepped = False
 
-        # Aggregate loss (weighted by rows) on GPU.
         loss_t = metrics.get("loss")
         if isinstance(loss_t, torch.Tensor):
             if total_loss_t is None:
                 total_loss_t = torch.zeros_like(loss_t)
-            total_loss_t.add_(loss_t.detach() * rows)
+            total_loss_t.add_(loss_t.detach() * b.rows)
 
-        # Raw-sum prefixes (tp_/fp_/fn_/tn_/n_/correct_/...) — accumulate as-is.
-        # Averaged prefixes (acc_/f1_/precision_/recall_/loss_/cos_sim_/...) — weighted by rows.
         has_sampled = False
         for key, val in metrics.items():
-            if key in ("loss", "_next_hidden"):
-                continue
-            if not isinstance(val, torch.Tensor):
+            if key in ("loss", "_next_hidden") or not isinstance(val, torch.Tensor):
                 continue
             if key.startswith(_RAW_SUM_METRIC_PREFIXES):
                 if key not in raw_sum_totals:
@@ -1469,11 +1073,27 @@ def run_epoch_gpu_resident(
                 has_sampled = True
                 if key not in avg_totals:
                     avg_totals[key] = torch.zeros_like(val)
-                avg_totals[key].add_(val.detach() * rows)
+                avg_totals[key].add_(val.detach() * b.rows)
         if has_sampled:
-            metric_rows += rows
+            metric_rows += b.rows
+        total_rows += b.rows
 
-        total_rows += rows
+        if b.on_step is not None:
+            b.on_step(
+                metrics,
+                stepped=stepped,
+                opt_steps=opt_steps,
+                total_rows=total_rows,
+                total_loss=total_loss_t,
+            )
+
+    # Final partial-accumulation flush.
+    if training and accum_count > 0:
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_grad_norm)
+        model.bc_step()
+        model.bc_zero_grad()
+        opt_steps += 1
 
     elapsed = _time.monotonic() - _t_start
     denom = max(total_rows, 1)
@@ -1505,3 +1125,396 @@ def run_epoch_gpu_resident(
     result[rps_key] = total_rows / max(elapsed, 1e-9)
     _apply_stable_epoch_metrics(result)
     return result
+
+
+def build_packed_plans(
+    ordered_items: Sequence[tuple[int, PrecomputedEpisode]],
+    chunk_size: int,
+    n_lanes: int,
+) -> list[_PackedChunkPlan]:
+    """Bin-pack episodes into ``n_lanes`` lanes (shortest-lane heap),
+    then slice each lane into chunks of ``chunk_size`` rows.
+    """
+    lane_lengths = [0] * n_lanes
+    lane_items: list[list[_LaneItem]] = [[] for _ in range(n_lanes)]
+    lane_heap = [(0, idx) for idx in range(n_lanes)]
+    heapq.heapify(lane_heap)
+    for ep_idx, episode in ordered_items:
+        if episode.n_samples <= 0:
+            continue
+        lane_length, lane = heapq.heappop(lane_heap)
+        item = _LaneItem(ep_idx=ep_idx, episode=episode, lane=lane, lane_start=lane_length)
+        lane_items[lane].append(item)
+        lane_lengths[lane] = lane_length + episode.n_samples
+        heapq.heappush(lane_heap, (lane_lengths[lane], lane))
+
+    total_length = max(lane_lengths, default=0)
+    n_chunks = (total_length + chunk_size - 1) // chunk_size
+    chunk_slices: list[list[_PackedSlice]] = [[] for _ in range(n_chunks)]
+    chunk_rows = [0] * n_chunks
+    for lane in range(n_lanes):
+        for item in lane_items[lane]:
+            item_start = item.lane_start
+            item_end = item_start + item.episode.n_samples
+            first_chunk = item_start // chunk_size
+            last_chunk = (item_end - 1) // chunk_size
+            for chunk_idx in range(first_chunk, last_chunk + 1):
+                chunk_start = chunk_idx * chunk_size
+                start = max(chunk_start, item_start)
+                end = min(chunk_start + chunk_size, item_end)
+                length = end - start
+                chunk_rows[chunk_idx] += length
+                chunk_slices[chunk_idx].append(_PackedSlice(
+                    item=item,
+                    src_start=start - item_start,
+                    dst_start=start - chunk_start,
+                    length=length,
+                    reset=start == item_start,
+                ))
+
+    plans: list[_PackedChunkPlan] = []
+    for chunk_idx, valid_rows in enumerate(chunk_rows):
+        if not valid_rows:
+            continue
+        slices = tuple(chunk_slices[chunk_idx])
+        dst_indices = np.empty((valid_rows,), dtype=np.int64)
+        reset_indices: list[int] = []
+        cursor = 0
+        for sl in slices:
+            base = sl.dst_start * n_lanes + sl.item.lane
+            end = cursor + sl.length
+            dst_indices[cursor:end] = base + (
+                np.arange(sl.length, dtype=np.int64) * n_lanes
+            )
+            cursor = end
+            if sl.reset:
+                reset_indices.append(base)
+        plans.append(_PackedChunkPlan(
+            slices=slices,
+            length=chunk_size,
+            batch_size=n_lanes,
+            valid_rows=valid_rows,
+            active_lanes=len({sl.item.lane for sl in slices}),
+            dst_indices=dst_indices,
+            reset_indices=np.asarray(reset_indices, dtype=np.int64),
+        ))
+    return plans
+
+
+def frame_shuffled_batches(
+    source: Source,
+    *,
+    batch_size: int,
+    training: bool,
+    rng: np.random.Generator | None,
+) -> Iterable[Callable[[], Batch]]:
+    """Yield zero-arg closures that produce shuffled-frame batches.
+
+    Yielding closures (not Batches) lets :func:`parallel_prefetch_iter`
+    schedule them across multiple worker threads so gather work overlaps
+    with the GPU step.
+    """
+    n_frames = source.n_total_rows
+    if training and rng is not None:
+        indices = torch.from_numpy(rng.permutation(n_frames)).to(source.device)
+    else:
+        indices = torch.arange(n_frames, device=source.device)
+    bs = max(1, int(batch_size))
+
+    def _prep(idx: torch.Tensor) -> Batch:
+        obs, actions = source.gather(idx)
+        return Batch(obs=obs, actions=actions, rows=int(idx.shape[0]))
+
+    for start in range(0, n_frames, bs):
+        idx = indices[start:start + bs]
+        yield lambda idx=idx: _prep(idx)
+
+
+def lane_packed_batches(
+    model: "QNNPolicy",
+    source: Source,
+    *,
+    chunk_size: int,
+    batch_size: int,
+    training: bool,
+    rng: np.random.Generator | None,
+    save_state_callback: Any = None,
+    snapshot_interval: int = 0,
+    step_callback: Any = None,
+    report_every: int = 0,
+    report_interval_seconds: float = 0.0,
+    resume_state: "MidEpochState | None" = None,
+) -> tuple[Iterable[Batch], "Mapping[str, Any] | None", float, int]:
+    """Yield lane-packed sequence batches with per-batch hidden propagation.
+
+    ``batch_size`` here means the number of **parallel lanes** (independent
+    sequences) per gradient step — the recurrent analog of the per-step
+    sample count in non-recurrent training. Each lane unrolls ``chunk_size``
+    timesteps before backward.
+
+    Returns ``(iterable, initial, accum_target, next_plan)``: the trainer
+    consumes the iterable and uses ``initial`` to seed its accumulators on
+    mid-epoch resume; ``accum_target`` is the gradient-accumulation target
+    (active_lanes summed across batches); ``next_plan`` is unused externally
+    and returned for diagnostics.
+    """
+    import time as _time
+
+    device = source.device
+    episodes = source.episodes
+    n_lanes = max(1, int(batch_size))
+    chunk_size = max(1, int(chunk_size))
+
+    if resume_state is not None and resume_state.ep_order is not None:
+        ep_order = [int(i) for i in resume_state.ep_order]
+    else:
+        ep_order = sorted(range(len(episodes)), key=lambda idx: episodes[idx].sort_key)
+        if rng is not None:
+            ep_order = [ep_order[int(i)] for i in rng.permutation(len(ep_order))]
+        ep_order = _apply_global_length_bucketing(ep_order, episodes)
+
+    ordered_items = [(idx, episodes[idx]) for idx in ep_order]
+    plans = build_packed_plans(ordered_items, chunk_size, n_lanes)
+    for p in plans:
+        p.dst_indices_d = torch.from_numpy(p.dst_indices).to(device)
+        if p.reset_indices.size:
+            p.reset_indices_d = torch.from_numpy(p.reset_indices).to(device)
+
+    next_plan = 0
+    initial: Mapping[str, Any] | None = None
+    if resume_state is not None:
+        next_plan = int(resume_state.next_episode)
+        initial = {
+            "opt_steps": resume_state.opt_steps,
+            "total_rows": resume_state.total_rows,
+            "total_loss": resume_state.total_loss,
+        }
+
+    lane_hidden = (
+        torch.zeros((n_lanes, model.gru_hidden), dtype=torch.float32, device=device)
+        if model.use_gru else None
+    )
+    if resume_state is not None and lane_hidden is not None:
+        for lane_idx, _cs, ch in resume_state.active_hiddens:
+            if 0 <= lane_idx < n_lanes and ch is not None:
+                lane_hidden[lane_idx].copy_(ch.to(device))
+
+    offsets = source.episode_offsets
+    _last_save_time = _time.monotonic()
+    _last_report_time = _time.monotonic() - max(float(report_interval_seconds), 0.0)
+    _report: Dict[str, Any] = {
+        "rows": 0, "metric_rows": 0, "loss_t": None, "avg": {}, "raw": {},
+    }
+
+    def _gather_plan(plan: _PackedChunkPlan):
+        flat_src = np.empty((plan.valid_rows,), dtype=np.int64)
+        cursor = 0
+        for sl in plan.slices:
+            base = int(offsets[sl.item.ep_idx]) + sl.src_start
+            flat_src[cursor:cursor + sl.length] = np.arange(base, base + sl.length, dtype=np.int64)
+            cursor += sl.length
+        src_idx = torch.from_numpy(flat_src).to(device)
+        dst_idx = plan.dst_indices_d  # pre-staged on device at plan-build time
+        T = plan.length
+        B = plan.batch_size
+        TB = T * B
+
+        gathered_obs, gathered_acts = source.gather(src_idx)
+        obs_batch: dict[str, torch.Tensor] = {}
+        for k, v in gathered_obs.items():
+            buf = torch.zeros((TB, *v.shape[1:]), dtype=v.dtype, device=device)
+            buf.index_copy_(0, dst_idx, v)
+            obs_batch[k] = buf.reshape(T, B, *v.shape[1:])
+        act_batch: dict[str, torch.Tensor] = {}
+        for k, v in gathered_acts.items():
+            buf = torch.zeros((TB, *v.shape[1:]), dtype=v.dtype, device=device)
+            buf.index_copy_(0, dst_idx, v)
+            act_batch[k] = buf.reshape(T, B, *v.shape[1:])
+
+        valid_flat = torch.zeros(TB, dtype=torch.bool, device=device)
+        valid_flat.index_fill_(0, dst_idx, True)
+        reset_flat = torch.zeros(TB, dtype=torch.bool, device=device)
+        if plan.reset_indices_d is not None:
+            reset_flat.index_fill_(0, plan.reset_indices_d, True)
+        return obs_batch, act_batch, {
+            "valid_mask": valid_flat.reshape(T, B),
+            "reset_mask": reset_flat.reshape(T, B),
+        }
+
+    def _make_batch(plan: _PackedChunkPlan, plan_idx: int) -> Batch:
+        obs_b, act_b, masks = _gather_plan(plan)
+        if training:
+            sample = (report_interval_seconds <= 0) or (
+                _time.monotonic() - _last_report_time >= report_interval_seconds
+            )
+        else:
+            sample = True
+
+        def _on_step(metrics, *, stepped, opt_steps, total_rows, total_loss):
+            nonlocal _last_save_time, _last_report_time
+            nh = metrics.pop("_next_hidden", None)
+            if nh is not None and lane_hidden is not None:
+                lane_hidden.copy_(nh.detach())
+            if not stepped:
+                return
+            if save_state_callback and snapshot_interval > 0:
+                now = _time.monotonic()
+                if now - _last_save_time >= snapshot_interval:
+                    _last_save_time = now
+                    active_hiddens = [
+                        (lane_idx, 0, lane_hidden[lane_idx].clone())
+                        for lane_idx in range(n_lanes)
+                        if lane_hidden is not None
+                    ]
+                    total_loss_val = float(total_loss.item()) if isinstance(total_loss, torch.Tensor) else 0.0
+                    save_state_callback(MidEpochState(
+                        next_episode=plan_idx + 1,
+                        opt_steps=opt_steps,
+                        active_hiddens=active_hiddens,
+                        total_rows=total_rows,
+                        total_loss=total_loss_val,
+                        ep_order=ep_order,
+                    ))
+            if step_callback and report_every > 0:
+                _report["rows"] += plan.valid_rows
+                loss_t = metrics["loss"].detach()
+                if _report["loss_t"] is None:
+                    _report["loss_t"] = torch.zeros_like(loss_t)
+                _report["loss_t"].add_(loss_t * plan.valid_rows)
+                has_sampled = any(k.startswith(_AVERAGED_METRIC_PREFIXES) for k in metrics)
+                if has_sampled:
+                    _report["metric_rows"] += plan.valid_rows
+                    for key, val in metrics.items():
+                        if not isinstance(val, torch.Tensor):
+                            continue
+                        if key.startswith(_AVERAGED_METRIC_PREFIXES):
+                            if key not in _report["avg"]:
+                                _report["avg"][key] = torch.zeros_like(val)
+                            _report["avg"][key].add_(val.detach() * plan.valid_rows)
+                        elif key.startswith(_RAW_SUM_METRIC_PREFIXES):
+                            if key not in _report["raw"]:
+                                _report["raw"][key] = val.detach().clone()
+                            else:
+                                _report["raw"][key].add_(val.detach())
+                step_ready = opt_steps % report_every == 0
+                time_ready = (report_interval_seconds <= 0) or (
+                    _time.monotonic() - _last_report_time >= report_interval_seconds
+                )
+                if step_ready and time_ready:
+                    _last_report_time = _time.monotonic()
+                    rd = max(_report["rows"], 1)
+                    md = max(_report["metric_rows"], 1)
+                    pending: Dict[str, torch.Tensor] = {"loss": _report["loss_t"]}
+                    pending.update(_report["avg"])
+                    pending.update(_report["raw"])
+                    synced = _flush_tensor_dict(pending)
+                    step_metrics: Dict[str, Any] = {
+                        "n_rows": float(_report["rows"]),
+                        "opt_step": opt_steps,
+                        "loss": synced["loss"] / rd,
+                    }
+                    for key in _report["avg"]:
+                        step_metrics[key] = synced[key] / md
+                    for key in _report["raw"]:
+                        step_metrics[key] = synced[key]
+                    step_callback(step_metrics)
+                    _report["rows"] = 0
+                    _report["metric_rows"] = 0
+                    _report["loss_t"] = None
+                    _report["avg"].clear()
+                    _report["raw"].clear()
+
+        return Batch(
+            obs=obs_b,
+            actions=act_b,
+            rows=plan.valid_rows,
+            hidden=lane_hidden,
+            masks=masks,
+            loss_scale=float(plan.active_lanes),
+            compute_metrics=sample,
+            on_step=_on_step,
+        )
+
+    def _iter():
+        for plan_idx in range(next_plan, len(plans)):
+            yield lambda pi=plan_idx: _make_batch(plans[pi], pi)
+
+    # accum_target = n_lanes (full lane sweep flushes the optimizer)
+    return _iter(), initial, float(n_lanes), next_plan
+
+
+def run_epoch(
+    model: "QNNPolicy",
+    source: Source,
+    *,
+    batch_size: int,
+    sequence_length: int = 0,
+    tbptt_limit: int = 0,
+    class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
+    lr: float | None = None,
+    rng: np.random.Generator | None = None,
+    max_grad_norm: float = 1.0,
+    head_loss_weights: Mapping[str, float] | None = None,
+    save_state_callback: Any = None,
+    snapshot_interval: int = 0,
+    step_callback: Any = None,
+    report_every: int = 0,
+    report_interval_seconds: float = 0.0,
+    resume_state: "MidEpochState | None" = None,
+) -> Dict[str, float]:
+    """Single supervised-epoch entry point.
+
+    Picks lane-packed sequence batching when the model is recurrent
+    (``model.use_gru``); frame-shuffled otherwise. Feeds the result to
+    :func:`train_on_batches`. Source-agnostic — pass any :class:`Source`.
+    """
+    if source.n_total_rows == 0:
+        return {"loss": 0.0, "accuracy": 0.0, "n_rows": 0.0}
+
+    training = class_weights is not None and lr is not None
+    accum_target: float = 1.0
+    initial: Mapping[str, Any] | None = None
+
+    if model.use_gru:
+        if sequence_length <= 0:
+            chunk_size = max(int(tbptt_limit), 1) if tbptt_limit > 0 else max(
+                (ep.n_samples for ep in source.episodes), default=64,
+            )
+        else:
+            chunk_size = max(int(sequence_length), 1)
+        batches, initial, accum_target, _ = lane_packed_batches(
+            model, source,
+            chunk_size=chunk_size,
+            batch_size=max(1, int(batch_size)),
+            training=training,
+            rng=rng,
+            save_state_callback=save_state_callback,
+            snapshot_interval=snapshot_interval,
+            step_callback=step_callback,
+            report_every=report_every,
+            report_interval_seconds=report_interval_seconds,
+            resume_state=resume_state,
+        )
+    else:
+        batches = frame_shuffled_batches(
+            source, batch_size=batch_size, training=training, rng=rng,
+        )
+
+    # Streaming sources hide disk-bound gather work behind the GPU step
+    # by running multiple gather workers in parallel. Resident has
+    # prefetch_depth=0 and runs the closures inline.
+    actual_batches = parallel_prefetch_iter(
+        batches,
+        n_workers=int(getattr(source, "n_workers", 0)),
+        depth=int(getattr(source, "prefetch_depth", 0)),
+    )
+
+    return train_on_batches(
+        model, actual_batches,
+        training=training,
+        class_weights=class_weights, lr=lr,
+        max_grad_norm=max_grad_norm,
+        head_loss_weights=head_loss_weights,
+        accum_target=accum_target,
+        initial=initial,
+    )

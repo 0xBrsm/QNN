@@ -95,7 +95,7 @@ def _write_tick_record(fp: IO[str], tick: int, obs: Mapping[str, np.ndarray],
         "action": {
             "move": list(action["move"]),
             "look": list(action["look"]),
-            "fire": int(action["fire"]),
+            "attack": int(action["attack"]),
             "weapon": int(action["weapon"]),
         },
     }

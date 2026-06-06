@@ -102,8 +102,7 @@ BC:
 | Path | Purpose |
 |------|---------|
 | `bc_data_dir` | precomputed BC data root (`artifacts/collect/qwd` by default) |
-| `batch_size` | BC batch size |
-| `microbatch_size` | gradient-accumulation microbatch size |
+| `batch_size` | BC batch size — per-step frame count (frame-shuffled / non-recurrent) or parallel-lane count (lane-packed / recurrent) |
 | `pin_memory` | pin host tensors for GPU transfer |
 | `prefetch` | batch prefetch toggle |
 | `snapshot_interval` | epochs between archived checkpoints |
@@ -149,7 +148,7 @@ Common:
 
 | Path | Purpose |
 |------|---------|
-| `trunk_hidden` | trunk width |
+| `encoder_hidden` | encoder width |
 | `gru_hidden` | GRU hidden width |
 | `n_heads` | transformer head count |
 | `n_layers` | transformer depth |
@@ -167,7 +166,7 @@ BC-only (PPO model templates carry only the common keys):
 | `weapon_context_from_obs` | use observed (vs predicted) held weapon when building motor-head context |
 | `weapon_switch_confidence` | minimum weapon-head softmax to emit a switch at inference |
 | `weapon_switch_margin` | minimum margin over currently-held weapon to emit a switch |
-| `gru_target_query` | route GRU output into the TargetPointer query (otherwise self_readout) |
+| `gru_target_query` | route GRU output into the TargetPointer query (otherwise cls_readout) |
 | `hard_target_feat` | hard-argmax target pooling instead of softmax |
 | `weapon_in_target_query` | add a current-weapon embedding to the target query |
 | `linear_slot_prior` | additive linear slot-index prior on target logits |

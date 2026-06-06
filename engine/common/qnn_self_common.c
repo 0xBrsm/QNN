@@ -113,4 +113,10 @@ void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot)
 	 * weapon-owned flags, armor-type ID, and powerup IDs via the
 	 * IT_* bit positions documented in qnn_vocab.h / engine_norm.py. */
 	out->items = (int32_t)snapshot->items_owned;
+
+	/* view_pitch normalized to ~[-1, 1] via deg/90. Engine clamps pitch
+	 * to ±70° (vendor/quake/QW/client/cl_input.c CL_AdjustAngles), so
+	 * the result stays well inside the i8 range. Used by the model's
+	 * self.motion subtoken; spatial dirs no longer carry pitch. */
+	out->view_pitch = snapshot->player_view_angles[0] * (1.0f / 90.0f);
 }

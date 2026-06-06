@@ -1,21 +1,21 @@
 """Flat-feature head probe — generic MLP over named per-frame features.
 
 Shared model class for ``fire`` and ``target`` flat-feature probes.
-Wraps the ``qnn.bc.heads.features`` torch registry: each probe declares
+Wraps the ``qnn.model.bench.features`` torch registry: each probe declares
 a feature list (e.g. ``("self_health_armor", "target_pooled_rel", …)``)
 and an MLP shape, and ``FlatFeatureHead`` extracts those features from
 the canonical BC obs dict per batch and routes the MLP output into the
-appropriate slot of the BC forward contract.
+appropriate idx of the BC forward contract.
 
-* The fire probe routes its output to ``logits["fire"]`` so the
-  canonical fire BCE path computes the loss.
+* The fire probe routes its output to ``logits["attack"]`` so the
+  canonical attack BCE path computes the loss.
 * The target probe routes to ``target_logits`` (and leaves ``logits``
   empty) so the canonical target soft-CE path computes the loss against
-  ``actions["target_dist"]``.
+  ``actions["target_probs"]``.
 
 Either way the rest of the BC pipeline — shard streaming, eval cadence,
 checkpointing, history — runs unchanged. Same canonical entry point as
-``fire_token``: no parallel pipeline.
+``attack_preattn``: no parallel pipeline.
 """
 
 from __future__ import annotations
@@ -25,20 +25,20 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 
-from qnn.bc.heads.features import build_feature_vector, feature_vector_dim
-from qnn.model.policy import FIRE_HEAD, FIRE_HEAD_SIZE
+from qnn.model.bench.features import build_feature_vector, feature_vector_dim
+from qnn.model.network import ATTACK_HEAD, ATTACK_HEAD_SIZE
 from qnn.vocab import MAX_TOKEN_OBJECTS
 
 
 _TARGET_ROUTE = "target"
-_FIRE_ROUTE = "fire"
+_ATTACK_ROUTE = "attack"
 
 
 class FlatFeatureHead(nn.Module):
     """Flat-feature MLP that matches the BC supervised-loop forward contract.
 
-    ``feature_names`` selects builders from ``qnn.bc.heads.features``;
-    ``output_route`` is either ``"fire"`` (write to ``logits['fire']``,
+    ``feature_names`` selects builders from ``qnn.model.bench.features``;
+    ``output_route`` is either ``"attack"`` (write to ``logits['attack']``,
     size 1) or ``"target"`` (write to ``target_logits``, size
     ``MAX_TOKEN_OBJECTS``).
 
@@ -57,16 +57,16 @@ class FlatFeatureHead(nn.Module):
         dropout: float,
     ) -> None:
         super().__init__()
-        if output_route not in (_FIRE_ROUTE, _TARGET_ROUTE):
+        if output_route not in (_ATTACK_ROUTE, _TARGET_ROUTE):
             raise ValueError(
-                f"output_route must be {_FIRE_ROUTE!r} or {_TARGET_ROUTE!r}, "
+                f"output_route must be {_ATTACK_ROUTE!r} or {_TARGET_ROUTE!r}, "
                 f"got {output_route!r}"
             )
         self.feature_names = tuple(feature_names)
         self.output_route = output_route
         self.in_dim = feature_vector_dim(self.feature_names)
         self.output_dim = (
-            FIRE_HEAD_SIZE if output_route == _FIRE_ROUTE else MAX_TOKEN_OBJECTS
+            ATTACK_HEAD_SIZE if output_route == _ATTACK_ROUTE else MAX_TOKEN_OBJECTS
         )
         layers: list[nn.Module] = []
         prev = self.in_dim
@@ -86,8 +86,8 @@ class FlatFeatureHead(nn.Module):
         hidden: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
         target_gt: torch.Tensor | None = None,
-        target_dist_slot: torch.Tensor | None = None,
-        prev_target_dist: torch.Tensor | None = None,
+        target_probs_idx: torch.Tensor | None = None,
+        prev_target_probs: torch.Tensor | None = None,
     ) -> Tuple[
         torch.Tensor,
         Dict[str, torch.Tensor],
@@ -96,7 +96,7 @@ class FlatFeatureHead(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        del hidden, reset_mask, target_gt, prev_target_dist
+        del hidden, reset_mask, target_gt, prev_target_probs
 
         sample = obs["self_scalars"]
         is_seq = sample.ndim == 3
@@ -107,15 +107,15 @@ class FlatFeatureHead(nn.Module):
                 k: v.reshape(T * B, *v.shape[2:]) for k, v in obs.items()
             }
             tds_flat = (
-                target_dist_slot.reshape(T * B, target_dist_slot.shape[-1])
-                if target_dist_slot is not None else None
+                target_probs_idx.reshape(T * B, target_probs_idx.shape[-1])
+                if target_probs_idx is not None else None
             )
             BB = T * B
         else:
             B = int(sample.shape[0])
             T = 0
             flat_obs = obs
-            tds_flat = target_dist_slot
+            tds_flat = target_probs_idx
             BB = B
 
         features_flat = build_feature_vector(self.feature_names, flat_obs, tds_flat)  # (BB, F)
@@ -123,13 +123,13 @@ class FlatFeatureHead(nn.Module):
 
         device = features_flat.device
         dtype = features_flat.dtype
-        # Default placeholders for the two output slots; the routed slot
+        # Default placeholders for the two output indices; the routed idx
         # gets overwritten below.
-        fire_flat = torch.zeros((BB, FIRE_HEAD_SIZE), dtype=dtype, device=device)
+        attack_flat = torch.zeros((BB, ATTACK_HEAD_SIZE), dtype=dtype, device=device)
         target_logits_flat = torch.zeros((BB, MAX_TOKEN_OBJECTS), dtype=dtype, device=device)
 
-        if self.output_route == _FIRE_ROUTE:
-            fire_flat = out_flat
+        if self.output_route == _ATTACK_ROUTE:
+            attack_flat = out_flat
         else:
             target_logits_flat = out_flat
 
@@ -138,23 +138,23 @@ class FlatFeatureHead(nn.Module):
 
         if is_seq:
             features = features_flat.reshape(T, B, -1)
-            fire_logits = fire_flat.reshape(T, B, FIRE_HEAD_SIZE)
+            attack_logits = attack_flat.reshape(T, B, ATTACK_HEAD_SIZE)
             target_logits = target_logits_flat.reshape(T, B, MAX_TOKEN_OBJECTS)
             target_query = target_query_flat.reshape(T, B, self.d_model)
             values = values_flat.reshape(T, B)
             next_hidden = torch.zeros((B, 0), dtype=dtype, device=device)
         else:
             features = features_flat
-            fire_logits = fire_flat
+            attack_logits = attack_flat
             target_logits = target_logits_flat
             target_query = target_query_flat
             values = values_flat
             next_hidden = torch.zeros((B, 0), dtype=dtype, device=device)
 
-        # logits dict only carries the fire head when this is a fire
-        # probe; target_logits flows through the separate return slot
+        # logits dict only carries the attack head when this is a fire
+        # probe; target_logits flows through the separate return idx
         # the canonical model uses for the pointer.
         logits: Dict[str, torch.Tensor] = (
-            {FIRE_HEAD: fire_logits} if self.output_route == _FIRE_ROUTE else {}
+            {ATTACK_HEAD: attack_logits} if self.output_route == _ATTACK_ROUTE else {}
         )
         return features, logits, values, next_hidden, target_logits, target_query

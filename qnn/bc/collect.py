@@ -40,8 +40,8 @@ from qnn.actions import MOVE_AXIS_THRESHOLD, MOVE_CLASS_NEG, MOVE_CLASS_NONE, MO
 from qnn.bc.target_labeler import (
     DEFAULT_LABELER_CONFIG,
     NO_TARGET_INDEX,
-    TARGET_DIST_CLASSES,
-    label_enemy_target_distribution,
+    TARGET_PROBS_CLASSES,
+    label_enemy_target_probs,
 )
 from qnn.vocab import (
     TOKEN_ACTOR, TOKEN_PROJECTILE, TOKEN_ITEM, TOKEN_MOVER,
@@ -49,20 +49,27 @@ from qnn.vocab import (
 )
 
 
-# Engine action struct: move[3] + look[3] + fire + weapon + op_input = 36 bytes.
-# Layout matches qnn_action_t on the C side. The int32 at offset 28
-# holds the raw engine weapon byte (0..8); the int32 at offset 32 holds
-# the per-axis op_input mask (only the low 5 bits are populated, bit i ⇔
-# the engine acted on axis i this tick; see QNN_PackOpInput in
-# qnn_collect_helpers.c for the canonical packing). Kept as a private
-# record dtype since the new wire pipeline no longer routes through
-# qnn.wire.ACTION_FIELDS (deleted with the legacy parser).
+# Engine action struct: 16 bytes. Layout matches qnn_action_t on the C side.
+#
+#   offset 0  : move       u8   — press byte:
+#                                  bit 0    = attack press
+#                                  bits 1-2 = forward neg / pos
+#                                  bits 3-4 = side neg / pos
+#                                  bits 5-6 = up neg / pos
+#                                  bit 7    = jump press (explicit)
+#   offset 1  : weapon     u8   — raw engine weapon byte (0..8)
+#   offset 2  : input_mask u8   — 8-bit per-axis feasibility, same layout as
+#                                  the press byte. Packed by QNN_PackInputMask.
+#   offset 3  : _pad       u8   — alignment for the trailing float[3]
+#   offset 4..15 : look[3] f32  — view-relative look-delta unit vector
+#
+# Kept as a private record dtype since the new wire pipeline no longer
+# routes through qnn.wire.ACTION_FIELDS (deleted with the legacy parser).
 _ACTION_FIELDS_LAYOUT = {
-    "move":     (0,  np.float32, (3,)),
-    "look":     (12, np.float32, (3,)),
-    "fire":     (24, np.int32,   ()),
-    "weapon":   (28, np.int32,   ()),
-    "op_input": (32, np.int32,   ()),
+    "move":       (0, np.uint8,   ()),
+    "weapon":     (1, np.uint8,   ()),
+    "input_mask": (2, np.uint8,   ()),
+    "look":       (4, np.float32, (3,)),
 }
 
 
@@ -242,7 +249,7 @@ _VALID_TOKEN_FIELDS = frozenset({
     "entity_amount", "entity_regen", "entity_state",
     "entity_count",
 })
-_VALID_ACTION_FIELDS = frozenset({"move", "look", "fire", "weapon", "target_dist"})
+_VALID_ACTION_FIELDS = frozenset({"move", "look", "attack", "weapon", "target_probs"})
 
 
 def _validate_filter_schema(spec: dict) -> None:
@@ -677,46 +684,46 @@ def _worker_stderr_tail(proc: subprocess.Popen | None, limit: int = 4000) -> str
 # (qnn.bc.target_labeler) was written against the legacy dense layout —
 # (T, 16, 19) float32 entity_scalars_raw, (T, 16, 3) int32 entity_ids,
 # (T, 16) int32 entity_types, (T, 17) float32 self_scalars — and reads
-# values at fixed slot offsets matching qnn_onnx.c:emit_actor (see
+# values at fixed idx offsets matching qnn_onnx.c:emit_actor (see
 # _ACTOR_*_OFFSET constants in target_labeler.py).
 #
 # We construct that dense view here from per-frame native arrays just
-# for the labeler call. The result is discarded after target_dist is
+# for the labeler call. The result is discarded after target_probs is
 # computed; only the native arrays go to disk.
 
-# Legacy actor scalar slot layout (mirrors qnn.model.dequant entity slot
+# Legacy actor scalar idx layout (mirrors qnn.model.dequant entity idx
 # comments — kept in sync there):
 #   [hx,hy,hz, rx,ry,rz, dist, vx,vy,vz, px,py,pz, pd, eta, fac,team,score, rec]
-#                          ^ slot 6 = dist, recomputed from rel
-_ACTOR_SLOT_HALFEXT = 0
-_ACTOR_SLOT_REL     = 3
-_ACTOR_SLOT_DIST    = 6
-_ACTOR_SLOT_VEL     = 7
-_ACTOR_SLOT_PATH    = 10
-_ACTOR_SLOT_PD      = 13
-_ACTOR_SLOT_ETA     = 14
-_ACTOR_SLOT_FACING  = 15
-_ACTOR_SLOT_TEAM    = 16
-_ACTOR_SLOT_SCORE   = 17
-_ACTOR_SLOT_RECENCY = 18
+#                          ^ idx 6 = dist, recomputed from rel
+_ACTOR_IDX_HALFEXT = 0
+_ACTOR_IDX_REL     = 3
+_ACTOR_IDX_DIST    = 6
+_ACTOR_IDX_VEL     = 7
+_ACTOR_IDX_PATH    = 10
+_ACTOR_IDX_PD      = 13
+_ACTOR_IDX_ETA     = 14
+_ACTOR_IDX_FACING  = 15
+_ACTOR_IDX_TEAM    = 16
+_ACTOR_IDX_SCORE   = 17
+_ACTOR_IDX_RECENCY = 18
 
-# Self scalars (T, 17) legacy slot layout matches qnn.model.dequant
-# SelfDequantizer _SLOT_* constants — kept in sync with that module.
-_SELF_SLOT_HEALTH      = 0
-_SELF_SLOT_ARMOR       = 1
-_SELF_SLOT_WEAPON_SG   = 2
-_SELF_SLOT_WEAPON_SSG  = 3
-_SELF_SLOT_WEAPON_NG   = 4
-_SELF_SLOT_WEAPON_SNG  = 5
-_SELF_SLOT_WEAPON_GL   = 6
-_SELF_SLOT_WEAPON_RL   = 7
-_SELF_SLOT_WEAPON_LG   = 8
-_SELF_SLOT_AMMO_SH     = 9
-_SELF_SLOT_AMMO_NA     = 10
-_SELF_SLOT_AMMO_RK     = 11
-_SELF_SLOT_AMMO_CE     = 12
-_SELF_SLOT_VEL         = 13   # 13..15
-_SELF_SLOT_ATTACK_FIN  = 16
+# Self scalars (T, 17) legacy idx layout matches qnn.model.dequant
+# SelfDequantizer _IDX_* constants — kept in sync with that module.
+_SELF_IDX_HEALTH      = 0
+_SELF_IDX_ARMOR       = 1
+_SELF_IDX_WEAPON_SG   = 2
+_SELF_IDX_WEAPON_SSG  = 3
+_SELF_IDX_WEAPON_NG   = 4
+_SELF_IDX_WEAPON_SNG  = 5
+_SELF_IDX_WEAPON_GL   = 6
+_SELF_IDX_WEAPON_RL   = 7
+_SELF_IDX_WEAPON_LG   = 8
+_SELF_IDX_AMMO_SH     = 9
+_SELF_IDX_AMMO_NA     = 10
+_SELF_IDX_AMMO_RK     = 11
+_SELF_IDX_AMMO_CE     = 12
+_SELF_IDX_VEL         = 13   # 13..15
+_SELF_IDX_ATTACK_FIN  = 16
 
 
 def _densify_native_obs_for_labeler(
@@ -737,39 +744,39 @@ def _densify_native_obs_for_labeler(
 
     Returns ``{entity_types, entity_ids, entity_scalars_raw,
     self_scalars}`` — exactly the keys
-    ``label_enemy_target_distribution`` reads from. Other native fields
+    ``label_enemy_target_probs`` reads from. Other native fields
     are dropped (not needed by the labeler).
     """
     T = native_obs["health"].shape[0]
-    N = MAX_TOKEN_OBJECTS  # legacy 16-slot dense layout
+    N = MAX_TOKEN_OBJECTS  # legacy 16-idx dense layout
 
     # ---- Self scalars (T, 17) ----
     self_scalars = np.zeros((T, 17), dtype=np.float32)
-    self_scalars[:, _SELF_SLOT_HEALTH]     = native_obs["health"]          .astype(np.float32) / en.MAX_HEALTH
-    self_scalars[:, _SELF_SLOT_ARMOR]      = native_obs["effective_armor"] .astype(np.float32) / en.MAX_ARMOR_EFFECT
-    self_scalars[:, _SELF_SLOT_AMMO_SH]    = native_obs["ammo_shells"]     .astype(np.float32) / en.MAX_SHELLS
-    self_scalars[:, _SELF_SLOT_AMMO_NA]    = native_obs["ammo_nails"]      .astype(np.float32) / en.MAX_NAILS
-    self_scalars[:, _SELF_SLOT_AMMO_RK]    = native_obs["ammo_rockets"]    .astype(np.float32) / en.MAX_ROCKETS
-    self_scalars[:, _SELF_SLOT_AMMO_CE]    = native_obs["ammo_cells"]      .astype(np.float32) / en.MAX_CELLS
-    self_scalars[:, _SELF_SLOT_VEL:_SELF_SLOT_VEL + 3] = (
+    self_scalars[:, _SELF_IDX_HEALTH]     = native_obs["health"]          .astype(np.float32) / en.MAX_HEALTH
+    self_scalars[:, _SELF_IDX_ARMOR]      = native_obs["effective_armor"] .astype(np.float32) / en.MAX_ARMOR_EFFECT
+    self_scalars[:, _SELF_IDX_AMMO_SH]    = native_obs["ammo_shells"]     .astype(np.float32) / en.MAX_SHELLS
+    self_scalars[:, _SELF_IDX_AMMO_NA]    = native_obs["ammo_nails"]      .astype(np.float32) / en.MAX_NAILS
+    self_scalars[:, _SELF_IDX_AMMO_RK]    = native_obs["ammo_rockets"]    .astype(np.float32) / en.MAX_ROCKETS
+    self_scalars[:, _SELF_IDX_AMMO_CE]    = native_obs["ammo_cells"]      .astype(np.float32) / en.MAX_CELLS
+    self_scalars[:, _SELF_IDX_VEL:_SELF_IDX_VEL + 3] = (
         native_obs["vel"].astype(np.float32) / en.MAX_VELOCITY
     )
-    self_scalars[:, _SELF_SLOT_ATTACK_FIN] = native_obs["attack_finished"] .astype(np.float32) / en.TIME_SCALE
-    # cl.items bit-extracted weapon flags (slots 2..8).
+    self_scalars[:, _SELF_IDX_ATTACK_FIN] = native_obs["attack_finished"] .astype(np.float32) / en.TIME_SCALE
+    # cl.items bit-extracted weapon flags (indices 2..8).
     items_i64 = native_obs["self_items"].astype(np.int64)
-    self_scalars[:, _SELF_SLOT_WEAPON_SG ] = ((items_i64 & en.IT_SHOTGUN)          != 0).astype(np.float32)
-    self_scalars[:, _SELF_SLOT_WEAPON_SSG] = ((items_i64 & en.IT_SUPER_SHOTGUN)    != 0).astype(np.float32)
-    self_scalars[:, _SELF_SLOT_WEAPON_NG ] = ((items_i64 & en.IT_NAILGUN)          != 0).astype(np.float32)
-    self_scalars[:, _SELF_SLOT_WEAPON_SNG] = ((items_i64 & en.IT_SUPER_NAILGUN)    != 0).astype(np.float32)
-    self_scalars[:, _SELF_SLOT_WEAPON_GL ] = ((items_i64 & en.IT_GRENADE_LAUNCHER) != 0).astype(np.float32)
-    self_scalars[:, _SELF_SLOT_WEAPON_RL ] = ((items_i64 & en.IT_ROCKET_LAUNCHER)  != 0).astype(np.float32)
-    self_scalars[:, _SELF_SLOT_WEAPON_LG ] = ((items_i64 & en.IT_LIGHTNING)        != 0).astype(np.float32)
+    self_scalars[:, _SELF_IDX_WEAPON_SG ] = ((items_i64 & en.IT_SHOTGUN)          != 0).astype(np.float32)
+    self_scalars[:, _SELF_IDX_WEAPON_SSG] = ((items_i64 & en.IT_SUPER_SHOTGUN)    != 0).astype(np.float32)
+    self_scalars[:, _SELF_IDX_WEAPON_NG ] = ((items_i64 & en.IT_NAILGUN)          != 0).astype(np.float32)
+    self_scalars[:, _SELF_IDX_WEAPON_SNG] = ((items_i64 & en.IT_SUPER_NAILGUN)    != 0).astype(np.float32)
+    self_scalars[:, _SELF_IDX_WEAPON_GL ] = ((items_i64 & en.IT_GRENADE_LAUNCHER) != 0).astype(np.float32)
+    self_scalars[:, _SELF_IDX_WEAPON_RL ] = ((items_i64 & en.IT_ROCKET_LAUNCHER)  != 0).astype(np.float32)
+    self_scalars[:, _SELF_IDX_WEAPON_LG ] = ((items_i64 & en.IT_LIGHTNING)        != 0).astype(np.float32)
 
     # ---- Entity dense (T, 16, ...) ----
     # Native entity fields are stored per-tick as 1D Python lists in
     # ``native_obs["_per_tick_entities"]`` — a list of length T where
     # each item is the per-tick dict from unpack_obs_buffer_native.
-    # Fast path: zero out and fill the actor slots used by the labeler.
+    # Fast path: zero out and fill the actor indices used by the labeler.
     entity_types        = np.full((T, N),  -1, dtype=np.int32)
     entity_ids          = np.zeros((T, N, 3),   dtype=np.int32)
     entity_scalars_raw  = np.zeros((T, N, ACTOR_SCALAR_DIM), dtype=np.float32)
@@ -787,7 +794,7 @@ def _densify_native_obs_for_labeler(
         n_tokens = int(tick_ents["entity_count"])
         if n_tokens <= 0:
             continue
-        # Hard cap at N=16 — legacy dense layout has fixed slot count;
+        # Hard cap at N=16 — legacy dense layout has fixed idx count;
         # native worker emits ≤ N anyway, but be defensive.
         nt = min(n_tokens, N)
         types_t = tick_ents["entity_types"][:nt]
@@ -796,53 +803,53 @@ def _densify_native_obs_for_labeler(
         entity_ids[t, :nt, 1] = tick_ents["entity_modality_id"][:nt].astype(np.int32)
         entity_ids[t, :nt, 2] = tick_ents["entity_player_id"][:nt].astype(np.int32)
 
-        # Common normalized scalars per actor slot. Tokens of other
+        # Common normalized scalars per actor idx. Tokens of other
         # types still get rel/recency filled (the labeler treats them
         # via mask later), but only actors contribute to target.
         # half_ext
-        entity_scalars_raw[t, :nt, _ACTOR_SLOT_HALFEXT:_ACTOR_SLOT_HALFEXT + 3] = (
+        entity_scalars_raw[t, :nt, _ACTOR_IDX_HALFEXT:_ACTOR_IDX_HALFEXT + 3] = (
             tick_ents["entity_half_extents"][:nt].astype(np.float32) / en.DIST_SCALE
         )
         # rel + derived dist
         rel = tick_ents["entity_rel"][:nt].astype(np.float32) / en.DIST_SCALE
-        entity_scalars_raw[t, :nt, _ACTOR_SLOT_REL:_ACTOR_SLOT_REL + 3] = rel
-        entity_scalars_raw[t, :nt, _ACTOR_SLOT_DIST] = np.linalg.norm(rel, axis=-1)
+        entity_scalars_raw[t, :nt, _ACTOR_IDX_REL:_ACTOR_IDX_REL + 3] = rel
+        entity_scalars_raw[t, :nt, _ACTOR_IDX_DIST] = np.linalg.norm(rel, axis=-1)
         # vel (proj+actor only have vel; item/mover have zero — safe to write)
-        entity_scalars_raw[t, :nt, _ACTOR_SLOT_VEL:_ACTOR_SLOT_VEL + 3] = (
+        entity_scalars_raw[t, :nt, _ACTOR_IDX_VEL:_ACTOR_IDX_VEL + 3] = (
             tick_ents["entity_vel"][:nt].astype(np.float32) / en.MAX_VELOCITY
         )
         # path / path_dist / eta — proj has none on the wire; native
-        # parser returns zeros for those slots, which is the right
+        # parser returns zeros for those indices, which is the right
         # fallback for the dense layout.
-        entity_scalars_raw[t, :nt, _ACTOR_SLOT_PATH:_ACTOR_SLOT_PATH + 3] = (
+        entity_scalars_raw[t, :nt, _ACTOR_IDX_PATH:_ACTOR_IDX_PATH + 3] = (
             tick_ents["entity_path"][:nt].astype(np.float32) / en.DIST_SCALE
         )
-        entity_scalars_raw[t, :nt, _ACTOR_SLOT_PD] = (
+        entity_scalars_raw[t, :nt, _ACTOR_IDX_PD] = (
             tick_ents["entity_path_dist"][:nt].astype(np.float32) / en.DIST_SCALE
         )
-        entity_scalars_raw[t, :nt, _ACTOR_SLOT_ETA] = (
+        entity_scalars_raw[t, :nt, _ACTOR_IDX_ETA] = (
             tick_ents["entity_eta"][:nt].astype(np.float32) / en.TIME_SCALE
         )
         # Actor-only fields (facing/team/score) — set where applicable.
         actor_mask = types_t == TOKEN_ACTOR
         if actor_mask.any():
-            entity_scalars_raw[t, :nt, _ACTOR_SLOT_FACING] = np.where(
+            entity_scalars_raw[t, :nt, _ACTOR_IDX_FACING] = np.where(
                 actor_mask,
                 tick_ents["entity_facing"][:nt].astype(np.float32) / 255.0,
                 0.0,
             )
-            entity_scalars_raw[t, :nt, _ACTOR_SLOT_TEAM] = np.where(
+            entity_scalars_raw[t, :nt, _ACTOR_IDX_TEAM] = np.where(
                 actor_mask,
                 tick_ents["entity_team"][:nt].astype(np.float32),
                 0.0,
             )
-            entity_scalars_raw[t, :nt, _ACTOR_SLOT_SCORE] = np.where(
+            entity_scalars_raw[t, :nt, _ACTOR_IDX_SCORE] = np.where(
                 actor_mask,
                 tick_ents["entity_score"][:nt].astype(np.float32) / 255.0,
                 0.0,
             )
         # Recency is present for every token type.
-        entity_scalars_raw[t, :nt, _ACTOR_SLOT_RECENCY] = (
+        entity_scalars_raw[t, :nt, _ACTOR_IDX_RECENCY] = (
             tick_ents["entity_recency"][:nt].astype(np.float32) / en.TIME_SCALE
         )
 
@@ -854,73 +861,51 @@ def _densify_native_obs_for_labeler(
     }
 
 
-# target_dist was previously encoded as sparse (T, 3) u8 here and
+# target_probs was previously encoded as sparse (T, 3) u8 here and
 # expanded back at training time. Both the encoder and decoder have
-# been removed: target_dist is now cached as a dense per-shard sidecar
+# been removed: target_probs is now cached as a dense per-shard sidecar
 # written by collect and consumed directly by BC training.
 
 
 def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
-    """Convert raw float/int wire labels to the compact on-disk format.
+    """Convert raw wire labels to the compact on-disk format.
 
     Mutates `act_arrays` in place.  See qnn.actions docstring for the spec.
 
-      move          float32[T, 3]  → uint8[T] packed: bits 0-1=fb, 2-3=lr,
-                                      4-5=ud, each holding a class index in
-                                      {0=neg, 1=none, 2=pos}.
+      move          uint8[T]       — press byte from the engine; same layout
+                                      as input_mask. Passed through; load
+                                      time unpackers in qnn.bc.train rebuild
+                                      the per-axis class streams.
       look          float32[T, 3]  → float16[T, 3].
-      fire          int32[T]       → uint8[T].
-      weapon        int32[T] raw engine weapon byte → uint8[T] same value:
-                                      0 = no weapon held (pre-spawn, dead,
-                                      transitional), 1..8 = Quake weapon id
-                                      in impulse order (axe..thunderbolt).
-                                      No-weapon frames are kept on disk so
-                                      downstream signals (move, fire, look)
-                                      still train; the model side masks them
-                                      out of the weapon-head CE loss via
+      weapon        uint8[T]       — raw engine weapon byte (0..8): 0 = no
+                                      weapon held, 1..8 = Quake weapon id
+                                      (axe..thunderbolt). No-weapon frames
+                                      are kept on disk so downstream signals
+                                      still train; the model masks them out
+                                      of the weapon-head CE loss via
                                       ignore_index.
-      target_dist   float32[T, 17] → uint8[T, 3] sparse
+      input_mask    uint8[T]       — engine-act feasibility byte (same layout
+                                      as the press byte).
+      target_probs   float32[T, 17] → uint8[T, 3] sparse
                                       ``(idx, idx2, w2_u8)`` per engine_norm.
                                       ActionDequantizer expands at the model
                                       boundary; the dataloader expands at
                                       load time for the legacy float code
-                                      path. See _encode_sparse_target_dist.
+                                      path. See _encode_sparse_target_probs.
 
-    Each move axis is thresholded independently against
-    MOVE_AXIS_THRESHOLD = 0.1.  The C-side cmd values (forwardmove/maxspeed
-    etc., in [-1, 1]) are clean multiples of 200/320 ≈ 0.625 in standard QW
-    play, so 0.1 separates "pressed" from "released" without dropping any
-    real press.
-
-    The engine-facing `switch` slot is derived from the weapon head's
-    argmax at inference time (model.policy._weapon_switch_slots_from_choices);
+    The engine-facing `switch` idx is derived from the weapon head's
+    argmax at inference time (model.policy._weapon_switch_indices_from_choices);
     no `switch` array is written to disk — it would be redundant since
-    the slot is a pure function of the weapon class.
+    the idx is a pure function of the weapon class.
     """
-    move = np.asarray(act_arrays.get("move"))
-    fire = act_arrays.get("fire")
-    if move is not None and move.dtype != np.uint8:
-        # move shape: (T, 3) float — fb, lr, ud
-        t = MOVE_AXIS_THRESHOLD
-        # Build per-axis class index in {0, 1, 2} via threshold arithmetic.
-        #   class = NONE + 1*(v >  t) - 1*(v < -t)
-        # which yields NONE-1=NEG when v<-t, NONE+1=POS when v>+t, else NONE.
-        none = np.full(move.shape[0], MOVE_CLASS_NONE, dtype=np.uint8)
-        fb_cls = none + (move[:, 0] >  t).astype(np.uint8) - (move[:, 0] < -t).astype(np.uint8)
-        lr_cls = none + (move[:, 1] >  t).astype(np.uint8) - (move[:, 1] < -t).astype(np.uint8)
-        ud_cls = none + (move[:, 2] >  t).astype(np.uint8) - (move[:, 2] < -t).astype(np.uint8)
-        # Pack bits 0-1=fb, 2-3=lr, 4-5=ud (2 bits per axis × 3 axes = 6 bits)
-        # + bit 6 = fire (BUTTON_ATTACK). Bit 7 reserved.
-        packed = (fb_cls & 0x3) | ((lr_cls & 0x3) << 2) | ((ud_cls & 0x3) << 4)
-        if fire is not None:
-            fire_bit = (np.asarray(fire, dtype=np.int32) != 0).astype(np.uint8)
-            packed = packed | (fire_bit << 6)
-        act_arrays["move"] = packed.astype(np.uint8)
-        # Fire is now packed into the move byte; drop the redundant
-        # standalone array — the loader (qnn.bc.train._unpack_move_axes)
-        # extracts bit 6 to reconstruct the (T,) fire stream the heads
-        # consume.
-        act_arrays.pop("fire", None)
+    move = act_arrays.get("move")
+    if move is not None and not (
+        isinstance(move, np.ndarray) and move.dtype == np.uint8
+    ):
+        raise ValueError(
+            f"action 'move' must be uint8 on the wire, got dtype "
+            f"{getattr(move, 'dtype', type(move))}"
+        )
 
     look = act_arrays.get("look")
     if look is not None and look.dtype != np.float16:
@@ -928,41 +913,41 @@ def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
 
     weapon = act_arrays.get("weapon")
     if weapon is not None:
-        weapon_bytes = np.asarray(weapon, dtype=np.int32).reshape(-1)
-        invalid = weapon_bytes[(weapon_bytes < 0) | (weapon_bytes > 8)]
+        weapon_arr = np.asarray(weapon)
+        if weapon_arr.dtype != np.uint8:
+            raise ValueError(
+                f"action 'weapon' must be uint8 on the wire, got dtype {weapon_arr.dtype}"
+            )
+        invalid = weapon_arr[weapon_arr > 8]
         if invalid.size:
             sample = sorted({int(v) for v in invalid[:8]})
             raise ValueError(
                 f"weapon bytes must be in 0..8 (0=no weapon, 1..8=axe..LG), "
                 f"got {sample}"
             )
-        act_arrays["weapon"] = np.ascontiguousarray(weapon_bytes.astype(np.uint8))
+        act_arrays["weapon"] = np.ascontiguousarray(weapon_arr)
 
-    # op_input: int32 on the wire (struct alignment) but only the low
-    # 5 bits are populated (see QNN_PackOpInput). Compact to uint8 on
-    # disk — 4x size reduction, no information loss.
-    op_input = act_arrays.get("op_input")
-    if op_input is not None and op_input.dtype != np.uint8:
-        op_bytes = np.asarray(op_input, dtype=np.int32).reshape(-1)
-        invalid = op_bytes[(op_bytes < 0) | (op_bytes > 0x1F)]
-        if invalid.size:
-            sample = sorted({int(v) for v in invalid[:8]})
+    # input_mask: uint8 on the wire (bit layout shared with the press
+    # byte; packed by QNN_PackInputMask).
+    input_mask = act_arrays.get("input_mask")
+    if input_mask is not None:
+        im_arr = np.asarray(input_mask)
+        if im_arr.dtype != np.uint8:
             raise ValueError(
-                f"op_input bytes must use only bits 0..4 (0..31), "
-                f"got {sample}"
+                f"action 'input_mask' must be uint8 on the wire, got dtype {im_arr.dtype}"
             )
-        act_arrays["op_input"] = np.ascontiguousarray(op_bytes.astype(np.uint8))
+        act_arrays["input_mask"] = np.ascontiguousarray(im_arr)
 
-    # target_dist: cast to f16 for on-disk caching, or drop if the
+    # target_probs: cast to f16 for on-disk caching, or drop if the
     # caller hasn't computed it. The labeler is ~95% of BC load time
     # when run live; caching here amortizes it across every subsequent
     # training launch. f16 max quantization error measured at 2.4e-4
     # on real labeler output (values in [0, 1], min nonzero ~7e-3);
     # well below noise. Train-time loader auto-detects the cache file
     # via shard manifest and falls back to live labeler if absent.
-    td = act_arrays.get("target_dist")
+    td = act_arrays.get("target_probs")
     if td is not None and td.dtype != np.float16:
-        act_arrays["target_dist"] = np.ascontiguousarray(td, dtype=np.float16)
+        act_arrays["target_probs"] = np.ascontiguousarray(td, dtype=np.float16)
 
 
 # Field categories for native obs handling. Self/spatial are fixed-
@@ -975,6 +960,7 @@ _NATIVE_SELF_FIELDS = (
     "ammo_shells", "ammo_nails", "ammo_rockets", "ammo_cells",
     "vel", "attack_finished",
     "self_weapon_id", "self_movement_id", "self_items",
+    "view_pitch",
 )
 _NATIVE_SPATIAL_FIELDS = (
     "spatial_dir",
@@ -1001,7 +987,7 @@ def _unpack_episode(
     drop_label_names: tuple[str, ...] = (),
     total_frames: int = 0,
     sight_only: bool = False,
-    target_dist_cache: bool = True,
+    target_probs_cache: bool = True,
 ) -> list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]]:
     """Unpack raw ticks into one or more (obs, action) sub-episodes.
 
@@ -1102,19 +1088,19 @@ def _unpack_episode(
         # Labeler runs at collect time when either:
         #   - combat_only=True: needed to derive the `present` mask for
         #     non-engagement frame filtering below.
-        #   - target_dist_cache=True: result is written to disk as an
+        #   - target_probs_cache=True: result is written to disk as an
         #     extra action array so BC training can mmap it instead of
         #     recomputing on every load (~95% of load time saved).
-        if combat_only or target_dist_cache:
+        if combat_only or target_probs_cache:
             labeler_view = _densify_native_obs_for_labeler({
                 **{k: sub_obs[k] for k in _NATIVE_SELF_FIELDS},
                 "_per_tick_entities": sub_per_tick,
             })
-            sub_act["target_dist"] = label_enemy_target_distribution(
+            sub_act["target_probs"] = label_enemy_target_probs(
                 labeler_view, sub_act, config=DEFAULT_LABELER_CONFIG,
                 sight_only=sight_only)
             if combat_only:
-                present = 1.0 - sub_act["target_dist"][:, NO_TARGET_INDEX]
+                present = 1.0 - sub_act["target_probs"][:, NO_TARGET_INDEX]
                 keep2 = present >= 0.25
                 if not bool(np.any(keep2)):
                     continue
@@ -1355,7 +1341,7 @@ class _ShardWriter:
             "episodes": total_episodes,
             "shard_rows": self.shard_rows,
             "target_labeler_version": "v3-simple",
-            "target_dist_classes": TARGET_DIST_CLASSES,
+            "target_probs_classes": TARGET_PROBS_CLASSES,
             # On-disk layout note: per-shard entity_* .npy files are
             # variable-length along axis 0 (one row per token, not per
             # frame). The companion obs/entity_count.npy is row-indexed
@@ -1474,7 +1460,7 @@ def _run_per_demo_collect(
 def _collect_demo(args: tuple) -> dict:
     """Collect one demo, return unpacked arrays. Runs in worker process."""
     (demo_name, force_mvd_emit, combat_only, labels,
-     total_frames, drop_label_names, sight_only, target_dist_cache) = args
+     total_frames, drop_label_names, sight_only, target_probs_cache) = args
     # Worker always walks the full demo; any clipping happens via the
     # tick mask (segments.drop in the filter config).
     return _run_per_demo_collect(
@@ -1485,7 +1471,7 @@ def _collect_demo(args: tuple) -> dict:
             ticks, combat_only=combat_only, labels=labels,
             drop_label_names=drop_label_names, total_frames=total_frames,
             sight_only=sight_only,
-            target_dist_cache=target_dist_cache),
+            target_probs_cache=target_probs_cache),
     )
 
 
@@ -1928,10 +1914,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-target-dist-cache",
-        dest="target_dist_cache",
+        dest="target_probs_cache",
         action="store_false",
         default=True,
-        help="Disable writing the per-shard target_dist (.npy f16) sidecar."
+        help="Disable writing the per-shard target_probs (.npy f16) sidecar."
              " Default: enabled. Caching the labeler output amortizes the"
              " ~95%% of BC load time the labeler accounts for (run once at"
              " collect, mmap thereafter). Use --no-target-dist-cache when"
@@ -1993,12 +1979,12 @@ def main() -> None:
 
     # Per-demo work tuple: (demo_name, force_mvd_emit,
     # combat_only, labels, total_frames, drop_label_names, sight_only,
-    # target_dist_cache) — the shape _collect_demo unpacks.
+    # target_probs_cache) — the shape _collect_demo unpacks.
     def build_work_args(entry, labels, total_frames, drop_labels):
         return (entry["file"], args.force_mvd_emit,
                 args.combat_only, labels, total_frames, drop_labels,
                 args.sight,
-                args.target_dist_cache)
+                args.target_probs_cache)
 
     run_collect(
         output=output,

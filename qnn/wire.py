@@ -12,7 +12,7 @@ widths; the entity stream is variable-length and type-tagged. See
 See OBS_SCHEMA in qnn/schema.py for the model-facing dict shape
 contract that downstream code consumes after the
 SelfDequantizer/SpatialDequantizer/EntityDequantizer adapt the native
-arrays at the Tokenizer boundary.
+arrays at the ObsEmbedding boundary.
 """
 
 import struct
@@ -30,11 +30,12 @@ MAX_ENTITY_SCALAR_DIM = ACTOR_SCALAR_DIM  # largest per-type scalar count
 MAX_ENTITY_ID_DIM = ACTOR_ID_DIM          # largest per-type ID count
 
 OBS_BUFFER_SIZE = 4096
-# sizeof(qnn_action_t) — move[3] + look[3] + fire + weapon + op_input.
-# op_input is uint8 semantically (only 5 bits used) but the C struct
-# declares it as `int` for natural alignment; wire bytes pad the
-# struct to 36 regardless.
-ACTION_SIZE = 36
+# sizeof(qnn_action_t) — move (press byte) + weapon + input_mask + pad +
+# look[3]. The press byte mirrors the input_mask bit layout (attack at
+# bit 0, fb/lr/ud neg/pos in bits 1-6, jump at bit 7) so the engine's
+# in-memory representation matches the on-disk compacted form emitted by
+# qnn.bc.collect.
+ACTION_SIZE = 16
 
 # Per-tick header emitted by demo worker collect mode.
 TICK_HEADER_SIZE = 16
@@ -115,7 +116,8 @@ def unpack_labeler_buffer(raw: bytes) -> dict[str, np.ndarray]:
 #    14    self_weapon_id           u8          ()             1
 #    15    self_movement_id         u8          ()             1
 #    16    self_items               u32         ()             4
-#    20    spatial_dir              i8          (9, 3)        27
+#    20    view_pitch               i8          ()             1  (deg / 90)
+#    21    spatial_dir              i8          (9, 3)        27
 #    47    spatial_nearest_dist     u16         (9,)          18
 #    65    spatial_mean_dist        u16         (9,)          18
 #    83    spatial_openness         u8          (9,)           9
@@ -153,11 +155,11 @@ def unpack_labeler_buffer(raw: bytes) -> dict[str, np.ndarray]:
 # the EntityDequantizer at the model boundary.
 
 NATIVE_SELF_OFFSET           = 0
-NATIVE_SELF_BYTES            = 20
+NATIVE_SELF_BYTES            = 21
 
-NATIVE_SPATIAL_OFFSET        = NATIVE_SELF_OFFSET + NATIVE_SELF_BYTES   # 20
+NATIVE_SPATIAL_OFFSET        = NATIVE_SELF_OFFSET + NATIVE_SELF_BYTES   # 21
 NATIVE_SPATIAL_BYTES         = 135                                      # 9 sectors × 15 B
-NATIVE_ENTITY_STREAM_OFFSET  = NATIVE_SPATIAL_OFFSET + NATIVE_SPATIAL_BYTES  # 155
+NATIVE_ENTITY_STREAM_OFFSET  = NATIVE_SPATIAL_OFFSET + NATIVE_SPATIAL_BYTES  # 156
 
 # Token-type tags on the wire — mirror qnn.vocab TOKEN_* constants.
 _TOK_PROJECTILE = TOKEN_PROJECTILE
@@ -193,6 +195,7 @@ def _unpack_native_self(raw: bytes) -> dict[str, np.ndarray]:
         "self_weapon_id":   _read_scalar(raw, o + 14, np.uint8),
         "self_movement_id": _read_scalar(raw, o + 15, np.uint8),
         "self_items":       _read_scalar(raw, o + 16, np.int32),
+        "view_pitch":       _read_scalar(raw, o + 20, np.int8),
     }
 
 

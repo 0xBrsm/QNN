@@ -1,15 +1,15 @@
-"""Per-original-slot eval of the randomized-mode GBT.
+"""Per-original-idx eval of the randomized-mode GBT.
 
 Loads the GBT model + rebuilds val features with the same seed/permutation
 the original eval used, then breaks down accuracy by the ORIGINAL
-(pre-randomization) target slot:
+(pre-randomization) target idx:
 
     orig=0   → bucket A (engine + labeler agreed)
     orig=1   → ~95% of bucket B
     orig=2+  → rare disagreements
 
 For mis-predictions, reports what the model picked instead — was it the
-"primary" enemy (slot 0 in pre-permute), some other enemy, or a non-enemy?
+"primary" enemy (idx 0 in pre-permute), some other enemy, or a non-enemy?
 
 Usage:
     PYTHONPATH=src python -m qnn.labeler.probes.target_head_gbt_eval \
@@ -48,7 +48,7 @@ def main() -> None:
     print(f"  {len(val_shards)} shards")
 
     # To get the ORIGINAL target, build features twice:
-    #   first without randomization (to capture original target slot)
+    #   first without randomization (to capture original target idx)
     #   then with the same RNG to reproduce the permuted features used by training
     rng_orig = np.random.default_rng(args.seed)
     fm_orig = _build_flat_features(val_shards, rng=rng_orig, randomize=False,
@@ -78,10 +78,10 @@ def main() -> None:
     proba = booster.predict(X_eval)
     pred = proba.argmax(axis=1)
     n = y_eval.shape[0]
-    print(f"\nn={n}  argmax acc on eval slot={100*(pred==y_eval).sum()/n:.2f}%")
+    print(f"\nn={n}  argmax acc on eval idx={100*(pred==y_eval).sum()/n:.2f}%")
 
-    print(f"\n=== accuracy by ORIGINAL target slot ===")
-    print(f"{'orig_slot':>9}  {'n':>9}  {'pct':>6}  {'acc%':>6}")
+    print(f"\n=== accuracy by ORIGINAL target idx ===")
+    print(f"{'orig_idx':>9}  {'n':>9}  {'pct':>6}  {'acc%':>6}")
     for s in range(16):
         mask = y_orig == s
         ns = int(mask.sum())
@@ -91,14 +91,14 @@ def main() -> None:
         print(f"{s:>9}  {ns:>9d}  {100*ns/n:>5.2f}%  {acc:>5.2f}%")
 
     if args.randomize:
-        # For frames where original target was slot 1 (the bulk of disagreement),
-        # what did GBT pick? Decode against the slot indices in the permuted obs.
-        # We need to know: on a slot-1-original frame, when GBT was wrong,
-        # was its pick the "primary" (originally slot 0) or another enemy?
-        # We can identify the original-slot-0 position in the permuted view by
+        # For frames where original target was idx 1 (the bulk of disagreement),
+        # what did GBT pick? Decode against the idx indices in the permuted obs.
+        # We need to know: on a idx-1-original frame, when GBT was wrong,
+        # was its pick the "primary" (originally idx 0) or another enemy?
+        # We can identify the original-idx-0 position in the permuted view by
         # reproducing the per-row permutation. For interpretability, just show
         # accuracy as above and confidence stats.
-        print(f"\n=== confidence on slot-1 originals (post-permute) ===")
+        print(f"\n=== confidence on idx-1 originals (post-permute) ===")
         m1 = y_orig == 1
         if m1.any():
             p_at_pred = proba[np.arange(n), pred][m1]
@@ -108,8 +108,8 @@ def main() -> None:
             print(f"correct (n={correct.sum()}):    mean={cc.mean():.3f}  median={np.median(cc):.3f}")
             print(f"incorrect (n={(~correct).sum()}): mean={ci.mean():.3f}  median={np.median(ci):.3f}")
 
-            # Threshold-curve restricted to slot-1 originals.
-            print(f"\n=== threshold curve on slot-1 originals ===")
+            # Threshold-curve restricted to idx-1 originals.
+            print(f"\n=== threshold curve on idx-1 originals ===")
             print(f"  {'tau':>5}  {'acc%':>6}  {'cov%':>6}  {'n_conf':>10}")
             for tau in [0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99]:
                 conf = p_at_pred >= tau

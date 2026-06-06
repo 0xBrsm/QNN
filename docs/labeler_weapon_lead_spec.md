@@ -1,5 +1,12 @@
 # Weapon-aware target labeler: projectile-lead correction spec
 
+> **Historical.** This spec documents the v2 hard-label `label_enemy_target`
+> weapon-aware design. v2 has been removed from
+> `src/qnn/bc/target_labeler.py`; the live path is the v3 distribution
+> labeler `label_enemy_target_probs`, which retains the lead-corrected aim
+> from this spec but replaces the analytic σ/K cone width with a simpler
+> adaptive cone (see [labeler_v3_simple.md](labeler_v3_simple.md)).
+
 ## Problem statement
 
 `src/qnn/bc/target_labeler.py` currently uses a single weapon-agnostic

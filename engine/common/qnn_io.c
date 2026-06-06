@@ -121,6 +121,9 @@ void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 			(uint8_t)tok->movement_id);
 
 		QNN_BufWriteI32(obs, QNN_OBS_OFF_SELF_ITEMS, tok->items);
+
+		QNN_BufWriteI8 (obs, QNN_OBS_OFF_SELF_VIEW_PITCH,
+			QNN_QuantizeI8(tok->view_pitch));
 	}
 
 	/* ── Spatial block (135 B = field-major across 9 sectors) ─

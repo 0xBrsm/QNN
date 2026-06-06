@@ -1,5 +1,14 @@
 # Target labeler and engine sticky: design, validation, and remaining gaps
 
+> **Historical.** This doc describes the v2 hard-label
+> `label_enemy_target` design and its engine alignment. v2 has been
+> removed from `qnn/bc/target_labeler.py`; the live path is the v3
+> distribution labeler `label_enemy_target_probs`
+> (see [labeler_v3_simple.md](labeler_v3_simple.md)). The engine sticky
+> machine in `qnn_oracle.c` is unchanged and still mirrors the v2 cone
+> geometry; the agreement numbers below remain a useful reference for
+> the engine state machine.
+
 ## TL;DR
 
 We redesigned the BC target labeler (`qnn/bc/target_labeler.py`) and the
@@ -874,10 +883,11 @@ The §8 post-deployment scripts are checked in:
   randomize-mode GBT (§8.3.2 table)
 
 The 4-pool re-collect baseline tables in §8.2 were produced by ad-hoc
-scripts that load the precomputed shards, apply the relevant
-filter/compaction, and re-run `label_enemy_target` from
-`qnn/bc/target_labeler.py`. The `--sight` flag on the labeler is
-the in-code knob that reproduces the SOUND-break behavior.
+scripts that loaded the precomputed shards, applied the relevant
+filter/compaction, and re-ran the v2 hard-label `label_enemy_target`
+that previously lived in `qnn/bc/target_labeler.py` (since removed in
+favor of `label_enemy_target_probs`). The `--sight` flag on the v2
+labeler was the in-code knob that reproduced the SOUND-break behavior.
 
 Re-running any of these requires the existing precomputed shards on
 disk at `artifacts/collect/qwd/precomputed_{train,val}/`.

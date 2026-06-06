@@ -185,7 +185,7 @@ void QNN_LabelerHandleTick(const qnn_snapshot_t *snapshot, FILE *out)
 	 * PlayerJump predicate's K-gated workaround with direct observation
 	 * of pmove's ground-jump success branch.  Frame-exact press
 	 * attribution; no snapshot.grounded lag artifact. */
-	op_jump = QNN_QwdEvalPmoveJump(snapshot);
+	op_jump = QNN_QwdEvalPmoveJump(snapshot, /*synth_button2=*/0);
 
 	/* Pack cmd_move as int16 (raw QW units).  Clamp to int16 range —
 	 * QW values rarely exceed ±400 so headroom is huge, but defensive. */

@@ -1,6 +1,6 @@
 """Per-frame feature builders for flat-feature head-probe ablations.
 
-Each builder takes a torch ``(obs_dict, target_dist_slot)`` pair where
+Each builder takes a torch ``(obs_dict, target_probs_idx)`` pair where
 ``obs_dict`` carries per-frame tensors keyed under the canonical BC
 naming (``self_scalars``, ``self_weapon_id``, ``entity_scalars_raw``,
 …) and returns a ``(N, dim)`` float32 tensor. ``N`` is the flat batch
@@ -9,12 +9,12 @@ chunk); the model's forward flattens before calling these builders.
 
 Builders are registered by name; head specs compose features by naming
 them and the runner builds an MLP of the resulting concat width. The
-oracle-pointer probes pool actor tokens by ``target_dist_slot`` (a
-16-slot renormalized distribution supplied by the BC trainer from
-``actions.target_dist``); features that don't need it accept ``None``.
+oracle-pointer probes pool actor tokens by ``target_probs_idx`` (a
+16-idx renormalized distribution supplied by the BC trainer from
+``actions.target_probs``); features that don't need it accept ``None``.
 
-This registry is consumed by ``qnn.bc.heads.flat.FlatFeatureHead``,
-which conforms to ``_CombatObjectiveNet.forward`` so the canonical BC
+This registry is consumed by ``qnn.model.bench.flat.FlatFeatureHead``,
+which conforms to ``Network.forward`` so the canonical BC
 trainer drives it through ``QNNPolicy(model_factory=...)``.
 """
 
@@ -31,10 +31,10 @@ from qnn.bc.target_labeler import (
     _ACTOR_REL_OFFSET,
     _ACTOR_VEL_OFFSET,
 )
-from qnn.model.policy import WEAPON_HEAD_SIZE
+from qnn.schema import WEAPON_HEAD_SIZE
 
 
-_N_SLOTS = 16
+_N_INDICES = 16
 _FeatureFn = Callable[[Mapping[str, torch.Tensor], torch.Tensor | None], torch.Tensor]
 
 
@@ -44,7 +44,7 @@ class FeatureBuilder:
 
     ``dim`` is the static output width — probes use it to size the MLP
     input. ``fn`` accepts the canonical BC obs dict + the
-    GT-renormalized 16-slot target distribution (or ``None`` if the
+    GT-renormalized 16-idx target distribution (or ``None`` if the
     feature doesn't need it) and returns a ``(N, dim)`` float32 tensor.
     """
     name: str
@@ -68,7 +68,7 @@ def register_feature(name: str, dim: int) -> Callable[[_FeatureFn], _FeatureFn]:
 def build_feature_vector(
     feature_names: tuple[str, ...],
     obs: Mapping[str, torch.Tensor],
-    target_dist_slot: torch.Tensor | None,
+    target_probs_idx: torch.Tensor | None,
 ) -> torch.Tensor:
     """Concatenate the named features along the last axis into a (N, F) tensor."""
     parts: list[torch.Tensor] = []
@@ -78,7 +78,7 @@ def build_feature_vector(
                 f"unknown feature {name!r}; registered: {sorted(FEATURE_REGISTRY)}"
             )
         builder = FEATURE_REGISTRY[name]
-        x = builder.fn(obs, target_dist_slot)
+        x = builder.fn(obs, target_probs_idx)
         if x.ndim != 2 or x.shape[1] != builder.dim:
             raise RuntimeError(
                 f"feature {name!r}: expected (N, {builder.dim}) got {tuple(x.shape)}"
@@ -169,58 +169,58 @@ def _self_weapon_one_hot(obs, _tds):
 
 # ── target distribution as input (privileged) ───────────────────────────────
 
-@register_feature("target_dist_slots", dim=_N_SLOTS)
-def _target_dist_slots(_obs, target_dist_slot):
-    """16-slot GT distribution renormalized by present, as supplied by the
+@register_feature("target_probs_indices", dim=_N_INDICES)
+def _target_probs_indices(_obs, target_probs_idx):
+    """16-idx GT distribution renormalized by present, as supplied by the
     BC supervised loop. Privileged: oracle-pointer feature."""
-    if target_dist_slot is None:
+    if target_probs_idx is None:
         raise RuntimeError(
-            "feature 'target_dist_slots' requires target_dist_slot — "
-            "ensure BC trainer is passing it (actions.target_dist driven)."
+            "feature 'target_probs_indices' requires target_probs_idx — "
+            "ensure BC trainer is passing it (actions.target_probs driven)."
         )
-    return _as_float(target_dist_slot)
+    return _as_float(target_probs_idx)
 
 
-# ── target-pooled actor features (privileged via target_dist_slot) ─────────
+# ── target-pooled actor features (privileged via target_probs_idx) ─────────
 
 def _pool_actor_block(
     obs: Mapping[str, torch.Tensor],
-    target_dist_slot: torch.Tensor | None,
+    target_probs_idx: torch.Tensor | None,
     offset: int,
     n: int,
 ) -> torch.Tensor:
-    """Soft-pool entity_scalars_raw[..., offset:offset+n] by renormalized target_dist."""
-    if target_dist_slot is None:
-        raise RuntimeError("target_pooled_* needs target_dist_slot from the BC trainer")
+    """Soft-pool entity_scalars_raw[..., offset:offset+n] by renormalized target_probs."""
+    if target_probs_idx is None:
+        raise RuntimeError("target_pooled_* needs target_probs_idx from the BC trainer")
     es = _as_float(obs["entity_scalars_raw"])                         # (N, 16, 19)
     block = es[:, :, offset:offset + n]                                # (N, 16, n)
-    slot = _as_float(target_dist_slot)                                # (N, 16)
-    return (slot.unsqueeze(-1) * block).sum(dim=1)                     # (N, n)
+    idx = _as_float(target_probs_idx)                                # (N, 16)
+    return (idx.unsqueeze(-1) * block).sum(dim=1)                     # (N, n)
 
 
 @register_feature("target_pooled_rel", dim=3)
-def _target_pooled_rel(obs, target_dist_slot):
-    return _pool_actor_block(obs, target_dist_slot, _ACTOR_REL_OFFSET, 3)
+def _target_pooled_rel(obs, target_probs_idx):
+    return _pool_actor_block(obs, target_probs_idx, _ACTOR_REL_OFFSET, 3)
 
 
 @register_feature("target_pooled_vel", dim=3)
-def _target_pooled_vel(obs, target_dist_slot):
-    return _pool_actor_block(obs, target_dist_slot, _ACTOR_VEL_OFFSET, 3)
+def _target_pooled_vel(obs, target_probs_idx):
+    return _pool_actor_block(obs, target_probs_idx, _ACTOR_VEL_OFFSET, 3)
 
 
 @register_feature("target_pooled_scalars", dim=19)
-def _target_pooled_scalars(obs, target_dist_slot):
+def _target_pooled_scalars(obs, target_probs_idx):
     """Full 19-dim soft-pooled actor scalar vector (rel + vel + dist +
     eta + facing + recency + etc.). The maximum-information target-aware
     feature; expensive but a clean upper bound for probes."""
-    return _pool_actor_block(obs, target_dist_slot, 0, 19)
+    return _pool_actor_block(obs, target_probs_idx, 0, 19)
 
 
-# ── target-head-style flat features (no privileged target_dist) ─────────────
+# ── target-head-style flat features (no privileged target_probs) ─────────────
 
-@register_feature("entity_scalars_flat", dim=_N_SLOTS * 19)
+@register_feature("entity_scalars_flat", dim=_N_INDICES * 19)
 def _entity_scalars_flat(obs, _tds):
-    """Per-slot entity scalars flattened. Used by the target-head probe
+    """Per-idx entity scalars flattened. Used by the target-head probe
     where the model has to identify the target without privileged info."""
     es = _as_float(obs["entity_scalars_raw"])
-    return es.reshape(es.shape[0], _N_SLOTS * 19)
+    return es.reshape(es.shape[0], _N_INDICES * 19)

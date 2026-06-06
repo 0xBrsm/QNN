@@ -1,6 +1,7 @@
 #ifndef QNN_H
 #define QNN_H
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -110,22 +111,51 @@ typedef struct
 
 typedef struct
 {
-	float	move[3];	/* view-relative direction: (forward, right, up) */
-	float	look[3];
-	int	fire;
-	int	weapon;		/* raw engine weapon byte: 0 = no switch this
+	uint8_t	move;		/* press byte — same bit layout as input_mask
+				 * (packed by QNN_PackInputMask):
+				 *   bit 0    = attack press
+				 *   bit 1    = forward neg press
+				 *   bit 2    = forward pos press
+				 *   bit 3    = side neg press
+				 *   bit 4    = side pos press
+				 *   bit 5    = up neg press (swim down)
+				 *   bit 6    = up pos press (swim up / jump)
+				 *   bit 7    = jump press (explicit) */
+	uint8_t	weapon;		/* raw engine weapon byte: 0 = no switch this
 				 * frame, 1..8 = Quake weapon id (axe..lightning)
 				 * consumed as an impulse by the runtime engine. */
-	int	op_input;	/* per-axis op mask of the usercmd this tick:
-				 * bit i set ⇔ press on axis i AND engine
-				 * acted on it. bit0=fb, bit1=lr, bit2=ud,
-				 * bit3=fire, bit4=impulse. Bits 5..7 reserved.
-				 * Packed by QNN_PackOpInput on both BC QWD
-				 * (action.op_input) and labeler (LOBS byte)
-				 * paths; the trainer's op_input_mask toggle
-				 * consumes it to drop held-but-ignored frames
-				 * from each head's loss subset. */
+	uint8_t	input_mask;	/* 8-bit per-axis PURE-FEASIBILITY mask: each
+				 * bit answers "would the engine accept this
+				 * axis press if I pressed it right now?".
+				 * NOT AND'd with the demo's actual cmd —
+				 * trainer combines feasibility with usercmd
+				 * intent itself to derive engine-outcome
+				 * labels. Bit layout matches `move` above
+				 * (packed by QNN_PackInputMask). Trainer uses
+				 * when input_mask=true in train.json. */
+	uint8_t	_pad;
+	float	look[3];
 } qnn_action_t;
+
+/* Per-axis sign in {-1, 0, +1}. axis ∈ {0=fb, 1=lr, 2=ud}. */
+static inline int QNN_ActionAxisSign(uint8_t move, int axis)
+{
+	int neg_bit = 1 + 2 * axis;
+	int pos_bit = 2 + 2 * axis;
+	return ((int)((move >> pos_bit) & 1)) - ((int)((move >> neg_bit) & 1));
+}
+
+static inline int QNN_ActionAttack(uint8_t move) { return move & 1; }
+static inline int QNN_ActionJump(uint8_t move)   { return (move >> 7) & 1; }
+
+/* Expand the press byte into a (forward, right, up) vector of ±1.0/0.0
+ * floats, suitable for runtime cmd dispatch. */
+static inline void QNN_ActionMoveVec(uint8_t move, float out[3])
+{
+	out[0] = (float)QNN_ActionAxisSign(move, 0);
+	out[1] = (float)QNN_ActionAxisSign(move, 1);
+	out[2] = (float)QNN_ActionAxisSign(move, 2);
+}
 
 typedef struct
 {
@@ -336,6 +366,13 @@ int QNN_ProgsEvalJump(
  * k_fire_cd_native[9] table. */
 int QNN_ProgsGetAttackCdRemaining(int tick, int tick_hz);
 
+/* Direct accessor for the persistent qnn_progs_attack_finished float.
+ * Used by QwdPackInputMask to save/restore around a synthetic feasibility
+ * call to QNN_ProgsEvalAttack — preventing the synthetic press from
+ * advancing the cooldown for subsequent real per-cmd evals. */
+float QNN_ProgsGetAttackFinished(void);
+void  QNN_ProgsSetAttackFinished(float value);
+
 /* QWD-side per-cmd operative-predicate driver (engine-specific impl
  * in qw/qnn_qwd_collect.c, declared here so common labeler-collect
  * code can call it without pulling qw/* headers).  Single pass through
@@ -360,7 +397,7 @@ void QNN_QwdEvalOperativePerCmd(
  * attribution at cmd granularity, no snapshot.grounded lag artifact.
  * Maintains pmove.oldbuttons across calls via qwd_state for cross-
  * tick anti-pogo. */
-int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot);
+int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot, int synth_button2);
 void QNN_PhysSetupMovers(const qnn_mover_state_t *movers, int count);
 void QNN_PhysSetupPlayers(const vec3_t *origins, int count);
 void QNN_PhysBestCandidate(
@@ -379,8 +416,25 @@ int QNN_BuildPushRefs(int *out_model_indices, vec3_t *out_velocities,
 	int max_count);
 int QNN_BuildPlayerRefs(int self_entity_num, int *out_entity_nums,
 	int max_count);
-void QNN_JitterFilter(qnn_action_t *mid, const float *prev_move,
-	const float *next_move);
+/* Pack per-axis press / feasibility bits into the shared byte layout used
+ * by qnn_action_t.move (press) and qnn_action_t.input_mask (feasibility).
+ * Bit positions:
+ *   bit 0    = attack
+ *   bits 1-2 = forward neg / pos
+ *   bits 3-4 = side neg / pos
+ *   bits 5-6 = up neg / pos
+ *   bit 7    = jump
+ * Dead frames (alive=0) return 0x00. */
+uint8_t QNN_PackInputMask(
+	int alive,
+	int fb_act_neg,  int fb_act_pos,
+	int lr_act_neg,  int lr_act_pos,
+	int up_act_neg,  int up_act_pos,
+	int jump_act,
+	int attack_act);
+
+void QNN_JitterFilter(qnn_action_t *mid, uint8_t prev_move,
+	uint8_t next_move);
 qboolean QNN_ActionIsFrozen(const qnn_action_t *a);
 void QNN_EmitTick(FILE *out, const uint8_t *obs, const qnn_action_t *action,
 	int tick, int steps, int tick_hz, uint16_t flags);
@@ -492,7 +546,7 @@ typedef struct
 	qboolean	has_jitter_buf;
 	qnn_fire_route_event_t jitter_fire_routes[QNN_MAX_FIRE_ROUTE_EVENTS];
 	int		jitter_fire_route_count;
-	float		prev_prev_move[3];
+	uint8_t		prev_prev_move;
 	qboolean	has_prev_prev_move;
 	qboolean	has_prev_emitted;
 	int		emitted_rows;

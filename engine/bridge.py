@@ -152,18 +152,49 @@ class NativeProcessBase:
 
     # -- Action helpers ------------------------------------------------------
 
-    # Binary step protocol: 1-byte opcode + packed action struct (32 bytes).
-    # Matches qnn_action_t layout: move[3] look[3] fire switch.
+    # Binary step protocol: 1-byte opcode + packed action struct (16 bytes).
+    # Matches qnn_action_t layout: move (press byte) + weapon + input_mask +
+    # pad + look[3]. The press byte bit layout mirrors input_mask:
+    #   bit 0   = attack press
+    #   bits 1-2 = forward neg / pos
+    #   bits 3-4 = side neg / pos
+    #   bits 5-6 = up neg / pos
+    #   bit 7   = jump press
     _BINARY_OP_STEP = b"\x01"
-    _ACTION_PACK_FORMAT = "<3f3f2i"  # 6 floats + 2 ints = 32 bytes
+    _ACTION_PACK_FORMAT = "<4B3f"  # 4 uint8 + 3 float32 = 16 bytes
+
+    @staticmethod
+    def _pack_press_byte(labels: ActionLabels) -> int:
+        t = 0.1
+        m0, m1, m2 = float(labels.move[0]), float(labels.move[1]), float(labels.move[2])
+        byte = 0
+        if int(labels.attack):
+            byte |= 0x01
+        if m0 < -t:
+            byte |= 0x02
+        if m0 > t:
+            byte |= 0x04
+        if m1 < -t:
+            byte |= 0x08
+        if m1 > t:
+            byte |= 0x10
+        if m2 < -t:
+            byte |= 0x20
+        if m2 > t:
+            byte |= 0x40
+        if m2 > t:
+            byte |= 0x80
+        return byte
 
     def _binary_step_request(self, action: Mapping[str, object]) -> bytes:
         labels = ActionLabels.from_dict(action)
         return self._BINARY_OP_STEP + struct.pack(
             self._ACTION_PACK_FORMAT,
-            float(labels.move[0]), float(labels.move[1]), float(labels.move[2]),
+            self._pack_press_byte(labels),
+            int(labels.weapon),
+            0,  # input_mask not transmitted from runtime
+            0,  # _pad
             float(labels.look[0]), float(labels.look[1]), float(labels.look[2]),
-            int(labels.fire), int(labels.weapon),
         )
 
     def _action_request(self, action: Mapping[str, object], op: str = "step") -> bytes:
@@ -260,7 +291,7 @@ import numpy as np
 # engine_norm phase 2: C side emits the native-width obs buffer per
 # qnn.engine_norm (see src/engine/common/qnn_io.{h,c}). The legacy f32
 # parser is dead; we use the native dict format end-to-end on this
-# bridge. Downstream consumers (qnn.model.policy via Tokenizer's
+# bridge. Downstream consumers (qnn.model.policy via ObsEmbedding's
 # dequantizers, qnn.eval.live's logging) read the native key set.
 from qnn.wire import OBS_BUFFER_SIZE, unpack_obs_buffer_native as _unpack_obs_buffer
 
@@ -448,7 +479,30 @@ class NativeClientProcess:
     """
 
     _BINARY_OP_STEP = b"\x01"
-    _ACTION_PACK_FORMAT = "<3f3f2i"
+    _ACTION_PACK_FORMAT = "<4B3f"  # 4 uint8 + 3 float32 = 16 bytes
+
+    @staticmethod
+    def _pack_press_byte(labels: ActionLabels) -> int:
+        t = 0.1
+        m0, m1, m2 = float(labels.move[0]), float(labels.move[1]), float(labels.move[2])
+        byte = 0
+        if int(labels.attack):
+            byte |= 0x01
+        if m0 < -t:
+            byte |= 0x02
+        if m0 > t:
+            byte |= 0x04
+        if m1 < -t:
+            byte |= 0x08
+        if m1 > t:
+            byte |= 0x10
+        if m2 < -t:
+            byte |= 0x20
+        if m2 > t:
+            byte |= 0x40
+        if m2 > t:
+            byte |= 0x80
+        return byte
 
     def __init__(
         self,
@@ -516,9 +570,11 @@ class NativeClientProcess:
         labels = ActionLabels.from_dict(action)
         payload = self._BINARY_OP_STEP + struct.pack(
             self._ACTION_PACK_FORMAT,
-            float(labels.move[0]), float(labels.move[1]), float(labels.move[2]),
+            self._pack_press_byte(labels),
+            int(labels.weapon),
+            0,  # input_mask not transmitted from runtime
+            0,  # _pad
             float(labels.look[0]), float(labels.look[1]), float(labels.look[2]),
-            int(labels.fire), int(labels.weapon),
         )
         proc.stdin.write(payload)
         proc.stdin.flush()

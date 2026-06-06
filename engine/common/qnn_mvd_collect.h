@@ -97,7 +97,7 @@ void QNN_MvdBackShiftWriteJumpEvents(const qnn_snapshot_t *snapshot,
 	float ping_sec, float emit_start_native_time);
 
 /* Copy the current emit's move XY to the back-shifted slot. */
-void QNN_MvdBackShiftWriteMoveXY(const float move[3], int shift_frames);
+void QNN_MvdBackShiftWriteMoveXY(uint8_t move, int shift_frames);
 
 /* Drain every remaining slot through `emit`.  Called at demo end. */
 void QNN_MvdBackShiftFlushAll(qnn_tick_emit_state_t *emit);

@@ -2,7 +2,7 @@
 
 Three dequantizer modules convert the engine-native dicts produced
 by the new wire format (see ``qnn.engine_norm``) into the float /
-int tensors the existing Tokenizer + heads consume:
+int tensors the existing ObsEmbedding + heads consume:
 
 - ``SelfDequantizer``    — health, armor, ammo, velocity, items
                             bitfield, attack cooldown.
@@ -15,7 +15,7 @@ int tensors the existing Tokenizer + heads consume:
 Each owns the per-field normalization (``/QNN_MAX_HEALTH``,
 ``/QNN_VELOCITY_SCALE``, ``/QNN_TIME_SCALE``, ``/QNN_DIST_SCALE``,
 ``/127`` for i8 unit vectors, ``/255`` for u8 [0, 1] fractions) and
-any bit / index demuxing. Output dict keys feed the Tokenizer's
+any bit / index demuxing. Output dict keys feed the ObsEmbedding's
 existing per-type projections and embedding lookups, so trained
 checkpoints load and run unchanged once the dataloader produces
 native-format obs dicts.
@@ -55,32 +55,71 @@ _SUBJECT_RING         = ENTITY_IDS["RING"]
 _SUBJECT_SUIT         = ENTITY_IDS["SUIT"]
 _SUBJECT_MEGAHEALTH   = ENTITY_IDS["MEGAHEALTH"]
 
-# Self-scalars vector slot layout. Mirrors the legacy float-32 self
-# block consumed by Tokenizer.self_proj (nn.Linear(17, d_model)). The
-# trained checkpoints have weights indexed by these positions; do not
-# reorder without an architectural retrain.
+# Weapon vocab IDs in axe-first impulse order (engine impulse 1..8).
+# These pair with the per-weapon readiness vector (B, 8) the dequant
+# emits — the ObsEmbedding looks each up in `entity_embed` and weights
+# it by the readiness scalar to form the arsenal subtoken contribution.
+_WEAPON_SUBJECT_IDS = (
+    ENTITY_IDS["AXE"],
+    ENTITY_IDS["SHOTGUN"],
+    ENTITY_IDS["SUPER_SHOTGUN"],
+    ENTITY_IDS["NAILGUN"],
+    ENTITY_IDS["SUPER_NAILGUN"],
+    ENTITY_IDS["GRENADE_LAUNCHER"],
+    ENTITY_IDS["ROCKET_LAUNCHER"],
+    ENTITY_IDS["THUNDERBOLT"],
+)
+_N_WEAPONS = len(_WEAPON_SUBJECT_IDS)
+
+# Legacy 17-wide self_scalars layout. The ObsEmbedding no longer uses
+# this tensor (it reads the three subtoken tensors below instead) but
+# downstream ablation heads / feature registry entries / labeler probes
+# still index it by these positions, so the dequant keeps emitting it
+# as-is. Do not reorder without an architectural retrain.
 _SELF_SCALAR_DIM = 17
-_SLOT_HEALTH          = 0
-_SLOT_ARMOR           = 1
-_SLOT_WEAPON_SG       = 2
-_SLOT_WEAPON_SSG      = 3
-_SLOT_WEAPON_NG       = 4
-_SLOT_WEAPON_SNG      = 5
-_SLOT_WEAPON_GL       = 6
-_SLOT_WEAPON_RL       = 7
-_SLOT_WEAPON_LG       = 8
-_SLOT_AMMO_SHELLS     = 9
-_SLOT_AMMO_NAILS      = 10
-_SLOT_AMMO_ROCKETS    = 11
-_SLOT_AMMO_CELLS      = 12
-_SLOT_VEL_X           = 13
-_SLOT_VEL_Y           = 14
-_SLOT_VEL_Z           = 15
-_SLOT_ATTACK_FINISHED = 16
+_IDX_HEALTH          = 0
+_IDX_ARMOR           = 1
+_IDX_WEAPON_SG       = 2
+_IDX_WEAPON_SSG      = 3
+_IDX_WEAPON_NG       = 4
+_IDX_WEAPON_SNG      = 5
+_IDX_WEAPON_GL       = 6
+_IDX_WEAPON_RL       = 7
+_IDX_WEAPON_LG       = 8
+# Public — bench heads (e.g. weapon_aim) read these indices off self_scalars
+# directly; keep the source-of-truth here so an obs-layout change can't drift
+# between the dequantizer that writes them and the bench consumers that read.
+IDX_AMMO_SHELLS      = 9
+IDX_AMMO_NAILS       = 10
+IDX_AMMO_ROCKETS     = 11
+IDX_AMMO_CELLS       = 12
+_IDX_VEL_X           = 13
+_IDX_VEL_Y           = 14
+_IDX_VEL_Z           = 15
+IDX_ATTACK_FINISHED  = 16
+# Back-compat private aliases for the dequantizer's internal writes.
+_IDX_AMMO_SHELLS     = IDX_AMMO_SHELLS
+_IDX_AMMO_NAILS      = IDX_AMMO_NAILS
+_IDX_AMMO_ROCKETS    = IDX_AMMO_ROCKETS
+_IDX_AMMO_CELLS      = IDX_AMMO_CELLS
+_IDX_ATTACK_FINISHED = IDX_ATTACK_FINISHED
+
+# Self subtoken scalar widths, consumed by the three projections in
+# ObsEmbedding (`self_proj_state`, `self_proj_arsenal`, `self_proj_motion`).
+SELF_STATE_SCALAR_DIM   = 2  # health, effective_armor
+SELF_ARSENAL_SCALAR_DIM = 1  # attack_finished
+SELF_MOTION_SCALAR_DIM  = 4  # vel_xyz, view_pitch
 
 
 class SelfDequantizer(nn.Module):
-    """Engine-native self block → Tokenizer-ready float / int tensors."""
+    """Engine-native self block → ObsEmbedding-ready float / int tensors.
+
+    Emits three subtoken scalar tensors (state / arsenal / motion), a
+    per-weapon readiness vector, and powerup IDs grouped by which
+    subtoken they route into. The legacy 17-wide ``self_scalars`` tensor
+    is kept alongside for feature-registry / labeler-probe consumers
+    that still index it by idx position.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -88,14 +127,13 @@ class SelfDequantizer(nn.Module):
     def forward(
         self, obs: Mapping[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Convert a native obs dict to the Tokenizer-expected obs dict.
+        """Convert a native obs dict to the ObsEmbedding-expected obs dict.
 
         Idempotent: if obs already carries the dequantized
-        ``self_scalars`` key (e.g. the GPU-resident preload step in
-        qnn.bc.supervised_loop.preload_episodes_to_gpu ran the dequant
-        once at startup), pass through unchanged.
+        ``self_state_scalars`` key (e.g. ``make_resident_source`` ran the
+        dequant once at startup), pass through unchanged.
         """
-        if "self_scalars" in obs:
+        if "self_state_scalars" in obs:
             return dict(obs)
         out: dict[str, torch.Tensor] = dict(obs)
 
@@ -109,37 +147,86 @@ class SelfDequantizer(nn.Module):
         vel         = obs["vel"]               # (B, 3) i16
         af          = obs["attack_finished"]   # (B,) f16, seconds
         items       = obs["self_items"]        # (B,) u32
+        view_pitch  = obs["view_pitch"]        # (B,) i8 — deg/90 quantized
 
         device = health.device
         batch = health.shape[0]
 
-        # Scalar normalizations. Promote to float32 for the matmul-bound
-        # downstream; division is a free cast on modern accelerators.
-        scalars = torch.zeros(batch, _SELF_SCALAR_DIM, device=device, dtype=torch.float32)
-        scalars[:, _SLOT_HEALTH]       = health.to(torch.float32)    / en.MAX_HEALTH
-        scalars[:, _SLOT_ARMOR]        = eff_armor.to(torch.float32) / en.MAX_ARMOR_EFFECT
-        scalars[:, _SLOT_AMMO_SHELLS]  = ammo_sh.to(torch.float32)   / en.MAX_SHELLS
-        scalars[:, _SLOT_AMMO_NAILS]   = ammo_na.to(torch.float32)   / en.MAX_NAILS
-        scalars[:, _SLOT_AMMO_ROCKETS] = ammo_rk.to(torch.float32)   / en.MAX_ROCKETS
-        scalars[:, _SLOT_AMMO_CELLS]   = ammo_ce.to(torch.float32)   / en.MAX_CELLS
-        scalars[:, _SLOT_VEL_X:_SLOT_VEL_Z + 1] = (
-            vel.to(torch.float32) / en.MAX_VELOCITY
-        )
-        scalars[:, _SLOT_ATTACK_FINISHED] = (
-            af.to(torch.float32) / en.TIME_SCALE
-        )
+        # ── Normalized scalar floats ────────────────────────────────
+        health_f    = health.to(torch.float32)    / en.MAX_HEALTH
+        eff_armor_f = eff_armor.to(torch.float32) / en.MAX_ARMOR_EFFECT
+        ammo_sh_f   = ammo_sh.to(torch.float32)   / en.MAX_SHELLS
+        ammo_na_f   = ammo_na.to(torch.float32)   / en.MAX_NAILS
+        ammo_rk_f   = ammo_rk.to(torch.float32)   / en.MAX_ROCKETS
+        ammo_ce_f   = ammo_ce.to(torch.float32)   / en.MAX_CELLS
+        vel_f       = vel.to(torch.float32)       / en.MAX_VELOCITY
+        af_f        = af.to(torch.float32)        / en.TIME_SCALE
+        # i8 already encodes pitch/90 with /127 quantization on the wire,
+        # so divide by 127 to recover the [-1, 1] interval.
+        pitch_f     = view_pitch.to(torch.float32) / 127.0
 
-        # cl.items bit-extracted weapon flags. Boolean → float {0.0,
-        # 1.0}, sitting in slots 2..8 so they line up byte-for-byte
-        # with the legacy weapon_sg..weapon_lg floats.
+        # ── Subtoken scalar tensors fed to the three ObsEmbedding projs ─
+        out["self_state_scalars"] = torch.stack(
+            [health_f, eff_armor_f], dim=1,
+        )                                                              # (B, 2)
+        out["self_arsenal_scalars"] = af_f.unsqueeze(-1)               # (B, 1)
+        out["self_motion_scalars"] = torch.cat(
+            [vel_f, pitch_f.unsqueeze(-1)], dim=1,
+        )                                                              # (B, 4)
+
+        # ── Legacy flat self_scalars (kept for downstream consumers) ─
+        scalars = torch.zeros(batch, _SELF_SCALAR_DIM, device=device, dtype=torch.float32)
+        scalars[:, _IDX_HEALTH]       = health_f
+        scalars[:, _IDX_ARMOR]        = eff_armor_f
+        scalars[:, _IDX_AMMO_SHELLS]  = ammo_sh_f
+        scalars[:, _IDX_AMMO_NAILS]   = ammo_na_f
+        scalars[:, _IDX_AMMO_ROCKETS] = ammo_rk_f
+        scalars[:, _IDX_AMMO_CELLS]   = ammo_ce_f
+        scalars[:, _IDX_VEL_X:_IDX_VEL_Z + 1] = vel_f
+        scalars[:, _IDX_ATTACK_FINISHED] = af_f
+
         items_i64 = items.to(torch.int64)
-        scalars[:, _SLOT_WEAPON_SG]  = ((items_i64 & en.IT_SHOTGUN)          != 0).to(torch.float32)
-        scalars[:, _SLOT_WEAPON_SSG] = ((items_i64 & en.IT_SUPER_SHOTGUN)    != 0).to(torch.float32)
-        scalars[:, _SLOT_WEAPON_NG]  = ((items_i64 & en.IT_NAILGUN)          != 0).to(torch.float32)
-        scalars[:, _SLOT_WEAPON_SNG] = ((items_i64 & en.IT_SUPER_NAILGUN)    != 0).to(torch.float32)
-        scalars[:, _SLOT_WEAPON_GL]  = ((items_i64 & en.IT_GRENADE_LAUNCHER) != 0).to(torch.float32)
-        scalars[:, _SLOT_WEAPON_RL]  = ((items_i64 & en.IT_ROCKET_LAUNCHER)  != 0).to(torch.float32)
-        scalars[:, _SLOT_WEAPON_LG]  = ((items_i64 & en.IT_LIGHTNING)        != 0).to(torch.float32)
+        # 7 ammo-using weapon-owned bits in legacy idx order (SG..LG).
+        owned_bits = torch.stack([
+            (items_i64 & en.IT_SHOTGUN)          != 0,
+            (items_i64 & en.IT_SUPER_SHOTGUN)    != 0,
+            (items_i64 & en.IT_NAILGUN)          != 0,
+            (items_i64 & en.IT_SUPER_NAILGUN)    != 0,
+            (items_i64 & en.IT_GRENADE_LAUNCHER) != 0,
+            (items_i64 & en.IT_ROCKET_LAUNCHER)  != 0,
+            (items_i64 & en.IT_LIGHTNING)        != 0,
+        ], dim=1).to(torch.float32)                                    # (B, 7)
+        scalars[:, _IDX_WEAPON_SG:_IDX_WEAPON_LG + 1] = owned_bits
+
+        # ── Per-weapon readiness in ENTITY_IDS weapon order ───────
+        # Order: [AXE, SG, SSG, NG, SNG, GL, RL, LG] — matches
+        # _WEAPON_SUBJECT_IDS so the ObsEmbedding can fold this into a
+        # single embedding-lookup-and-sum.
+        # readiness = 0.1 + 0.9 × (shots_remaining / MAX_shots), masked by
+        # ownership. For every ammo-weapon, pool_cap = cost_per_shot ×
+        # MAX_shots exactly (e.g. SSG: 2 × 50 = 100 = MAX_SHELLS), so
+        # shots_remaining/MAX_shots collapses to the normalized pool
+        # fraction the dequant already computes. Two pool-sharing
+        # weapons (GL/RL, SG/SSG, NG/SNG) read the same scalar with
+        # different MAX_shots semantically, but the collapse means
+        # they share the same readiness value here — which is correct:
+        # SSG firing leaves SG ammo at the same fraction.
+        axe_owned = ((items_i64 & en.IT_AXE) != 0).to(torch.float32)
+        sh_ready  = self._ammo_readiness(ammo_sh_f)
+        na_ready  = self._ammo_readiness(ammo_na_f)
+        rk_ready  = self._ammo_readiness(ammo_rk_f)
+        ce_ready  = self._ammo_readiness(ammo_ce_f)
+
+        readiness = torch.stack([
+            axe_owned,                            # AXE: 1 if owned else 0
+            sh_ready * owned_bits[:, 0],          # SG
+            sh_ready * owned_bits[:, 1],          # SSG
+            na_ready * owned_bits[:, 2],          # NG
+            na_ready * owned_bits[:, 3],          # SNG
+            rk_ready * owned_bits[:, 4],          # GL
+            rk_ready * owned_bits[:, 5],          # RL
+            ce_ready * owned_bits[:, 6],          # LG
+        ], dim=1)                                                      # (B, 8)
 
         # Armor type ID: 0 if no armor bit set, else GREEN/YELLOW/RED.
         # Higher tier wins if multiple bits are set (defensive — engine
@@ -161,49 +248,50 @@ class SelfDequantizer(nn.Module):
             armor_type,
         )
 
-        # Powerup IDs: pack present powerups (incl. megahealth via
-        # health>100) into the leading slots of a (B, 5) tensor. Empty
-        # trailing slots stay 0 (NONE), which the Tokenizer masks with
-        # `pmask = (pids > 0)`. Order matches the legacy emitter in
-        # qnn_self_common.c:124-133 (QUAD, PENT, RING, SUIT, MEGAHEALTH).
-        flags = torch.stack([
-            (items_i64 & en.IT_QUAD)            != 0,
-            (items_i64 & en.IT_INVULNERABILITY) != 0,
-            (items_i64 & en.IT_INVISIBILITY)    != 0,
-            (items_i64 & en.IT_SUIT)            != 0,
-            health.to(torch.int64) > 100,                # megahealth
-        ], dim=1)  # (B, 5) bool
-        subject_ids = torch.tensor(
-            [_SUBJECT_QUAD, _SUBJECT_PENT, _SUBJECT_RING, _SUBJECT_SUIT, _SUBJECT_MEGAHEALTH],
-            dtype=torch.int64, device=device,
-        )  # (5,)
-        values = subject_ids.unsqueeze(0).expand(batch, -1)        # (B, 5)
+        # ── Powerup IDs routed by primary effect (per self-spatial design)
+        # state ← PENT (invuln), RING (invisibility), MEGAHEALTH
+        # arsenal ← QUAD (damage mult)
+        # motion ← SUIT (lava/slime traversal)
+        # Each slot holds the powerup's ENTITY_IDS subject if present,
+        # else 0 (NONE) — ObsEmbedding masks zeros at embed-lookup time.
+        zero = torch.zeros(batch, dtype=torch.int64, device=device)
+        have_pent = (items_i64 & en.IT_INVULNERABILITY) != 0
+        have_ring = (items_i64 & en.IT_INVISIBILITY)    != 0
+        have_mega = health.to(torch.int64) > 100
+        have_quad = (items_i64 & en.IT_QUAD)            != 0
+        have_suit = (items_i64 & en.IT_SUIT)            != 0
 
-        # Per-row prefix sum over flags gives each present powerup a
-        # unique compact slot 0..4 in legacy order. Absent powerups get
-        # routed to a sentinel slot (5) which we then discard — this
-        # avoids the non-deterministic-write hazard scatter has when
-        # multiple sources alias the same destination.
-        slot_idx = flags.to(torch.int64).cumsum(dim=1) - 1         # (B, 5)
-        write_idx = torch.where(
-            flags, slot_idx, torch.full_like(slot_idx, 5)
-        )                                                          # (B, 5)
-        scratch = torch.zeros(batch, 6, dtype=torch.int64, device=device)
-        scratch.scatter_(1, write_idx, values)
-        powerup_ids = scratch[:, :5].contiguous()
+        out["self_state_powerup_ids"] = torch.stack([
+            torch.where(have_pent, torch.full_like(zero, _SUBJECT_PENT),       zero),
+            torch.where(have_ring, torch.full_like(zero, _SUBJECT_RING),       zero),
+            torch.where(have_mega, torch.full_like(zero, _SUBJECT_MEGAHEALTH), zero),
+        ], dim=1)                                                      # (B, 3)
+        out["self_arsenal_powerup_ids"] = torch.where(
+            have_quad, torch.full_like(zero, _SUBJECT_QUAD), zero,
+        ).unsqueeze(-1)                                                # (B, 1)
+        out["self_motion_powerup_ids"] = torch.where(
+            have_suit, torch.full_like(zero, _SUBJECT_SUIT), zero,
+        ).unsqueeze(-1)                                                # (B, 1)
 
-        out["self_scalars"] = scalars
-        out["self_weapon_id"]     = obs["self_weapon_id"].to(torch.int64).unsqueeze(-1)
-        out["self_armor_type_id"] = armor_type.unsqueeze(-1)
-        out["self_movement_id"]   = obs["self_movement_id"].to(torch.int64).unsqueeze(-1)
-        out["self_powerup_ids"]   = powerup_ids
+        out["self_scalars"]         = scalars
+        out["self_weapon_readiness"] = readiness
+        out["self_weapon_id"]       = obs["self_weapon_id"].to(torch.int64).unsqueeze(-1)
+        out["self_armor_type_id"]   = armor_type.unsqueeze(-1)
+        out["self_movement_id"]     = obs["self_movement_id"].to(torch.int64).unsqueeze(-1)
         return out
+
+    @staticmethod
+    def _ammo_readiness(pool_norm: torch.Tensor) -> torch.Tensor:
+        # 0.1 floor keeps owned-empty distinct from not-owned (which the
+        # caller's ownership mask zeros out entirely). 0.9 × pool_norm
+        # gives full 1.0 at pool cap.
+        return 0.1 + 0.9 * pool_norm.clamp(0.0, 1.0)
 
 
 # ── SpatialDequantizer ───────────────────────────────────────────
 
-# spatial_scalars slot layout — mirrors qnn_onnx.c:374-386. The
-# Tokenizer's spatial_proj is nn.Linear(13, d_model); trained
+# spatial_scalars idx layout — mirrors qnn_onnx.c:374-386. The
+# ObsEmbedding's spatial_proj is nn.Linear(13, d_model); trained
 # checkpoints have weights indexed by these positions, so reordering
 # requires retraining.
 _SPATIAL_SCALAR_DIM   = 13
@@ -223,11 +311,11 @@ _SP_LAVA_FRAC         = 12
 
 
 class SpatialDequantizer(nn.Module):
-    """Engine-native spatial block → Tokenizer-ready ``spatial_scalars``.
+    """Engine-native spatial block → ObsEmbedding-ready ``spatial_scalars``.
 
     Input: per-field native-typed tensors (per qnn.engine_norm.SPATIAL_FIELDS).
     Output: ``spatial_scalars`` (B, 9, 13) float32 in the layout the
-    Tokenizer's ``spatial_proj`` consumes.
+    ObsEmbedding's ``spatial_proj`` consumes.
     """
 
     def __init__(self) -> None:
@@ -279,22 +367,22 @@ class SpatialDequantizer(nn.Module):
         return out
 
 
-# ActionDequantizer was deleted along with the sparse act_target_dist
+# ActionDequantizer was deleted along with the sparse act_target_probs
 # encoding. The target distribution is now recomputed at training start
-# from obs+actions by qnn.bc.train._compute_target_dist and arrives as
-# dense (T, TARGET_DIST_CLASSES) float32 — heads consume it directly,
+# from obs+actions by qnn.bc.train._compute_target_probs and arrives as
+# dense (T, TARGET_PROBS_CLASSES) float32 — heads consume it directly,
 # no model-side expansion needed.
 
 
 # ── EntityDequantizer ────────────────────────────────────────────
 
-# Per-type scalar slot layouts in the legacy (B, N, ACTOR_SCALAR_DIM=19)
-# entity_scalars_raw tensor that the Tokenizer's per-type Linear
+# Per-type scalar idx layouts in the legacy (B, N, ACTOR_SCALAR_DIM=19)
+# entity_scalars_raw tensor that the ObsEmbedding's per-type Linear
 # projections consume. These mirror the C side qnn_onnx.c:194-318
 # emit_{actor,projectile,item,mover} functions exactly so trained
 # checkpoints stay valid.
 #
-# Slot indices the model expects (post-dist-recompute):
+# Idx indices the model expects (post-dist-recompute):
 #   ACTOR:      [hx,hy,hz, rx,ry,rz, dist, vx,vy,vz, px,py,pz, pd, eta, fac,team,score, rec]
 #   PROJECTILE: [rx,ry,rz, dist, vx,vy,vz, rec, 0..0]                        (8 used / 19)
 #   ITEM:       [hx,hy,hz, rx,ry,rz, dist, px,py,pz, pd, eta, amt, regen, rec, 0..0]  (15)
@@ -314,7 +402,7 @@ class EntityDequantizer(nn.Module):
     Inputs (from the dataloader after variable-length read + batch
     pad to N_max-in-batch):
 
-      entity_types          (B, N) i64/i8 — type per slot; -1 for empty
+      entity_types          (B, N) i64/i8 — type per idx; -1 for empty
       entity_subject_id     (B, N) u8
       entity_modality_id    (B, N) u8
       entity_player_id      (B, N) u8     — actor only, 0 elsewhere
@@ -335,9 +423,9 @@ class EntityDequantizer(nn.Module):
       entity_regen          (B, N)    f16 — item only
       entity_state          (B, N)    u8  — mover only
 
-    Outputs (Tokenizer-ready):
+    Outputs (ObsEmbedding-ready):
 
-      entity_scalars_raw   (B, N, 19) f32 — legacy slot layout per type
+      entity_scalars_raw   (B, N, 19) f32 — legacy idx layout per type
       entity_types         (B, N)    i64
       entity_ids           (B, N, 3) i64
       entity_event_actions (B, N, 4) i64
@@ -396,9 +484,9 @@ class EntityDequantizer(nn.Module):
             device=et.device, dtype=torch.float32,
         )
 
-        # Per-type writes via boolean masks. Each branch is the slot
+        # Per-type writes via boolean masks. Each branch is the idx
         # layout the C-side emit_{type} produced; the legacy
-        # entity_scalars_raw passes through the Tokenizer's per-type
+        # entity_scalars_raw passes through the ObsEmbedding's per-type
         # Linear, which projects only the [:type_scalar_dim] prefix.
 
         mask_actor = (et == TOKEN_ACTOR)
@@ -445,7 +533,7 @@ class EntityDequantizer(nn.Module):
             scalars[..., 12]    = torch.where(mask_mover,               state,      scalars[..., 12])
             scalars[..., 13]    = torch.where(mask_mover,               recency,    scalars[..., 13])
 
-        # Pack entity_ids into the (B, N, 3) layout the Tokenizer reads.
+        # Pack entity_ids into the (B, N, 3) layout the ObsEmbedding reads.
         ids = torch.stack([
             obs["entity_subject_id"].to(torch.int64),
             obs["entity_modality_id"].to(torch.int64),

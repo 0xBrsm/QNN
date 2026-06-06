@@ -436,7 +436,7 @@ static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, const qnn_action_
 	{
 		qboolean fire_window_active;
 
-		if (current_action->fire)
+		if (QNN_ActionAttack(current_action->move))
 		{
 			shots_fired = 1;
 			damage_weapon_id = weapon_id > 0 ? weapon_id : qnn_runtime.last_fire_weapon_id;
@@ -467,7 +467,7 @@ static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, const qnn_action_
 		if (monster_kills > qnn_runtime.prev_monster_kills)
 			QNN_AddDeltaEvent(snapshot, "monster_kill", current_region_id, monster_kills - qnn_runtime.prev_monster_kills);
 
-		fire_window_active = current_action->fire || qnn_runtime.recent_fire_steps > 0;
+		fire_window_active = QNN_ActionAttack(current_action->move) || qnn_runtime.recent_fire_steps > 0;
 		if (fire_window_active && damage_weapon_id <= 0)
 			damage_weapon_id = qnn_runtime.last_fire_weapon_id > 0 ? qnn_runtime.last_fire_weapon_id : weapon_id;
 		if (fire_window_active)
@@ -535,7 +535,7 @@ static void QNN_CommitSnapshot(const qnn_snapshot_t *snapshot, const qnn_action_
 	qnn_runtime.prev_frags = QNN_CurrentFrags();
 	qnn_runtime.prev_monster_kills = QNN_CurrentMonsterKills();
 	qnn_runtime.done = snapshot->done;
-	if (current_action->fire)
+	if (QNN_ActionAttack(current_action->move))
 		qnn_runtime.recent_fire_steps = 2;
 	else if (qnn_runtime.recent_fire_steps > 0)
 		qnn_runtime.recent_fire_steps -= 1;
@@ -818,10 +818,28 @@ static int QNN_HandleStep(const char *line)
 	}
 
 	QNN_ClearAction(&action);
-	QNN_JsonExtractVec3(line, "\"move\"", action.move);
-	QNN_JsonExtractVec3(line, "\"look\"", action.look);
-	action.fire = QNN_JsonExtractInt(line, "\"fire\"", 0);
-	action.weapon = QNN_JsonExtractInt(line, "\"weapon\"", 0);
+	{
+		vec3_t move_vec = {0.0f, 0.0f, 0.0f};
+		int attack_press;
+		int jump_press;
+		int fb_neg, fb_pos, lr_neg, lr_pos, up_neg, up_pos;
+		QNN_JsonExtractVec3(line, "\"move\"", move_vec);
+		QNN_JsonExtractVec3(line, "\"look\"", action.look);
+		attack_press = QNN_JsonExtractInt(line, "\"attack\"", 0) ? 1 : 0;
+		jump_press = QNN_JsonExtractInt(line, "\"jump\"", 0) ? 1 : 0;
+		action.weapon = (uint8_t)QNN_JsonExtractInt(line, "\"weapon\"", 0);
+		fb_neg = (move_vec[0] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		fb_pos = (move_vec[0] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		lr_neg = (move_vec[1] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		lr_pos = (move_vec[1] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		up_neg = (move_vec[2] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		up_pos = (move_vec[2] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		action.move = QNN_PackInputMask(
+			/*alive=*/1,
+			fb_neg, fb_pos, lr_neg, lr_pos,
+			up_neg, up_pos,
+			jump_press, attack_press);
+	}
 	qnn_pending_action = action;
 	QNN_TrainingResetTick();
 

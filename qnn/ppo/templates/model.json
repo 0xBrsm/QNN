@@ -1,5 +1,5 @@
 {
-  "trunk_hidden": 64,
+  "encoder_hidden": 64,
   "gru_hidden": 64,
   "n_heads": 2,
   "n_layers": 2,

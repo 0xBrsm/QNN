@@ -98,7 +98,7 @@ static void QNN_DumpFireRoutes(int row, int tick, int steps,
 			r->weapon_id, r->native_time, r->emit_start_native,
 			r->ping_sec, r->phase, r->press_offset,
 			r->deterministic_offset,
-			r->route_offset, action->fire ? 1 : 0);
+			r->route_offset, QNN_ActionAttack(action->move));
 	}
 	fclose(out);
 }
@@ -184,40 +184,36 @@ int QNN_BuildPlayerRefs(int self_entity_num, int *out_entity_nums,
 	return count;
 }
 
-/* 3-frame jitter filter: if the buffered tick's XY move reverses
- * the previous tick (dot < -0.866, >150°) and the current tick
- * agrees with the previous (dot > 0.6, <~45°), replace the
- * buffered tick's move with the previous tick's move.
- * Only operates on the XY plane; Z is independent (jump/swim).
+/* 3-frame jitter filter on the per-axis press bits.  If the prev and
+ * next ticks share an axis press (both neg, or both pos) but the mid
+ * tick disagrees with both — including the case where mid is released
+ * — restore the neighbors' bits onto the mid tick.  One-tick anomaly
+ * removal for discrete press signals.  Operates on fb and lr axes only;
+ * ud bits (and attack/jump) are passed through unchanged.
  *
  * Pure math — no globals.  Used by the WriteObsTick integration in
  * each engine's collect main. */
-void QNN_JitterFilter(qnn_action_t *mid, const float *prev_move,
-	const float *next_move)
+void QNN_JitterFilter(qnn_action_t *mid, uint8_t prev_move,
+	uint8_t next_move)
 {
-	float mp, mm, mn;
-	float dp[2], dm[2], dn[2];
-	float dot_neighbors, dot_mid_prev, dot_mid_next;
+	int axis;
 
-	mp = sqrtf(prev_move[0] * prev_move[0] + prev_move[1] * prev_move[1]);
-	mm = sqrtf(mid->move[0] * mid->move[0] + mid->move[1] * mid->move[1]);
-	mn = sqrtf(next_move[0] * next_move[0] + next_move[1] * next_move[1]);
-
-	if (mp < 0.01f || mm < 0.01f || mn < 0.01f)
-		return;
-
-	dp[0] = prev_move[0] / mp;  dp[1] = prev_move[1] / mp;
-	dm[0] = mid->move[0] / mm;  dm[1] = mid->move[1] / mm;
-	dn[0] = next_move[0] / mn;  dn[1] = next_move[1] / mn;
-
-	dot_neighbors = dp[0] * dn[0] + dp[1] * dn[1];
-	dot_mid_prev  = dm[0] * dp[0] + dm[1] * dp[1];
-	dot_mid_next  = dm[0] * dn[0] + dm[1] * dn[1];
-
-	if (dot_neighbors > 0.6f && dot_mid_prev < 0.0f && dot_mid_next < 0.0f)
+	for (axis = 0; axis < 2; ++axis)
 	{
-		mid->move[0] = prev_move[0];
-		mid->move[1] = prev_move[1];
+		int neg_bit = 1 + 2 * axis;
+		int pos_bit = 2 + 2 * axis;
+		int mask = (1 << neg_bit) | (1 << pos_bit);
+		int prev_axis = prev_move & mask;
+		int next_axis = next_move & mask;
+		int mid_axis  = mid->move & mask;
+
+		if (prev_axis == 0 || next_axis == 0)
+			continue;
+		if (prev_axis != next_axis)
+			continue;
+		if (mid_axis == prev_axis)
+			continue;
+		mid->move = (uint8_t)((mid->move & ~mask) | prev_axis);
 	}
 }
 
@@ -228,8 +224,7 @@ void QNN_JitterFilter(qnn_action_t *mid, const float *prev_move,
  * same weapon doesn't constitute movement. */
 qboolean QNN_ActionIsFrozen(const qnn_action_t *a)
 {
-	return a->move[0] == 0.0f && a->move[1] == 0.0f && a->move[2] == 0.0f
-		&& a->fire == 0
+	return a->move == 0
 		&& fabsf(a->look[0] - 1.0f) < QNN_FROZEN_LOOK_TOL
 		&& fabsf(a->look[1]) < QNN_FROZEN_LOOK_TOL
 		&& fabsf(a->look[2]) < QNN_FROZEN_LOOK_TOL;
@@ -292,9 +287,7 @@ static void QNN_TickEmitFlush(qnn_tick_emit_state_t *st)
 		st->has_prev_emitted = true;
 	}
 	st->has_prev_prev_move = true;
-	st->prev_prev_move[0] = st->jitter_action.move[0];
-	st->prev_prev_move[1] = st->jitter_action.move[1];
-	st->prev_prev_move[2] = st->jitter_action.move[2];
+	st->prev_prev_move = st->jitter_action.move;
 	st->has_jitter_buf = false;
 }
 
@@ -391,9 +384,7 @@ static void QNN_WriteObsTickInner(qnn_tick_emit_state_t *st, FILE *out,
 		}
 
 		/* Advance: jitter_buf move becomes prev_prev, current becomes jitter_buf. */
-		st->prev_prev_move[0] = st->jitter_action.move[0];
-		st->prev_prev_move[1] = st->jitter_action.move[1];
-		st->prev_prev_move[2] = st->jitter_action.move[2];
+		st->prev_prev_move = st->jitter_action.move;
 		st->has_prev_prev_move = true;
 
 		memcpy(st->jitter_obs, st->buffered_obs, QNN_OBS_BUFFER_SIZE);
@@ -568,6 +559,42 @@ uint8_t QNN_PackOpInput(
 	return op;
 }
 
+/* Pack per-axis bits into the byte layout shared by qnn_action_t.input_mask
+ * and qnn_action_t.move (the action press byte).  Generic across the
+ * feasibility and press uses — same bit positions, callers supply either
+ * feasibility or press intent for each axis. */
+uint8_t QNN_PackInputMask(
+	int alive,
+	int fb_act_neg,  int fb_act_pos,
+	int lr_act_neg,  int lr_act_pos,
+	int up_act_neg,  int up_act_pos,
+	int jump_act,
+	int attack_act)
+{
+	uint8_t m;
+
+	if (!alive)
+		return 0;
+	m = 0;
+	if (attack_act)
+		m |= 0x01;	/* bit 0 */
+	/* Per-axis 2-bit fields.  Under PURE-FEASIBILITY semantics both
+	 * direction bits may be set (e.g. fb_act_neg=fb_act_pos=1 means
+	 * "engine accepts EITHER direction this tick" — always true for
+	 * fb/lr in pmove). Under demo-AND-engine semantics caller can
+	 * still pass mutually-exclusive bits and only one will end up set.
+	 * Layout: bit n = neg, bit n+1 = pos. */
+	if (fb_act_neg) m |= 0x02;	/* bit 1 */
+	if (fb_act_pos) m |= 0x04;	/* bit 2 */
+	if (lr_act_neg) m |= 0x08;	/* bit 3 */
+	if (lr_act_pos) m |= 0x10;	/* bit 4 */
+	if (up_act_neg) m |= 0x20;	/* bit 5 */
+	if (up_act_pos) m |= 0x40;	/* bit 6 */
+	if (jump_act)
+		m |= 0x80;	/* bit 7 */
+	return m;
+}
+
 FILE *QNN_EmitFilter(qnn_snapshot_t *snapshot)
 {
 	int health = snapshot->health;
@@ -592,10 +619,7 @@ FILE *QNN_EmitFilter(qnn_snapshot_t *snapshot)
 		qnn_runtime.dead_emit_count++;
 		if (qnn_runtime.dead_emit_count > QNN_DEAD_MAX_EMIT)
 			return NULL;
-		snapshot->action_label.fire = 1;
-		snapshot->action_label.move[0] = 0.0f;
-		snapshot->action_label.move[1] = 0.0f;
-		snapshot->action_label.move[2] = 0.0f;
+		snapshot->action_label.move = 0x01; /* bit 0 = attack press */
 		return stdout;
 	}
 

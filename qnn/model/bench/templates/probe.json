@@ -1,5 +1,5 @@
 {
-  "head": "fire",
+  "head": "attack",
   "d_model": 64,
   "self_weapon_embed_in_self": true,
   "strip_self_embeds": false,

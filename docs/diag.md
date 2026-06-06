@@ -33,7 +33,7 @@ Each module is independently importable. Modules without `torch` work outside th
 | `qnn.diag.participation` | Are head bottlenecks utilized? Dead units? | tens of seconds | yes |
 | `qnn.diag.attention` | Are attention heads redundant? Asymmetric? | tens of seconds | yes |
 | `qnn.diag.pruning` | Which neurons are essential vs redundant? | minutes | yes |
-| `qnn.diag.linear_probe` | Are trunk features linearly separable per task? | minutes | yes |
+| `qnn.diag.linear_probe` | Are encoder features linearly separable per task? | minutes | yes |
 
 ## Convergence — the critical pre-check
 
@@ -63,7 +63,7 @@ Late-epoch slope, classification, asymptote projection (if fittable). Use this t
 SVD effective rank for every Linear. Sorted by `frac` ascending — most-overparameterized first. Layers with frac < 0.7 are candidates for low-rank factorization or width reduction.
 
 ### Layer ablation
-Each submodule's val-loss delta when zeroed. Larger delta = more essential. Standard ranking on a healthy v22 model: trunk.blocks.0 > target_pointer > trunk.blocks.1 > weapon_head > gru > move_head > fire_head > look_head.
+Each submodule's val-loss delta when zeroed. Larger delta = more essential. Standard ranking on a healthy v22 model: encoder.blocks.0 > target_pointer > encoder.blocks.1 > weapon_head > gru > move_head > attack_head > look_head.
 
 ### Gradient norms
 Per-parameter gradient norm during one supervised batch. Aggregated by module. The summary identifies the fraction of layers with near-zero gradient (cruft).
@@ -92,7 +92,7 @@ A head with PR=5 still benefited from B=192 in our sweep. PR measures activation
 With 2 heads and 1 seed you'll always see one head "winning" — but which one is seed-dependent. Run across 3+ seeds before concluding architectural redundancy. The `attention` diag at 1 seed is descriptive, not prescriptive.
 
 ### Low ablation impact ≠ unused
-A head can have small ablation impact (its forward output mostly redundant with a strong prior) yet contribute via training-time gradient pressure on the trunk. The `look` head exemplifies this: cos_sim_look saturates at B=16 but the look gradient still shapes how the trunk encodes engagement geometry. To distinguish, run the head with `loss_weight=0` and see if metrics on *other* heads change. Use `compare_runs` to flag if the comparison is convergence-biased.
+A head can have small ablation impact (its forward output mostly redundant with a strong prior) yet contribute via training-time gradient pressure on the encoder. The `look` head exemplifies this: cos_sim_look saturates at B=16 but the look gradient still shapes how the encoder encodes engagement geometry. To distinguish, run the head with `loss_weight=0` and see if metrics on *other* heads change. Use `compare_runs` to flag if the comparison is convergence-biased.
 
 ### 8-epoch ablations on an undertrained baseline
 This BC setup typically isn't converged at 8 epochs (slope ≈ −0.005 at ep7). For decisions near the noise floor, either run a calibration at 16 epochs or trust the asymptote projection from `convergence.compare_runs`. Most ablation rankings hold across this bias when both configs are similarly undertrained, but the absolute gap may overstate the asymptotic delta.

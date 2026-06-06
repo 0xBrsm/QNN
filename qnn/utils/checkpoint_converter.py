@@ -8,9 +8,9 @@ Two conversion directions:
 SF 2.1.1 model state_dict layout:
 
   Transformer encoder:
-    encoder.trunk.tokenizer.*                — input token projections + embeddings
-    encoder.trunk.blocks.*                   — transformer block weights
-    encoder.trunk.final_ln.*                 — final layer norm
+    encoder.obs_embedding.*                    — input embedding (projections + embeddings)
+    encoder.encoder.blocks.*                   — transformer block weights
+    encoder.encoder.final_ln.*                 — final layer norm
 
   Shared:
     core.core.{weight_ih_l0, ...}            — single-layer GRU
@@ -33,7 +33,8 @@ from qnn.schema import (
     SPATIAL_SCALAR_DIM,
     SPATIAL_TOKEN_COUNT,
 )
-from qnn.model.policy import ModelConfig, QNNPolicy
+from qnn.model.network import ModelConfig
+from qnn.model.policy import QNNPolicy
 from qnn.utils.io import trusted_torch_load
 from qnn.vocab import ENTITY_IDS
 
@@ -41,7 +42,7 @@ _HEAD_ORDER = HEAD_ORDER
 _HEAD_SIZES: list[int] = list(ACTION_HEADS.values())
 
 # SF 2.1.1 key prefixes
-_SF_ENCODER_PREFIX = "encoder.trunk"
+_SF_ENCODER_PREFIX = "encoder.encoder"
 _SF_GRU_PREFIX = "core.core"
 _SF_VALUE_PREFIX = "critic_linear"
 _SF_COMBINED_HEAD_KEY = "action_parameterization.distribution_linear"
@@ -63,7 +64,7 @@ def bc_to_sf(
     bc_state = bc_policy.model.state_dict()
     sf_state = sf_model.state_dict()
 
-    _copy_trunk(bc_state, sf_state, device)
+    _copy_encoder(bc_state, sf_state, device)
     _copy_gru(bc_state, sf_state, device)
     _copy_value_head(bc_state, sf_state, device)
     _copy_bc_heads_to_sf_combined(bc_state, sf_state, device)
@@ -96,7 +97,7 @@ def sf_to_qnn(
     )
     bc_state = bc_policy.model.state_dict()
 
-    _copy_trunk(sf_state, bc_state, device, reverse=True)
+    _copy_encoder(sf_state, bc_state, device, reverse=True)
     _copy_gru(sf_state, bc_state, device, reverse=True)
     _copy_value_head(sf_state, bc_state, device, reverse=True)
     _copy_sf_combined_to_bc_heads(sf_state, bc_state, device)
@@ -119,10 +120,13 @@ def save_sf_format(
     bc_state = bc_policy.model.state_dict()
     sf_style: Dict[str, torch.Tensor] = {}
 
-    # Trunk
+    # Encoder
     for bc_key, tensor in bc_state.items():
-        if bc_key.startswith("trunk."):
+        if bc_key.startswith("obs_embedding."):
             sf_key = f"encoder.{bc_key}"
+            sf_style[sf_key] = tensor.cpu()
+        elif bc_key.startswith("encoder."):
+            sf_key = f"{_SF_ENCODER_PREFIX}.{bc_key[len('encoder.'):]}"
             sf_style[sf_key] = tensor.cpu()
 
     # GRU
@@ -202,7 +206,7 @@ def save_sf_format(
     }
     meta = {
         "obs_dim": bc_policy.obs_dim,
-        "trunk_hidden": bc_policy.trunk_hidden,
+        "encoder_hidden": bc_policy.encoder_hidden,
         "gru_hidden": bc_policy.gru_hidden,
         "use_gru": bc_policy.use_gru,
         "n_heads": bc_policy.n_heads,
@@ -250,7 +254,7 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
 
     Limitations:
     - For v17: synthesized weapon_logits are constant zeros at export.
-    - ``jump_pos_weight`` / ``fire_focal_gamma`` defaults are inert at
+    - ``jump_pos_weight`` / ``attack_focal_gamma`` defaults are inert at
       inference but won't match training-time values.
     """
     if "model" in meta:
@@ -280,11 +284,11 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
             "weapon_context_from_obs":  False,
             "look_bypass_gru":          bool(meta["look_bypass_gru"]),
             # v17's target_bypass_gru=True maps to gru_target_query=False
-            # (target_pointer queries with self_readout, not gru_flat).
+            # (target_pointer queries with cls_readout, not gru_flat).
             "gru_target_query":         False,
             "hard_target_feat":         False,
             "weapon_in_target_query":   False,
-            "linear_slot_prior":        False,
+            "linear_idx_prior":        False,
             "gt_dist_target_feat":      False,
             "prev_target_in_query":     False,
             # Required by invariant even when use_weapon_head=False
@@ -297,8 +301,8 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
         return {
             "obs_dim":          int(meta.get("obs_dim", 0)),
             "jump_pos_weight":  1.0,
-            "fire_focal_gamma": 0.0,
-            "fire_focal_alpha": 0.5,
+            "attack_focal_gamma": 0.0,
+            "attack_focal_alpha": 0.5,
             "model":            model_cfg,
         }
 
@@ -308,7 +312,11 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
     # current ModelConfig.from_dict expects singular head_bottleneck_dim.
     bottleneck = meta.get("head_bottleneck_dims") or meta.get("head_bottleneck_dim")
     if isinstance(bottleneck, dict):
+        # Legacy "fire" head key was renamed "attack" to match the QW
+        # source's BUTTON_ATTACK / self.button0 naming.
         head_bottleneck_dim: Any = {k: int(v) for k, v in bottleneck.items()}
+        if "fire" in head_bottleneck_dim and "attack" not in head_bottleneck_dim:
+            head_bottleneck_dim["attack"] = head_bottleneck_dim.pop("fire")
     elif bottleneck is not None:
         head_bottleneck_dim = int(bottleneck)
     else:
@@ -328,27 +336,47 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
         "weapon_use_gru":            bool(meta.get("weapon_use_gru", True)),
         "weapon_context_from_obs":   bool(meta.get("weapon_context_from_obs", False)),
         "look_bypass_gru":           bool(meta["look_bypass_gru"]),
-        "gru_target_query":          False,
-        "hard_target_feat":          False,
-        "weapon_in_target_query":    False,
-        "linear_slot_prior":         False,
-        "gt_dist_target_feat":       False,
-        "prev_target_in_query":      False,
-        # Historical default (true, true) — weapon head trained with
-        # cat(gru_flat, self_readout, target_feat) selector.
-        "weapon_use_self_readout":   True,
-        "self_weapon_embed_in_self": False,
+        # Per-flag defaults preserved where the legacy flat meta didn't
+        # carry them. Where the flag IS present in the source meta, use
+        # that value — pre-v23 flat checkpoints did persist some of
+        # these flags at the top level (gru_target_query, etc.) and
+        # discarding them silently caused state-dict mismatches on load
+        # (e.g. missing target_pointer.weapon_query_embed when
+        # weapon_in_target_query=True at training time).
+        "gru_target_query":          bool(meta.get("gru_target_query", False)),
+        "hard_target_feat":          bool(meta.get("hard_target_feat", False)),
+        "weapon_in_target_query":    bool(meta.get("weapon_in_target_query", False)),
+        "linear_idx_prior":          bool(
+            meta.get("linear_idx_prior", meta.get("linear_slot_prior", False))
+        ),
+        "gt_dist_target_feat":       bool(meta.get("gt_dist_target_feat", False)),
+        "prev_target_in_query":      bool(meta.get("prev_target_in_query", False)),
+        # Historical default (true) — weapon head trained with
+        # cat(gru_flat, self_readout, target_feat) selector. Legacy
+        # temporary feature-branch alias was ``weapon_use_cls_readout``.
+        "weapon_use_self_readout":   bool(
+            meta.get("weapon_use_self_readout", meta.get("weapon_use_cls_readout", True))
+        ),
+        "self_weapon_embed_in_self": bool(meta.get("self_weapon_embed_in_self", False)),
         "head_bottleneck_dim":       head_bottleneck_dim,
         "head_activation":           str(meta.get("head_activation", "relu")),
     }
+    # fire_* keys are the pre-rename names for the attack-head focal /
+    # distance knobs. Honor them when the modern key is absent.
     return {
         "obs_dim":             int(meta.get("obs_dim", 0)),
         "jump_pos_weight":     float(meta.get("jump_pos_weight", 1.0)),
-        "fire_focal_gamma":    float(meta.get("fire_focal_gamma", 0.0)),
-        # fire_focal_alpha=0.5 is neutral (equivalent to no class
+        "attack_focal_gamma":  float(
+            meta.get("attack_focal_gamma", meta.get("fire_focal_gamma", 0.0))
+        ),
+        # attack_focal_alpha=0.5 is neutral (equivalent to no class
         # rebalancing); safe migration default for pre-toggle ckpts.
-        "fire_focal_alpha":    float(meta.get("fire_focal_alpha", 0.5)),
-        "fire_distance_sigma": float(meta.get("fire_distance_sigma", 0.0)),
+        "attack_focal_alpha":  float(
+            meta.get("attack_focal_alpha", meta.get("fire_focal_alpha", 0.5))
+        ),
+        "attack_distance_sigma": float(
+            meta.get("attack_distance_sigma", meta.get("fire_distance_sigma", 0.0))
+        ),
         "jump_distance_sigma": float(meta.get("jump_distance_sigma", 0.0)),
         "model":               model_cfg,
     }
@@ -412,19 +440,22 @@ def migrate_drop_fire_align_scalar(state: Dict[str, torch.Tensor]) -> bool:
     alignment scalar) even though their training treated the scalar
     as essentially dead weight.
 
-    Migration drops the last input column from the fire head's first
+    Migration drops the last input column from the attack head's first
     Linear so it matches the current 128-wide architecture.  Covers
-    both single-Linear (`fire_head.weight`) and bottlenecked
-    (`fire_head.0.weight`) layouts.  Bias is per-output, unaffected.
+    both single-Linear (`attack_head.weight`) and bottlenecked
+    (`attack_head.0.weight`) layouts.  Bias is per-output, unaffected.
     Returns True iff a migration ran.
 
     Detection is by shape, not by meta flag: v17 doesn't record a
     `fire_use_align_scalar` field even though it trained with the
     scalar wired in.  An odd `in_dim` is the unambiguous tell — the
     even base_features_dim makes that impossible without the +1.
+
+    Runs AFTER `migrate_rename_fire_head_to_attack_head`, so the
+    keys this scans are already in the new `attack_head.*` layout.
     """
     migrated = False
-    for key in ("fire_head.weight", "fire_head.0.weight"):
+    for key in ("attack_head.weight", "attack_head.0.weight"):
         w = state.get(key)
         if w is None or w.ndim != 2:
             continue
@@ -439,7 +470,7 @@ def migrate_drop_fire_align_scalar(state: Dict[str, torch.Tensor]) -> bool:
 def migrate_drop_weapon_embed_self(state: Dict[str, torch.Tensor]) -> bool:
     """Strip the dedicated `weapon_embed_self` table from v24-era checkpoints.
 
-    v24 added a separate impulse-indexed `tokenizer.weapon_embed_self`
+    v24 added a separate impulse-indexed `obs_embedding.weapon_embed_self`
     Embedding(WEAPON_HEAD_SIZE+1, d_model) for the current-held-weapon
     contribution on the self token.  That contribution now routes through
     the shared `entity_embed` (weapons live at rows 3..10 by design — see
@@ -460,15 +491,15 @@ def migrate_drop_weapon_embed_self(state: Dict[str, torch.Tensor]) -> bool:
 
 
 def migrate_drop_action_history(state: Dict[str, torch.Tensor]) -> bool:
-    """Strip the action_history tokenizer pieces from pre-rip-out checkpoints.
+    """Strip the action_history obs-embedding pieces from pre-rip-out checkpoints.
 
-    Pre-rip-out tokenizers carried:
-      - trunk.tokenizer.action_proj.{weight,bias}: Linear(8, d_model)
-      - trunk.tokenizer.action_pos_embed.weight:   Embedding(8, d_model)
-      - trunk.tokenizer.kind_embed.weight:         Embedding(4, d_model)
+    Pre-rip-out embeddings carried:
+      - obs_embedding.action_proj.{weight,bias}: Linear(8, d_model)
+      - obs_embedding.action_pos_embed.weight:   Embedding(8, d_model)
+      - obs_embedding.kind_embed.weight:         Embedding(4, d_model)
         — kinds 0..3 = self / entity / spatial / action.
 
-    The new tokenizer drops the action-history branch entirely and sizes
+    The new obs embedding drops the action-history branch entirely and sizes
     kind_embed at (3, d_model), keeping the same row order for the first
     three kinds.  This migration deletes the dead action_proj / pos_embed
     keys and truncates kind_embed to its first three rows so load_state_dict
@@ -476,21 +507,182 @@ def migrate_drop_action_history(state: Dict[str, torch.Tensor]) -> bool:
     kind embedding.  Returns True iff any change was made.
     """
     migrated = False
-    for key in (
-        "trunk.tokenizer.action_proj.weight",
-        "trunk.tokenizer.action_proj.bias",
-        "trunk.tokenizer.action_pos_embed.weight",
-    ):
-        if key in state:
-            del state[key]
+    prefixes = ("obs_embedding.", "encoder.obs_embedding.", "tokenizer.", "encoder.tokenizer.")
+    for prefix in prefixes:
+        for suffix in (
+            "action_proj.weight",
+            "action_proj.bias",
+            "action_pos_embed.weight",
+        ):
+            key = f"{prefix}{suffix}"
+            if key in state:
+                del state[key]
+                migrated = True
+
+        kind_key = f"{prefix}kind_embed.weight"
+        kind_w = state.get(kind_key)
+        if kind_w is not None and kind_w.shape[0] == 4:
+            state[kind_key] = kind_w[:3].clone()
             migrated = True
 
-    kind_key = "trunk.tokenizer.kind_embed.weight"
-    kind_w = state.get(kind_key)
-    if kind_w is not None and kind_w.shape[0] == 4:
-        state[kind_key] = kind_w[:3].clone()
-        migrated = True
+    return migrated
 
+
+def migrate_rename_trunk_to_encoder(state: Dict[str, torch.Tensor]) -> bool:
+    """Rename ``trunk.*`` state-dict keys to ``encoder.*``.
+
+    The transformer-stack module was renamed ``TransformerTrunk`` →
+    ``TransformerEncoder`` (and its enclosing attribute ``self.trunk`` →
+    ``self.encoder``) to match transformer-canonical naming. Pre-rename
+    checkpoints carry keys like ``trunk.obs_embedding.self_proj.weight`` and
+    ``trunk.blocks.0.*``; this rewrites them to the ``encoder.*`` prefix.
+    Prefix-based (only at start-of-key) so it doesn't touch unrelated
+    occurrences.
+    """
+    migrated = False
+    prefix = "trunk."
+    replacement = "encoder."
+    for key in list(state.keys()):
+        if key.startswith(prefix):
+            new_key = replacement + key[len(prefix):]
+            state[new_key] = state.pop(key)
+            migrated = True
+    return migrated
+
+
+def migrate_rename_tokenizer_to_obs_embedding(state: Dict[str, torch.Tensor]) -> bool:
+    """Rename temporary ``tokenizer`` state-dict paths to ``obs_embedding``.
+
+    A short-lived feature branch named the input-embedding module
+    ``tokenizer``. The settled public name is ``obs_embedding``. Rewrite both
+    top-level keys (``tokenizer.*``) and nested keys
+    (``encoder.tokenizer.*`` / ``trunk.tokenizer.*`` after trunk migration).
+    """
+    migrated = False
+    for key in list(state.keys()):
+        new_key = key
+        if new_key.startswith("tokenizer."):
+            new_key = "obs_embedding." + new_key[len("tokenizer."):]
+        new_key = new_key.replace(".tokenizer.", ".obs_embedding.")
+        if new_key != key:
+            state[new_key] = state.pop(key)
+            migrated = True
+    return migrated
+
+
+def migrate_hoist_encoder_obs_embedding(state: Dict[str, torch.Tensor]) -> bool:
+    """Move pre-split ``encoder.obs_embedding.*`` keys to top-level ``obs_embedding.*``.
+
+    The transformer stack remains under ``encoder.*``; only the raw
+    observation embedding was lifted out so it can be swapped independently
+    from the stack in bench/probe networks.
+    """
+    migrated = False
+    prefix = "encoder.obs_embedding."
+    replacement = "obs_embedding."
+    for key in list(state.keys()):
+        if key.startswith(prefix):
+            new_key = replacement + key[len(prefix):]
+            state[new_key] = state.pop(key)
+            migrated = True
+    return migrated
+
+
+def migrate_rename_fire_head_to_attack_head(state: Dict[str, torch.Tensor]) -> bool:
+    """Rename ``fire_head.*`` state-dict keys to ``attack_head.*``.
+
+    The binary attack-bit head was historically named ``fire_head`` even
+    after the broader fire→attack rename (486af0b / b0279fe) renamed the
+    action axis, head string ("attack"), and logits dict key. The
+    attribute name lagged behind. Pre-rename checkpoints carry keys like
+    ``fire_head.weight`` / ``fire_head.0.weight`` / ``fire_head.2.bias``;
+    this rewrites the prefix so load_state_dict matches ``self.attack_head``.
+
+    Prefix-based — only rewrites keys starting with ``fire_head.``.
+    Must run BEFORE ``migrate_drop_fire_align_scalar``, which expects
+    the new ``attack_head.*`` layout.
+    """
+    migrated = False
+    prefix = "fire_head."
+    replacement = "attack_head."
+    for key in list(state.keys()):
+        if key.startswith(prefix):
+            new_key = replacement + key[len(prefix):]
+            state[new_key] = state.pop(key)
+            migrated = True
+    return migrated
+
+
+def migrate_wrap_gru_in_temporal(state: Dict[str, torch.Tensor]) -> bool:
+    """Rename ``gru.*`` state-dict keys to ``temporal.gru.*``.
+
+    The GRU now lives inside the ``Temporal`` component so the orchestrator
+    can stay seq/flat-agnostic. Pre-refactor checkpoints carry keys like
+    ``gru.weight_ih_l0`` / ``gru.bias_hh_l0``; this rewrites the prefix so
+    load_state_dict matches ``self.temporal.gru.*``.
+
+    Prefix-based — only rewrites keys starting with ``gru.`` exactly.
+    """
+    migrated = False
+    prefix = "gru."
+    replacement = "temporal.gru."
+    for key in list(state.keys()):
+        if key.startswith(prefix):
+            new_key = replacement + key[len(prefix):]
+            state[new_key] = state.pop(key)
+            migrated = True
+    return migrated
+
+
+def migrate_wrap_heads_in_components(state: Dict[str, torch.Tensor]) -> bool:
+    """Wrap head MLPs and aux params into per-head Component containers.
+
+    Heads (move/look/attack/weapon) used to live as flat attributes on
+    ``Network`` — ``self.move_head`` was a Linear or Sequential directly,
+    and weapon_embed / attack_alignment_scale[_emb] were siblings of the
+    heads. The component refactor moves each head's machinery under its
+    own ``nn.Module`` container (``MoveHead``, ``LookHead``, ``AttackHead``,
+    ``WeaponHead``). This shifts the state-dict layout:
+
+      Before                              After
+      -------                             -----
+      move_head.*                         move_head.mlp.*
+      look_head.*                         look_head.mlp.*
+      attack_head.*                       attack_head.mlp.*
+      weapon_head.*                       weapon_head.mlp.*
+      weapon_embed.*                      weapon_head.embed.*
+      attack_alignment_scale_emb.*        attack_head.alignment_scale_emb.*
+      attack_alignment_scale  (scalar)    attack_head.alignment_scale
+
+    Runs AFTER ``migrate_rename_fire_head_to_attack_head`` so it sees
+    the ``attack_head.*`` layout (not ``fire_head.*``) and AFTER
+    ``migrate_drop_fire_align_scalar`` so the trimmed shapes are already
+    in place under the new key.
+    """
+    PREFIX_REWRITES = (
+        ("attack_alignment_scale_emb.", "attack_head.alignment_scale_emb."),
+        ("weapon_embed.",               "weapon_head.embed."),
+        ("move_head.",                  "move_head.mlp."),
+        ("look_head.",                  "look_head.mlp."),
+        ("attack_head.",                "attack_head.mlp."),
+        ("weapon_head.",                "weapon_head.mlp."),
+    )
+    EXACT_REWRITES = {
+        "attack_alignment_scale": "attack_head.alignment_scale",
+    }
+    migrated = False
+    for old_key in list(state.keys()):
+        if old_key in EXACT_REWRITES:
+            new_key = EXACT_REWRITES[old_key]
+            state[new_key] = state.pop(old_key)
+            migrated = True
+            continue
+        for old_prefix, new_prefix in PREFIX_REWRITES:
+            if old_key.startswith(old_prefix):
+                new_key = new_prefix + old_key[len(old_prefix):]
+                state[new_key] = state.pop(old_key)
+                migrated = True
+                break
     return migrated
 
 
@@ -527,10 +719,10 @@ def _expanded_self_scalar_vector(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _pad_self_scalar_weight_for_attack_finished(tensor: torch.Tensor) -> torch.Tensor:
-    """Append a zero column for the new attack_finished scalar at slot 16.
+    """Append a zero column for the new attack_finished scalar at idx 16.
 
     Pre-c38a5a26 checkpoints have self_proj input dim 16; commit c38a5a26
-    added attack_finished as slot 16, bumping SELF_SCALAR_DIM 16 → 17.
+    added attack_finished as idx 16, bumping SELF_SCALAR_DIM 16 → 17.
     Zero-padding the column means the migrated model treats that input as
     dead weight (semantically: trained without that signal), so forward
     outputs are unchanged for the same observation.
@@ -619,24 +811,24 @@ def _permute_entity_rows_to_impulse(old: torch.Tensor) -> torch.Tensor | None:
       AXE=3, SG=4, SSG=5, NG=6, SNG=7, GL=8, RL=9, LG=10, AMMO=11 .. TRAIN=43.
 
     Returns the permuted (44, D) tensor.  If the old tail rows for SSG /
-    SNG don't exist, those slots are seeded from the family parent
+    SNG don't exist, those indices are seeded from the family parent
     (SHOTGUN / NAILGUN).
     """
     n_old = old.shape[0]
     if n_old not in (42, 43, 44):
         return None
     new = torch.zeros((44, *old.shape[1:]), dtype=old.dtype)
-    # NONE..SHOTGUN (slots 0-4) carry over unchanged.
+    # NONE..SHOTGUN (indices 0-4) carry over unchanged.
     new[0:5] = old[0:5]
-    # SUPER_SHOTGUN: from old slot 42 if present, else seed from SHOTGUN.
+    # SUPER_SHOTGUN: from old idx 42 if present, else seed from SHOTGUN.
     new[5] = old[42] if n_old >= 43 else old[4]
-    # NAILGUN: old slot 5 → new slot 6.
+    # NAILGUN: old idx 5 → new idx 6.
     new[6] = old[5]
-    # SUPER_NAILGUN: from old slot 43 if present, else seed from NAILGUN.
+    # SUPER_NAILGUN: from old idx 43 if present, else seed from NAILGUN.
     new[7] = old[43] if n_old >= 44 else old[5]
-    # GL, RL, LG: old slots 6..8 → new slots 8..10.
+    # GL, RL, LG: old indices 6..8 → new indices 8..10.
     new[8:11] = old[6:9]
-    # AMMO..TRAIN: old slots 9..41 → new slots 11..43.
+    # AMMO..TRAIN: old indices 9..41 → new indices 11..43.
     new[11:44] = old[9:42]
     return new
 
@@ -715,26 +907,32 @@ def _copy_weight(src: Dict[str, torch.Tensor], dst: Dict[str, torch.Tensor], src
     return True
 
 
-def _copy_trunk(src: Dict, dst: Dict, device: str, reverse: bool = False) -> None:
-    """Copy trunk weights between BC and SF state dicts.
+def _copy_encoder(src: Dict, dst: Dict, device: str, reverse: bool = False) -> None:
+    """Copy encoder weights between BC and SF state dicts.
 
-    BC keys start with ``trunk.``, SF keys start with ``encoder.trunk.``.
+    BC keys split input embedding (``obs_embedding.*``) from transformer
+    stack (``encoder.*``). SF wraps both under its actor-critic encoder:
+    ``encoder.obs_embedding.*`` and ``encoder.encoder.*``.
     """
-    bc_prefix = "trunk."
-    sf_prefix = f"{_SF_ENCODER_PREFIX}."
+    pairs = (
+        ("obs_embedding.", "encoder.obs_embedding."),
+        ("encoder.", f"{_SF_ENCODER_PREFIX}."),
+    )
 
     if reverse:
-        for dst_key in list(dst.keys()):
-            if not dst_key.startswith(bc_prefix):
-                continue
-            sf_key = sf_prefix + dst_key[len(bc_prefix):]
-            _copy_weight(src, dst, sf_key, dst_key, device)
+        for bc_prefix, sf_prefix in pairs:
+            for dst_key in list(dst.keys()):
+                if not dst_key.startswith(bc_prefix):
+                    continue
+                sf_key = sf_prefix + dst_key[len(bc_prefix):]
+                _copy_weight(src, dst, sf_key, dst_key, device)
     else:
-        for src_key in list(src.keys()):
-            if not src_key.startswith(bc_prefix):
-                continue
-            sf_key = sf_prefix + src_key[len(bc_prefix):]
-            _copy_weight(src, dst, src_key, sf_key, device)
+        for bc_prefix, sf_prefix in pairs:
+            for src_key in list(src.keys()):
+                if not src_key.startswith(bc_prefix):
+                    continue
+                sf_key = sf_prefix + src_key[len(bc_prefix):]
+                _copy_weight(src, dst, src_key, sf_key, device)
 
 
 def _copy_gru(src: Dict, dst: Dict, device: str, reverse: bool = False) -> None:

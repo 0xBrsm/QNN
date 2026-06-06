@@ -80,7 +80,7 @@ def aggregate_by_module(
 ) -> list[dict]:
     """Sum grad-norm and param-norm by submodule prefix at the given depth.
 
-    e.g. ``trunk.blocks.0.attn.q_proj.weight`` aggregated at depth 2 → ``trunk.blocks``.
+    e.g. ``encoder.blocks.0.attn.q_proj.weight`` aggregated at depth 2 → ``encoder.blocks``.
     """
     grouped: dict[str, dict] = OrderedDict()
     for r in rows:

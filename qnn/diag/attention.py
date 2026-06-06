@@ -1,6 +1,6 @@
 """Per-attention-head diagnostics: entropy, specialization, redundancy.
 
-Forces the trunk's MultiheadAttention modules to return per-head weights via
+Forces the encoder's MultiheadAttention modules to return per-head weights via
 a temporary forward override, runs a few val passes, and computes:
 
   - Per-head attention entropy (avg over queries) — high entropy means diffuse

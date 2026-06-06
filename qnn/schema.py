@@ -11,7 +11,7 @@ from qnn.vocab import (
     ENTITY_VOCAB_SIZE,
     ACTION_VOCAB_SIZE,
     MODALITY_VOCAB_SIZE,
-    MAX_PLAYER_SLOTS,
+    MAX_PLAYER_INDICES,
     MAX_TOKEN_OBJECTS,
     MAX_ENTITY_EVENTS,
     PROJECTILE_SCALAR_DIM,
@@ -27,7 +27,13 @@ from qnn.vocab import (
 SPATIAL_TOKEN_COUNT = 9
 SPATIAL_SCALAR_DIM = 13
 
-SELF_SCALAR_DIM = 17  # + attack_finished at slot 16
+SELF_SCALAR_DIM = 17  # legacy flat layout, kept for ablation heads / probes (+ attack_finished at idx 16)
+
+# Self-subtoken widths consumed by the three ObsEmbedding projections
+# (self_proj_state / self_proj_arsenal / self_proj_motion).
+SELF_STATE_SCALAR_DIM   = 2  # health, effective_armor
+SELF_ARSENAL_SCALAR_DIM = 1  # attack_finished
+SELF_MOTION_SCALAR_DIM  = 4  # vel_xyz, view_pitch
 
 # Quake weapon classes: axe, shotgun, super_shotgun, nailgun,
 # super_nailgun, grenade_launcher, rocket_launcher, thunderbolt.
@@ -38,16 +44,22 @@ WEAPON_HEAD_SIZE = 8
 
 from qnn.wire import MAX_ENTITY_SCALAR_DIM, MAX_ENTITY_ID_DIM
 
-# v9: obs_dim is unused by the transformer trunk (it uses token dicts).
+# v9: obs_dim is unused by the transformer encoder (it uses token dicts).
 # Kept as 0 for callers that still reference it (e.g. bc_train model init).
 OBS_DIM = 0
 
 # Canonical obs shape schema — single source of truth for env, checkpoint, and adapter.
 OBS_SCHEMA: dict[str, tuple[int, ...]] = {
     "self_scalars": (SELF_SCALAR_DIM,),
+    "self_state_scalars":   (SELF_STATE_SCALAR_DIM,),
+    "self_arsenal_scalars": (SELF_ARSENAL_SCALAR_DIM,),
+    "self_motion_scalars":  (SELF_MOTION_SCALAR_DIM,),
     "self_weapon_id": (1,),
+    "self_weapon_readiness": (WEAPON_HEAD_SIZE,),
     "self_armor_type_id": (1,),
-    "self_powerup_ids": (5,),
+    "self_state_powerup_ids":   (3,),
+    "self_arsenal_powerup_ids": (1,),
+    "self_motion_powerup_ids":  (1,),
     "self_movement_id": (1,),
     "entity_types": (MAX_TOKEN_OBJECTS,),
     "entity_scalars_raw": (MAX_TOKEN_OBJECTS, MAX_ENTITY_SCALAR_DIM),

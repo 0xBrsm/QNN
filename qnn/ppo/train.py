@@ -635,7 +635,7 @@ def register_quake_components() -> None:
     register_env("quake_combat", make_quake_env)
     if _HAS_REGISTER_CUSTOM_ENCODER:
         # SF < 2.1: direct registration helper
-        _register_custom_encoder("quake_trunk", QuakeTransformerEncoder)  # type: ignore[name-defined]
+        _register_custom_encoder("quake_encoder", QuakeTransformerEncoder)  # type: ignore[name-defined]
     else:
         # SF 2.1+: register via model factory
         global_model_factory().register_encoder_factory(_make_quake_encoder)  # type: ignore[name-defined]
@@ -700,7 +700,7 @@ def add_quake_cli_args(parser: Any) -> None:
     # log-prob sum, entropy, and KL — so no gradient flows to that head.
     parser.add_argument("--head_loss_weights", type=str, default="",
                         help='JSON object of per-head weights, e.g. '
-                             '\'{"move":0.0,"fire":0.0,"weapon":0.0}\' '
+                             '\'{"move":0.0,"attack":0.0,"weapon":0.0}\' '
                              'to isolate the look head.')
 
 
@@ -760,7 +760,7 @@ def build_ppo_cfg(
     fixed_tick_hz: int,
     seed: int,
     device: str,
-    trunk_hidden: int,
+    encoder_hidden: int,
     gru_hidden: int,
     use_gru: bool,
     d_model: int,

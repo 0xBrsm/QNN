@@ -189,7 +189,7 @@ def prepare_eval_checkpoint(checkpoint_path: str, output_dir: str) -> str:
         return str(path)
 
     from qnn.utils.checkpoint_converter import sf_to_qnn
-    from qnn.model.policy import ModelConfig
+    from qnn.model.network import ModelConfig
 
     sidecar_path = path.with_suffix(".json")
     if not sidecar_path.exists():

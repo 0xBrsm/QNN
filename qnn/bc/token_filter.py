@@ -1,6 +1,6 @@
 """Token-level masking for BC training obs.
 
-Drops entity-token slots at train time via a MongoDB-style predicate,
+Drops entity-token indices at train time via a MongoDB-style predicate,
 parallel to ``segment_mask`` (which acts on per-frame fields).  This
 replaces the deprecated collect-time ``--entity-filter pvs_actors`` flag:
 collects always emit the full 4-pool token stream, and any subsetting
@@ -23,15 +23,15 @@ Modality IDs (qnn_vocab.h):
     2 = SOUND       — heard but not seen (actors only)
     3 = MEMORY      — last-known position after sight loss (actors only)
 
-Slots where the predicate evaluates to False are zeroed in place:
+Indices where the predicate evaluates to False are zeroed in place:
 
-    entity_types[slot]       = -1   (the empty sentinel)
-    entity_ids[slot, :]      = 0
-    entity_scalars_raw[slot] = 0
-    entity_event_*[slot]     = 0
+    entity_types[idx]       = -1   (the empty sentinel)
+    entity_ids[idx, :]      = 0
+    entity_scalars_raw[idx] = 0
+    entity_event_*[idx]     = 0
 
-Slot positions are preserved — no compaction — so target labels remain
-valid.  A label pointing into a now-masked slot becomes the caller's
+Idx positions are preserved — no compaction — so target labels remain
+valid.  A label pointing into a now-masked idx becomes the caller's
 problem; the BC train loop sets the affected ``target`` row to -100 so
 CE skips it.
 
@@ -54,7 +54,7 @@ import numpy as np
 from qnn import filter_dsl
 
 
-_TOKEN_SLOT_KEYS = (
+_TOKEN_IDX_KEYS = (
     "entity_types",
     "entity_ids",
     "entity_scalars_raw",
@@ -80,7 +80,7 @@ def apply_token_mask(
     obs: Mapping[str, np.ndarray],
     predicate: Mapping[str, Any] | None,
 ) -> dict[str, np.ndarray]:
-    """Return a copy of ``obs`` with non-matching token slots zeroed.
+    """Return a copy of ``obs`` with non-matching token indices zeroed.
 
     ``predicate`` is a MongoDB-style filter_dsl predicate over per-token
     fields.  None or an empty predicate is a no-op (the obs dict is
@@ -95,19 +95,19 @@ def apply_token_mask(
     expected = obs["entity_types"].shape
     if keep.shape != expected:
         raise ValueError(
-            f"token_mask predicate must produce a per-slot bool array of "
+            f"token_mask predicate must produce a per-idx bool array of "
             f"shape {expected}; got {keep.shape}"
         )
     if keep.all():
         return obs_out
 
     drop = ~keep
-    for key in _TOKEN_SLOT_KEYS:
+    for key in _TOKEN_IDX_KEYS:
         if key not in obs:
             continue
         arr = np.asarray(obs[key]).copy()
         # entity_types uses -1 as the empty sentinel (TOKEN_PROJECTILE=0,
-        # so plain 0 would silently relabel padded slots as projectiles).
+        # so plain 0 would silently relabel padded indices as projectiles).
         fill = -1 if key == "entity_types" else 0
         if arr.ndim == 2:
             arr[drop] = fill
@@ -117,25 +117,25 @@ def apply_token_mask(
     return obs_out
 
 
-def clear_target_dist_on_masked_slots(
-    target_dist: np.ndarray,
+def clear_target_probs_on_masked_indices(
+    target_probs: np.ndarray,
     obs: Mapping[str, np.ndarray],
 ) -> np.ndarray:
-    """Return a copy of ``target_dist`` with mass on masked slots moved
+    """Return a copy of ``target_probs`` with mass on masked indices moved
     to NO_TARGET (index 0).
 
-    A slot is "masked" iff its ``entity_types`` is the -1 empty sentinel.
-    Mass that would otherwise fall on a hidden slot is folded into
+    A idx is "masked" iff its ``entity_types`` is the -1 empty sentinel.
+    Mass that would otherwise fall on a hidden idx is folded into
     NO_TARGET so row sums stay 1.0 and the target head doesn't get
-    gradient pulling toward a slot the model can't see.
+    gradient pulling toward a idx the model can't see.
     """
-    target_dist = np.asarray(target_dist, dtype=np.float32).copy()
-    if target_dist.size == 0:
-        return target_dist
+    target_probs = np.asarray(target_probs, dtype=np.float32).copy()
+    if target_probs.size == 0:
+        return target_probs
     types = np.asarray(obs["entity_types"])         # (T, N) int8
-    # target_dist[:, 0] = NO_TARGET; target_dist[:, 1:] = slot probabilities.
-    masked_slot = (types == -1).astype(np.float32)  # (T, N) — 1 where the slot is gone
-    moved = (target_dist[:, 1:] * masked_slot).sum(axis=1)
-    target_dist[:, 1:] *= (1.0 - masked_slot)
-    target_dist[:, 0] += moved
-    return target_dist
+    # target_probs[:, 0] = NO_TARGET; target_probs[:, 1:] = idx probabilities.
+    masked_idx = (types == -1).astype(np.float32)  # (T, N) — 1 where the idx is gone
+    moved = (target_probs[:, 1:] * masked_idx).sum(axis=1)
+    target_probs[:, 1:] *= (1.0 - masked_idx)
+    target_probs[:, 0] += moved
+    return target_probs

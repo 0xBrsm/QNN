@@ -26,7 +26,7 @@ python -m qnn.run.router --run-dir runs/bc/bc_v1
 | Path | Purpose |
 |------|---------|
 | `qnn/` | Python model, training pipeline, observation contract |
-| `qnn/model/` | Transformer tokenizer, trunk, TargetPointer, GRU actor-critic policy |
+| `qnn/model/` | Observation embedding, transformer encoder, TargetPointer, GRU actor-critic policy |
 | `qnn/run/` | Run directory management, config, router |
 | `qnn/bc/` | Behavioral cloning — demo collection, target labeler, supervised loop |
 | `qnn/ppo/` | PPO — Sample Factory APPO integration and RL training |

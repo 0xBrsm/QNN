@@ -321,7 +321,7 @@ def _evaluate_mode(
     executor = ThreadPoolExecutor(max_workers=num_envs, thread_name_prefix="nq-eval") if num_envs > 1 else None
 
     envs: Dict[int, NativeWorldEnv] = {}
-    slot_scenarios: Dict[int, _ScenarioSpec] = {}
+    idx_scenarios: Dict[int, _ScenarioSpec] = {}
     returns: List[float] = []
     end_health: List[int] = []
     end_armor: List[int] = []
@@ -350,25 +350,25 @@ def _evaluate_mode(
                 return queue.popleft()
         return None
 
-    def _ensure_env(slot: int, scenario: _ScenarioSpec) -> NativeWorldEnv:
-        current = slot_scenarios.get(slot)
+    def _ensure_env(idx: int, scenario: _ScenarioSpec) -> NativeWorldEnv:
+        current = idx_scenarios.get(idx)
         if current is not None and current.scenario_id == scenario.scenario_id:
-            return envs[slot]
-        existing = envs.pop(slot, None)
+            return envs[idx]
+        existing = envs.pop(idx, None)
         if existing is not None:
             existing.close()
         env = _build_eval_env(config, scenario)
-        envs[slot] = env
-        slot_scenarios[slot] = scenario
+        envs[idx] = env
+        idx_scenarios[idx] = scenario
         return env
 
     try:
         active: Dict[int, _EpisodeState] = {}
-        for slot in range(num_envs):
+        for idx in range(num_envs):
             job = _next_job()
             if job is None:
                 break
-            env = _ensure_env(slot, job.scenario)
+            env = _ensure_env(idx, job.scenario)
             if config.record_demos:
                 _set_demo_recording(env, job.episode_index, mode)
             obs = env.reset(seed=job.episode_seed, start_variant=job.start_variant)
@@ -393,8 +393,8 @@ def _evaluate_mode(
             )
 
         while active:
-            slot_ids = sorted(active.keys())
-            states = [active[slot] for slot in slot_ids]
+            idx_ids = sorted(active.keys())
+            states = [active[idx] for idx in idx_ids]
             obs_batch = _stack_obs([state.obs for state in states])
             actions, next_hidden = _select_actions_batch(
                 model=model,
@@ -404,17 +404,17 @@ def _evaluate_mode(
             )
 
             if executor is None:
-                results = [_step_env(envs[slot], action) for slot, action in zip(slot_ids, actions)]
+                results = [_step_env(envs[idx], action) for idx, action in zip(idx_ids, actions)]
             else:
                 futures = [
-                    executor.submit(_step_env, envs[slot], action)
-                    for slot, action in zip(slot_ids, actions)
+                    executor.submit(_step_env, envs[idx], action)
+                    for idx, action in zip(idx_ids, actions)
                 ]
                 results = [future.result() for future in futures]
 
-            for batch_idx, (slot, result) in enumerate(zip(slot_ids, results)):
+            for batch_idx, (idx, result) in enumerate(zip(idx_ids, results)):
                 obs, reward, done, info = result
-                state = active[slot]
+                state = active[idx]
                 state.hidden = next_hidden[batch_idx].copy()
                 state.step_count += 1
                 terminal = bool(done or state.step_count >= config.max_steps_per_episode)
@@ -457,13 +457,13 @@ def _evaluate_mode(
                         episode_metric_values.setdefault(key, []).append(value)
                         scenario_episode_metric_values.setdefault(state.scenario_id, {}).setdefault(key, []).append(value)
 
-                    next_job = _next_job(slot_scenarios[slot].scenario_id)
+                    next_job = _next_job(idx_scenarios[idx].scenario_id)
                     if next_job is not None:
-                        env = _ensure_env(slot, next_job.scenario)
+                        env = _ensure_env(idx, next_job.scenario)
                         if config.record_demos:
                             _set_demo_recording(env, next_job.episode_index, mode)
                         next_obs = env.reset(seed=next_job.episode_seed, start_variant=next_job.start_variant)
-                        active[slot] = _EpisodeState(
+                        active[idx] = _EpisodeState(
                             episode_index=next_job.episode_index,
                             obs=next_obs,
                             scenario_id=next_job.scenario.scenario_id,
@@ -471,7 +471,7 @@ def _evaluate_mode(
                             hidden=model.zero_hidden(1)[0].copy(),
                         )
                     else:
-                        del active[slot]
+                        del active[idx]
                 else:
                     state.obs = obs
     finally:

@@ -16,16 +16,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-HEAD_NAMES = ("move_head", "look_head", "fire_head", "weapon_head")
+HEAD_NAMES = ("move_head", "look_head", "attack_head", "weapon_head")
 
 
 def _resolve_bottleneck_heads(model: nn.Module) -> dict[str, nn.Sequential]:
-    """Collect heads built as Linear → ReLU/GELU → Linear (3-element Sequential)."""
+    """Collect heads built as Linear → ReLU/GELU → Linear (3-element Sequential).
+
+    Heads are wrapped in Component containers (``MoveHead``, ``LookHead``,
+    ``AttackHead``, ``WeaponHead``); the underlying MLP lives at ``head.mlp``.
+    """
     heads: dict[str, nn.Sequential] = {}
     for name in HEAD_NAMES:
-        head = getattr(model, name, None)
-        if isinstance(head, nn.Sequential) and len(head) == 3:
-            heads[name] = head
+        component = getattr(model, name, None)
+        mlp = getattr(component, "mlp", None) if component is not None else None
+        if isinstance(mlp, nn.Sequential) and len(mlp) == 3:
+            heads[name] = mlp
     return heads
 
 

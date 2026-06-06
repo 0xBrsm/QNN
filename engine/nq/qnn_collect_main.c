@@ -71,7 +71,8 @@ static void QNN_InferEmitAction(qnn_action_t *action, const qnn_snapshot_t *snap
 
 	if (snapshot->weapon_id > 0)
 		action->weapon = snapshot->weapon_id;
-	action->fire = qnn_runtime.native_fire_this_window ? 1 : 0;
+	if (qnn_runtime.native_fire_this_window)
+		action->move |= 0x01; /* bit 0 = attack press */
 }
 
 /* Per-native-frame: infer fire from sound/ammo cues.  Shared with the
@@ -84,7 +85,7 @@ static void QNN_InferNativeAction(qnn_action_t *action,
 	QNN_ClearAction(action);
 	if (QNN_DetectFireEvent(snapshot))
 	{
-		action->fire = 1;
+		action->move |= 0x01; /* bit 0 = attack press */
 		qnn_runtime.native_fire_this_window = true;
 	}
 }
@@ -191,9 +192,25 @@ snap:
 	else
 		medium = QNN_MEDIUM_AIR;
 
-	QNN_SnapMove(raw, medium,
-		QNN_SnapshotHasSelfJumpSound(snapshot),
-		action->move);
+	{
+		float snapped[3];
+		int fb_neg, fb_pos, lr_neg, lr_pos, up_neg, up_pos;
+		uint8_t fb_lr_ud;
+		QNN_SnapMove(raw, medium,
+			QNN_SnapshotHasSelfJumpSound(snapshot),
+			snapped);
+		fb_neg = (snapped[0] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		fb_pos = (snapped[0] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		lr_neg = (snapped[1] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		lr_pos = (snapped[1] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		up_neg = (snapped[2] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		up_pos = (snapped[2] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		fb_lr_ud = QNN_PackInputMask(
+			/*alive=*/1, fb_neg, fb_pos, lr_neg, lr_pos,
+			up_neg, up_pos, 0, 0);
+		/* Preserve attack/jump bits set by native-frame inference. */
+		action->move = (uint8_t)((action->move & 0x81) | fb_lr_ud);
+	}
 }
 
 /* QNN_EmitTick, QNN_JitterFilter, QNN_ActionIsFrozen, QNN_WriteObsTick,
@@ -616,11 +633,11 @@ static int QNN_HandleCollect(const char *line)
 					float phys_dt = qnn_runtime.native_frame_count * qnn_runtime.fixed_dt;
 					QNN_InferEmitMove(&snapshot.action_label,
 						&snapshot, phys_dt);
-					VectorCopy(snapshot.action_label.move, qnn_runtime.prev_move);
+					qnn_runtime.prev_move = snapshot.action_label.move;
 				}
 				else
 				{
-					VectorCopy(qnn_runtime.prev_move, snapshot.action_label.move);
+					snapshot.action_label.move = qnn_runtime.prev_move;
 				}
 			}
 			else

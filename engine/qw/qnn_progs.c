@@ -526,6 +526,17 @@ int QNN_ProgsGetAttackCdRemaining(int tick, int tick_hz)
 }
 
 
+float QNN_ProgsGetAttackFinished(void)
+{
+	return qnn_progs_attack_finished;
+}
+
+void QNN_ProgsSetAttackFinished(float value)
+{
+	qnn_progs_attack_finished = value;
+}
+
+
 int QNN_ProgsEvalJump(
 	int tick, int tick_hz,
 	int health, int grounded, int waterlevel, int button2_pressed)

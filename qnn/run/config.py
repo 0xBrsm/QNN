@@ -133,7 +133,7 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
 
     if mode == "head_probe":
         # Head probes train memoryless MLPs from frozen shards — no
-        # trunk/GRU/pointer model.json, but they do carry a probe.json
+        # encoder/GRU/pointer model.json, but they do carry a probe.json
         # with the MLP shape + feature list.
         required_keys = ["train", "machine", "probe"]
     else:
@@ -217,7 +217,7 @@ def build_run_bc_config(
     instance built from ``config/model.json``. Train + machine knobs
     populate the remaining BCConfig fields.
     """
-    from qnn.model.policy import ModelConfig
+    from qnn.model.network import ModelConfig
 
     train = _require_mapping(run_cfg, "train", "run config")
     model = _require_mapping(run_cfg, "model", "run config")
@@ -232,12 +232,21 @@ def build_run_bc_config(
     bc_cfg["output_dir"] = str(checkpoints_dir)
     bc_cfg["bc_data_dir"] = _require_string(machine, "bc_data_dir", "machine.json")
     bc_cfg["device"] = requested_device
+    # batch_size carries the gradient-step sample count for both training
+    # paths: per-step frame count for frame-shuffled (non-recurrent), and
+    # parallel-lane count for lane-packed (recurrent). The pre-rename
+    # microbatch_size knob is gone — fail loudly so old configs surface.
+    if "microbatch_size" in machine:
+        raise ValueError(
+            "machine.json: 'microbatch_size' was renamed — use 'batch_size'. "
+            "For recurrent training, batch_size is the parallel lane count "
+            "(see lane_packed_batches docstring)."
+        )
     bc_cfg["batch_size"] = int(_require_key(machine, "batch_size", "machine.json"))
     bc_cfg["pin_memory"] = bool(_require_key(machine, "pin_memory", "machine.json"))
     bc_cfg["prefetch"] = int(_require_key(machine, "prefetch", "machine.json"))
-    bc_cfg["microbatch_size"] = int(_require_key(machine, "microbatch_size", "machine.json"))
     bc_cfg["snapshot_interval"] = int(_require_key(machine, "snapshot_interval", "machine.json"))
-    bc_cfg["preload_to_gpu"] = bool(_require_key(machine, "preload_to_gpu", "machine.json"))
+    bc_cfg["streaming"] = bool(_require_key(machine, "streaming", "machine.json"))
     bc_cfg["dtype"] = str(_require_string(train, "dtype", "train.json"))
     bc_cfg["collection_fingerprint"] = _require_string(
         train, "collection_fingerprint", "train.json"

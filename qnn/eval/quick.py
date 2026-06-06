@@ -40,7 +40,7 @@ _TICK_KEYS = (
     "health_gain", "armor_gain",
 )
 _TARGET_TICK_KEYS = (
-    "target_pred_slot",
+    "target_pred_idx",
     "target_pred_pid",
     "target_pred_prob",
     "target_entropy",
@@ -64,12 +64,12 @@ def _target_tick_values(
     if target_logits.ndim != 2 or target_logits.shape[0] != 1:
         return {}
     probs = torch.softmax(target_logits[0], dim=0)
-    pred_slot = int(torch.argmax(probs).item())
-    pred_prob = float(probs[pred_slot].item())
+    pred_idx = int(torch.argmax(probs).item())
+    pred_prob = float(probs[pred_idx].item())
     entropy = float((-(probs * torch.log(probs.clamp_min(1e-8))).sum()).item())
-    pred_pid = float(int(batched["entity_ids"][0, pred_slot, 2])) if pred_slot < batched["entity_ids"].shape[1] else 0.0
+    pred_pid = float(int(batched["entity_ids"][0, pred_idx, 2])) if pred_idx < batched["entity_ids"].shape[1] else 0.0
     return {
-        "target_pred_slot": float(pred_slot),
+        "target_pred_idx": float(pred_idx),
         "target_pred_pid": pred_pid,
         "target_pred_prob": pred_prob,
         "target_entropy": entropy,

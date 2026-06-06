@@ -40,14 +40,14 @@ void QNN_QwdCollectReset(void);
  *     Most-negative value across the window.
  *
  * action->weapon is left untouched by this function; the held-weapon
- * state machine lives in QNN_QwdInferEmitAction.
+ * state machine lives in QNN_QwdBuildActionLabel.
  */
 int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot);
 
 /* Emit-time QWD action: usercmd extraction + held-weapon state machine
  * (impulse / engine-forced / carry, using snapshot->weapon_id) +
  * look/switch fill. */
-void QNN_QwdInferEmitAction(qnn_action_t *action,
+void QNN_QwdBuildActionLabel(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
 
 /* Per-cmd fire-predicate eval + cmd-block aggregation across the
@@ -70,15 +70,26 @@ void QNN_QwdEvalOperativePerCmd(
 /* Pmove-driven jump operativeness.  Per-cmd PlayerMove() invocation
  * with pmove globals seeded from the snapshot; returns 1 iff any cmd
  * in this tick's window triggered the patched JumpButton() success
- * branch.  See qnn_pmove_hooks.h for the flag and save/restore. */
-int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot);
+ * branch.  See qnn_pmove_hooks.h for the flag and save/restore.
+ *
+ * synth_button2:
+ *   0 = honour each cmd's actual button2 / upmove>0 — the labeler /
+ *       op-jump label path uses this.
+ *   1 = pure feasibility mode: force button2=1 on every cmd, and save
+ *       / restore all persistent pmove carry state (oldbuttons,
+ *       prev_simorg/vel) so the synthetic press doesn't contaminate
+ *       the next real-jump tick.  Used by QwdPackInputMask to compute
+ *       input_mask bit 7 ("would the engine jump if I pressed?"). */
+int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot, int synth_button2);
 
-/* Fill action->op_input from press bits (read off action->move/fire,
+/* Fill action->input_mask from press bits (read off action->move,
  * already filled by QwdExtractAction) + per-axis op predicate results.
- * Must run exactly once per tick — invoked from QwdInferEmitAction
+ * Must run exactly once per tick — invoked from QwdBuildActionLabel
  * right after FillLookAndSwitch.  Reads qwd_state.last_op_fire /
- * last_impulse_any stashed by the same-tick QwdExtractAction call. */
-void QNN_QwdPackOpInput(qnn_action_t *action,
+ * last_jump_press_any / last_upmove_pos_any stashed by the same-tick
+ * QwdExtractAction call.  See QNN_PackInputMask in qnn_collect_helpers.h
+ * for the bit layout. */
+void QNN_QwdPackInputMask(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
 
 #endif /* QNN_QWD_COLLECT_H */

@@ -21,11 +21,12 @@ from qnn.bc.train import (
     _NATIVE_TOKEN_INDEXED_OBS_FIELDS,
     _build_indptr,
     _filter_referenced_keys,
-    _mask_target_dist_for_tokens,
+    _inject_view_pitch_from_spatial_dir,
+    _mask_target_probs_for_tokens,
     _mask_token_array,
     _shard_segments,
     _token_keep_mask,
-    _unpack_fire_bit,
+    _unpack_attack_bit,
     _unpack_move_axes,
 )
 
@@ -122,6 +123,7 @@ class StreamingSource:
             key: np.load(self.cache_dir / fname, mmap_mode="r")
             for key, fname in shard["obs"].items()
         }
+        obs = _inject_view_pitch_from_spatial_dir(obs)
         actions = {
             key: np.load(self.cache_dir / fname, mmap_mode="r")
             for key, fname in shard["actions"].items()
@@ -131,10 +133,10 @@ class StreamingSource:
         if "entity_count" in obs:
             indptr = _build_indptr(obs["entity_count"])
             token_keep = _token_keep_mask(obs, self._token_mask)
-            if token_keep is not None and "target_dist" in actions:
+            if token_keep is not None and "target_probs" in actions:
                 actions = dict(actions)
-                actions["target_dist"] = _mask_target_dist_for_tokens(
-                    actions["target_dist"], indptr, token_keep,
+                actions["target_probs"] = _mask_target_probs_for_tokens(
+                    actions["target_probs"], indptr, token_keep,
                 )
         view = ShardView(obs=obs, actions=actions, indptr=indptr, token_keep=token_keep)
         cache[shard_idx] = view
@@ -171,8 +173,8 @@ class StreamingSource:
         for key in want:
             if key.startswith("act."):
                 head = key[4:]
-                if head == "fire" and "fire" not in view.actions and "move" in view.actions:
-                    out[key] = _unpack_fire_bit(view.actions["move"][abs_lo:abs_hi])
+                if head == "attack" and "attack" not in view.actions and "move" in view.actions:
+                    out[key] = _unpack_attack_bit(view.actions["move"][abs_lo:abs_hi])
                     continue
                 out[key] = view.actions[head][abs_lo:abs_hi]
                 continue
@@ -199,8 +201,8 @@ def _build_shard_episode_refs(
 ) -> list[EpisodeRef]:
     if "entity_count" not in shard.get("obs", {}):
         raise RuntimeError(f"{cache_dir} shard {shard_idx} is missing obs.entity_count")
-    if "target_dist" not in shard.get("actions", {}):
-        raise RuntimeError(f"{cache_dir} shard {shard_idx} is missing act.target_dist")
+    if "target_probs" not in shard.get("actions", {}):
+        raise RuntimeError(f"{cache_dir} shard {shard_idx} is missing act.target_probs")
     obs = {
         key: np.load(cache_dir / fname, mmap_mode="r")
         for key, fname in shard["obs"].items()
@@ -211,16 +213,16 @@ def _build_shard_episode_refs(
     }
     if "move" in actions:
         refs = _filter_referenced_keys(segment_mask)
-        if "act.move" in refs or "act.fire" in refs:
+        if "act.move" in refs or "act.attack" in refs:
             move_packed = actions["move"]
             actions["move"] = _unpack_move_axes(move_packed)
-            actions["fire"] = _unpack_fire_bit(move_packed)
+            actions["attack"] = _unpack_attack_bit(move_packed)
 
     indptr = _build_indptr(obs["entity_count"])
     token_keep = _token_keep_mask(obs, token_mask)
     if token_keep is not None:
-        actions["target_dist"] = _mask_target_dist_for_tokens(
-            actions["target_dist"], indptr, token_keep,
+        actions["target_probs"] = _mask_target_probs_for_tokens(
+            actions["target_probs"], indptr, token_keep,
         )
 
     segments = _shard_segments(

@@ -8,12 +8,13 @@
  * write labels back at the press frame instead of the broadcast frame.
  *
  *   FIRE   sound (weapon-fire PHS multicast) → walkback by full ping
- *          → set slot.action.fire = 1 → co-temporal dedup → chain-fill
- *          across short cooldown gaps → forward log-normal hold tail.
+ *          → OR the attack bit into slot.action.move → co-temporal dedup
+ *          → chain-fill across short cooldown gaps → forward log-normal
+ *          hold tail.
  *
- *   JUMP   sound (player/plyrjmp8.wav) → walkback by full ping → set
- *          slot.action.move[2] = jump_speed → grounded-count chain
- *          gate → forward log-normal hold tail.
+ *   JUMP   sound (player/plyrjmp8.wav) → walkback by full ping → OR
+ *          the ud-pos and jump bits into slot.action.move → grounded-
+ *          count chain gate → forward log-normal hold tail.
  *
  *   SWITCH per-emit `action.weapon = snapshot.weapon_id`.  On
  *          weapon_id transitions, rewrite the trailing K slots back to
@@ -312,13 +313,13 @@ static void QNN_BackShiftFillBetween(qnn_backshift_ring_t *ring,
 		if (!QNN_BackShiftSlotAt(ring, i, &s))
 			break;
 		if (s->tick > from_tick && s->tick < to_tick)
-			s->action.fire = 1;
+			s->action.move |= 0x01; /* bit 0 = attack press */
 	}
 }
 
 static void qnn_press_set_fire(qnn_action_t *a)
 {
-	a->fire = 1;
+	a->move |= 0x01; /* bit 0 = attack press */
 }
 
 static qboolean qnn_press_chain_gate_fire(qnn_backshift_ring_t *ring,
@@ -434,7 +435,7 @@ static void QNN_BackShiftFillJumpBetween(qnn_backshift_ring_t *ring,
 		if (!QNN_BackShiftSlotAt(ring, i, &s))
 			break;
 		if (s->tick > from_tick && s->tick < to_tick)
-			s->action.move[2] = QNN_SV_JUMP_SPEED / QNN_SV_MAXSPEED;
+			s->action.move |= 0xC0; /* ud-pos | jump bits */
 	}
 }
 
@@ -459,7 +460,7 @@ static int QNN_BackShiftJumpGroundedCount(qnn_backshift_ring_t *ring,
 
 static void qnn_press_set_jump(qnn_action_t *a)
 {
-	a->move[2] = QNN_SV_JUMP_SPEED / QNN_SV_MAXSPEED;
+	a->move |= 0xC0; /* ud-pos | jump bits */
 }
 
 static qboolean qnn_press_chain_gate_jump(qnn_backshift_ring_t *ring,
@@ -576,11 +577,12 @@ void QNN_MvdBackShiftOnWeaponChange(int new_weapon_id,
  * time position delta in QNN_MvdInferEmitMove.
  */
 
-void QNN_MvdBackShiftWriteMoveXY(const float move[3], int shift_frames)
+void QNN_MvdBackShiftWriteMoveXY(uint8_t move, int shift_frames)
 {
 	qnn_backshift_ring_t *ring = &mvd_state.backshift;
 	qnn_backshift_slot_t *slot;
 	qnn_backshift_slot_t *latest;
+	const uint8_t fb_lr_mask = 0x1E; /* bits 1-4: fb_neg, fb_pos, lr_neg, lr_pos */
 
 	if (ring->count == 0 || shift_frames <= 0)
 		return;
@@ -588,11 +590,11 @@ void QNN_MvdBackShiftWriteMoveXY(const float move[3], int shift_frames)
 		|| !QNN_BackShiftSlotAt(ring, shift_frames, &slot)
 		|| slot == latest)
 		return;
-	/* Only back-shift fb/lr — these come from view-relative velocity
+	/* Only back-shift fb/lr bits — these come from view-relative velocity
 	 * sign, which lags the keyboard press by ping+tick like fire and
-	 * switch.  move[2] is back-shifted per-event by the jump writer. */
-	slot->action.move[0] = move[0];
-	slot->action.move[1] = move[1];
+	 * switch.  ud bits are back-shifted per-event by the jump writer. */
+	slot->action.move = (uint8_t)((slot->action.move & ~fb_lr_mask)
+		| (move & fb_lr_mask));
 }
 
 
@@ -680,12 +682,12 @@ void QNN_MvdBackShiftPush(qnn_tick_emit_state_t *emit, FILE *out,
 	/* Apply any hold extension that spilled past the previous head. */
 	if (mvd_state.fire_hold_remaining > 0)
 	{
-		slot->action.fire = 1;
+		slot->action.move |= 0x01; /* bit 0 = attack press */
 		mvd_state.fire_hold_remaining--;
 	}
 	if (mvd_state.jump_hold_remaining > 0)
 	{
-		slot->action.move[2] = QNN_SV_JUMP_SPEED / QNN_SV_MAXSPEED;
+		slot->action.move |= 0xC0; /* ud-pos | jump bits */
 		mvd_state.jump_hold_remaining--;
 	}
 
@@ -761,7 +763,7 @@ void QNN_MvdInferNativeAction(qnn_action_t *action,
 	QNN_ClearAction(action);
 	if (QNN_DetectFireEvent(snapshot))
 	{
-		action->fire = 1;
+		action->move |= 0x01; /* bit 0 = attack press */
 		qnn_runtime.native_fire_this_window = true;
 	}
 	/* Jump is handled by QNN_MvdBackShiftWriteJumpEvents at emit time. */
@@ -772,7 +774,6 @@ void QNN_MvdInferEmitAction(qnn_action_t *action,
 {
 	QNN_ClearAction(action);
 	QNN_FillLookAndSwitch(action, snapshot);
-	action->fire = 0;
 }
 
 void QNN_MvdInferEmitMove(qnn_action_t *action,
@@ -814,28 +815,28 @@ void QNN_MvdInferEmitMove(qnn_action_t *action,
 		 * just below threshold.  The Python relabeler applies a +2-frame
 		 * lookahead to improve strafe accuracy beyond this C-side baseline. */
 		static const float eps = 20.0f;
-		float sfb = 0.0f, slr = 0.0f;
-		if (rel_vel[0] > eps)       sfb =  1.0f;
-		else if (rel_vel[0] < -eps) sfb = -1.0f;
-		if (rel_vel[1] > eps)       slr =  1.0f;
-		else if (rel_vel[1] < -eps) slr = -1.0f;
-		if (sfb != 0.0f && slr != 0.0f)
-		{
-			action->move[0] = sfb * 0.70710678f;
-			action->move[1] = slr * 0.70710678f;
-		}
-		else
-		{
-			action->move[0] = sfb;
-			action->move[1] = slr;
-		}
+		int fb_neg = (rel_vel[0] < -eps) ? 1 : 0;
+		int fb_pos = (rel_vel[0] >  eps) ? 1 : 0;
+		int lr_neg = (rel_vel[1] < -eps) ? 1 : 0;
+		int lr_pos = (rel_vel[1] >  eps) ? 1 : 0;
+		uint8_t fb_lr = QNN_PackInputMask(
+			/*alive=*/1, fb_neg, fb_pos, lr_neg, lr_pos,
+			0, 0, 0, 0);
+		/* Preserve any attack/ud/jump bits the back-shift writers
+		 * may have set on this slot. */
+		action->move = (uint8_t)((action->move & ~0x1E) | fb_lr);
+		return;
 	}
-	else
+
+	/* Water: position-delta for fb/lr/ud. */
 	{
-		/* Water: position-delta for fb/lr (same as original). */
 		vec3_t delta, rel_delta;
 		int i;
 		float raw[3];
+		float snapped[3];
+		int fb_neg, fb_pos, lr_neg, lr_pos, up_neg, up_pos;
+		uint8_t packed;
+
 		for (i = 0; i < 3; i++)
 			delta[i] = (emit_dt > 0.0f)
 				? (snapshot->player_origin[i] - qnn_runtime.emit_origin[i]) / emit_dt
@@ -844,19 +845,18 @@ void QNN_MvdInferEmitMove(qnn_action_t *action,
 		raw[0] = rel_delta[0] / QNN_SV_MAXSPEED;
 		raw[1] = rel_delta[1] / QNN_SV_MAXSPEED;
 		raw[2] = rel_delta[2] / QNN_SV_MAXSPEED;
-		{
-			float snapped[3];
-			QNN_SnapMove(raw, QNN_MEDIUM_WATER,
-				QNN_SnapshotHasSelfJumpSound(snapshot), snapped);
-			action->move[0] = snapped[0];
-			action->move[1] = snapped[1];
-			action->move[2] = snapped[2];
-		}
-		return;  /* ud already filled above */
+		QNN_SnapMove(raw, QNN_MEDIUM_WATER,
+			QNN_SnapshotHasSelfJumpSound(snapshot), snapped);
+		fb_neg = (snapped[0] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		fb_pos = (snapped[0] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		lr_neg = (snapped[1] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		lr_pos = (snapped[1] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		up_neg = (snapped[2] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
+		up_pos = (snapped[2] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
+		packed = QNN_PackInputMask(
+			/*alive=*/1, fb_neg, fb_pos, lr_neg, lr_pos,
+			up_neg, up_pos, 0, 0);
+		/* Preserve attack and jump bits set by back-shift writers. */
+		action->move = (uint8_t)((action->move & 0x81) | packed);
 	}
-
-	/* ud: set by QNN_MvdBackShiftWriteJumpEvents into the back-shifted
-	 * ring slot; 0 here at emit time. */
-	action->move[2] = 0.0f;
-	/* Water ud already handled above via position delta (early return). */
 }

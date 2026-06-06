@@ -15,7 +15,7 @@ This runner reads the run-dir's three config blobs:
                        — zero out the heads the model doesn't predict.
   * ``machine.json`` — same machine knobs the BC runner uses.
   * ``probe.json``   — head-specific architecture knobs (which head,
-                       MLP shape, feature list, tokenizer width, …),
+                       MLP shape, feature list, obs-embedding width, …),
                        all consumed by ``HeadSpec.build``.
 
 It asks the per-head ``HeadSpec.build`` callable to produce a
@@ -33,7 +33,7 @@ import time as _time
 from pathlib import Path
 from typing import Any
 
-from qnn.bc.heads.heads import HEADS
+from qnn.model.bench.heads import HEADS
 from qnn.bc.train import BCConfig, run_behavior_cloning
 from qnn.run.common import RunnerContext, base_results, finalize_results, prepare_bc_run_outputs
 from qnn.run.config import (
@@ -74,12 +74,16 @@ def _build_head_probe_bc_config(
     bc_cfg["output_dir"] = str(run_output_dirs(run_cfg)["checkpoints"])
     bc_cfg["bc_data_dir"] = _require_string(machine, "bc_data_dir", "machine.json")
     bc_cfg["device"] = device
+    if "microbatch_size" in machine:
+        raise ValueError(
+            "machine.json: 'microbatch_size' was renamed — use 'batch_size'. "
+            "For recurrent training, batch_size is the parallel lane count."
+        )
     bc_cfg["batch_size"] = int(_require_key(machine, "batch_size", "machine.json"))
-    bc_cfg["microbatch_size"] = int(_require_key(machine, "microbatch_size", "machine.json"))
     bc_cfg["pin_memory"] = bool(_require_key(machine, "pin_memory", "machine.json"))
     bc_cfg["prefetch"] = int(_require_key(machine, "prefetch", "machine.json"))
     bc_cfg["snapshot_interval"] = int(_require_key(machine, "snapshot_interval", "machine.json"))
-    bc_cfg["preload_to_gpu"] = bool(_require_key(machine, "preload_to_gpu", "machine.json"))
+    bc_cfg["streaming"] = bool(_require_key(machine, "streaming", "machine.json"))
 
     return BCConfig(**bc_cfg), model_factory
 

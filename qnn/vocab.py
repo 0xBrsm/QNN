@@ -13,7 +13,7 @@ from typing import Dict
 # (axe, shotgun, super_shotgun, nailgun, super_nailgun, grenade,
 # rocket, lightning) so the entity_embed rows for "weapon X" and
 # "weapon X+1" are adjacent and the model isn't asked to learn that
-# SUPER_SHOTGUN at slot 42 is in the shotgun family.
+# SUPER_SHOTGUN at idx 42 is in the shotgun family.
 ENTITY_IDS: Dict[str, int] = {
     "NONE": 0,
     "PLAYER": 1,
@@ -98,7 +98,7 @@ MODALITY_IDS: Dict[str, int] = {
 
 MODALITY_VOCAB_SIZE = 4
 
-MAX_PLAYER_SLOTS = 32
+MAX_PLAYER_INDICES = 32
 
 SPATIAL_SECTOR_IDS: Dict[str, int] = {
     "FOV_Center": 0,
@@ -142,7 +142,7 @@ MAX_TOKEN_OBJECTS = 16
 # (0=no weapon, 1=axe, …, 8=LG). Past bugs repeatedly fed self_weapon_id
 # directly into an embedding sized WEAPON_HEAD_SIZE+1 (impulse-indexed)
 # with a .clamp(0, WEAPON_HEAD_SIZE), silently collapsing RL+LG (and
-# wasting slots 1, 2) — the model trained on a 5-class weapon embed
+# wasting indices 1, 2) — the model trained on a 5-class weapon embed
 # instead of 8. ALWAYS use this helper before indexing any
 # impulse-keyed table (e.g. weapon_embed_self of size 9, the BC weapon
 # head's 8-class output). For entity_embed (size 44) use

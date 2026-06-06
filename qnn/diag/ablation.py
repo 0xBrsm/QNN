@@ -87,15 +87,15 @@ def layer_ablation_table(
     Larger delta = more essential.
     """
     if targets is None:
-        # Default: ablate each top-level head MLP and selected trunk components.
+        # Default: ablate each top-level head MLP and selected encoder components.
         targets = []
         for name, _ in policy.model.named_children():
             if name.endswith("_head") or name in ("gru", "target_pointer"):
                 targets.append(name)
         # Plus each transformer layer if present
-        if hasattr(policy.model, "trunk") and hasattr(policy.model.trunk, "blocks"):
-            for i in range(len(policy.model.trunk.blocks)):
-                targets.append(f"trunk.blocks.{i}")
+        if hasattr(policy.model, "encoder") and hasattr(policy.model.encoder, "blocks"):
+            for i in range(len(policy.model.encoder.blocks)):
+                targets.append(f"encoder.blocks.{i}")
 
     baseline = episode_val_loss(policy, val_episodes)
     rows: list[dict] = []

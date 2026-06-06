@@ -31,7 +31,7 @@ forcing a one-hot switch.
 V3 emits:
 
 ```text
-target_dist: float32[T, 17]
+target_probs: float32[T, 17]
 index 0: NO_TARGET
 index 1..16: slot_0..slot_15
 row sum: 1.0
@@ -44,8 +44,8 @@ For model training, `NO_TARGET` is a loss gate, not a model logit. The target
 pointer remains a 16-slot head:
 
 ```text
-present = 1 - target_dist[:, NO_TARGET]
-slot_target = target_dist[:, 1:] / max(present, eps)
+present = 1 - target_probs[:, NO_TARGET]
+slot_target = target_probs[:, 1:] / max(present, eps)
 target_loss = present * CE_soft(slot_logits, slot_target)
 ```
 
@@ -163,7 +163,7 @@ fitting and is currently deferred — noisy-OR is the principled zero-parameter
 upgrade.
 
 Frag support is design-only and not currently wired into
-`label_enemy_target_distribution`. The "Frag And Death Plumbing" section
+`label_enemy_target_probs`. The "Frag And Death Plumbing" section
 below describes the extraction path if frag support is ever added; today
 only cone + physics admit candidates.
 
@@ -281,7 +281,7 @@ re-tune per collection.
 | `cone_admit` | 0.25 | Load-bearing | Grid `{0.10, 0.20, 0.25, 0.35, 0.50}`. Select by BC target CE and cone-only sustained-run recall. Require the 2+ fire cone-only recency-0 bucket to retain at least 80% of opt3 frames. |
 | `physics_hit_base` | 0.95 | Load-bearing | Default lands at the high end of the co-primary range. Grid `{0.80, 0.90, 0.95, 0.98}`. Pick by held-out consensus NLL and overlap-frame calibration. With noisy-OR aggregation, a cone+physics agreement at this default yields `base = 1 - (1-cone)(1-0.95)`, which compresses to ≥0.95 — the agreement-boost target. |
 | Evidence aggregator | noisy-OR | Load-bearing, new | `base = 1 - (1-cone_e)(1-phys_e)` replaces `max(cone_e, phys_e)`. Empirically: ~3pp accuracy gain on the agreement subset (~5.6% of fires); the agreement region is where max() loses information. A fitted logistic with cone·physics interaction is a further upgrade (~65% NLL reduction on the consensus subset) but requires per-collection fitting; deferred. |
-| `frag_base` | — | Not implemented | Frag support is not wired into `label_enemy_target_distribution`. If added, grid `{0.85, 0.90, 0.95, 0.98}` on unambiguous frag windows; metric is NLL for the inferred victim pid. |
+| `frag_base` | — | Not implemented | Frag support is not wired into `label_enemy_target_probs`. If added, grid `{0.85, 0.90, 0.95, 0.98}` on unambiguous frag windows; metric is NLL for the inferred victim pid. |
 | `theta_reject_deg` | 45.0 | Load-bearing | Hard reject for cone-only candidates whose angle exceeds this; physics hits bypass the reject. |
 | `fire_count_tau` | 2 | Load-bearing | Grid `{1, 2, 3, 5}`. Optimize calibration for cone-only recency-0 runs bucketed by fire count. The 2+ fire bucket should get higher present mass than 0-fire extension-only runs. |
 | `eng_logistic_*` (intercept + 5 weights) | see code | Load-bearing as a family, **fitted** | σ(intercept + w·x) over `(mean_anchor, fire_count_conf, max_anchor, log1p(duration), log1p(n_fires))`. Defaults fitted on QWD val shards 0..5 (7,345 physics-confirmed streams) against v2-and-physics consensus support. Brier 0.061 (vs 0.080 for the prior clip-linear; ~24% reduction); calibration near-perfect across quintiles. Refit via `labeler_v3_eng_conf_audit.py --shards ... --emit-config --drop-recency`. |
@@ -310,7 +310,7 @@ Calibration split:
    ```
 
 5. Reject any setting that increases hard-argmax jitter against opt3 by more
-   than 10% when converting `target_dist` to argmax labels for diagnostics.
+   than 10% when converting `target_probs` to argmax labels for diagnostics.
 
 This keeps calibration empirical without pretending any single hard labeler is
 ground truth.
@@ -323,9 +323,9 @@ data. Scripts live under `scripts/analysis/labeler_v3_*_audit.py`.
 
 ### Aggregation: max → noisy-OR (logistic deferred)
 
-`scripts/analysis/labeler_v3_aggregation_audit.py` compares three per-candidate
-aggregators on the v2-and-physics consensus subset (fires where v2's hard pick
-is also in the recency-0 physics-hit set; unbiased between the two LFs):
+A one-shot audit (since removed) compared three per-candidate aggregators on
+the v2-and-physics consensus subset (fires where v2's hard pick is also in
+the recency-0 physics-hit set; unbiased between the two LFs):
 
 | aggregator | shard 0 NLL | shard 0 acc@1 | shard 1 NLL | shard 1 acc@1 |
 |---|---|---|---|---|
@@ -645,7 +645,7 @@ Expected:
 
 ### Hard-Argmax Diagnostics
 
-Convert `target_dist` to hard labels only for diagnostics:
+Convert `target_probs` to hard labels only for diagnostics:
 
 ```text
 hard[t] = TARGET_IGNORE if p(NO_TARGET) >= 0.5 else argmax_slot(p_slots)
@@ -682,31 +682,29 @@ metrics regress.
 
 File: `qnn/bc/target_labeler.py`
 
-1. Add `label_enemy_target_distribution(...) -> np.ndarray` returning `(T, 17)`.
-2. Keep `label_enemy_target(...)` as a compatibility wrapper.
-3. Port `all_hits_at_fire()` and weapon physics helpers from
+1. Add `label_enemy_target_probs(...) -> np.ndarray` returning `(T, 17)`.
+2. Port `all_hits_at_fire()` and weapon physics helpers from
    `scripts/analysis/hit_labeler.py` / `hit_streams.py`.
-4. Remove sigma/K hard cone width code from the new distribution path. Leave
-   old hard path untouched until the wrapper is proven.
-5. Unit-test row sums, empty episodes, axe/LG gates, co-angular split,
+3. Remove sigma/K hard cone width code from the new distribution path.
+4. Unit-test row sums, empty episodes, axe/LG gates, co-angular split,
    physics-only admission, cone-only sustained admission, and stream loss.
 
 #### PR 2 - Collector emit format
 
 File: `qnn/bc/collect.py`
 
-1. Emit `act_target_dist.npy`.
+1. Emit `act_target_probs.npy`.
 2. Continue emitting `act_target.npy` during transition.
 3. Change `combat_only` to keep frames where `1 - p(NO_TARGET) >= 0.25`.
 4. Add manifest metadata:
    `target_labeler_version = "v3-simple-co-primary"` and
-   `target_dist_classes = ["NO_TARGET", "slot_0", ..., "slot_15"]`.
+   `target_probs_classes = ["NO_TARGET", "slot_0", ..., "slot_15"]`.
 
 #### PR 3 - Soft CE
 
 Files: `qnn/bc/train.py`, loader plumbing, and policy loss code.
 
-1. Load `act_target_dist` when present.
+1. Load `act_target_probs` when present.
 2. Train target pointer with present-weighted soft CE.
 3. Keep hard-label CE fallback for old collections.
 4. Report `loss_target_soft`, `target_present_mean`, target entropy, and hard
@@ -724,7 +722,7 @@ Files: `scripts/analysis/`.
 ## Pseudocode
 
 ```python
-def label_enemy_target_distribution(obs, actions, *, config=DEFAULT,
+def label_enemy_target_probs(obs, actions, *, config=DEFAULT,
                                     sight_only=False):
     T, N = obs["entity_types"].shape
     slot_scores = zeros((T, N), float32)

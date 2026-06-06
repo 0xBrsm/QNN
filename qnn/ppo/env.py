@@ -26,14 +26,14 @@ from mapgen.pool import PROCGEN_SENTINEL
 _MOVE_DIM = ACTION_HEADS["move"]
 _LOOK_DIM = ACTION_HEADS["look"]
 _DISCRETE_HEAD_ORDER = [
-    "fire",
+    "attack",
     "weapon",
 ]
 
 _HEAD_NOOP_VALUES: Dict[str, object] = {
     "move": [0.0, 0.0, 0.0],
     "look": [0.0, 0.0, 0.0],
-    "fire": 0,
+    "attack": 0,
     "weapon": 0,
 }
 
@@ -101,7 +101,7 @@ def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
     """Convert a canonical action dict to the flat Tuple array expected by SF.
 
     Inverse of tuple_action_to_heads: labels.weapon is the engine impulse
-    byte 1..8, SF Tuple wants the class index 0..7 in its Discrete slot.
+    byte 1..8, SF Tuple wants the class index 0..7 in its Discrete idx.
     """
     labels = ActionLabels.from_dict(heads)
     return np.asarray(
@@ -112,7 +112,7 @@ def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
             float(labels.look[0]),
             float(labels.look[1]),
             float(labels.look[2]),
-            int(labels.fire),
+            int(labels.attack),
             int(labels.weapon) - 1,  # impulse 1..8 → class 0..7
         ],
         dtype=np.float32,
@@ -121,10 +121,12 @@ def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
 
 _OBS_SPACE_SPEC: dict[str, tuple[np.dtype, float, float]] = {
     # (dtype, low, high) — float32 fields default to (-inf, inf)
-    "self_weapon_id":        (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "self_armor_type_id":    (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "self_powerup_ids":      (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "self_movement_id":      (np.dtype(np.int32), 0, 4),
+    "self_weapon_id":            (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "self_armor_type_id":        (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "self_state_powerup_ids":    (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "self_arsenal_powerup_ids":  (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "self_motion_powerup_ids":   (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
+    "self_movement_id":          (np.dtype(np.int32), 0, 4),
     "entity_types":          (np.dtype(np.int32), -1, 3),
     "entity_ids":            (np.dtype(np.int32), 0, 255),
     "entity_event_actions":  (np.dtype(np.int32), 0, ACTION_VOCAB_SIZE - 1),
@@ -258,7 +260,7 @@ class QuakeEnv(gymnasium.Env):
             (
                 gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_MOVE_DIM,), dtype=np.float32),
                 gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(_LOOK_DIM,), dtype=np.float32),
-                gymnasium.spaces.Discrete(ACTION_HEADS["fire"]),
+                gymnasium.spaces.Discrete(ACTION_HEADS["attack"]),
                 gymnasium.spaces.Discrete(ACTION_HEADS["weapon"]),
             )
         )

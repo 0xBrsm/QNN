@@ -15,7 +15,7 @@ The canonical Python source of truth for obs shapes is `OBS_SCHEMA` in
   supervised pointer head over actor slots, `target_feat` conditioning
   action heads, 8-class weapon head replaces 5-slot switch end-to-end,
   move = 3 ternary categorical axes, recall removed from the wire,
-  action_history removed from the wire and Tokenizer end-to-end
+  action_history removed from the wire and ObsEmbedding end-to-end
   (only the checkpoint-converter migration remembers it).
 - **v10** (archived, [token-spec-v10.md](../../docs/archive/token-spec-v10.md)):
   silent version bump during 0.15.0 — move[2]+jump collapsed into move[3],
@@ -34,7 +34,7 @@ The canonical Python source of truth for obs shapes is `OBS_SCHEMA` in
   variable-length tokens; the Python adapter densifies these into fixed arrays.
 - **Projection inside the model.** The adapter emits raw scalars
   (`entity_scalars_raw`); type-specific linear projections happen inside the
-  transformer `Tokenizer`, not in the transport layer.
+  transformer `ObsEmbedding`, not in the transport layer.
 - **Pre-computed derived scalars.** Distance, path distance, and ETA are
   shipped explicitly so the model does not waste capacity on sqrt or route
   planning.
@@ -61,12 +61,12 @@ Binary obs buffer, 4096 bytes, little-endian. Layout from `engine/common/qnn_io.
 Total max: ~2389 bytes. Buffer oversized to 4096 for safety.
 
 `action_history` is removed end-to-end in v11: no wire region, no entry in
-`qnn/wire.py` or `qnn/schema.py`, no Tokenizer support in
+`qnn/wire.py` or `qnn/schema.py`, no ObsEmbedding support in
 `qnn/model/transformer.py`, and no `action_history_tokens` key in BC or PPO
 `model.json` templates. The only residue is
 `migrate_drop_action_history` in `qnn/utils/checkpoint_converter.py`, which
-strips the pre-rip-out Tokenizer weights from old checkpoints. Re-enabling
-would require restoring the wire region, the adapter unpack, the Tokenizer
+strips the pre-rip-out ObsEmbedding weights from old checkpoints. Re-enabling
+would require restoring the wire region, the adapter unpack, the ObsEmbedding
 path, and the template knob.
 
 ---
@@ -215,7 +215,7 @@ Each entity can carry up to 4 events. Each event is a pair:
 
 ### Model Representation
 
-The `Tokenizer._project_entity_scalars` method routes raw scalars through
+The `ObsEmbedding._project_entity_scalars` method routes raw scalars through
 type-specific linear layers:
 
 ```
@@ -274,7 +274,7 @@ spatial_token = spatial_proj(scalars) + kind_embed(SPATIAL)
 
 ## Action History (parked)
 
-Not present in the v11 wire format. Tokenizer infrastructure remains in
+Not present in the v11 wire format. ObsEmbedding infrastructure remains in
 `qnn/model/transformer.py` and BC + PPO templates set
 `action_history_tokens: 0`. Re-enabling requires re-adding a wire region
 and bumping the spec version.
@@ -297,14 +297,14 @@ action_token = action_proj(history_row)
 
 ---
 
-## Transformer Trunk Outputs
+## Transformer Encoder Outputs
 
-`TransformerTrunk.forward` returns four d_model-sized summary tensors from
+`TransformerEncoder.forward` returns four d_model-sized summary tensors from
 the post-attention token sequence:
 
 | Output | Shape | Source | Consumer |
 |--------|-------|--------|----------|
-| `self_readout` | (B, d) | self-token at position 0 | GRU input, head conditioning |
+| `cls_readout` | (B, d) | CLS token at slot 0 (attention-pooled over self/spatial/entity) | GRU input, head conditioning |
 | `entity_outs` | (B, N, d) | post-attention entity slots | TargetPointer pool, look-head base direction |
 | `target_feat` | (B, d) | soft-gather `sum_i softmax(logits)[i] * entity_out[i]` over actor slots | head conditioning |
 | `target_logits` | (B, 16) | pre-softmax attention scores over actor slots (non-actor slots masked to -1e9) | supervised CE loss vs labeler; not sampled |
@@ -312,17 +312,17 @@ the post-attention token sequence:
 ### GRU Input
 
 ```
-gru_input = self_readout
+gru_input = cls_readout
 ```
 
-GRU runs over the sequence of `self_readout` tensors (no extra projection,
+GRU runs over the sequence of `cls_readout` tensors (no extra projection,
 no actor-token pooling). Hidden size 64 (see `gru_hidden` in model config).
 
 ### TargetPointer
 
 Supervised pointer head over actor slots; see `qnn/model/target.py`.
 
-- Query: `linear(self_readout)`, d_model dim.
+- Query: `linear(cls_readout)`, d_model dim.
 - Scores: `(entity_outs * query).sum(-1)` masked to actor slots.
 - `target_logits`: raw scores with non-actor slots set to -1e9.
 - `target_feat`: `sum_i softmax(target_logits)[i] * entity_outs[i]`; zeroed
@@ -341,15 +341,16 @@ and a weapon-context embedding:
 features = cat(gru_out, target_feat, weapon_context)
 ```
 
-The weapon head reads gru_out (optional via `weapon_use_gru`), self_readout,
+The weapon head reads gru_out (optional via `weapon_use_gru`), cls_readout,
 and target_feat:
 
 ```
-weapon_features = cat(gru_out, self_readout, target_feat)   # or omit gru_out
+weapon_features = cat(gru_out, cls_readout, target_feat)   # or omit gru_out
 ```
 
-When the trunk-level GRU is disabled, motor heads see
-`cat(self_readout, target_feat, weapon_context)` instead. Each head is a
+When the encoder-level GRU is disabled, motor heads see
+`cat(self_readout, target_feat, weapon_context)` instead (slot 0 = CLS).
+Each head is a
 Linear (optionally with a ReLU bottleneck per `head_bottleneck_dim`).
 
 ---
@@ -386,29 +387,33 @@ struct qnn_action_t {
 
 ### Auxiliary Target Label
 
-`actions["target"]`: (T,) int64, values in `{0..15, -100}`. Derived
-offline by `qnn.bc.target_labeler.label_enemy_target` from `fire`, `look`,
-and entity tokens. Algorithm (adaptive-cone Schmitt-trigger, sticky-by-PID):
+`actions["target_probs"]`: `(T, 17)` float32, a per-tick distribution over
+`(NO_TARGET, idx_0, ..., idx_15)`. Row sums to 1.0. Derived offline by
+`qnn.bc.target_labeler.label_enemy_target_probs` from `attack`, `look`,
+`weapon`, and entity tokens. Algorithm (see
+[labeler_v3_simple.md](labeler_v3_simple.md) for the full design):
 
-1. For each fire tick, decide acquire vs sticky-keep:
-   - If current sticky pid is in obs and `cos(look, rel)` is above the
-     **release cone** `clamp(atan(416/d), 5°, 45°)`, sticky-keeps.
-   - Otherwise admit any actor with cos above the per-actor **acquire cone**
-     `clamp(atan(208/d), 5°, 30°)`; pick the cos-argmax as the new sticky pid.
-   - If sticky pid disappeared from obs between the previous fire and this
-     one (transient stream loss), release sticky before deciding.
-2. Group consecutive same-pid fire attributions into engagements.
-3. Extend each engagement backward to the previous engagement's end and
-   forward until the pid leaves obs (or the next engagement starts).
+1. **Per-fire anchor evidence.** For each fire tick, admit every enemy pid
+   with cone evidence (lead-corrected angle below the adaptive 208u/30°
+   acquire cone) OR physics-hit evidence (recency-0 ray/projectile test).
+   Combine cone and physics via noisy-OR and distribute anchor mass
+   proportionally — never argmax.
+2. **Per-pid stream grouping.** Group anchors per pid into streams while
+   the pid stays continuously in the token stream. Multiple pid streams
+   may overlap; the soft distribution captures the ambiguity rather than
+   forcing a one-hot switch.
+3. **Stream extension.** Extend each stream backward/forward through
+   continuous presence. Accumulate per-idx scores as
+   `engagement_confidence × time_decay × visibility` and normalize to 17
+   classes.
 
-The acquire/release asymmetry (K=2 transverse multiplier, capped at 30°/45°)
-is a Schmitt trigger that suppresses co-angular A↔B oscillation during
-two-enemy engagements. The same state machine runs at inference time inside
-`engine/common/qnn_oracle.c` so labeler and engine pid agree on ~97.5% of
-labeled SIGHT-only frames (~89% on the full 4-pool stream — see
-[target_labeler_engine_alignment.md](target_labeler_engine_alignment.md)).
+The lead-corrected aim center is `rel + target_velocity * (dist /
+projectile_speed)`; hitscan weapons collapse to `rel`. Per-weapon
+projectile speeds and range gates live in
+`qnn.bc.target_labeler._WEAPON_SPEED` and the physics helpers in
+`qnn.bc.weapon_physics`.
 
-Unlabeled ticks carry `-100`; `F.cross_entropy` ignores them by default.
+Frames with no candidate evidence collapse to `p(NO_TARGET) = 1.0`.
 
 ---
 
@@ -463,7 +468,7 @@ The C worker emits a variable-length entity stream. The Python adapter
 - `entity_event_sources`: (16, 4) int32
 - `entity_event_counts`: (16,) uint8
 
-The transformer `Tokenizer._project_entity_scalars` reads `entity_types` to
+The transformer `ObsEmbedding._project_entity_scalars` reads `entity_types` to
 route each slot through the correct type-specific projection layer, slicing
 only the first N scalars for that type.
 
@@ -473,7 +478,7 @@ only the first N scalars for that type.
 
 Infrastructure retained but not active in v11:
 
-- **action_history**: removed from the v11 wire region; Tokenizer support
+- **action_history**: removed from the v11 wire region; ObsEmbedding support
   intact in `qnn/model/transformer.py`, templates set
   `action_history_tokens: 0`. Re-enabling requires restoring the wire region
   and bumping the spec version.

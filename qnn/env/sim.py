@@ -42,7 +42,7 @@ from qnn.vocab import (
 
 # ── Per-token scalar field layouts ───────────────────────────────────
 # Matches src/engine/common/qnn_io.c's wire-format packing.
-# Each entry: field_name -> (offset, length) inside that token's scalar slot.
+# Each entry: field_name -> (offset, length) inside that token's scalar idx.
 
 _ACTOR_LAYOUT: Dict[str, Tuple[int, int]] = {
     "half_extents": (0, 3),
@@ -184,6 +184,15 @@ def _write_scalar_field(
     dest[offset:offset + length] = arr.reshape(-1)
 
 
+_POWERUP_ROUTING = {
+    "QUAD":       ("self_arsenal_powerup_ids", 0),
+    "PENT":       ("self_state_powerup_ids",   0),
+    "RING":       ("self_state_powerup_ids",   1),
+    "MEGAHEALTH": ("self_state_powerup_ids",   2),
+    "SUIT":       ("self_motion_powerup_ids",  0),
+}
+
+
 def _write_self_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any]) -> None:
     for field, idx in _SELF_SCALAR_LAYOUT.items():
         if field in tok:
@@ -201,11 +210,25 @@ def _write_self_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any]) -> None:
         ids = tok["powerup_ids"]
         if not isinstance(ids, list):
             raise ValueError("self.powerup_ids must be a list")
-        n = obs["self_powerup_ids"].shape[0]
-        for i, name in enumerate(ids[:n]):
-            obs["self_powerup_ids"][i] = _lookup_vocab(name, ENTITY_IDS, f"self.powerup_ids[{i}]")
+        for i, name in enumerate(ids):
+            if name not in _POWERUP_ROUTING:
+                raise ValueError(
+                    f"self.powerup_ids[{i}] = {name!r} unknown; valid: "
+                    f"{sorted(_POWERUP_ROUTING)}"
+                )
+            key, slot = _POWERUP_ROUTING[name]
+            obs[key][slot] = _lookup_vocab(name, ENTITY_IDS, f"self.powerup_ids[{i}]")
     if "movement_id" in tok:
         obs["self_movement_id"][0] = int(tok["movement_id"])
+
+    # Derive subtoken scalar tensors from the legacy slot layout so the
+    # dequant's "self_state_scalars in obs" short-circuit sees real
+    # values rather than zeros from _zero_obs. view_pitch defaults to 0
+    # — probes don't currently expose pitch as a separate field.
+    obs["self_state_scalars"][:]   = obs["self_scalars"][0:2]
+    obs["self_arsenal_scalars"][:] = obs["self_scalars"][16:17]
+    obs["self_motion_scalars"][:3] = obs["self_scalars"][13:16]
+    obs["self_motion_scalars"][3]  = float(tok.get("view_pitch", 0.0))
 
 
 def _write_spatial_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: int) -> None:
@@ -230,8 +253,8 @@ def _write_spatial_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index:
 
 
 def _write_entity_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: int) -> int:
-    slot = index - (1 + SPATIAL_TOKEN_COUNT)  # 10..25 → 0..15
-    if not 0 <= slot < MAX_TOKEN_OBJECTS:
+    idx = index - (1 + SPATIAL_TOKEN_COUNT)  # 10..25 → 0..15
+    if not 0 <= idx < MAX_TOKEN_OBJECTS:
         raise ValueError(
             f"entity token index {index} out of range [12, {12 + MAX_TOKEN_OBJECTS - 1}]"
         )
@@ -244,13 +267,13 @@ def _write_entity_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: 
     tok_type = _ENTITY_TYPE_NAMES[type_name]
     layout = _ENTITY_LAYOUTS[tok_type]
 
-    obs["entity_types"][slot] = tok_type
-    obs["entity_ids"][slot, 0] = _lookup_vocab(tok.get("subject"),  ENTITY_IDS,   f"entity[{index}].subject")
-    obs["entity_ids"][slot, 1] = _lookup_vocab(tok.get("modality"), MODALITY_IDS, f"entity[{index}].modality")
+    obs["entity_types"][idx] = tok_type
+    obs["entity_ids"][idx, 0] = _lookup_vocab(tok.get("subject"),  ENTITY_IDS,   f"entity[{index}].subject")
+    obs["entity_ids"][idx, 1] = _lookup_vocab(tok.get("modality"), MODALITY_IDS, f"entity[{index}].modality")
     if tok_type == TOKEN_ACTOR:
-        obs["entity_ids"][slot, 2] = int(tok.get("player_id", 0))
+        obs["entity_ids"][idx, 2] = int(tok.get("player_id", 0))
 
-    dest = obs["entity_scalars_raw"][slot]
+    dest = obs["entity_scalars_raw"][idx]
     for field, (off, length) in layout.items():
         if field in tok:
             _write_scalar_field(dest, tok[field], off, length, f"entity[{index}].{field}")
@@ -260,10 +283,10 @@ def _write_entity_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: 
         raise ValueError(f"entity[{index}].events must be a list")
     n_evt = min(len(events), obs["entity_event_actions"].shape[1])
     for i, ev in enumerate(events[:n_evt]):
-        obs["entity_event_actions"][slot, i] = _lookup_vocab(ev.get("action"), ACTION_IDS,  f"entity[{index}].events[{i}].action")
-        obs["entity_event_sources"][slot, i] = _lookup_vocab(ev.get("source"), ENTITY_IDS,  f"entity[{index}].events[{i}].source")
-    obs["entity_event_counts"][slot] = n_evt
-    return slot
+        obs["entity_event_actions"][idx, i] = _lookup_vocab(ev.get("action"), ACTION_IDS,  f"entity[{index}].events[{i}].action")
+        obs["entity_event_sources"][idx, i] = _lookup_vocab(ev.get("source"), ENTITY_IDS,  f"entity[{index}].events[{i}].source")
+    obs["entity_event_counts"][idx] = n_evt
+    return idx
 
 
 # ── Scene loader ─────────────────────────────────────────────────────
@@ -273,7 +296,7 @@ def load_scene(
 ) -> Tuple[Dict[str, np.ndarray], List[Tuple[int, int, np.ndarray]], np.ndarray, int]:
     """Parse a tokens.json.
 
-    Returns ``(zero_view_obs, [(slot, tok_type, world_pos)], target_world_pos, target_slot)``.
+    Returns ``(zero_view_obs, [(idx, tok_type, world_pos)], target_world_pos, target_idx)``.
     """
     payload = json.loads(Path(path).read_text())
     tokens = payload.get("tokens", [])
@@ -282,7 +305,7 @@ def load_scene(
 
     obs = _zero_obs()
     entity_worlds: List[Tuple[int, int, np.ndarray]] = []
-    designated_target_slot: int | None = None
+    designated_target_idx: int | None = None
     designated_target_world: np.ndarray | None = None
 
     for tok in tokens:
@@ -300,22 +323,22 @@ def load_scene(
         elif kind == "spatial":
             _write_spatial_token(obs, tok, index)
         elif kind == "entity":
-            slot = _write_entity_token(obs, tok, index)
-            tok_type = int(obs["entity_types"][slot])
+            idx = _write_entity_token(obs, tok, index)
+            tok_type = int(obs["entity_types"][idx])
             layout = _ENTITY_LAYOUTS[tok_type]
             rel_off, _ = layout["rel"]
-            world_pos = obs["entity_scalars_raw"][slot, rel_off:rel_off + 3].copy()
-            entity_worlds.append((slot, tok_type, world_pos))
+            world_pos = obs["entity_scalars_raw"][idx, rel_off:rel_off + 3].copy()
+            entity_worlds.append((idx, tok_type, world_pos))
             if bool(tok.get("target", False)):
                 if tok_type != TOKEN_ACTOR:
                     raise ValueError(f"{path}: target=true is only valid for actor tokens")
-                designated_target_slot = slot
+                designated_target_idx = idx
                 designated_target_world = world_pos.copy()
         else:
             raise ValueError(f"Unknown kind {kind!r} at index {index}. Valid: self/spatial/entity")
 
-    if designated_target_slot is not None and designated_target_world is not None:
-        return obs, entity_worlds, designated_target_world, designated_target_slot
+    if designated_target_idx is not None and designated_target_world is not None:
+        return obs, entity_worlds, designated_target_world, designated_target_idx
 
     # Target = nearest actor (matches QNN_TrackingCosine).
     actors = [(s, t, wp) for (s, t, wp) in entity_worlds if t == TOKEN_ACTOR and np.linalg.norm(wp) > 1e-6]
@@ -324,64 +347,64 @@ def load_scene(
             f"{path}: no actor-type entity with non-zero rel; can't pick a tracking target"
         )
     actors.sort(key=lambda e: float(np.linalg.norm(e[2])))
-    target_slot = int(actors[0][0])
+    target_idx = int(actors[0][0])
     target_world = actors[0][2].copy()
-    return obs, entity_worlds, target_world, target_slot
+    return obs, entity_worlds, target_world, target_idx
 
 
-def _active_actor_slots(
+def _active_actor_indices(
     obs_template: Dict[str, np.ndarray],
     entity_worlds: List[Tuple[int, int, np.ndarray]],
 ) -> List[int]:
-    actor_slots: List[int] = []
-    for slot, tok_type, world_pos in entity_worlds:
+    actor_indices: List[int] = []
+    for idx, tok_type, world_pos in entity_worlds:
         if tok_type != TOKEN_ACTOR:
             continue
         if np.linalg.norm(world_pos) <= 1e-6:
             continue
-        if int(obs_template["entity_ids"][slot, 2]) <= 0:
+        if int(obs_template["entity_ids"][idx, 2]) <= 0:
             continue
-        actor_slots.append(int(slot))
-    return actor_slots
+        actor_indices.append(int(idx))
+    return actor_indices
 
 
-def _shuffle_actor_slots(
+def _shuffle_actor_indices(
     obs_template: Dict[str, np.ndarray],
     entity_worlds: List[Tuple[int, int, np.ndarray]],
-    target_slot: int,
+    target_idx: int,
     rng: np.random.Generator,
 ) -> Tuple[Dict[str, np.ndarray], List[Tuple[int, int, np.ndarray]], int]:
-    actor_slots = _active_actor_slots(obs_template, entity_worlds)
-    if len(actor_slots) <= 1:
-        return obs_template, entity_worlds, target_slot
+    actor_indices = _active_actor_indices(obs_template, entity_worlds)
+    if len(actor_indices) <= 1:
+        return obs_template, entity_worlds, target_idx
 
-    permuted_sources = list(rng.permutation(actor_slots))
-    if permuted_sources == actor_slots:
-        permuted_sources = actor_slots[1:] + actor_slots[:1]
+    permuted_sources = list(rng.permutation(actor_indices))
+    if permuted_sources == actor_indices:
+        permuted_sources = actor_indices[1:] + actor_indices[:1]
 
     shuffled = {key: value.copy() for key, value in obs_template.items()}
-    world_by_slot = {int(slot): (int(tok_type), world_pos.copy()) for slot, tok_type, world_pos in entity_worlds}
+    world_by_idx = {int(idx): (int(tok_type), world_pos.copy()) for idx, tok_type, world_pos in entity_worlds}
     src_to_dest: Dict[int, int] = {}
 
-    for dest_slot, src_slot in zip(actor_slots, permuted_sources):
-        shuffled["entity_types"][dest_slot] = obs_template["entity_types"][src_slot]
-        shuffled["entity_ids"][dest_slot] = obs_template["entity_ids"][src_slot]
-        shuffled["entity_scalars_raw"][dest_slot] = obs_template["entity_scalars_raw"][src_slot]
-        shuffled["entity_event_actions"][dest_slot] = obs_template["entity_event_actions"][src_slot]
-        shuffled["entity_event_sources"][dest_slot] = obs_template["entity_event_sources"][src_slot]
-        shuffled["entity_event_counts"][dest_slot] = obs_template["entity_event_counts"][src_slot]
-        src_to_dest[int(src_slot)] = int(dest_slot)
+    for dest_idx, src_idx in zip(actor_indices, permuted_sources):
+        shuffled["entity_types"][dest_idx] = obs_template["entity_types"][src_idx]
+        shuffled["entity_ids"][dest_idx] = obs_template["entity_ids"][src_idx]
+        shuffled["entity_scalars_raw"][dest_idx] = obs_template["entity_scalars_raw"][src_idx]
+        shuffled["entity_event_actions"][dest_idx] = obs_template["entity_event_actions"][src_idx]
+        shuffled["entity_event_sources"][dest_idx] = obs_template["entity_event_sources"][src_idx]
+        shuffled["entity_event_counts"][dest_idx] = obs_template["entity_event_counts"][src_idx]
+        src_to_dest[int(src_idx)] = int(dest_idx)
 
     shuffled_worlds: List[Tuple[int, int, np.ndarray]] = []
-    for slot, tok_type, world_pos in entity_worlds:
-        new_slot = src_to_dest.get(int(slot), int(slot))
-        if int(tok_type) == TOKEN_ACTOR and int(slot) in world_by_slot:
-            _, mapped_world = world_by_slot[int(slot)]
-            shuffled_worlds.append((new_slot, int(tok_type), mapped_world.copy()))
+    for idx, tok_type, world_pos in entity_worlds:
+        new_idx = src_to_dest.get(int(idx), int(idx))
+        if int(tok_type) == TOKEN_ACTOR and int(idx) in world_by_idx:
+            _, mapped_world = world_by_idx[int(idx)]
+            shuffled_worlds.append((new_idx, int(tok_type), mapped_world.copy()))
         else:
-            shuffled_worlds.append((new_slot, int(tok_type), world_pos.copy()))
+            shuffled_worlds.append((new_idx, int(tok_type), world_pos.copy()))
 
-    return shuffled, shuffled_worlds, src_to_dest.get(int(target_slot), int(target_slot))
+    return shuffled, shuffled_worlds, src_to_dest.get(int(target_idx), int(target_idx))
 
 
 # ── Sim dynamics ─────────────────────────────────────────────────────
@@ -395,13 +418,13 @@ def _apply_view(
     basis = _angle_basis(view_angles[0], view_angles[1])
     obs = {k: v.copy() for k, v in obs_template.items()}
     scalars = obs["entity_scalars_raw"]
-    for slot, tok_type, world_pos in entity_worlds:
+    for idx, tok_type, world_pos in entity_worlds:
         layout = _ENTITY_LAYOUTS[tok_type]
         rel_off, _ = layout["rel"]
         dist_off, _ = layout["dist"]
         rel_view = basis @ world_pos
-        scalars[slot, rel_off:rel_off + 3] = rel_view
-        scalars[slot, dist_off] = float(np.linalg.norm(world_pos))
+        scalars[idx, rel_off:rel_off + 3] = rel_view
+        scalars[idx, dist_off] = float(np.linalg.norm(world_pos))
     return obs
 
 
@@ -419,7 +442,8 @@ def _tracking_cos(view_angles: Tuple[float, float], target_world: np.ndarray) ->
 _INT_KEYS = {
     "entity_types", "entity_ids",
     "entity_event_actions", "entity_event_sources", "entity_event_counts",
-    "self_weapon_id", "self_armor_type_id", "self_powerup_ids", "self_movement_id",
+    "self_weapon_id", "self_armor_type_id", "self_movement_id",
+    "self_state_powerup_ids", "self_arsenal_powerup_ids", "self_motion_powerup_ids",
 }
 
 
@@ -449,8 +473,8 @@ def _target_probe_step(
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     _, _, _, _, target_logits = policy._forward_tensors(obs_batch)
     probs = F.softmax(target_logits, dim=-1)
-    pred_slot = int(torch.argmax(probs, dim=-1)[0].item())
-    return target_logits[0], probs[0], pred_slot
+    pred_idx = int(torch.argmax(probs, dim=-1)[0].item())
+    return target_logits[0], probs[0], pred_idx
 
 
 # ── Training loop ────────────────────────────────────────────────────
@@ -503,11 +527,11 @@ def _target_topk_summary(
     probs_np = probs.detach().cpu().numpy()
     order = np.argsort(-probs_np)[:topk]
     parts: List[str] = []
-    for slot in order:
-        prob = float(probs_np[slot])
-        pid = int(obs_frame["entity_ids"][slot, 2])
-        rel = obs_frame["entity_scalars_raw"][slot, _ACTOR_LAYOUT["rel"][0]:_ACTOR_LAYOUT["rel"][0] + 3]
-        parts.append(f"s{int(slot)}:p{pid}@{prob:.3f} rel={np.round(rel, 3).tolist()}")
+    for idx in order:
+        prob = float(probs_np[idx])
+        pid = int(obs_frame["entity_ids"][idx, 2])
+        rel = obs_frame["entity_scalars_raw"][idx, _ACTOR_LAYOUT["rel"][0]:_ACTOR_LAYOUT["rel"][0] + 3]
+        parts.append(f"s{int(idx)}:p{pid}@{prob:.3f} rel={np.round(rel, 3).tolist()}")
     return " | ".join(parts)
 
 
@@ -516,7 +540,7 @@ def run_target_probe(
     obs_template: Dict[str, np.ndarray],
     entity_worlds: List[Tuple[int, int, np.ndarray]],
     target_world: np.ndarray,
-    target_slot: int,
+    target_idx: int,
     *,
     steps: int,
     log_every: int,
@@ -530,8 +554,8 @@ def run_target_probe(
     if shuffle_actors:
         if rng is None:
             rng = np.random.default_rng(0)
-        obs_template, entity_worlds, target_slot = _shuffle_actor_slots(
-            obs_template, entity_worlds, target_slot, rng,
+        obs_template, entity_worlds, target_idx = _shuffle_actor_indices(
+            obs_template, entity_worlds, target_idx, rng,
         )
 
     view_angles = [0.0, 0.0]
@@ -539,19 +563,19 @@ def run_target_probe(
     for step in range(steps):
         obs_frame = _apply_view(obs_template, entity_worlds, tuple(view_angles))
         obs_batch = _to_tensor_batch([obs_frame], device)
-        _target_logits, probs, pred_slot = _target_probe_step(policy, obs_batch)
-        target_prob = float(probs[target_slot].item())
-        pred_prob = float(probs[pred_slot].item())
-        is_correct = pred_slot == target_slot
+        _target_logits, probs, pred_idx = _target_probe_step(policy, obs_batch)
+        target_prob = float(probs[target_idx].item())
+        pred_prob = float(probs[pred_idx].item())
+        is_correct = pred_idx == target_idx
         correct += int(is_correct)
 
         if step % log_every == 0 or step == steps - 1:
-            target_pid = int(obs_frame["entity_ids"][target_slot, 2])
-            pred_pid = int(obs_frame["entity_ids"][pred_slot, 2])
+            target_pid = int(obs_frame["entity_ids"][target_idx, 2])
+            pred_pid = int(obs_frame["entity_ids"][pred_idx, 2])
             topk_summary = _target_topk_summary(obs_frame, probs, topk=topk)
             print(
-                f"step {step:3d}  target_slot={target_slot} pid={target_pid}  "
-                f"pred_slot={pred_slot} pid={pred_pid}  "
+                f"step {step:3d}  target_idx={target_idx} pid={target_pid}  "
+                f"pred_idx={pred_idx} pid={pred_pid}  "
                 f"target_p={target_prob:.3f} pred_p={pred_prob:.3f}  "
                 f"correct={is_correct}  {topk_summary}",
                 flush=True,
@@ -583,7 +607,7 @@ def train_target_sl(
     obs_template: Dict[str, np.ndarray],
     entity_worlds: List[Tuple[int, int, np.ndarray]],
     target_world: np.ndarray,
-    target_slot: int,
+    target_idx: int,
     *,
     steps: int,
     lr: float,
@@ -592,7 +616,7 @@ def train_target_sl(
     shuffle_actors: bool = False,
     rng: np.random.Generator | None = None,
 ) -> None:
-    """Supervised CE training on TargetPointer logits with optional actor-slot shuffling."""
+    """Supervised CE training on TargetPointer logits with optional actor-idx shuffling."""
     policy.model.train()
     optimizer = torch.optim.Adam(policy.model.parameters(), lr=lr)
     if rng is None:
@@ -601,15 +625,15 @@ def train_target_sl(
     for step in range(steps):
         step_obs = obs_template
         step_worlds = entity_worlds
-        step_target_slot = target_slot
+        step_target_idx = target_idx
         if shuffle_actors:
-            step_obs, step_worlds, step_target_slot = _shuffle_actor_slots(
-                obs_template, entity_worlds, target_slot, rng,
+            step_obs, step_worlds, step_target_idx = _shuffle_actor_indices(
+                obs_template, entity_worlds, target_idx, rng,
             )
         obs_frame = _apply_view(step_obs, step_worlds, (0.0, 0.0))
         obs_batch = _to_tensor_batch([obs_frame], device)
-        target_logits, probs, pred_slot = _target_probe_step(policy, obs_batch)
-        target_tensor = torch.tensor([step_target_slot], dtype=torch.long, device=device)
+        target_logits, probs, pred_idx = _target_probe_step(policy, obs_batch)
+        target_tensor = torch.tensor([step_target_idx], dtype=torch.long, device=device)
         loss = F.cross_entropy(target_logits.unsqueeze(0), target_tensor)
 
         optimizer.zero_grad()
@@ -617,11 +641,11 @@ def train_target_sl(
         optimizer.step()
 
         if step % log_every == 0 or step == steps - 1:
-            target_prob = float(probs[step_target_slot].item())
+            target_prob = float(probs[step_target_idx].item())
             print(
                 f"step {step:6d}  loss={loss.item():+.4f}  "
-                f"target_slot={step_target_slot} pred_slot={pred_slot}  "
-                f"target_p={target_prob:.3f} correct={pred_slot == step_target_slot}",
+                f"target_idx={step_target_idx} pred_idx={pred_idx}  "
+                f"target_p={target_prob:.3f} correct={pred_idx == step_target_idx}",
                 flush=True,
             )
 
@@ -897,9 +921,9 @@ def main() -> int:
     ap.add_argument("--entropy-coef", type=float, default=0.01, help="RL mode only.")
     ap.add_argument("--normalize-adv", action="store_true", default=False, help="RL mode only.")
     ap.add_argument("--log-every", type=int, default=2)
-    ap.add_argument("--topk", type=int, default=3, help="target-probe only: how many slots to print per step.")
+    ap.add_argument("--topk", type=int, default=3, help="target-probe only: how many indices to print per step.")
     ap.add_argument("--shuffle-actors", action="store_true", default=False,
-                    help="target-probe / target-sl: permute active actor slots so the target is not tied to a fixed token position.")
+                    help="target-probe / target-sl: permute active actor indices so the target is not tied to a fixed token position.")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "gpu"])
     # Architecture knobs — defaults match runs/ppo/ppo_look_sanity/config/model.json.
     ap.add_argument("--d-model", type=int, default=64)
@@ -917,15 +941,15 @@ def main() -> int:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    obs_template, entity_worlds, target_world, target_slot = load_scene(args.tokens)
+    obs_template, entity_worlds, target_world, target_idx = load_scene(args.tokens)
     print(f"scene: {args.tokens}")
     print(f"  entity tokens loaded: {len(entity_worlds)}")
     print(
-        f"  target slot: {target_slot}  world_pos: {target_world}  "
+        f"  target idx: {target_idx}  world_pos: {target_world}  "
         f"|target|={np.linalg.norm(target_world):.3f}"
     )
 
-    from qnn.model.policy import ModelConfig
+    from qnn.model.network import ModelConfig
     model_cfg = ModelConfig(
         d_model=args.d_model,
         n_heads=args.n_heads,
@@ -944,11 +968,11 @@ def main() -> int:
         gru_target_query=False,
         hard_target_feat=False,
         weapon_in_target_query=False,
-        linear_slot_prior=False,
+        linear_idx_prior=False,
         gt_dist_target_feat=False,
         prev_target_in_query=False,
         self_weapon_embed_in_self=False,
-        head_bottleneck_dim={"move": 0, "look": 0, "fire": 0, "weapon": 0},
+        head_bottleneck_dim={"move": 0, "look": 0, "attack": 0, "weapon": 0},
         head_activation="none",
     )
     policy = QNNPolicy(
@@ -981,7 +1005,7 @@ def main() -> int:
             f"shuffle_actors={args.shuffle_actors}"
         )
         run_target_probe(
-            policy, obs_template, entity_worlds, target_world, target_slot,
+            policy, obs_template, entity_worlds, target_world, target_idx,
             steps=args.steps, log_every=args.log_every, device=policy.device,
             driver=args.driver, shuffle_actors=args.shuffle_actors,
             rng=np.random.default_rng(args.seed), topk=args.topk,
@@ -992,13 +1016,13 @@ def main() -> int:
             f"shuffle_actors={args.shuffle_actors}"
         )
         train_target_sl(
-            policy, obs_template, entity_worlds, target_world, target_slot,
+            policy, obs_template, entity_worlds, target_world, target_idx,
             steps=args.steps, lr=args.lr, log_every=args.log_every,
             device=policy.device, shuffle_actors=args.shuffle_actors,
             rng=np.random.default_rng(args.seed),
         )
         run_target_probe(
-            policy, obs_template, entity_worlds, target_world, target_slot,
+            policy, obs_template, entity_worlds, target_world, target_idx,
             steps=min(args.steps_per_episode, 8), log_every=1, device=policy.device,
             driver="oracle", shuffle_actors=args.shuffle_actors,
             rng=np.random.default_rng(args.seed + 1), topk=args.topk,

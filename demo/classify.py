@@ -166,7 +166,7 @@ class ClassifyResult(NamedTuple):
     deathmatch: int | None = None
     hostname: str | None = None
     map: str | None = None
-    # Mean svc_updateping value for the recorder's slot (QWD only).
+    # Mean svc_updateping value for the recorder's idx (QWD only).
     # None when the demo has no usable ping samples.
     avg_ping_ms: float | None = None
 

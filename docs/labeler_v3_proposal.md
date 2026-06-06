@@ -59,7 +59,7 @@ The labeler still uses opt3 as a fallback prior, but opt3 is no longer the cente
 
 | Evidence | Status | Use |
 |----------|--------|-----|
-| `act_fire`, `act_look`, `act_weapon` | Available | Shot records |
+| `act_attack`, `act_look`, `act_weapon` | Available | Shot records |
 | actor rel/vel/half extents/pid | Available | Geometry and slot maps |
 | entity events | Available in token spec | Pain/death/event hints |
 | projectile tokens | Available in token spec | Optional flight confirmation |

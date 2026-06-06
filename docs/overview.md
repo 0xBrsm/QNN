@@ -18,8 +18,8 @@ Related docs: [token-spec.md](token-spec.md) (wire format, head shapes),
 ## Policy Architecture
 
 ```text
-TransformerTrunk
-  self_readout x_t           (self token at position 0)
+TransformerEncoder
+  self_readout x_t           (slot 0 = CLS; pools self subtokens / spatial / entity)
   actor tokens e_i           (entity slots where type == ACTOR)
         │
         ├──► TargetPointer:  query = linear(x_t)        (or GRU output if gru_target_query)
@@ -27,13 +27,13 @@ TransformerTrunk
         │      target_logits   (B, 16) — CE label vs labeler
         │      target_feat = softmax(scores) @ e_i  (soft pool)
         │
-        └──► GRU input:      x_t -> h_t                  (sequence of self_readouts)
+        └──► GRU input:      x_t -> h_t                  (sequence of cls_readouts)
 
 Action features (per tick):
   motor heads (move, look, fire):
     features = cat(gru_out, target_feat, weapon_context)
   weapon head:
-    features = cat(gru_out, self_readout, target_feat)   (gru_out optional)
+    features = cat(gru_out, cls_readout, target_feat)   (gru_out optional)
 
   weapon_context comes from the held weapon in obs (default) or from a
   softmax over the weapon head's own logits.
@@ -53,7 +53,7 @@ Primary supervised heads: `target` (pointer over actor slots), `move`,
 impulse byte (1..8 = axe..lightning) by the engine bridge; no separate
 switch controller.
 
-| Trunk parameter | Value |
+| Encoder parameter | Value |
 |-----------------|-------|
 | d_model | 64 |
 | n_heads | 2 |
@@ -119,10 +119,10 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 | `qnn/vocab.py` | shared semantic IDs (source of truth) |
 | `qnn/actions.py` | canonical mixed action schema, move pack/unpack, look decoding |
 | `qnn/wire.py` | binary wire format parser, action struct layout, LOBS labeler frame |
-| `qnn/schema.py` | OBS_SCHEMA, tokenizer input shapes |
+| `qnn/schema.py` | OBS_SCHEMA, observation-embedding input shapes |
 | `qnn/filter_dsl.py` | shared filter mini-language (collect + train) |
 | `qnn/collection_fingerprint.py` | collect-identity hash recorded at train time |
-| `qnn/model/transformer.py` | tokenizer + transformer trunk |
+| `qnn/model/transformer.py` | observation embedding + transformer encoder |
 | `qnn/model/target.py` | TargetPointer attention module |
 | `qnn/model/policy.py` | actor-critic with GRU + play heads |
 | `qnn/run/router.py` | run-dir router |

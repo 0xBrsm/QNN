@@ -1,6 +1,6 @@
 """Shared per-frame loss-shaping helpers for binary-class heads.
 
-Both the fire head and the jump (move ud-axis) head fit a binary
+Both the attack head and the jump (move ud-axis) head fit a binary
 positive/negative decision against a label stream where the demonstrator's
 button press doesn't always land on the geometrically-ideal frame: humans
 react late, releases linger, and the labeling pipeline downsamples 70 Hz
