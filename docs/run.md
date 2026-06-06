@@ -166,10 +166,7 @@ BC-only (PPO model templates carry only the common keys):
 | `weapon_context_from_obs` | use observed (vs predicted) held weapon when building motor-head context |
 | `weapon_switch_confidence` | minimum weapon-head softmax to emit a switch at inference |
 | `weapon_switch_margin` | minimum margin over currently-held weapon to emit a switch |
-| `gru_target_query` | route GRU output into the TargetPointer query (otherwise cls_readout) |
-| `hard_target_feat` | hard-argmax target pooling instead of softmax |
-| `weapon_in_target_query` | add a current-weapon embedding to the target query |
-| `linear_slot_prior` | additive linear slot-index prior on target logits |
+| `d_target` | TargetPointer MLP hidden width (per-entity scoring head) |
 | `head_bottleneck_dim` | per-head bottleneck width (0 = no bottleneck) |
 | `head_use_relu` | apply ReLU inside the head bottleneck |
 

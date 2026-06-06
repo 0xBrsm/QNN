@@ -4,7 +4,7 @@ Mirrors ``attack_preattn`` for the 8-way weapon classifier. Network with
 ``PreAttnEncoder`` in the encoder slot, ``GTTargetPointer`` in the
 target_pointer slot, temporal off, every head except weapon disabled.
 The weapon head is the canonical ``WeaponHead`` with the historical
-``hidden`` bottleneck and ``context_from_obs=False`` (softmax-pooled
+``d_hidden`` bottleneck and ``context_from_obs=False`` (softmax-pooled
 weapon embed feeds non-existent motor heads in this probe — but the
 classifier itself runs the same way).
 
@@ -50,7 +50,7 @@ def _build_weapon_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
 
       d_model (int).
       self_weapon_embed_in_self (bool).
-      hidden (int): WeaponHead bottleneck width.
+      d_hidden (int): WeaponHead bottleneck width.
 
     Earlier knobs ``strip_self_embeds``, ``weapon_embed_concat``,
     ``n_hidden_layers``, ``dropout`` were used at defaults in every
@@ -58,7 +58,7 @@ def _build_weapon_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
     """
     d_model = int(_required(probe, "d_model"))
     self_weapon = bool(_required(probe, "self_weapon_embed_in_self"))
-    hidden = int(_required(probe, "hidden"))
+    d_hidden = int(_required(probe, "d_hidden"))
 
     model_config = neutral_model_config(
         d_model=d_model, self_weapon_embed_in_self=self_weapon,
@@ -83,7 +83,7 @@ def _build_weapon_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
             weapon_head=WeaponHead(
                 selector_dim=dims["weapon_in"],
                 d_model=d_model,
-                bottleneck_dim=hidden,
+                d_hidden=d_hidden,
                 activation="gelu",
                 context_from_obs=False,
             ),

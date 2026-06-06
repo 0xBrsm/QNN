@@ -35,7 +35,7 @@ class AimPriorAttackHead(nn.Module):
     def __init__(
         self,
         in_dim: int,
-        bottleneck_dim: int,
+        d_hidden: int,
         activation: str,
         *,
         scale_mode: str = "fixed",
@@ -48,7 +48,7 @@ class AimPriorAttackHead(nn.Module):
             )
         self.scale_mode = scale_mode
         self.scale_init = float(scale_init)
-        self.mlp = make_head_mlp(in_dim, OUT_DIM, bottleneck_dim, activation)
+        self.mlp = make_head_mlp(in_dim, OUT_DIM, d_hidden, activation)
         if scale_mode == "scalar":
             self.scale = nn.Parameter(torch.tensor(self.scale_init, dtype=torch.float32))
         elif scale_mode == "perweapon":

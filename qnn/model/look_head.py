@@ -39,9 +39,9 @@ class LookHeadOutput:
 
 
 class LookHead(nn.Module):
-    def __init__(self, in_dim: int, bottleneck_dim: int, activation: str) -> None:
+    def __init__(self, in_dim: int, d_hidden: int, activation: str) -> None:
         super().__init__()
-        self.mlp = make_head_mlp(in_dim, OUT_DIM, bottleneck_dim, activation)
+        self.mlp = make_head_mlp(in_dim, OUT_DIM, d_hidden, activation)
 
     def forward(self, inp: LookHeadInput) -> LookHeadOutput:
         # Soft-attended target relative position; target_logits already has

@@ -17,9 +17,10 @@ except ImportError as exc:
 from qnn.actions import ACTION_HEADS, ActionLabels
 from qnn.env.world import NativeWorldEnv
 from qnn.run.metrics import EpisodeStatAccumulator
-from qnn.schema import OBS_SCHEMA
+from qnn.schema import SPATIAL_TOKEN_COUNT
 from qnn.vocab import (
     ENTITY_VOCAB_SIZE, ACTION_VOCAB_SIZE, MAX_ENTITY_EVENTS,
+    MAX_TOKEN_OBJECTS,
 )
 from mapgen.pool import PROCGEN_SENTINEL
 
@@ -119,35 +120,118 @@ def heads_to_tuple_action(heads: Dict[str, object]) -> np.ndarray:
     )
 
 
-_OBS_SPACE_SPEC: dict[str, tuple[np.dtype, float, float]] = {
-    # (dtype, low, high) — float32 fields default to (-inf, inf)
-    "self_weapon_id":            (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "self_armor_type_id":        (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "self_state_powerup_ids":    (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "self_arsenal_powerup_ids":  (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "self_motion_powerup_ids":   (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "self_movement_id":          (np.dtype(np.int32), 0, 4),
-    "entity_types":          (np.dtype(np.int32), -1, 3),
-    "entity_ids":            (np.dtype(np.int32), 0, 255),
-    "entity_event_actions":  (np.dtype(np.int32), 0, ACTION_VOCAB_SIZE - 1),
-    "entity_event_sources":  (np.dtype(np.int32), 0, ENTITY_VOCAB_SIZE - 1),
-    "entity_event_counts":   (np.dtype(np.uint8), 0, MAX_ENTITY_EVENTS),
+# Native per-field obs format emitted by NativeWorldEnv (bridge.py +
+# wire.py unpack_obs_buffer_native). The model's ObsEmbedding owns the
+# dequant chain (Self / Spatial / Entity dequantizers), so SF receives
+# the raw quantized fields directly — no aggregation here. Entity
+# fields are emitted with variable leading dim ≤ MAX_TOKEN_OBJECTS;
+# they are zero-padded to MAX_TOKEN_OBJECTS inside QuakeEnv before
+# returning so the gym observation space stays fixed-shape.
+_N = MAX_TOKEN_OBJECTS  # padded entity row count
+_E = MAX_ENTITY_EVENTS  # per-entity event count
+_S = SPATIAL_TOKEN_COUNT
+
+
+def _box(dtype, low, high, shape):
+    return gymnasium.spaces.Box(low=low, high=high, shape=shape, dtype=dtype)
+
+
+_OBS_SPACE: dict[str, gymnasium.spaces.Box] = {
+    # ─── self ─────────────────────────────────────────────────────
+    "health":              _box(np.uint8,   0,    255,                  ()),
+    "effective_armor":     _box(np.uint8,   0,    255,                  ()),
+    "ammo_shells":         _box(np.uint8,   0,    255,                  ()),
+    "ammo_nails":          _box(np.uint8,   0,    255,                  ()),
+    "ammo_rockets":        _box(np.uint8,   0,    255,                  ()),
+    "ammo_cells":          _box(np.uint8,   0,    255,                  ()),
+    "vel":                 _box(np.int16,  -32768, 32767,               (3,)),
+    "attack_finished":     _box(np.float16, 0.0,  np.inf,               ()),
+    "self_weapon_id":      _box(np.uint8,   0,    255,                  ()),
+    "self_movement_id":    _box(np.uint8,   0,    255,                  ()),
+    "self_items":          _box(np.int32,  -2**31, 2**31 - 1,           ()),
+    "view_pitch":          _box(np.int8,   -128,  127,                  ()),
+    # ─── spatial ─────────────────────────────────────────────────
+    "spatial_dir":            _box(np.int8,   -128, 127, (_S, 3)),
+    "spatial_nearest_dist":   _box(np.uint16, 0, 65535, (_S,)),
+    "spatial_mean_dist":      _box(np.uint16, 0, 65535, (_S,)),
+    "spatial_openness":       _box(np.uint8,  0, 255,   (_S,)),
+    "spatial_clearance":      _box(np.uint8,  0, 255,   (_S,)),
+    "spatial_traversable":    _box(np.uint8,  0, 255,   (_S,)),
+    "spatial_dropoff":        _box(np.uint8,  0, 255,   (_S,)),
+    "spatial_solid_frac":     _box(np.uint8,  0, 255,   (_S,)),
+    "spatial_water_frac":     _box(np.uint8,  0, 255,   (_S,)),
+    "spatial_slime_frac":     _box(np.uint8,  0, 255,   (_S,)),
+    "spatial_lava_frac":      _box(np.uint8,  0, 255,   (_S,)),
+    # ─── entities (padded to MAX_TOKEN_OBJECTS) ─────────────────
+    "entity_count":           _box(np.uint8,  0, _N,    ()),
+    "entity_types":           _box(np.int8,  -1, 127,   (_N,)),
+    "entity_subject_id":      _box(np.uint8,  0, 255,   (_N,)),
+    "entity_modality_id":     _box(np.uint8,  0, 255,   (_N,)),
+    "entity_player_id":       _box(np.uint8,  0, 255,   (_N,)),
+    "entity_event_count":     _box(np.uint8,  0, _E,    (_N,)),
+    "entity_event_actions":   _box(np.uint8,  0, 255,   (_N, _E)),
+    "entity_event_sources":   _box(np.uint8,  0, 255,   (_N, _E)),
+    "entity_half_extents":    _box(np.uint8,  0, 255,   (_N, 3)),
+    "entity_rel":             _box(np.int16, -32768, 32767, (_N, 3)),
+    "entity_vel":             _box(np.int16, -32768, 32767, (_N, 3)),
+    "entity_path":            _box(np.int16, -32768, 32767, (_N, 3)),
+    "entity_path_dist":       _box(np.uint16, 0, 65535, (_N,)),
+    "entity_eta":             _box(np.float16, 0.0, np.inf, (_N,)),
+    "entity_recency":         _box(np.float16, 0.0, np.inf, (_N,)),
+    "entity_facing":          _box(np.uint8,  0, 255,   (_N,)),
+    "entity_team":            _box(np.uint8,  0, 255,   (_N,)),
+    "entity_score":           _box(np.uint8,  0, 255,   (_N,)),
+    "entity_amount":          _box(np.uint8,  0, 255,   (_N,)),
+    "entity_regen":           _box(np.float16, 0.0, np.inf, (_N,)),
+    "entity_state":           _box(np.uint8,  0, 255,   (_N,)),
 }
+
+# Entity keys that carry the variable leading dim from the wire and
+# need zero-padding to MAX_TOKEN_OBJECTS before SF buffers them.
+_ENTITY_PAD_KEYS = tuple(k for k in _OBS_SPACE if k.startswith("entity_") and k != "entity_count")
+
+# Persistent zero / sentinel pad buffers, allocated once at module
+# import. _pad_entities rewrites the leading n rows from the wire and
+# leaves the trailing (_N - n) rows as the cached pad. entity_types
+# uses -1 (empty-slot sentinel the model's mask reads); everything else
+# zero-fills.
+_PAD_BUFFERS: Dict[str, np.ndarray] = {}
+for _key, _box_space in _OBS_SPACE.items():
+    if _key not in _ENTITY_PAD_KEYS:
+        continue
+    _fill = -1 if _key == "entity_types" else 0
+    _PAD_BUFFERS[_key] = np.full(_box_space.shape, _fill, dtype=_box_space.dtype)
 
 
 def _build_observation_space() -> gymnasium.spaces.Dict:
-    """Build observation space from canonical OBS_SCHEMA."""
-    spaces = {}
-    for key, shape in OBS_SCHEMA.items():
-        spec = _OBS_SPACE_SPEC.get(key)
-        if spec is not None:
-            dtype, low, high = spec
-        else:
-            dtype, low, high = np.float32, -np.inf, np.inf
-        spaces[key] = gymnasium.spaces.Box(
-            low=low, high=high, shape=shape, dtype=dtype,
-        )
-    return gymnasium.spaces.Dict(spaces)
+    """Build the canonical PPO observation space (native per-field
+    format, entities zero-padded to MAX_TOKEN_OBJECTS)."""
+    return gymnasium.spaces.Dict(dict(_OBS_SPACE))
+
+
+def _pad_entities(obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Pad every variable-length entity_* field to MAX_TOKEN_OBJECTS.
+
+    Mutates the dict in place — the bridge owns no reference to the
+    arrays after returning. The wire caps emit at MAX_TOKEN_OBJECTS so
+    n is always ≤ _N; assert that, then copy the wire rows into a fresh
+    pad-shaped buffer for each key. ``entity_types`` padding uses -1
+    (empty-slot sentinel the model's mask logic reads); everything else
+    zero-fills.
+    """
+    if "entity_count" not in obs:
+        return obs
+    n = int(obs["entity_count"].item())
+    assert 0 <= n <= _N, f"entity_count={n} out of range [0, {_N}]"
+    for key, pad_template in _PAD_BUFFERS.items():
+        wire = obs.get(key)
+        if wire is None:
+            continue
+        padded = pad_template.copy()
+        if n > 0:
+            padded[:n] = wire
+        obs[key] = padded
+    return obs
 
 
 class QuakeEnv(gymnasium.Env):
@@ -276,6 +360,7 @@ class QuakeEnv(gymnasium.Env):
     ):
         self._episode_stats = EpisodeStatAccumulator()
         obs = self.inner_env.reset(seed=seed)
+        _pad_entities(obs)
         return obs, {"scenario_id": self.scenario_id}
 
     def step(self, action):
@@ -296,6 +381,7 @@ class QuakeEnv(gymnasium.Env):
                 if norm > 1e-6:
                     action_dict["look"] = (look_arr / norm).tolist()
         obs, reward, done, info = self.inner_env.step(action_dict)
+        _pad_entities(obs)
         info = dict(info)
         info.setdefault("scenario_id", self.scenario_id)
         done_reason: str = str(info.get("done_reason", ""))

@@ -253,11 +253,10 @@ void QNN_EmitTick(FILE *out, const uint8_t *obs, const qnn_action_t *action,
 
 /* ── Shared tick-emission pipeline ───────────────────────────────
  *
- * Two-level buffer:
- *   Level 1 (obs buffer): obs from tick t is held until tick t+1 so we
- *   can pair it with the action computed at t+1.
- *   Level 2 (jitter buffer): the paired obs+action is held one more tick
- *   so the 3-frame jitter filter can check it against prev and next.
+ * One-level buffer:
+ *   The paired obs+action is held one tick so the 3-frame jitter filter
+ *   can check it against prev and next. Demo collect callers pass
+ *   pre-command obs with the same tick's action label already aligned.
  *
  * Action history is pushed at EMIT time with the filtered action, not at
  * capture time.  This ensures the next frame's obs has the correct T-1
@@ -317,33 +316,24 @@ static void QNN_WriteObsTickInner(qnn_tick_emit_state_t *st, FILE *out,
 		route_count = 0;
 	if (route_count > QNN_MAX_FIRE_ROUTE_EVENTS)
 		route_count = QNN_MAX_FIRE_ROUTE_EVENTS;
+	if (done) flags |= 0x02;
+	if (reset_flag) flags |= 0x01;
 
-	if (!st->has_buffered_obs)
+	if (!st->has_jitter_buf)
 	{
 		if (done)
 		{
 			if (out != NULL)
 			{
 				QNN_EmitTick(out, cur_obs, action,
-					tick, steps, tick_hz, 0x02);
+					tick, steps, tick_hz, flags);
 				QNN_DumpFireRoutes(st->emitted_rows, tick,
 					steps, action, routes, route_count);
 				st->emitted_rows++;
 			}
 			return;
 		}
-		memcpy(st->buffered_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
-		st->has_buffered_obs = true;
-		return;
-	}
-
-	if (done) flags |= 0x02;
-	if (reset_flag) flags |= 0x01;
-
-	if (!st->has_jitter_buf)
-	{
-		/* First real pair: push into jitter buffer, can't filter yet. */
-		memcpy(st->jitter_obs, st->buffered_obs, QNN_OBS_BUFFER_SIZE);
+		memcpy(st->jitter_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
 		st->jitter_action = *action;
 		st->jitter_tick = tick;
 		st->jitter_steps = steps;
@@ -355,59 +345,51 @@ static void QNN_WriteObsTickInner(qnn_tick_emit_state_t *st, FILE *out,
 			memcpy(st->jitter_fire_routes, routes,
 				sizeof(qnn_fire_route_event_t) * route_count);
 		st->has_jitter_buf = true;
-	}
-	else
-	{
-		/* We have prev_prev (if any), jitter_buf (middle), and current
-		   action (next).  Apply the 3-frame filter to the middle. */
-		if (st->has_prev_prev_move)
-			QNN_JitterFilter(&st->jitter_action,
-				st->prev_prev_move,
-				action->move);
-
-		/* Emit the (possibly corrected) jitter-buffered tick. */
-		if (st->jitter_out != NULL)
-		{
-			QNN_EmitTick(st->jitter_out, st->jitter_obs,
-				&st->jitter_action,
-				st->jitter_tick,
-				st->jitter_steps,
-				st->jitter_tick_hz,
-				st->jitter_flags);
-			QNN_DumpFireRoutes(st->emitted_rows,
-				st->jitter_tick, st->jitter_steps,
-				&st->jitter_action,
-				st->jitter_fire_routes,
-				st->jitter_fire_route_count);
-			st->emitted_rows++;
-			st->has_prev_emitted = true;
-		}
-
-		/* Advance: jitter_buf move becomes prev_prev, current becomes jitter_buf. */
-		st->prev_prev_move = st->jitter_action.move;
-		st->has_prev_prev_move = true;
-
-		memcpy(st->jitter_obs, st->buffered_obs, QNN_OBS_BUFFER_SIZE);
-		st->jitter_action = *action;
-		st->jitter_tick = tick;
-		st->jitter_steps = steps;
-		st->jitter_tick_hz = tick_hz;
-		st->jitter_flags = flags;
-		st->jitter_out = out;
-		st->jitter_fire_route_count = route_count;
-		if (route_count > 0)
-			memcpy(st->jitter_fire_routes, routes,
-				sizeof(qnn_fire_route_event_t) * route_count);
-	}
-
-	if (done)
-	{
-		QNN_TickEmitFlush(st);
-		st->has_buffered_obs = false;
 		return;
 	}
 
-	memcpy(st->buffered_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
+	/* We have prev_prev (if any), jitter_buf (middle), and current
+	   action (next).  Apply the 3-frame filter to the middle. */
+	if (st->has_prev_prev_move)
+		QNN_JitterFilter(&st->jitter_action,
+			st->prev_prev_move,
+			action->move);
+
+	/* Emit the (possibly corrected) jitter-buffered tick. */
+	if (st->jitter_out != NULL)
+	{
+		QNN_EmitTick(st->jitter_out, st->jitter_obs,
+			&st->jitter_action,
+			st->jitter_tick,
+			st->jitter_steps,
+			st->jitter_tick_hz,
+			st->jitter_flags);
+		QNN_DumpFireRoutes(st->emitted_rows,
+			st->jitter_tick, st->jitter_steps,
+			&st->jitter_action,
+			st->jitter_fire_routes,
+			st->jitter_fire_route_count);
+		st->emitted_rows++;
+		st->has_prev_emitted = true;
+	}
+
+	st->prev_prev_move = st->jitter_action.move;
+	st->has_prev_prev_move = true;
+
+	memcpy(st->jitter_obs, cur_obs, QNN_OBS_BUFFER_SIZE);
+	st->jitter_action = *action;
+	st->jitter_tick = tick;
+	st->jitter_steps = steps;
+	st->jitter_tick_hz = tick_hz;
+	st->jitter_flags = flags;
+	st->jitter_out = out;
+	st->jitter_fire_route_count = route_count;
+	if (route_count > 0)
+		memcpy(st->jitter_fire_routes, routes,
+			sizeof(qnn_fire_route_event_t) * route_count);
+
+	if (done)
+		QNN_TickEmitFlush(st);
 }
 
 void QNN_WriteObsTick(qnn_tick_emit_state_t *st, FILE *out,

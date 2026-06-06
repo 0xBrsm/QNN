@@ -17,11 +17,11 @@ from __future__ import annotations
 from torch import nn
 
 
-def make_head_mlp(in_dim: int, out_dim: int, bottleneck_dim: int, activation: str) -> nn.Module:
-    hidden = bottleneck_dim if bottleneck_dim > 0 else in_dim
+def make_head_mlp(in_dim: int, out_dim: int, d_hidden: int, activation: str) -> nn.Module:
+    hidden = d_hidden if d_hidden > 0 else in_dim
     activations = {"gelu": nn.GELU, "relu": nn.ReLU}
     has_activation = activation in activations
-    if bottleneck_dim > 0 or has_activation:
+    if d_hidden > 0 or has_activation:
         layers: list[nn.Module] = [nn.Linear(in_dim, hidden)]
         if has_activation:
             layers.append(activations[activation]())

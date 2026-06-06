@@ -73,6 +73,108 @@ class PolicyActionBatch:
     next_hidden: torch.Tensor
 
 
+def _prev_look_scope(actions):
+    """Enter a PrevLookContext if the batch carries an ``actions["look_prev"]``
+    column; otherwise a no-op contextmanager.
+
+    Built at preload (qnn.bc.supervised_loop._make_resident_source) so the
+    per-frame shifted look vector survives frame-shuffled batching. Bench
+    look heads read it via qnn.model.bench.inputs.prev_look_context.
+    """
+    import contextlib
+    from collections.abc import Mapping as _Mapping
+    if not isinstance(actions, _Mapping) or "look_prev" not in actions:
+        return contextlib.nullcontext()
+    from qnn.model.bench.inputs.prev_look_context import (
+        PrevLookContext, prev_look_context,
+    )
+    lp = actions["look_prev"]
+    if not isinstance(lp, torch.Tensor):
+        lp = torch.as_tensor(lp)
+    # look_prev is shape (..., K_MAX * 3). Flatten leading dims; the head
+    # slices the prefix it consumes via its own num_prev_frames config.
+    return prev_look_context(PrevLookContext(prev_look=lp.reshape(-1, lp.shape[-1])))
+
+
+def _engagement_ema_scope(actions):
+    """Enter an EngagementEMAContext if the batch carries
+    ``actions["engagement_ema"]``; otherwise a no-op contextmanager.
+
+    Built at preload (qnn.bc.supervised_loop) on both resident and streaming
+    paths. Bench attack heads read it via
+    qnn.model.bench.inputs.engagement_ema_context.
+    """
+    import contextlib
+    from collections.abc import Mapping as _Mapping
+    if not isinstance(actions, _Mapping) or "engagement_ema" not in actions:
+        return contextlib.nullcontext()
+    from qnn.model.bench.inputs.engagement_ema_context import (
+        EngagementEMAContext, engagement_ema_context,
+    )
+    ee = actions["engagement_ema"]
+    if not isinstance(ee, torch.Tensor):
+        ee = torch.as_tensor(ee)
+    # engagement_ema is shape (..., ). Flatten leading dims to match the
+    # head's batch axis (head sees B* = batch · time after any padding).
+    return engagement_ema_context(EngagementEMAContext(engagement_ema=ee.reshape(-1)))
+
+
+def _target_supervision_scope(actions, masks):
+    """Enter a TargetSupervisionContext carrying ``target_gt``,
+    ``target_probs_idx`` and ``prev_target_probs`` derived from
+    ``actions`` — privileged inputs for bench pointer variants
+    (``CanonicalTargetPointer`` hard / gt-dist / prev modes,
+    ``GTTargetPointer``).
+
+    No-op when ``actions`` carries neither ``target`` nor ``target_probs``;
+    the canonical MLP pointer never reads from this context.
+    """
+    import contextlib
+    from collections.abc import Mapping as _Mapping
+    if not isinstance(actions, _Mapping):
+        return contextlib.nullcontext()
+    has_target_gt = "target" in actions
+    has_target_probs = "target_probs" in actions
+    if not (has_target_gt or has_target_probs):
+        return contextlib.nullcontext()
+    from qnn.model.bench.inputs.target_supervision_context import (
+        TargetSupervisionContext, target_supervision_context,
+    )
+    target_gt_flat: torch.Tensor | None = None
+    if has_target_gt:
+        tg = actions["target"]
+        if not isinstance(tg, torch.Tensor):
+            tg = torch.as_tensor(tg)
+        target_gt_flat = tg.reshape(-1).long()
+    target_probs_idx_flat: torch.Tensor | None = None
+    prev_target_probs_flat: torch.Tensor | None = None
+    if has_target_probs:
+        td = actions["target_probs"]
+        if not isinstance(td, torch.Tensor):
+            td = torch.as_tensor(td, dtype=torch.float32)
+        else:
+            td = td.float()
+        present = (1.0 - td[..., 0]).clamp(min=1e-6)
+        idx_dist = td[..., 1:] / present.unsqueeze(-1)
+        if td.ndim == 3:
+            prev = torch.zeros_like(idx_dist)
+            prev[1:] = idx_dist[:-1]
+            if isinstance(masks, _Mapping) and "reset_mask" in masks:
+                rm = masks["reset_mask"]
+                if not isinstance(rm, torch.Tensor):
+                    rm = torch.as_tensor(rm)
+                rm = rm.bool()
+                if rm.ndim == 2:
+                    prev = prev.masked_fill(rm.unsqueeze(-1), 0.0)
+            prev_target_probs_flat = prev.reshape(-1, prev.shape[-1])
+        target_probs_idx_flat = idx_dist.reshape(-1, idx_dist.shape[-1])
+    return target_supervision_context(TargetSupervisionContext(
+        target_gt=target_gt_flat,
+        target_probs_idx=target_probs_idx_flat,
+        prev_target_probs=prev_target_probs_flat,
+    ))
+
+
 class QNNPolicy:
     """Feed-forward combat-objective model for BC."""
 
@@ -108,8 +210,8 @@ class QNNPolicy:
         self.obs_dim = int(obs_dim)
         self.config = model
         self.d_model = int(model.d_model)
-        self.use_gru = bool(model.use_gru and model.gru_hidden > 0)
-        self.gru_hidden = int(model.gru_hidden) if self.use_gru else 0
+        self.use_gru = bool(model.use_gru and model.d_gru > 0)
+        self.d_gru = int(model.d_gru) if self.use_gru else 0
         self.use_weapon_head = bool(model.use_weapon_head)
         self.look_bypass_gru = bool(model.look_bypass_gru and self.use_gru)
         self.weapon_switch_confidence = float(model.weapon_switch_confidence)
@@ -117,13 +219,11 @@ class QNNPolicy:
         self.weapon_use_gru = bool(model.weapon_use_gru)
         self.weapon_use_self_readout = bool(model.weapon_use_self_readout)
         self.weapon_context_from_obs = bool(model.weapon_context_from_obs)
-        self.gru_target_query = bool(model.gru_target_query and self.use_gru)
-        self.hard_target_feat = bool(model.hard_target_feat)
-        self.weapon_in_target_query = bool(model.weapon_in_target_query and self.use_gru)
-        self.linear_idx_prior = bool(model.linear_idx_prior and self.use_gru)
-        self.gt_dist_target_feat = bool(model.gt_dist_target_feat and self.use_gru)
-        self.prev_target_in_query = bool(model.prev_target_in_query and self.use_gru)
-        self.head_bottleneck_dims = dict(model.head_bottleneck_dim)
+        self.d_target = int(model.d_target)
+        self.d_move = int(model.d_move)
+        self.d_look = int(model.d_look)
+        self.d_attack = int(model.d_attack)
+        self.d_weapon = int(model.d_weapon)
         self.head_activation = model.head_activation
         # jump_pos_weight > 1.0 upweights the POS class on the move ud-axis CE
         # — direct imbalance fix for the rare jump-positive case (~4% pos rate).
@@ -152,6 +252,16 @@ class QNNPolicy:
         # engine outcome (act = max(usercmd − infeasibility_mask, 0));
         # for fire this collapses to "label = op_input bit 3".
         self.input_mask: bool = False
+        # attack_label_shift is another training-time attribute (NOT a
+        # ModelConfig field — keeps checkpoint meta clean and a single
+        # ckpt can be retrained either way). Trainer sets this to True
+        # after construction when train.json.attack_label_shift is true.
+        # When on, ``_compute_head_losses_and_metrics`` swaps the attack
+        # BCE *target* from ``actions["attack"]`` to
+        # ``actions["attack_shifted"]`` (per-episode +1 op-frame OR). The
+        # val precision/recall/F1 metrics still use the original
+        # ``attack`` label so they remain comparable to the baseline.
+        self.attack_label_shift: bool = False
         # attack_distance_sigma > 0 enables Gaussian-shouldered BCE on the
         # attack head: per-frame BCE is multiplied by 1 at positives and by
         # 1 - exp(-d^2/(2*sigma^2)) at negatives, where d is distance (in
@@ -165,9 +275,9 @@ class QNNPolicy:
         self.jump_distance_sigma = float(jump_distance_sigma)
         self.n_heads = int(model.n_heads)
         self.n_layers = int(model.n_layers)
-        self.ffn_dim = int(model.ffn_dim)
+        self.d_ffn = int(model.d_ffn)
         self.attn_dropout = float(model.attn_dropout)
-        self.head_hidden = (self.gru_hidden + self.d_model) if self.use_gru else (2 * self.d_model)
+        self.head_hidden = (self.d_gru + self.d_model) if self.use_gru else (2 * self.d_model)
         self.seed = int(seed)
         self.device_spec = resolve_torch_device(device)
         configure_torch_runtime(self.device_spec)
@@ -194,7 +304,7 @@ class QNNPolicy:
         self._optimizers: Dict[str, torch.optim.Optimizer] = {}
 
     def zero_hidden(self, batch_size: int) -> np.ndarray:
-        return np.zeros((batch_size, self.gru_hidden), dtype=np.float32)
+        return np.zeros((batch_size, self.d_gru), dtype=np.float32)
 
     def _tensor(self, value: np.ndarray | torch.Tensor | Iterable[float], dtype: torch.dtype = torch.float32) -> torch.Tensor:
         if isinstance(value, torch.Tensor):
@@ -280,13 +390,10 @@ class QNNPolicy:
     ) -> torch.Tensor | None:
         """Zero-pad a companion tensor along dim 0 to match obs padding.
 
-        Used after ``_maybe_pad_obs_batch`` to extend hidden state and
-        per-frame supervision tensors (target_gt, target_probs_idx,
-        prev_target_probs) so callers that pass any of them on ROCm with
-        small batches don't hit a B mismatch inside heads that consume
-        them as features (e.g. fire-token head probe's
-        ``target_probs_indices`` feature builder). Pass-through when the
-        tensor is None or no padding was applied.
+        Used after ``_maybe_pad_obs_batch`` to extend hidden state so
+        callers that pass it on ROCm with small batches don't hit a B
+        mismatch. Pass-through when the tensor is None or no padding
+        was applied.
         """
         if tensor is None or pad_rows <= 0:
             return tensor
@@ -300,10 +407,7 @@ class QNNPolicy:
         *,
         hidden: np.ndarray | torch.Tensor | None = None,
         masks: Mapping[str, np.ndarray | torch.Tensor] | np.ndarray | torch.Tensor | None = None,
-        target_gt: np.ndarray | torch.Tensor | None = None,
-        target_probs_idx: np.ndarray | torch.Tensor | None = None,
-        prev_target_probs: np.ndarray | torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(obs, dict):
             raise ValueError("Token policy expects dict observations")
 
@@ -320,18 +424,6 @@ class QNNPolicy:
         if self.use_gru and hidden is not None:
             hidden_tensor = self._tensor(hidden, dtype=torch.float32)
 
-        target_gt_tensor: torch.Tensor | None = None
-        if target_gt is not None:
-            target_gt_tensor = self._tensor(target_gt, dtype=torch.long)
-
-        target_probs_idx_tensor: torch.Tensor | None = None
-        if target_probs_idx is not None:
-            target_probs_idx_tensor = self._tensor(target_probs_idx, dtype=torch.float32)
-
-        prev_target_probs_tensor: torch.Tensor | None = None
-        if prev_target_probs is not None:
-            prev_target_probs_tensor = self._tensor(prev_target_probs, dtype=torch.float32)
-
         # Use `vel` to detect flat-batch (B, 3) vs sequence (B, T, 3).
         # The legacy obs carried `self_scalars` (B, 17) here; the native
         # obs has per-field arrays, with vel matching the same ndim
@@ -346,22 +438,18 @@ class QNNPolicy:
                 self._pad_companion(hidden_tensor, pad_rows)
                 if self.use_gru else hidden_tensor
             )
-            features, logits, values, next_hidden, target_logits, target_query = self.model(
+            features, logits, values, next_hidden, target_logits = self.model(
                 padded_obs,
                 padded_hidden,
-                target_gt=self._pad_companion(target_gt_tensor, pad_rows),
-                target_probs_idx=self._pad_companion(target_probs_idx_tensor, pad_rows),
-                prev_target_probs=self._pad_companion(prev_target_probs_tensor, pad_rows),
             )
             if pad_rows == 0:
-                return features, logits, values, next_hidden, target_logits, target_query
+                return features, logits, values, next_hidden, target_logits
             return (
                 features[:batch_size],
                 {head: tensor[:batch_size] for head, tensor in logits.items()},
                 values[:batch_size],
                 next_hidden[:batch_size],
                 target_logits[:batch_size],
-                target_query[:batch_size],
             )
 
         if sample.ndim != 3:
@@ -373,9 +461,6 @@ class QNNPolicy:
             obs_tensors,
             hidden_tensor,
             reset_mask=reset_mask_tensor,
-            target_gt=target_gt_tensor,
-            target_probs_idx=target_probs_idx_tensor,
-            prev_target_probs=prev_target_probs_tensor,
         )
 
     def _optimizer(self, name: str, params: Iterable[nn.Parameter], lr: float) -> torch.optim.Optimizer:
@@ -403,7 +488,7 @@ class QNNPolicy:
         hidden: np.ndarray | None = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         with torch.inference_mode():
-            features, _, _, next_hidden, _, _ = self._forward_tensors(obs, hidden=hidden)
+            features, _, _, next_hidden, _ = self._forward_tensors(obs, hidden=hidden)
         return (
             features.detach().cpu().numpy().astype(np.float32),
             next_hidden.detach().cpu().numpy().astype(np.float32),
@@ -415,7 +500,7 @@ class QNNPolicy:
         hidden: np.ndarray | None = None,
     ) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
         with torch.inference_mode():
-            features, logits_t, values_t, next_hidden, _, _ = self._forward_tensors(obs, hidden=hidden)
+            features, logits_t, values_t, next_hidden, _ = self._forward_tensors(obs, hidden=hidden)
         logits = {head: tensor.detach().cpu().numpy().astype(np.float32) for head, tensor in logits_t.items()}
         values = values_t.detach().cpu().numpy().astype(np.float32)
         features_np = features.detach().cpu().numpy().astype(np.float32)
@@ -454,7 +539,7 @@ class QNNPolicy:
         """
         del masks, generator
         with torch.inference_mode():
-            _, logits, _, next_hidden, target_logits, _ = self._forward_tensors(obs, hidden=hidden)
+            _, logits, _, next_hidden, target_logits = self._forward_tensors(obs, hidden=hidden)
 
         sample_mode = str(mode).lower()
         if sample_mode not in ("greedy", "sampled"):
@@ -692,7 +777,6 @@ class QNNPolicy:
         head_loss_weights: Mapping[str, float] | None = None,
         compute_metrics: bool = True,
         target_logits: torch.Tensor | None = None,
-        target_query: torch.Tensor | None = None,
         obs: Mapping[str, np.ndarray | torch.Tensor] | None = None,
         valid_mask: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor], list[bool], Dict[str, torch.Tensor | int | float]]:
@@ -738,11 +822,10 @@ class QNNPolicy:
                 actions["input_mask"], dtype=torch.long).reshape(-1)
 
         target_loss_weight = float(weights_map.get("target", 1.0))
-        target_pid_aux_weight = float(weights_map.get("target_pid_aux", 0.0))
         if (
             target_logits is not None
             and "target_probs" in actions
-            and (target_loss_weight != 0.0 or target_pid_aux_weight != 0.0)
+            and target_loss_weight != 0.0
         ):
             target_flat = self._flatten_logits(target_logits)
             dist_t = self._tensor(actions["target_probs"], dtype=torch.float32)
@@ -763,9 +846,6 @@ class QNNPolicy:
                 else torch.ones_like(present, dtype=torch.bool)
             )
             aux_is_real = bool(valid.any().item())
-            # Argmax of idx_dist serves as the hard label for the existing
-            # accuracy / per-idx recall diagnostics.
-            target_label = idx_dist.argmax(dim=-1)
             if aux_is_real:
                 # Present-weighted soft CE: -sum_s p_idx * log_softmax(logits).
                 # idx_dist sums to `present`; renormalize so each frame's
@@ -784,105 +864,55 @@ class QNNPolicy:
                 metrics["loss_target"] = aux_ce.detach()
                 metrics["target_present_mean"] = present.mean().detach()
                 if aux_is_real:
-                    # Present-weighted soft-distribution diagnostics, all
-                    # computed at frames passing segment_mask (valid_flat).
-                    # The renormalized idx_target sums to 1 per row so
-                    # these are real probability-distribution quantities.
-                    soft = F.softmax(target_flat[valid], dim=-1)
-                    # Entropy of the (renormalized) label distribution.
+                    # Aggregate KL — primary selection metric for target heads.
+                    # KL(label || model) = present-weighted-NLL - entropy(label).
                     ent_per_frame = -(idx_target.clamp(min=1e-8) * idx_target.clamp(min=1e-8).log()).sum(dim=-1)
                     target_entropy = (present_v * ent_per_frame).sum() / present_v.sum().clamp(min=1e-6)
-                    metrics["target_entropy"] = target_entropy.detach()
-                    # KL(label || model) = NLL - entropy(label).
                     metrics["target_kl"] = (aux_ce - target_entropy).detach()
-                    # Brier: present-weighted squared error between predicted
-                    # and renormalized label distributions.
-                    brier_per_frame = ((soft - idx_target) ** 2).sum(dim=-1)
-                    metrics["target_brier"] = (
-                        (present_v * brier_per_frame).sum() / present_v.sum().clamp(min=1e-6)
-                    ).detach()
-                    # Top-1 mass: label mass at the model's argmax idx.
-                    pred = torch.argmax(target_flat, dim=1)
-                    pred_v = pred[valid]
-                    target_v = target_label[valid]
-                    batch_idx = torch.arange(pred_v.shape[0], device=pred_v.device)
-                    top1_mass_per_frame = idx_target[batch_idx, pred_v]
-                    metrics["target_top1_mass"] = (
-                        (present_v * top1_mass_per_frame).sum() / present_v.sum().clamp(min=1e-6)
-                    ).detach()
-                    acc = (pred_v == target_v).float().mean()
-                    metrics["acc_target"] = acc
-                    accuracy_components.append(acc)
                     metrics["n_target_valid"] = torch.as_tensor(
-                        float(target_v.numel()), dtype=target_flat.dtype, device=target_flat.device,
+                        float(present_v.numel()), dtype=target_flat.dtype, device=target_flat.device,
                     )
-                    metrics["correct_target"] = (pred_v == target_v).sum().to(target_flat.dtype).detach()
 
-                    true_nonzero = target_v != 0
-                    pred_nonzero = pred_v != 0
-                    tp_nz = (pred_nonzero & true_nonzero).sum().to(target_flat.dtype)
-                    fp_nz = (pred_nonzero & ~true_nonzero).sum().to(target_flat.dtype)
-                    fn_nz = (~pred_nonzero & true_nonzero).sum().to(target_flat.dtype)
-                    metrics["tp_target_nonzero"] = tp_nz.detach()
-                    metrics["fp_target_nonzero"] = fp_nz.detach()
-                    metrics["fn_target_nonzero"] = fn_nz.detach()
-                    metrics["n_target_nonzero"] = true_nonzero.sum().to(target_flat.dtype).detach()
-                    metrics["acc_target_idx0_baseline"] = (target_v == 0).float().mean().detach()
-
-                    recalls = []
-                    for idx in range(target_flat.shape[1]):
-                        pred_idx = pred_v == idx
-                        true_idx = target_v == idx
-                        tp = (pred_idx & true_idx).sum().to(target_flat.dtype)
-                        fp = (pred_idx & ~true_idx).sum().to(target_flat.dtype)
-                        fn = (~pred_idx & true_idx).sum().to(target_flat.dtype)
-                        support = true_idx.sum().to(target_flat.dtype)
-                        pred_count = pred_idx.sum().to(target_flat.dtype)
-                        metrics[f"tp_target_idx_{idx}"] = tp.detach()
-                        metrics[f"fp_target_idx_{idx}"] = fp.detach()
-                        metrics[f"fn_target_idx_{idx}"] = fn.detach()
-                        metrics[f"n_target_idx_{idx}"] = support.detach()
-                        metrics[f"pred_target_idx_{idx}"] = pred_count.detach()
-                        if bool((support > 0).item()):
-                            recalls.append(tp / support.clamp(min=1.0))
-                    if recalls:
-                        metrics["balanced_acc_target"] = torch.stack(recalls).mean().detach()
-
-            # Auxiliary loss: bind the predicted query to the target pid's
-            # embedding identity.  Idx labels alone don't push the model to
-            # encode "I'm engaging this specific pid" because idx ordering
-            # shuffles within an engagement (a former idx 0 becomes idx 1
-            # ~half the time within a second).  Cosine pull between the query
-            # and the static pid embedding gives identity-stable supervision.
-            pid_aux_weight = target_pid_aux_weight
-            if (
-                pid_aux_weight > 0.0
-                and target_query is not None
-                and obs is not None
-                and "entity_ids" in obs
-                and aux_is_real
-            ):
-                query_flat = target_query.reshape(-1, target_query.shape[-1])
-                entity_ids = self._tensor(obs["entity_ids"], dtype=torch.long)
-                # Flatten leading dims to match target_label.
-                eids_flat = entity_ids.reshape(-1, entity_ids.shape[-2], entity_ids.shape[-1])
-                idx_idx = target_label[valid]
-                # Gather pid for the target idx of each valid frame.
-                row_idx = torch.arange(eids_flat.shape[0], device=eids_flat.device)[valid]
-                target_pid = eids_flat[row_idx, idx_idx, 2]
-                # Drop frames where target_pid resolves to 0 (no-pid sentinel).
-                pid_mask = target_pid > 0
-                if bool(pid_mask.any().item()):
-                    q = query_flat[valid][pid_mask]
-                    p = self.model.obs_embedding.player_embed(target_pid[pid_mask])
-                    cos = F.cosine_similarity(q, p, dim=-1)
-                    aux_pid = -(cos.mean())
-                else:
-                    aux_pid = torch.zeros((), dtype=query_flat.dtype, device=query_flat.device)
-                losses.append(aux_pid * pid_aux_weight)
-                loss_is_real.append(bool(pid_mask.any().item()))
-                if compute_metrics:
-                    metrics["loss_target_pid_aux"] = aux_pid.detach()
+                    # Multi-candidate KL — KL restricted to frames where the
+                    # head genuinely had a choice (#live enemies in obs > 1).
+                    # Single-candidate frames are trivial wins for any head
+                    # that points at the only available actor; this metric
+                    # isolates real discrimination ability.  Requires
+                    # entity_types + entity_ids[..., 2] (player_id) in obs.
+                    if (
+                        obs is not None
+                        and isinstance(obs, dict)
+                        and "entity_types" in obs
+                        and "entity_ids" in obs
+                    ):
+                        types_t = self._tensor(obs["entity_types"], dtype=torch.long)
+                        eids_t = self._tensor(obs["entity_ids"], dtype=torch.long)
+                        if types_t.dim() >= 2 and eids_t.dim() >= 3:
+                            types_flat = types_t.reshape(-1, types_t.shape[-1])
+                            pids_flat = eids_t.reshape(-1, eids_t.shape[-2], eids_t.shape[-1])[..., 2]
+                            live_actor = (types_flat == TOKEN_ACTOR) & (pids_flat > 0)
+                            n_live = live_actor.sum(dim=-1)
+                            multi_mask = (n_live > 1)
+                            multi_valid = valid & multi_mask
+                            if bool(multi_valid.any().item()):
+                                log_probs_m = F.log_softmax(target_flat[multi_valid], dim=-1)
+                                present_m = present[multi_valid]
+                                idx_target_m = (
+                                    idx_dist[multi_valid]
+                                    / present_m.clamp(min=1e-6).unsqueeze(-1)
+                                )
+                                ce_m = -(idx_target_m * log_probs_m).sum(dim=-1)
+                                ent_m = -(idx_target_m.clamp(min=1e-8) * idx_target_m.clamp(min=1e-8).log()).sum(dim=-1)
+                                kl_m = (
+                                    (present_m * (ce_m - ent_m)).sum()
+                                    / present_m.sum().clamp(min=1e-6)
+                                )
+                                metrics["target_kl_multi"] = kl_m.detach()
+                                metrics["n_target_valid_multi"] = torch.as_tensor(
+                                    float(present_m.numel()),
+                                    dtype=target_flat.dtype,
+                                    device=target_flat.device,
+                                )
 
         if WEAPON_HEAD in logits and WEAPON_HEAD in actions:
             weapon_logits = logits[WEAPON_HEAD].reshape(-1, WEAPON_HEAD_SIZE)
@@ -1182,11 +1212,25 @@ class QNNPolicy:
             attack_pred_full = attack_logits.reshape(-1)
             attack_target_full = attack_target_t.reshape(-1)
             attack_dw_full = distance_weight_flat
+            # Optional +1 op-frame shifted loss target. Built per-episode at
+            # preload by qnn.bc.supervised_loop._compute_attack_shifted and
+            # surfaced as actions["attack_shifted"]. Only the BCE *target*
+            # shifts; metrics below stay on the original attack label.
+            attack_loss_target_full: torch.Tensor | None = None
+            if (
+                self.attack_label_shift
+                and "attack_shifted" in actions
+            ):
+                attack_loss_target_full = self._tensor(
+                    actions["attack_shifted"], dtype=torch.float32,
+                ).reshape(-1)
             if valid_flat is not None:
                 attack_pred_full = attack_pred_full[valid_flat]
                 attack_target_full = attack_target_full[valid_flat]
                 if attack_dw_full is not None:
                     attack_dw_full = attack_dw_full[valid_flat]
+                if attack_loss_target_full is not None:
+                    attack_loss_target_full = attack_loss_target_full[valid_flat]
             # Label rewrite under input_mask. Off: label is the raw demo
             # button (usercmd, move byte bit 6). On: label becomes the
             # engine OUTCOME = pure feasibility (input_mask bit 0) AND
@@ -1201,8 +1245,21 @@ class QNNPolicy:
                 feasibility = (input_mask_full & 1).to(attack_target_full.dtype)
                 demo_press  = attack_target_full
                 attack_target_full = feasibility * demo_press
+                if attack_loss_target_full is not None:
+                    # Apply the same feasibility AND to the shifted target
+                    # so the loss label remains an engine-outcome bit when
+                    # input_mask is on.
+                    attack_loss_target_full = feasibility * attack_loss_target_full
             attack_pred = attack_pred_full
             attack_target = attack_target_full
+            # attack_loss_target = label fed to BCE; defaults to the metric
+            # target (current attack label) so behavior is bit-identical
+            # when attack_label_shift is off.
+            attack_loss_target = (
+                attack_loss_target_full
+                if attack_loss_target_full is not None
+                else attack_target_full
+            )
             attack_dw = attack_dw_full
             attack_is_real = attack_target.numel() > 0
             # pos_weight conventionally lives in class_weights[ATTACK_HEAD] (set
@@ -1216,9 +1273,14 @@ class QNNPolicy:
                 # by (focal? * distance?). When both gamma and sigma are 0
                 # the product is all-ones and the reduction matches the
                 # original ``F.binary_cross_entropy_with_logits(..., reduction="mean")``.
+                # The BCE *target* is attack_loss_target — equal to
+                # attack_target by default; under attack_label_shift it's
+                # the +1 op-frame shifted label. Focal weighting also keys
+                # off the loss target so easy/hard is judged against
+                # whatever the loss is asked to fit.
                 if self.attack_focal_gamma > 0.0 or attack_dw is not None:
                     bce = F.binary_cross_entropy_with_logits(
-                        attack_pred, attack_target, pos_weight=pos_weight, reduction="none",
+                        attack_pred, attack_loss_target, pos_weight=pos_weight, reduction="none",
                     )
                     weight = torch.ones_like(bce)
                     if self.attack_focal_gamma > 0.0:
@@ -1226,9 +1288,9 @@ class QNNPolicy:
                         # Optional per-class alpha (Lin et al.): alpha on
                         # positives, (1 - alpha) on negatives.
                         p = torch.sigmoid(attack_pred)
-                        pt = torch.where(attack_target > 0.5, p, 1.0 - p)
+                        pt = torch.where(attack_loss_target > 0.5, p, 1.0 - p)
                         alpha_t = torch.where(
-                            attack_target > 0.5,
+                            attack_loss_target > 0.5,
                             torch.full_like(p, self.attack_focal_alpha),
                             torch.full_like(p, 1.0 - self.attack_focal_alpha),
                         )
@@ -1238,7 +1300,7 @@ class QNNPolicy:
                     attack_loss = (weight * bce).mean()
                 else:
                     attack_loss = F.binary_cross_entropy_with_logits(
-                        attack_pred, attack_target, pos_weight=pos_weight, reduction="mean",
+                        attack_pred, attack_loss_target, pos_weight=pos_weight, reduction="mean",
                     )
             else:
                 attack_loss = torch.zeros((), dtype=attack_logits.dtype, device=attack_logits.device)
@@ -1388,41 +1450,23 @@ class QNNPolicy:
         if not accumulate_only:
             optimizer.zero_grad()
 
-        # Teacher-force the hard-target gather with the BC GT idx so motor
-        # heads always see the correctly-paired enemy vector during training.
-        # No-op when hard_target_feat is off (TargetPointer ignores target_gt
-        # in soft-pool mode).
-        target_gt_arr = actions.get("target") if isinstance(actions, Mapping) else None
-        # GT-distribution STE: derive a (T*B, N) renormalized idx distribution
-        # from actions["target_probs"] (T*B, 17) when present. TargetPointer
-        # uses it as the STE forward signal in training mode only; eval falls
-        # back to the soft path even when target_probs_idx is supplied (gated
-        # on self.training). Only supplied here in the training step.
-        target_probs_idx_arr = None
-        prev_target_probs_arr = None
-        if isinstance(actions, Mapping) and "target_probs" in actions:
-            td = self._tensor(actions["target_probs"], dtype=torch.float32)
-            present = (1.0 - td[..., 0]).clamp(min=1e-6)
-            target_probs_idx_arr = td[..., 1:] / present.unsqueeze(-1)
-            # prev_target_probs: shift idx_target by one along the time axis
-            # (only meaningful for sequence inputs). Zero at episode starts
-            # via reset_mask if provided; the t=0 row is also zeroed.
-            if td.ndim == 3:
-                prev_st = torch.zeros_like(target_probs_idx_arr)
-                prev_st[1:] = target_probs_idx_arr[:-1]
-                if isinstance(masks, Mapping) and "reset_mask" in masks:
-                    rm = self._tensor(masks["reset_mask"], dtype=torch.bool)
-                    if rm.ndim == 2:
-                        prev_st = prev_st.masked_fill(rm.unsqueeze(-1), 0.0)
-                prev_target_probs_arr = prev_st
-        with self._autocast():
-            _, logits, _, next_hidden, target_logits, target_query = self._forward_tensors(
+        # Side-channel contexts for bench heads. prev_look / engagement_ema
+        # feed bench look/attack ablations; target-supervision feeds bench
+        # pointer variants (GT oracle, canonical hard/gt-dist/prev modes).
+        # All three are no-ops for the canonical model.
+        prev_look_ctx_mgr = _prev_look_scope(actions)
+        engagement_ema_ctx_mgr = _engagement_ema_scope(actions)
+        target_supervision_ctx_mgr = _target_supervision_scope(actions, masks)
+        with (
+            self._autocast(),
+            prev_look_ctx_mgr,
+            engagement_ema_ctx_mgr,
+            target_supervision_ctx_mgr,
+        ):
+            _, logits, _, next_hidden, target_logits = self._forward_tensors(
                 obs,
                 hidden=hidden,
                 masks=masks,
-                target_gt=target_gt_arr,
-                target_probs_idx=target_probs_idx_arr,
-                prev_target_probs=prev_target_probs_arr,
             )
             valid_mask = (
                 self._tensor(masks["valid_mask"], dtype=torch.bool)
@@ -1436,7 +1480,6 @@ class QNNPolicy:
                 head_loss_weights=head_loss_weights,
                 compute_metrics=compute_metrics,
                 target_logits=target_logits,
-                target_query=target_query,
                 obs=obs,
                 valid_mask=valid_mask,
             )
@@ -1460,26 +1503,20 @@ class QNNPolicy:
         head_loss_weights: Mapping[str, float] | None = None,
         compute_metrics: bool = True,
     ) -> Dict[str, Any]:
-        # Mirror the privileged inputs supervised_step derives from
-        # ``actions``: target_gt and a renormalized 16-idx target_probs.
-        # The canonical model is no-op for these in eval (TargetPointer
-        # gates STE on self.training) — but a model_factory-injected
-        # ablation may need them (e.g., a probe whose entire encoder
-        # pools by GT idx mass). Passing them keeps eval symmetric with
-        # training across both code paths.
-        target_gt_arr = actions.get("target") if isinstance(actions, Mapping) else None
-        target_probs_idx_arr = None
-        if isinstance(actions, Mapping) and "target_probs" in actions:
-            td = self._tensor(actions["target_probs"], dtype=torch.float32)
-            present = (1.0 - td[..., 0]).clamp(min=1e-6)
-            target_probs_idx_arr = td[..., 1:] / present.unsqueeze(-1)
-        with torch.inference_mode(), self._autocast():
-            _, logits, _, next_hidden, target_logits, target_query = self._forward_tensors(
+        prev_look_ctx_mgr = _prev_look_scope(actions)
+        engagement_ema_ctx_mgr = _engagement_ema_scope(actions)
+        target_supervision_ctx_mgr = _target_supervision_scope(actions, masks)
+        with (
+            torch.inference_mode(),
+            self._autocast(),
+            prev_look_ctx_mgr,
+            engagement_ema_ctx_mgr,
+            target_supervision_ctx_mgr,
+        ):
+            _, logits, _, next_hidden, target_logits = self._forward_tensors(
                 obs,
                 hidden=hidden,
                 masks=masks,
-                target_gt=target_gt_arr,
-                target_probs_idx=target_probs_idx_arr,
             )
             valid_mask = (
                 self._tensor(masks["valid_mask"], dtype=torch.bool)
@@ -1492,7 +1529,6 @@ class QNNPolicy:
                 head_loss_weights=head_loss_weights,
                 compute_metrics=compute_metrics,
                 target_logits=target_logits,
-                target_query=target_query,
                 obs=obs,
                 valid_mask=valid_mask,
             )
@@ -1521,6 +1557,12 @@ class QNNPolicy:
             "attack_focal_alpha": self.attack_focal_alpha,
             "attack_distance_sigma": self.attack_distance_sigma,
             "jump_distance_sigma": self.jump_distance_sigma,
+            # input_mask is a training-time label-rewrite toggle (not a
+            # ModelConfig field) — persist it so downstream eval / final
+            # val pass / PPO seed selection don't silently revert to
+            # raw-demo-press labels when reloading a checkpoint that was
+            # trained against the masked-outcome labels.
+            "input_mask": bool(self.input_mask),
             "backend": "pytorch",
             "requested_device": self.device_spec.requested,
             "resolved_device": self.device_spec.resolved,
@@ -1583,6 +1625,9 @@ class QNNPolicy:
             device=device,
             model_factory=model_factory,
         )
+        # Restore the input_mask label-rewrite toggle (default False for
+        # pre-fix checkpoints that didn't carry the field).
+        policy.input_mask = bool(meta.get("input_mask", False))
         if model_factory is None:
             from qnn.utils.checkpoint_converter import (
                 migrate_drop_action_history,
@@ -1676,8 +1721,8 @@ class QNNPolicy:
         path: str | Path,
         *,
         use_gru: bool,
-        gru_hidden: int,
+        d_gru: int,
         device: str,
     ) -> "QNNPolicy":
-        del use_gru, gru_hidden
+        del use_gru, d_gru
         return cls.load(path, device=device)

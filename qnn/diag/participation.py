@@ -132,7 +132,7 @@ def head_bottleneck_report(
 
         out[name] = {
             "input_dim": int(head[0].in_features),
-            "bottleneck_dim": int(head[0].out_features),
+            "d_hidden": int(head[0].out_features),
             "output_dim": int(head[2].out_features),
             "frames_analyzed": int(act.shape[0]),
             "participation_ratio": pr,

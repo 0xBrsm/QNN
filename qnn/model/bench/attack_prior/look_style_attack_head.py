@@ -36,14 +36,14 @@ class LookStyleAttackHead(nn.Module):
     def __init__(
         self,
         in_dim: int,
-        bottleneck_dim: int,
+        d_hidden: int,
         activation: str,
         *,
         scale_init: float = 5.0,
     ) -> None:
         super().__init__()
         self.scale_init = float(scale_init)
-        self.mlp = make_head_mlp(in_dim, OUT_DIM, bottleneck_dim, activation)
+        self.mlp = make_head_mlp(in_dim, OUT_DIM, d_hidden, activation)
         final = self.mlp[-1] if isinstance(self.mlp, nn.Sequential) else self.mlp
         if isinstance(final, nn.Linear):
             nn.init.zeros_(final.weight)

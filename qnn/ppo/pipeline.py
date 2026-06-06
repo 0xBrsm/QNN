@@ -43,8 +43,8 @@ def _validate_warm_start_arch(init_ckpt: str, ppo_cfg: dict[str, Any]) -> None:
     if not init_ckpt or not Path(init_ckpt).exists():
         return
     arch_keys = (
-        "encoder_hidden", "gru_hidden", "use_gru", "d_model", "n_heads",
-        "n_layers", "ffn_dim", "attn_dropout",
+        "encoder_hidden", "d_gru", "use_gru", "d_model", "n_heads",
+        "n_layers", "d_ffn", "attn_dropout",
     )
     try:
         payload = trusted_torch_load(init_ckpt, map_location="cpu")
@@ -151,12 +151,12 @@ def run_training_job(
         init_checkpoints=ppo_cfg.get("init_ckpts"),
         resume=resume,
         encoder_hidden=int(require_cfg_value(ppo_cfg, "encoder_hidden", "PPO config")),
-        gru_hidden=int(require_cfg_value(ppo_cfg, "gru_hidden", "PPO config")),
+        d_gru=int(require_cfg_value(ppo_cfg, "d_gru", "PPO config")),
         use_gru=bool(require_cfg_value(ppo_cfg, "use_gru", "PPO config")),
         d_model=int(require_cfg_value(ppo_cfg, "d_model", "PPO config")),
         n_heads=int(require_cfg_value(ppo_cfg, "n_heads", "PPO config")),
         n_layers=int(require_cfg_value(ppo_cfg, "n_layers", "PPO config")),
-        ffn_dim=int(require_cfg_value(ppo_cfg, "ffn_dim", "PPO config")),
+        d_ffn=int(require_cfg_value(ppo_cfg, "d_ffn", "PPO config")),
         attn_dropout=float(require_cfg_value(ppo_cfg, "attn_dropout", "PPO config")),
         ppo_epochs=int(require_cfg_value(ppo_cfg, "ppo_epochs", "PPO config")),
         lr=float(require_cfg_value(ppo_cfg, "policy_lr", "PPO config")),

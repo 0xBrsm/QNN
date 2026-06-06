@@ -16,7 +16,7 @@ the one component that needs the time axis to apply reset_mask
 per-step).
 
 Forward returns
-``(features, logits_dict, values, next_hidden, target_logits, target_query)``;
+``(features, logits_dict, values, next_hidden, target_logits)``;
 ablation modules (e.g. ``qnn.model.bench.*``) must respect the same contract.
 """
 
@@ -35,8 +35,7 @@ from qnn.model.move_head import MoveHead, MoveHeadInput
 from qnn.model.target import TargetPointer, TargetPointerInput
 from qnn.model.temporal import Temporal, TemporalInput
 from qnn.model.transformer import ObsEmbedding, TransformerEncoder
-from qnn.model.weapon_head import WeaponHead, WeaponHeadInput, weapon_index_from_id
-from qnn.schema import WEAPON_HEAD_SIZE
+from qnn.model.weapon_head import WeaponHead, WeaponHeadInput
 from qnn.vocab import TOKEN_ACTOR
 
 
@@ -47,53 +46,52 @@ class ModelConfig:
     All fields are required; defaults live only in model.json. The
     dataclass is frozen so a constructed config can't drift from its
     serialized form. ``head_activation`` is "none" or "gelu" (ReLU was
-    removed). ``head_bottleneck_dim`` is per-head ({move,look,attack,weapon}
-    → int); ``0`` disables the bottleneck for that head.
+    removed). Per-action-head MLP intermediate widths are explicit
+    scalars (``d_move`` etc.); ``0`` disables the intermediate
+    layer for that head.
+
+    The target pointer is the MLP variant — see
+    :mod:`qnn.model.target`. ``d_target`` is its MLP hidden width and
+    the only architectural knob. Legacy attention-style variants
+    (cls/GRU query, weapon-id query shift, hard-argmax / gt-dist /
+    prev-target probes, learnable idx prior) live exclusively in
+    :mod:`qnn.model.bench` for ablation.
     """
     d_model: int
     n_heads: int
     n_layers: int
-    ffn_dim: int
+    d_ffn: int
     attn_dropout: float
     use_gru: bool
-    gru_hidden: int
+    d_gru: int
     use_weapon_head: bool
     weapon_switch_confidence: float
     weapon_switch_margin: float
     weapon_use_gru: bool
     weapon_context_from_obs: bool
     look_bypass_gru: bool
-    gru_target_query: bool
-    hard_target_feat: bool
-    weapon_in_target_query: bool
-    linear_idx_prior: bool
-    gt_dist_target_feat: bool
-    prev_target_in_query: bool
+    d_target: int
     weapon_use_self_readout: bool
     self_weapon_embed_in_self: bool
-    head_bottleneck_dim: "dict[str, int]"
+    d_move: int
+    d_look: int
+    d_attack: int
+    d_weapon: int
     head_activation: str
 
     @classmethod
     def from_dict(cls, raw: "Mapping[str, Any]") -> "ModelConfig":
         """Build from a model.json-style mapping.
 
-        Accepts ``head_bottleneck_dim`` as either an int (broadcast to all
-        four heads) or a per-head dict. Strips the legacy ``encoder_hidden``
-        alias of ``d_model``. Any other unknown key or any missing
-        required field raises TypeError — every architectural flag must
-        be set explicitly in model.json.
+        Strips the legacy ``encoder_hidden`` alias of ``d_model``. Any
+        other unknown key or any missing required field raises
+        TypeError — every architectural flag must be set explicitly in
+        model.json.
         """
         data = dict(raw)
         data.pop("encoder_hidden", None)
         if "weapon_use_cls_readout" in data:
             data.setdefault("weapon_use_self_readout", data.pop("weapon_use_cls_readout"))
-        hbd = data.get("head_bottleneck_dim")
-        if isinstance(hbd, int):
-            v = int(hbd)
-            data["head_bottleneck_dim"] = {"move": v, "look": v, "attack": v, "weapon": v}
-        elif isinstance(hbd, Mapping):
-            data["head_bottleneck_dim"] = {k: int(v) for k, v in hbd.items()}
         if data.get("head_activation") not in ("none", "gelu", "relu"):
             raise ValueError(
                 f"head_activation must be 'none', 'gelu', or 'relu', got {data.get('head_activation')!r}"
@@ -132,6 +130,11 @@ ATTACK_HEAD_SIZE = 1  # binary logit
 # Mirrors qnn.bc.target_labeler._ACTOR_REL_OFFSET; duplicated here so the model
 # layer doesn't import from BC.
 _ACTOR_REL_OFFSET = 3
+# Offset of the team scalar inside an actor's per-token scalar vector.
+# Mirrors qnn.bc.target_labeler._ACTOR_TEAM_OFFSET. Used to derive enemy_mask
+# for the target pointer.
+_ACTOR_TEAM_OFFSET = 16
+_TEAM_TEAMMATE_VALUE = 1.0
 
 
 class _Off:
@@ -188,9 +191,8 @@ def _restore_outputs(
     logits_flat: Dict[str, torch.Tensor],
     values_flat: torch.Tensor,
     target_logits_flat: torch.Tensor,
-    target_query_flat: torch.Tensor,
     seq_shape: tuple[int, int],
-) -> tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """Reshape every flat output back to ``(T, B, ...)`` for sequence callers."""
     seq_len, batch_size = seq_shape
     features = features_flat.reshape(seq_len, batch_size, -1)
@@ -200,8 +202,7 @@ def _restore_outputs(
     }
     values = values_flat.reshape(seq_len, batch_size)
     target_logits = target_logits_flat.reshape(seq_len, batch_size, target_logits_flat.shape[-1])
-    target_query = target_query_flat.reshape(seq_len, batch_size, target_query_flat.shape[-1])
-    return features, logits, values, target_logits, target_query
+    return features, logits, values, target_logits
 
 
 def compute_slot_dims(
@@ -219,28 +220,28 @@ def compute_slot_dims(
 
     Keys:
       d_model           — token width / target_feat width / weapon_context width.
-      gru_hidden        — Temporal hidden width (0 when temporal slot is off).
+      d_gru        — Temporal hidden width (0 when temporal slot is off).
       base_features_dim — input to motor heads excluding weapon_context.
       motor_in          — input to MoveHead / LookHead / AttackHead.
       weapon_in         — input to WeaponHead's classifier.
     """
     if has_temporal is None:
-        has_temporal = bool(model.use_gru and model.gru_hidden > 0)
+        has_temporal = bool(model.use_gru and model.d_gru > 0)
     if has_weapon_head is None:
         has_weapon_head = bool(model.use_weapon_head)
-    gru_hidden = int(model.gru_hidden) if has_temporal else 0
+    d_gru = int(model.d_gru) if has_temporal else 0
     d_model = int(model.d_model)
     weapon_ctx_dim = d_model if has_weapon_head else 0
-    base_features_dim = (gru_hidden + d_model) if has_temporal else (2 * d_model)
+    base_features_dim = (d_gru + d_model) if has_temporal else (2 * d_model)
     motor_in = base_features_dim + weapon_ctx_dim
     weapon_in = (
-        (gru_hidden if (model.weapon_use_gru and has_temporal) else 0)
+        (d_gru if (model.weapon_use_gru and has_temporal) else 0)
         + (d_model if model.weapon_use_self_readout else 0)
         + d_model
     )
     return {
         "d_model": d_model,
-        "gru_hidden": gru_hidden,
+        "d_gru": d_gru,
         "base_features_dim": base_features_dim,
         "motor_in": motor_in,
         "weapon_in": weapon_in,
@@ -251,8 +252,7 @@ class Network(nn.Module):
     """The compute graph: encoder + temporal + target pointer + heads.
 
     Built by ``QNNPolicy`` (the training-time wrapper). Forward returns the
-    six-tuple ``(features, logits_dict, values, next_hidden, target_logits,
-    target_query)``.
+    five-tuple ``(features, logits_dict, values, next_hidden, target_logits)``.
 
     Per-slot overrides
     ------------------
@@ -309,11 +309,11 @@ class Network(nn.Module):
             d_model=int(model.d_model),
             n_heads=int(model.n_heads),
             n_layers=int(model.n_layers),
-            ffn_dim=int(model.ffn_dim),
+            d_ffn=int(model.d_ffn),
             dropout=float(model.attn_dropout),
         )
-        self.use_gru = bool(model.use_gru and model.gru_hidden > 0)
-        self.gru_hidden = int(model.gru_hidden) if self.use_gru else 0
+        self.use_gru = bool(model.use_gru and model.d_gru > 0)
+        self.d_gru = int(model.d_gru) if self.use_gru else 0
         self.use_weapon_head = bool(model.use_weapon_head)
         # look_bypass_gru is a v17-fidelity load-time flag.  v20+ always sets
         # this False — when True (only via QNNPolicy.load on a v17 checkpoint)
@@ -333,26 +333,11 @@ class Network(nn.Module):
                 "alone is too thin)"
             )
         self.weapon_context_from_obs = bool(model.weapon_context_from_obs)
-        self.gru_target_query = bool(model.gru_target_query and self.use_gru)
-        # hard_target_feat: target_feat is the entity vector at a single chosen
-        # idx (BC GT during training, argmax at eval) instead of a soft pool.
-        # Decouples target-head loss tuning from motor-head training distribution.
-        self.hard_target_feat = bool(model.hard_target_feat)
-        self.weapon_in_target_query = bool(model.weapon_in_target_query and self.use_gru)
-        self.linear_idx_prior = bool(model.linear_idx_prior and self.use_gru)
-        # gt_dist_target_feat: training-time STE that pools target_feat by the
-        # labeler's GT idx distribution in the forward and routes gradient
-        # through softmax(logits) on the backward. Motors see clean target
-        # context; the pointer still trains from motor gradient. Gated on
-        # self.training inside TargetPointer so val/eval/PPO use soft.
-        self.gt_dist_target_feat = bool(model.gt_dist_target_feat and self.use_gru)
-        # prev_target_in_query: concat previous-frame renormalized idx
-        # distribution (16 floats) to the target pointer's query input. At
-        # BC train the caller passes the GT prev dist (privileged); at
-        # eval the caller passes None and TargetPointer substitutes zeros
-        # (probe-style train/eval forward mismatch — see target docstring).
-        self.prev_target_in_query = bool(model.prev_target_in_query and self.use_gru)
-        self.head_bottleneck_dims = dict(model.head_bottleneck_dim)
+        self.d_target = int(model.d_target)
+        self.d_move = int(model.d_move)
+        self.d_look = int(model.d_look)
+        self.d_attack = int(model.d_attack)
+        self.d_weapon = int(model.d_weapon)
         self.head_activation = model.head_activation
 
         # Resolve slot activation FIRST so dim computation reflects what
@@ -370,10 +355,10 @@ class Network(nn.Module):
         # base_features_dim swaps gru_flat → self_readout when temporal is off;
         # the weapon_ctx contribution to motor_in disappears when weapon head is off.
         weapon_ctx_dim = self.d_model if self._has_weapon_head else 0
-        base_features_dim = (self.gru_hidden + self.d_model) if self._has_temporal else (2 * self.d_model)
+        base_features_dim = (self.d_gru + self.d_model) if self._has_temporal else (2 * self.d_model)
         motor_in = base_features_dim + weapon_ctx_dim
         weapon_in = (
-            (self.gru_hidden if (self.weapon_use_gru and self._has_temporal) else 0)
+            (self.d_gru if (self.weapon_use_gru and self._has_temporal) else 0)
             + (self.d_model if self.weapon_use_self_readout else 0)
             + self.d_model  # target_feat is always present (zero when target_pointer is off)
         )
@@ -382,7 +367,7 @@ class Network(nn.Module):
 
         if self._has_temporal:
             self.temporal = (
-                Temporal(d_model=self.d_model, hidden_dim=self.gru_hidden)
+                Temporal(d_model=self.d_model, hidden_dim=self.d_gru)
                 if temporal is None else temporal
             )
 
@@ -390,13 +375,7 @@ class Network(nn.Module):
             if target_pointer is None:
                 self.target_pointer = TargetPointer(
                     d_model=self.d_model,
-                    query_in_dim=self.gru_hidden if (self._has_temporal and self.gru_target_query) else self.d_model,
-                    inject_weapon=self.weapon_in_target_query,
-                    weapon_vocab=WEAPON_HEAD_SIZE,
-                    hard_target=self.hard_target_feat,
-                    linear_idx_prior=self.linear_idx_prior,
-                    gt_dist_target_feat=self.gt_dist_target_feat,
-                    prev_target_in_query=self.prev_target_in_query,
+                    d_target=self.d_target,
                 )
             else:
                 self.target_pointer = target_pointer
@@ -406,7 +385,7 @@ class Network(nn.Module):
                 self.weapon_head = WeaponHead(
                     selector_dim=weapon_in,
                     d_model=self.d_model,
-                    bottleneck_dim=self.head_bottleneck_dims["weapon"],
+                    d_hidden=self.d_weapon,
                     activation=self.head_activation,
                     context_from_obs=self.weapon_context_from_obs,
                 )
@@ -415,19 +394,19 @@ class Network(nn.Module):
 
         if self._has_move_head:
             self.move_head = (
-                MoveHead(in_dim=motor_in, bottleneck_dim=self.head_bottleneck_dims["move"], activation=self.head_activation)
+                MoveHead(in_dim=motor_in, d_hidden=self.d_move, activation=self.head_activation)
                 if move_head is None else move_head
             )
         if self._has_look_head:
             self.look_head = (
-                LookHead(in_dim=motor_in, bottleneck_dim=self.head_bottleneck_dims["look"], activation=self.head_activation)
+                LookHead(in_dim=motor_in, d_hidden=self.d_look, activation=self.head_activation)
                 if look_head is None else look_head
             )
         if self._has_attack_head:
             self.attack_head = (
                 AttackHead(
                     in_dim=motor_in,
-                    bottleneck_dim=self.head_bottleneck_dims["attack"],
+                    d_hidden=self.d_attack,
                     activation=self.head_activation,
                 )
                 if attack_head is None else attack_head
@@ -456,10 +435,7 @@ class Network(nn.Module):
         obs: Dict[str, torch.Tensor],
         hidden: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
-        target_gt: torch.Tensor | None = None,
-        target_probs_idx: torch.Tensor | None = None,
-        prev_target_probs: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         seq_shape, flat_obs = _flatten_obs(obs)
         sample = flat_obs.get("vel")
         if sample is None:
@@ -482,44 +458,29 @@ class Network(nn.Module):
             gru_flat = None
             next_hidden = torch.zeros((batch_flat, 0), dtype=sample.dtype, device=sample.device)
 
-        # Target pointer (slot). Query is gru_flat when temporal is active and
-        # gru_target_query is set; otherwise self_readout. When the slot is
-        # Off, target_logits / target_feat / target_query become zeros and
-        # downstream consumers continue with shape-preserving substitutes.
+        # Target pointer (slot). The canonical MLP pointer scores each entity
+        # token independently and pools by the resulting softmax; enemy_mask
+        # restricts the softmax to actor entities that are not on the
+        # player's team. When the slot is Off, target_logits / target_feat
+        # become zeros and downstream consumers continue with
+        # shape-preserving substitutes.
+        actor_mask_flat = (flat_obs["entity_types"].long() == TOKEN_ACTOR)
+        team_flat = flat_obs["entity_scalars_raw"][..., _ACTOR_TEAM_OFFSET]
+        enemy_mask_flat = actor_mask_flat & (team_flat != _TEAM_TEAMMATE_VALUE)
         if self._has_target_pointer:
-            tp_query = gru_flat if (self._has_temporal and self.gru_target_query) else self_readout
-            tp_weapon_idx = None
-            if self.weapon_in_target_query:
-                tp_weapon_idx = weapon_index_from_id(
-                    flat_obs["self_weapon_id"].reshape(-1)
-                ).clamp(0, WEAPON_HEAD_SIZE - 1)
-            tp_target_gt = target_gt.reshape(-1) if target_gt is not None else None
-            tp_target_probs_idx = (
-                target_probs_idx.reshape(-1, target_probs_idx.shape[-1])
-                if target_probs_idx is not None else None
-            )
-            tp_prev_target_probs = (
-                prev_target_probs.reshape(-1, prev_target_probs.shape[-1])
-                if prev_target_probs is not None else None
-            )
             tp_out = self.target_pointer(TargetPointerInput(
-                query=tp_query,
                 entity_outs=enc_out.entity_outs,
                 entity_mask=enc_out.entity_mask,
-                self_weapon_idx=tp_weapon_idx,
-                target_gt=tp_target_gt,
-                target_probs_idx=tp_target_probs_idx,
-                prev_target_probs=tp_prev_target_probs,
+                enemy_mask=enemy_mask_flat,
+                self_readout=self_readout,
             ))
             target_logits = tp_out.target_logits
             target_feat = tp_out.target_feat
-            target_query = tp_out.target_query
         else:
             n_entities = int(enc_out.entity_outs.shape[1])
             zero_kw = {"dtype": self_readout.dtype, "device": self_readout.device}
             target_logits = torch.zeros((batch_flat, n_entities), **zero_kw)
             target_feat = torch.zeros((batch_flat, self.d_model), **zero_kw)
-            target_query = torch.zeros((batch_flat, self.d_model), **zero_kw)
 
         if self._has_temporal:
             features_base_flat = torch.cat([gru_flat, target_feat], dim=-1)
@@ -536,7 +497,6 @@ class Network(nn.Module):
 
         entity_scalars_flat = flat_obs["entity_scalars_raw"]
         entity_rel_flat = entity_scalars_flat[..., _ACTOR_REL_OFFSET:_ACTOR_REL_OFFSET + 3]
-        actor_mask_flat = (flat_obs["entity_types"].long() == TOKEN_ACTOR)
 
         weapon_out = None
         if self._has_weapon_head:
@@ -609,10 +569,10 @@ class Network(nn.Module):
         if seq_shape is None:
             return (
                 features_flat, logits_flat, values_flat,
-                next_hidden, target_logits, target_query,
+                next_hidden, target_logits,
             )
-        features, logits, values, target_logits, target_query = _restore_outputs(
+        features, logits, values, target_logits = _restore_outputs(
             features_flat, logits_flat, values_flat,
-            target_logits, target_query, seq_shape,
+            target_logits, seq_shape,
         )
-        return features, logits, values, next_hidden, target_logits, target_query
+        return features, logits, values, next_hidden, target_logits

@@ -39,11 +39,19 @@ ENGINE-FACING (ActionLabels):
 
 TRAINING-FACING (on-disk corpus):
 
-  move    uint8 packed (6 bits)
-            bits 0-1 = fb axis class {0=back, 1=none, 2=forward}
-            bits 2-3 = lr axis class {0=left, 1=none, 2=right}
-            bits 4-5 = ud axis class {0=down, 1=none, 2=up}
-            Loader unpacks to ``uint8[T, 3]`` — one class index per axis.
+  move    uint8 packed (one bit per direction — mirrors the
+                       input_mask byte produced by QNN_PackInputMask):
+            bit 0 = attack press
+            bit 1 = fb neg            bit 2 = fb pos
+            bit 3 = lr neg            bit 4 = lr pos
+            bit 5 = ud neg            bit 6 = ud pos (swim-up / jumppad
+                                                       upmove>0, NOT
+                                                       jump button)
+            bit 7 = jump button press
+            Loader (qnn.bc.train._unpack_move_axes) collapses each axis
+            pair into ``uint8[T, 3]`` class indices in {0=neg,1=none,
+            2=pos} via ``class = 1 + pos_bit - neg_bit``.  Attack and
+            jump bits are extracted separately.
 
   look    float16[3]  Same semantics as engine-facing.  fp16 is finer
                       than the source mouse quantization (~0.066°) so

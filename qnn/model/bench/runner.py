@@ -84,6 +84,14 @@ def _build_head_probe_bc_config(
     bc_cfg["prefetch"] = int(_require_key(machine, "prefetch", "machine.json"))
     bc_cfg["snapshot_interval"] = int(_require_key(machine, "snapshot_interval", "machine.json"))
     bc_cfg["streaming"] = bool(_require_key(machine, "streaming", "machine.json"))
+    # Optional per-run knob: engagement EMA decay rate. Defaults to 0.5
+    # to preserve historical behavior for run-dirs that don't set it.
+    bc_cfg["engagement_ema_alpha"] = float(probe.get("engagement_ema_alpha", 0.5))
+    # Optional per-run knob: when true, the attack-head LOSS is computed
+    # against a +1 op-frame shifted attack label (val metrics still use
+    # the original label). Off by default — bit-identical to historical
+    # runs that don't set it. See BCConfig.attack_label_shift.
+    bc_cfg["attack_label_shift"] = bool(probe.get("attack_label_shift", False))
 
     return BCConfig(**bc_cfg), model_factory
 

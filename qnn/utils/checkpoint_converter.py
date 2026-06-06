@@ -120,7 +120,12 @@ def save_sf_format(
     bc_state = bc_policy.model.state_dict()
     sf_style: Dict[str, torch.Tensor] = {}
 
-    # Encoder
+    # ─── Encoder ──────────────────────────────────────────────────
+    # BC trunk lives under ``obs_embedding.*`` + ``encoder.*``; SF's
+    # actor-critic wraps both under its own ``encoder.*`` namespace.
+    # ``target_pointer.*`` is the MLP score module (``score.0.*`` /
+    # ``score.2.*``) — port its keys so the SF QuakeTransformerEncoder's
+    # owned TargetPointer warm-starts rather than orthogonal-initializing.
     for bc_key, tensor in bc_state.items():
         if bc_key.startswith("obs_embedding."):
             sf_key = f"encoder.{bc_key}"
@@ -128,41 +133,80 @@ def save_sf_format(
         elif bc_key.startswith("encoder."):
             sf_key = f"{_SF_ENCODER_PREFIX}.{bc_key[len('encoder.'):]}"
             sf_style[sf_key] = tensor.cpu()
+        elif bc_key.startswith("target_pointer."):
+            sf_key = f"encoder.{bc_key}"
+            sf_style[sf_key] = tensor.cpu()
+        # Legacy attention-style pointer keys (query_proj.*,
+        # weapon_query_embed.*, idx_prior_scale) are silently dropped:
+        # the pre-MLP pointer doesn't load into the new MLP score module.
+        # Pre-promotion checkpoints are not compatible — see
+        # ModelConfig.d_target for the new pointer's sole knob.
 
-    # GRU
+    # ─── GRU ───────────────────────────────────────────────────────
+    # Pre-temporal-wrap checkpoints emit ``gru.*``; modern checkpoints
+    # (post-migrate_wrap_gru_in_temporal) emit ``temporal.gru.*``. SF
+    # expects ``core.core.*``.
     for gru_param in ("weight_ih_l0", "weight_hh_l0", "bias_ih_l0", "bias_hh_l0"):
-        bc_key = f"gru.{gru_param}"
-        if bc_key in bc_state:
-            sf_style[f"{_SF_GRU_PREFIX}.{gru_param}"] = bc_state[bc_key].cpu()
+        for bc_prefix in ("temporal.gru.", "gru."):
+            bc_key = f"{bc_prefix}{gru_param}"
+            if bc_key in bc_state:
+                sf_style[f"{_SF_GRU_PREFIX}.{gru_param}"] = bc_state[bc_key].cpu()
+                break
 
-    # Value head
+    # ─── Value head ────────────────────────────────────────────────
+    # Modern BC doesn't train a value head (combat-objective phase 1);
+    # leave SF's critic_linear at random init. Earlier checkpoints
+    # carried a ``value_head.*`` Linear → keep the old mapping for them.
     for suffix in ("weight", "bias"):
         bc_key = f"value_head.{suffix}"
         if bc_key in bc_state:
             sf_style[f"{_SF_VALUE_PREFIX}.{suffix}"] = bc_state[bc_key].cpu()
 
-    # Combined policy head
-    combined_w_parts = []
-    combined_b_parts = []
-    for head in _HEAD_ORDER:
-        weight_key = f"policy_heads.{head}.weight"
-        bias_key = f"policy_heads.{head}.bias"
-        if weight_key not in bc_state or bias_key not in bc_state:
-            continue
-        head_weight = bc_state[weight_key]
-        head_bias = bc_state[bias_key]
-        if head in CONTINUOUS_ACTION_HEADS:
-            log_std_key = f"continuous_log_std.{head}"
-            log_std = bc_state[log_std_key] if log_std_key in bc_state else torch.full_like(head_bias, -1.0)
-            combined_w_parts.extend([head_weight, torch.zeros_like(head_weight)])
-            combined_b_parts.extend([head_bias, log_std])
-        else:
-            combined_w_parts.append(head_weight)
-            combined_b_parts.append(head_bias)
-    if combined_w_parts:
-        sf_style[f"{_SF_COMBINED_HEAD_KEY}.weight"] = torch.cat(combined_w_parts, dim=0).cpu()
-    if combined_b_parts:
-        sf_style[f"{_SF_COMBINED_HEAD_KEY}.bias"] = torch.cat(combined_b_parts, dim=0).cpu()
+    # ─── Action head ───────────────────────────────────────────────
+    # Modern BC heads (move/look/attack/weapon) are bottleneck MLPs
+    # (Linear → GELU → Linear) under ``{head}_head.mlp.*``, while SF
+    # expects a single combined Linear over all heads at
+    # ``action_parameterization.distribution_linear.*``. There is no
+    # bit-perfect projection, so when we detect the modern layout we
+    # skip the action head copy and let SF orthogonal-init it — the
+    # encoder + GRU + target_pointer warm-start is still useful for
+    # PPO. Older checkpoints with the flat ``policy_heads.*`` layout
+    # keep the legacy concat path.
+    # Modern heads are wired together — one canonical lookup catches
+    # all four. (move_head.mlp.0.weight is the move head's input
+    # projection; if it's present, the BC checkpoint was trained with
+    # bottleneck-MLP heads end to end.)
+    has_modern_heads = "move_head.mlp.0.weight" in bc_state
+    if has_modern_heads:
+        print(
+            "[bc_to_sf] BC checkpoint uses bottleneck-MLP heads "
+            "(move_head/look_head/attack_head/weapon_head); SF's flat "
+            "action_parameterization can't represent them — leaving the SF "
+            "action head and critic_linear at orthogonal init. Encoder + GRU + "
+            "target_pointer weights are warm-started."
+        )
+    else:
+        combined_w_parts = []
+        combined_b_parts = []
+        for head in _HEAD_ORDER:
+            weight_key = f"policy_heads.{head}.weight"
+            bias_key = f"policy_heads.{head}.bias"
+            if weight_key not in bc_state or bias_key not in bc_state:
+                continue
+            head_weight = bc_state[weight_key]
+            head_bias = bc_state[bias_key]
+            if head in CONTINUOUS_ACTION_HEADS:
+                log_std_key = f"continuous_log_std.{head}"
+                log_std = bc_state[log_std_key] if log_std_key in bc_state else torch.full_like(head_bias, -1.0)
+                combined_w_parts.extend([head_weight, torch.zeros_like(head_weight)])
+                combined_b_parts.extend([head_bias, log_std])
+            else:
+                combined_w_parts.append(head_weight)
+                combined_b_parts.append(head_bias)
+        if combined_w_parts:
+            sf_style[f"{_SF_COMBINED_HEAD_KEY}.weight"] = torch.cat(combined_w_parts, dim=0).cpu()
+        if combined_b_parts:
+            sf_style[f"{_SF_COMBINED_HEAD_KEY}.bias"] = torch.cat(combined_b_parts, dim=0).cpu()
 
     # Seed returns_normalizer at identity (the actor-critic constructs this
     # module regardless of cfg.normalize_input). We skip the obs_normalizer
@@ -204,15 +248,12 @@ def save_sf_format(
             }],
         },
     }
+    # Arch fields are sourced from the policy's ModelConfig (the
+    # canonical home is now ``bc_policy.config`` — a frozen
+    # ModelConfig dataclass; the older flat attributes are gone).
     meta = {
         "obs_dim": bc_policy.obs_dim,
-        "encoder_hidden": bc_policy.encoder_hidden,
-        "gru_hidden": bc_policy.gru_hidden,
-        "use_gru": bc_policy.use_gru,
-        "n_heads": bc_policy.n_heads,
-        "n_layers": bc_policy.n_layers,
-        "ffn_dim": bc_policy.ffn_dim,
-        "attn_dropout": bc_policy.attn_dropout,
+        "model": bc_policy.config.to_dict(),
         "source": "bc_to_sf_converter",
     }
     ckpt_path = output / "checkpoint_000000000_0.pth"
@@ -237,7 +278,7 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
     """Translate a pre-ModelConfig flat checkpoint meta into the modern nested format.
 
     Pre-ModelConfig checkpoints stored architecture as a flat top-level dict
-    (`d_model`, `gru_hidden`, `look_bypass_gru`, ...). Modern ``QNNPolicy.load``
+    (`d_model`, `d_gru`, `look_bypass_gru`, ...). Modern ``QNNPolicy.load``
     expects ``meta["model"]`` to be a ModelConfig-shaped sub-dict and requires
     ``jump_pos_weight`` at the top level. Two flavors are recognized:
 
@@ -259,8 +300,8 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
     """
     if "model" in meta:
         return None
-    required = ("d_model", "n_heads", "n_layers", "ffn_dim", "attn_dropout",
-                "use_gru", "gru_hidden", "look_bypass_gru")
+    required = ("d_model", "n_heads", "n_layers", "d_ffn", "attn_dropout",
+                "use_gru", "d_gru", "look_bypass_gru")
     if any(k not in meta for k in required):
         return None
 
@@ -271,10 +312,10 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
             "d_model":                  int(meta["d_model"]),
             "n_heads":                  int(meta["n_heads"]),
             "n_layers":                 int(meta["n_layers"]),
-            "ffn_dim":                  int(meta["ffn_dim"]),
+            "d_ffn":                  int(meta["d_ffn"]),
             "attn_dropout":             float(meta["attn_dropout"]),
             "use_gru":                  bool(meta["use_gru"]),
-            "gru_hidden":               int(meta["gru_hidden"]),
+            "d_gru":               int(meta["d_gru"]),
             # v17 had no weapon head — state_dict migration allow-lists
             # weapon_head.* / weapon_embed.* as missing keys at load time.
             "use_weapon_head":          False,
@@ -283,19 +324,18 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
             "weapon_use_gru":           False,
             "weapon_context_from_obs":  False,
             "look_bypass_gru":          bool(meta["look_bypass_gru"]),
-            # v17's target_bypass_gru=True maps to gru_target_query=False
-            # (target_pointer queries with cls_readout, not gru_flat).
-            "gru_target_query":         False,
-            "hard_target_feat":         False,
-            "weapon_in_target_query":   False,
-            "linear_idx_prior":        False,
-            "gt_dist_target_feat":      False,
-            "prev_target_in_query":     False,
+            # MLP target pointer hidden width — d_model is the historical
+            # default. v17 had no MLP pointer; weights are random-init at
+            # load time for the new score module.
+            "d_target":                 int(meta["d_model"]),
             # Required by invariant even when use_weapon_head=False
             # (weapon_head module isn't built so the value is inert).
             "weapon_use_self_readout":  True,
             "self_weapon_embed_in_self": False,
-            "head_bottleneck_dim":      0,
+            "d_move":      0,
+            "d_look":      0,
+            "d_attack":    0,
+            "d_weapon":    0,
             "head_activation":          "none",
         }
         return {
@@ -307,50 +347,55 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
         }
 
     # v22 schema: most modern fields already present, only the post-v22
-    # additions (target-pointer flavors, weapon_use_self_readout) need
-    # synthesized defaults. v22 stored head_bottleneck_dims (plural) — the
-    # current ModelConfig.from_dict expects singular head_bottleneck_dim.
-    bottleneck = meta.get("head_bottleneck_dims") or meta.get("head_bottleneck_dim")
+    # additions need synthesized defaults.  Older schemas stored the
+    # per-head MLP widths under names that have since been retired:
+    #   * v22:        head_bottleneck_dims (dict, "fire" head name)
+    #   * v23 era:    head_d_hidden        (dict, "attack" head name)
+    # The modern schema is four scalar fields (d_move,
+    # d_look, d_attack, d_weapon).
+    bottleneck = meta.get("head_bottleneck_dims") or meta.get("head_d_hidden")
     if isinstance(bottleneck, dict):
         # Legacy "fire" head key was renamed "attack" to match the QW
         # source's BUTTON_ATTACK / self.button0 naming.
-        head_bottleneck_dim: Any = {k: int(v) for k, v in bottleneck.items()}
-        if "fire" in head_bottleneck_dim and "attack" not in head_bottleneck_dim:
-            head_bottleneck_dim["attack"] = head_bottleneck_dim.pop("fire")
+        bd = {k: int(v) for k, v in bottleneck.items()}
+        if "fire" in bd and "attack" not in bd:
+            bd["attack"] = bd.pop("fire")
+        d_move = int(bd.get("move", 0))
+        d_look = int(bd.get("look", 0))
+        d_attack = int(bd.get("attack", 0))
+        d_weapon = int(bd.get("weapon", 0))
     elif bottleneck is not None:
-        head_bottleneck_dim = int(bottleneck)
+        v = int(bottleneck)
+        d_move = d_look = d_attack = d_weapon = v
     else:
-        head_bottleneck_dim = 0
+        # Modern direct schema — already four scalars in the metadata.
+        d_move = int(meta.get("d_move", 0))
+        d_look = int(meta.get("d_look", 0))
+        d_attack = int(meta.get("d_attack", 0))
+        d_weapon = int(meta.get("d_weapon", 0))
 
     model_cfg = {
         "d_model":                   int(meta["d_model"]),
         "n_heads":                   int(meta["n_heads"]),
         "n_layers":                  int(meta["n_layers"]),
-        "ffn_dim":                   int(meta["ffn_dim"]),
+        "d_ffn":                   int(meta["d_ffn"]),
         "attn_dropout":              float(meta["attn_dropout"]),
         "use_gru":                   bool(meta["use_gru"]),
-        "gru_hidden":                int(meta["gru_hidden"]),
+        "d_gru":                int(meta["d_gru"]),
         "use_weapon_head":           bool(meta.get("use_weapon_head", True)),
         "weapon_switch_confidence":  float(meta.get("weapon_switch_confidence", 0.65)),
         "weapon_switch_margin":      float(meta.get("weapon_switch_margin", 0.15)),
         "weapon_use_gru":            bool(meta.get("weapon_use_gru", True)),
         "weapon_context_from_obs":   bool(meta.get("weapon_context_from_obs", False)),
         "look_bypass_gru":           bool(meta["look_bypass_gru"]),
-        # Per-flag defaults preserved where the legacy flat meta didn't
-        # carry them. Where the flag IS present in the source meta, use
-        # that value — pre-v23 flat checkpoints did persist some of
-        # these flags at the top level (gru_target_query, etc.) and
-        # discarding them silently caused state-dict mismatches on load
-        # (e.g. missing target_pointer.weapon_query_embed when
-        # weapon_in_target_query=True at training time).
-        "gru_target_query":          bool(meta.get("gru_target_query", False)),
-        "hard_target_feat":          bool(meta.get("hard_target_feat", False)),
-        "weapon_in_target_query":    bool(meta.get("weapon_in_target_query", False)),
-        "linear_idx_prior":          bool(
-            meta.get("linear_idx_prior", meta.get("linear_slot_prior", False))
+        # MLP target pointer hidden width — falls back to d_model when
+        # the source meta predates the MLP pointer (pre-promotion
+        # checkpoints carried query_proj weights instead). state_dict
+        # migration drops the pre-MLP target_pointer.* keys and the new
+        # MLP score module is random-init at load.
+        "d_target":                  int(
+            meta.get("d_target", meta.get("d_model"))
         ),
-        "gt_dist_target_feat":       bool(meta.get("gt_dist_target_feat", False)),
-        "prev_target_in_query":      bool(meta.get("prev_target_in_query", False)),
         # Historical default (true) — weapon head trained with
         # cat(gru_flat, self_readout, target_feat) selector. Legacy
         # temporary feature-branch alias was ``weapon_use_cls_readout``.
@@ -358,7 +403,10 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
             meta.get("weapon_use_self_readout", meta.get("weapon_use_cls_readout", True))
         ),
         "self_weapon_embed_in_self": bool(meta.get("self_weapon_embed_in_self", False)),
-        "head_bottleneck_dim":       head_bottleneck_dim,
+        "d_move":             d_move,
+        "d_look":             d_look,
+        "d_attack":           d_attack,
+        "d_weapon":           d_weapon,
         "head_activation":           str(meta.get("head_activation", "relu")),
     }
     # fire_* keys are the pre-rename names for the attack-head focal /

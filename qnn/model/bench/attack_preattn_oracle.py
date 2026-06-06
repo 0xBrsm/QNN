@@ -45,12 +45,12 @@ def _build_attack_oracle(probe: Mapping[str, Any]) -> HeadBuildResult:
 
       d_model (int).
       self_weapon_embed_in_self (bool).
-      hidden (int): residual MLP bottleneck width.
+      d_hidden (int): residual MLP bottleneck width.
       aim_scale (float): prior magnitude per unit aim cosine.
     """
     d_model = int(_required(probe, "d_model"))
     self_weapon = bool(_required(probe, "self_weapon_embed_in_self"))
-    hidden = int(_required(probe, "hidden"))
+    d_hidden = int(_required(probe, "d_hidden"))
     aim_scale = float(_required(probe, "aim_scale"))
 
     model_config = neutral_model_config(
@@ -73,7 +73,7 @@ def _build_attack_oracle(probe: Mapping[str, Any]) -> HeadBuildResult:
             weapon_head=Off,
             attack_head=OracleAttackHead(
                 in_dim=dims["motor_in"],
-                bottleneck_dim=hidden,
+                d_hidden=d_hidden,
                 activation="gelu",
                 aim_scale=aim_scale,
             ),

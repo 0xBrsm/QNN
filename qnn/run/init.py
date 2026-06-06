@@ -35,7 +35,7 @@ _TEMPLATE_DIRS = {
     "ppo": Path(__file__).resolve().parent.parent / "ppo" / "templates",
     "pbt": Path(__file__).resolve().parent.parent / "ppo" / "templates",
     "optuna": Path(__file__).resolve().parent.parent / "ppo" / "templates",
-    "head_probe": Path(__file__).resolve().parent.parent / "bc" / "heads" / "templates",
+    "head_probe": Path(__file__).resolve().parent.parent / "model" / "bench" / "templates",
 }
 
 

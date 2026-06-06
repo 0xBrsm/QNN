@@ -29,11 +29,11 @@ OUT_DIM = 1
 class WeaponAimAttackHead(nn.Module):
     """Attack head fed by (aim_vec, target_feat, noop) — computed internally."""
 
-    def __init__(self, in_dim: int, bottleneck_dim: int, activation: str) -> None:
+    def __init__(self, in_dim: int, d_hidden: int, activation: str) -> None:
         super().__init__()
         self._target_feat_dim = int(in_dim)
         mlp_in = 3 + self._target_feat_dim + 1
-        self.mlp = make_head_mlp(mlp_in, OUT_DIM, bottleneck_dim, activation)
+        self.mlp = make_head_mlp(mlp_in, OUT_DIM, d_hidden, activation)
 
     def forward(self, inp: AttackHeadInput) -> AttackHeadOutput:
         ctx = current_weapon_aim_context()

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.21.0
+
+### Added
+
+- Dynamic BC ablation daemon + reusable ablation-sequence runner (BC-source bundle plumbing) on top of the `head_probe` run-dir mode
+- Attack-head probe family: `engagement_ema` (op-frame EMA prior, α configurable via `probe.json`), `geom` (radial_vel/tang_speed/dist), `weapon_embed`, and the stacked `engaged_geom_weapon_embed`; `attack_op_only` loss/metric gating
+- PPO BC warm-start that survives modern arch drift: SF obs-space matched to the native worker, v23 meta normalization, overnight smoke script
+- `diag` attack-head input-column ablation + saliency report (also ablates encoder `self_scalars`); temporal look-head probe (prev_look + aim_vec prior, K-sweep)
+
+### Changed
+
+- Hyperparameters standardize on a `d_*` prefix (mirrors `n_*`); per-head MLP dims split into scalar fields (`bottleneck_dim` → `d_hidden`); the MLP target-head variant promoted to canonical (legacy → bench)
+- Target metrics locked to `val_target_kl` + `val_target_kl_multi`; the slot-confounded `acc_target*` family dropped
+- `input_mask` persisted in checkpoint meta (pre-fix reloads silently defaulted to `False`); `best_val_loss` renamed
+
+### Removed
+
+- `src/docker/runs/` leak
+
+### Fixed
+
+- BC obs capture made MDP-correct: obs snapshotted pre-`Host_Frame` so `(obs[t], action[t])` align, with pre-loop `attack_finished`
+- PPO encoder/core arity mismatch (3-way → 2-way split); worker stdout kept protocol-clean for trainer/demo workers
+
 ## 0.20.0
 
 ### Added

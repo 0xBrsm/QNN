@@ -52,7 +52,7 @@ class FlatFeatureHead(nn.Module):
         *,
         feature_names: tuple[str, ...],
         output_route: str,
-        hidden: int,
+        d_hidden: int,
         n_hidden_layers: int,
         dropout: float,
     ) -> None:
@@ -71,8 +71,8 @@ class FlatFeatureHead(nn.Module):
         layers: list[nn.Module] = []
         prev = self.in_dim
         for _ in range(int(n_hidden_layers)):
-            layers += [nn.Linear(prev, int(hidden)), nn.GELU(), nn.Dropout(float(dropout))]
-            prev = int(hidden)
+            layers += [nn.Linear(prev, int(d_hidden)), nn.GELU(), nn.Dropout(float(dropout))]
+            prev = int(d_hidden)
         layers.append(nn.Linear(prev, self.output_dim))
         self.head = nn.Sequential(*layers)
         # d_model is reported so QNNPolicy's runtime-shape computations
@@ -85,18 +85,25 @@ class FlatFeatureHead(nn.Module):
         obs: Dict[str, torch.Tensor],
         hidden: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
-        target_gt: torch.Tensor | None = None,
-        target_probs_idx: torch.Tensor | None = None,
-        prev_target_probs: torch.Tensor | None = None,
     ) -> Tuple[
         torch.Tensor,
         Dict[str, torch.Tensor],
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
     ]:
-        del hidden, reset_mask, target_gt, prev_target_probs
+        del hidden, reset_mask
+
+        # The target probe reads the GT idx distribution via the
+        # target-supervision contextvar (the trainer enters the scope per
+        # forward) so this head doesn't need a Network-forward kwarg.
+        from qnn.model.bench.inputs.target_supervision_context import (
+            current_target_supervision_context,
+        )
+        supervision = current_target_supervision_context()
+        target_probs_idx = (
+            supervision.target_probs_idx if supervision is not None else None
+        )
 
         sample = obs["self_scalars"]
         is_seq = sample.ndim == 3
@@ -106,17 +113,15 @@ class FlatFeatureHead(nn.Module):
             flat_obs: Dict[str, torch.Tensor] = {
                 k: v.reshape(T * B, *v.shape[2:]) for k, v in obs.items()
             }
-            tds_flat = (
-                target_probs_idx.reshape(T * B, target_probs_idx.shape[-1])
-                if target_probs_idx is not None else None
-            )
             BB = T * B
         else:
             B = int(sample.shape[0])
             T = 0
             flat_obs = obs
-            tds_flat = target_probs_idx
             BB = B
+        # target_probs_idx already arrives flat (BB, N) — the supervision
+        # scope flattens before entering the contextvar.
+        tds_flat = target_probs_idx
 
         features_flat = build_feature_vector(self.feature_names, flat_obs, tds_flat)  # (BB, F)
         out_flat = self.head(features_flat)                                            # (BB, D_out)
@@ -133,21 +138,18 @@ class FlatFeatureHead(nn.Module):
         else:
             target_logits_flat = out_flat
 
-        target_query_flat = torch.zeros((BB, self.d_model), dtype=dtype, device=device)
         values_flat = torch.zeros((BB,), dtype=dtype, device=device)
 
         if is_seq:
             features = features_flat.reshape(T, B, -1)
             attack_logits = attack_flat.reshape(T, B, ATTACK_HEAD_SIZE)
             target_logits = target_logits_flat.reshape(T, B, MAX_TOKEN_OBJECTS)
-            target_query = target_query_flat.reshape(T, B, self.d_model)
             values = values_flat.reshape(T, B)
             next_hidden = torch.zeros((B, 0), dtype=dtype, device=device)
         else:
             features = features_flat
             attack_logits = attack_flat
             target_logits = target_logits_flat
-            target_query = target_query_flat
             values = values_flat
             next_hidden = torch.zeros((B, 0), dtype=dtype, device=device)
 
@@ -157,4 +159,4 @@ class FlatFeatureHead(nn.Module):
         logits: Dict[str, torch.Tensor] = (
             {ATTACK_HEAD: attack_logits} if self.output_route == _ATTACK_ROUTE else {}
         )
-        return features, logits, values, next_hidden, target_logits, target_query
+        return features, logits, values, next_hidden, target_logits

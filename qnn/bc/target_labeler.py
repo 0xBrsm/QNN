@@ -299,7 +299,7 @@ def label_enemy_target_probs(
             cone_e = cone_val if cone_ok else 0.0
             phys_e = config.physics_hit_base if hit else 0.0
             base = 1.0 - (1.0 - cone_e) * (1.0 - phys_e)
-            vis = math.exp(-float(recency[t, s]) / config.recency_tau)
+            vis = math.exp(-max(0.0, float(recency[t, s])) / config.recency_tau)
             cand.append((pid, s))
             evidence.append(base * vis)
         if not evidence:
@@ -392,7 +392,7 @@ def label_enemy_target_probs(
             time_conf = (config.time_floor
                          + (1.0 - config.time_floor)
                          * math.exp(-dt / config.extension_tau))
-            vis = math.exp(-float(recency[t, s]) / config.recency_tau)
+            vis = math.exp(-max(0.0, float(recency[t, s])) / config.recency_tau)
             idx_scores[t, s] += eng_conf * time_conf * vis
 
     # ── Normalize per frame ──────────────────────────────────────────

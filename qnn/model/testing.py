@@ -11,7 +11,7 @@ Pattern:
     from qnn.model.look_head import LookHead
 
     inp = make_look_head_input(batch=8, in_dim=192)
-    out = LookHead(in_dim=192, bottleneck_dim=128, activation="gelu")(inp)
+    out = LookHead(in_dim=192, d_hidden=128, activation="gelu")(inp)
     assert out.pred_look.shape == (8, 3)
 
 The builders intentionally produce *valid* inputs (e.g. actor masks have
@@ -137,16 +137,21 @@ def make_encoder_input(
 def make_target_pointer_input(
     batch: int = 4,
     *,
-    query_in_dim: int = 64,
     d_model: int = 64,
     n_entities: int = MAX_TOKEN_OBJECTS,
     seed: int = 0,
 ) -> TargetPointerInput:
     gen = _gen(seed)
+    entity_mask = _actor_mask(batch, n_entities, gen)
+    # Enemy mask: AND-of actor-mask with a coin-flip per slot so the
+    # canonical pointer's softmax sees a non-empty enemy set on most rows.
+    enemy_coin = torch.randint(0, 2, (batch, n_entities), generator=gen).bool()
+    enemy_mask = entity_mask & enemy_coin
     return TargetPointerInput(
-        query=torch.randn(batch, query_in_dim, generator=gen),
         entity_outs=torch.randn(batch, n_entities, d_model, generator=gen),
-        entity_mask=_actor_mask(batch, n_entities, gen),
+        entity_mask=entity_mask,
+        enemy_mask=enemy_mask,
+        self_readout=torch.randn(batch, d_model, generator=gen),
     )
 
 

@@ -307,7 +307,12 @@ int QNN_OracleEmitTokens(
 			candidates[candidate_count].type = cand_type;
 			candidates[candidate_count].modality = modality;
 			candidates[candidate_count].store_index = i;
-			candidates[candidate_count].recency = age;
+			/* Clamp recency to non-negative. age = cl.mtime[0] - newest_obs
+			 * can go negative across map-change-within-demo boundaries
+			 * (cl.mtime resets while qnn_store retains prior-segment
+			 * timestamps). Negative recency in the obs blows up the
+			 * target labeler's exp(-recency/tau). */
+			candidates[candidate_count].recency = (age < 0.0f) ? 0.0f : age;
 			candidates[candidate_count].entry = e;
 			candidates[candidate_count].entity_num = e->entity_num;
 

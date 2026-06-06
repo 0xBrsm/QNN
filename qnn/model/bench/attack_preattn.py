@@ -52,22 +52,22 @@ def _build_attack_head(
     prior_mode: str,
     *,
     in_dim: int,
-    bottleneck: int,
+    d_hidden: int,
     alignment_scale: float,
 ):
     if prior_mode == "none":
-        return AttackHead(in_dim=in_dim, bottleneck_dim=bottleneck, activation="gelu")
+        return AttackHead(in_dim=in_dim, d_hidden=d_hidden, activation="gelu")
     if prior_mode in _GEOM_SCALE_MODES:
         return AimPriorAttackHead(
             in_dim=in_dim,
-            bottleneck_dim=bottleneck,
+            d_hidden=d_hidden,
             activation="gelu",
             scale_mode=_GEOM_SCALE_MODES[prior_mode],
             scale_init=alignment_scale,
         )
     if prior_mode == "hit_test":
         return HitTestAttackHead(
-            in_dim=in_dim, bottleneck_dim=bottleneck, activation="gelu",
+            in_dim=in_dim, d_hidden=d_hidden, activation="gelu",
         )
     raise ValueError(
         f"unknown prior_mode {prior_mode!r}; expected one of "
@@ -82,7 +82,7 @@ def _build_attack_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
 
       d_model (int): token width (PreAttnEncoder + AttackHead share it).
       self_weapon_embed_in_self (bool): pass through to ObsEmbedding.
-      hidden (int): residual MLP bottleneck width.
+      d_hidden (int): residual MLP bottleneck width.
 
     Optional:
 
@@ -98,7 +98,7 @@ def _build_attack_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
     """
     d_model = int(_required(probe, "d_model"))
     self_weapon = bool(_required(probe, "self_weapon_embed_in_self"))
-    hidden = int(_required(probe, "hidden"))
+    d_hidden = int(_required(probe, "d_hidden"))
     prior_mode = str(probe.get("prior_mode", "none"))
     alignment_scale = float(probe.get("alignment_scale", 5.0))
 
@@ -127,7 +127,7 @@ def _build_attack_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
             attack_head=_build_attack_head(
                 prior_mode,
                 in_dim=dims["motor_in"],
-                bottleneck=hidden,
+                d_hidden=d_hidden,
                 alignment_scale=alignment_scale,
             ),
         )

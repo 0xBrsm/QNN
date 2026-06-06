@@ -34,7 +34,7 @@ OUT_DIM = 3  # 3D direction vector
 class WeaponAimLookHead(nn.Module):
     """Look head fed by (aim_vec, target_feat) — computed internally."""
 
-    def __init__(self, in_dim: int, bottleneck_dim: int, activation: str) -> None:
+    def __init__(self, in_dim: int, d_hidden: int, activation: str) -> None:
         super().__init__()
         # MLP input is the canonical features (= cat(self_readout,
         # target_feat) when temporal Off). aim_vec goes into base_look,
@@ -42,7 +42,7 @@ class WeaponAimLookHead(nn.Module):
         # the canonical input shape avoids ROCm/MIOpen issues we hit with
         # non-canonical MLP widths.
         self._motor_in = int(in_dim)
-        self.mlp = make_head_mlp(self._motor_in, OUT_DIM, bottleneck_dim, activation)
+        self.mlp = make_head_mlp(self._motor_in, OUT_DIM, d_hidden, activation)
 
     def forward(self, inp: LookHeadInput) -> LookHeadOutput:
         ctx = current_weapon_aim_context()

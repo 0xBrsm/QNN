@@ -65,7 +65,7 @@ class WeaponHead(nn.Module):
         self,
         selector_dim: int,
         d_model: int,
-        bottleneck_dim: int,
+        d_hidden: int,
         activation: str,
         *,
         context_from_obs: bool,
@@ -73,7 +73,7 @@ class WeaponHead(nn.Module):
         super().__init__()
         self.context_from_obs = bool(context_from_obs)
         self.d_model = int(d_model)
-        self.mlp = make_head_mlp(selector_dim, WEAPON_HEAD_SIZE, bottleneck_dim, activation)
+        self.mlp = make_head_mlp(selector_dim, WEAPON_HEAD_SIZE, d_hidden, activation)
         self.embed = nn.Embedding(WEAPON_HEAD_SIZE, self.d_model)
 
     def forward(self, inp: WeaponHeadInput) -> WeaponHeadOutput:

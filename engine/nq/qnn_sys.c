@@ -37,10 +37,20 @@ void Sys_DebugNumber(int y, int val)
 void Sys_Printf(char *fmt, ...)
 {
 	va_list ap;
+	static int route_resolved = 0;
+	static int route_to_stderr = 0;
+	FILE *out;
 
+	if (!route_resolved) {
+		const char *env = getenv("QNN_STDOUT_PROTOCOL");
+		route_to_stderr = (env != NULL && env[0] != '\0' && env[0] != '0');
+		route_resolved = 1;
+	}
+	out = route_to_stderr ? stderr : stdout;
 	va_start(ap, fmt);
-	vfprintf(stdout, fmt, ap);
+	vfprintf(out, fmt, ap);
 	va_end(ap);
+	fflush(out);
 }
 
 void Sys_Quit(void)

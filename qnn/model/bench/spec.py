@@ -29,8 +29,8 @@ class HeadLossSpec:
     (BCE for fire, soft-CE for target, multi-axis CE for move, …).
     ``metrics_fn(logits, labels) -> dict[str, float]`` — returns
     metrics under the same key names BC training uses
-    (``acc_target``, ``balanced_acc_target``, ``f1_attack`` …) so probe
-    JSON diffs cleanly against BC ``bc_history.json``.
+    (``target_kl``, ``f1_attack`` …) so probe JSON diffs cleanly
+    against BC ``bc_history.json``.
     """
     loss_fn: Callable[..., torch.Tensor]
     metrics_fn: Callable[..., dict[str, float]]
@@ -66,7 +66,7 @@ def neutral_model_config(
     encoder/GRU dimensions — is never invoked. The policy layer still
     reads policy-relevant flags (``use_gru``, ``use_weapon_head``, …),
     so those need to be False for the probe to make sense. Numeric
-    fields (``ffn_dim``, ``n_layers``, …) are inert under the factory
+    fields (``d_ffn``, ``n_layers``, …) are inert under the factory
     path and set to safe placeholders.
 
     ``d_model`` and ``self_weapon_embed_in_self`` are required so each
@@ -77,10 +77,10 @@ def neutral_model_config(
         d_model=int(d_model),
         n_heads=1,
         n_layers=0,
-        ffn_dim=0,
+        d_ffn=0,
         attn_dropout=0.0,
         use_gru=False,
-        gru_hidden=0,
+        d_gru=0,
         use_weapon_head=False,
         weapon_switch_confidence=0.0,
         weapon_switch_margin=0.0,
@@ -88,14 +88,12 @@ def neutral_model_config(
         weapon_use_self_readout=True,
         weapon_context_from_obs=False,
         look_bypass_gru=False,
-        gru_target_query=False,
-        hard_target_feat=False,
-        weapon_in_target_query=False,
-        linear_idx_prior=False,
-        gt_dist_target_feat=False,
-        prev_target_in_query=False,
+        d_target=int(d_model),
         self_weapon_embed_in_self=bool(self_weapon_embed_in_self),
-        head_bottleneck_dim={"move": 0, "look": 0, "attack": 0, "weapon": 0},
+        d_move=0,
+        d_look=0,
+        d_attack=0,
+        d_weapon=0,
         head_activation="none",
     )
 

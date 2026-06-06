@@ -54,13 +54,13 @@ class OracleAttackHead(nn.Module):
         self,
         *,
         in_dim: int,
-        bottleneck_dim: int,
+        d_hidden: int,
         activation: str,
         aim_scale: float,
     ) -> None:
         super().__init__()
         self.aim_scale = float(aim_scale)
-        self.mlp = make_head_mlp(in_dim, OUT_DIM, bottleneck_dim, activation)
+        self.mlp = make_head_mlp(in_dim, OUT_DIM, d_hidden, activation)
         # Zero-init the residual head's final Linear so training starts
         # at the oracle's decision. Matches look_head's convention.
         final = self.mlp[-1] if isinstance(self.mlp, nn.Sequential) else self.mlp

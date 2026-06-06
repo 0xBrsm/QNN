@@ -41,7 +41,7 @@ def per_parameter_grad_norms(
             p.grad = None
 
     # Forward + loss + backward (no optimizer step; we just want gradients)
-    _, logits, _, _, target_logits, target_query = policy._forward_tensors(
+    _, logits, _, _, target_logits = policy._forward_tensors(
         obs_t, hidden=None,
     )
     losses, loss_is_real, _ = policy._compute_head_losses_and_metrics(
@@ -50,7 +50,6 @@ def per_parameter_grad_norms(
         head_loss_weights=head_loss_weights,
         compute_metrics=False,
         target_logits=target_logits,
-        target_query=target_query,
         obs=obs_t,
     )
     real = [l for l, r in zip(losses, loss_is_real) if r]

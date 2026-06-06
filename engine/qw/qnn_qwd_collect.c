@@ -570,7 +570,7 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 	else if (last_nonzero_impulse >= 1 && last_nonzero_impulse <= 8)
 	{
 		int item = QNN_ItemFlagFromImpulse(last_nonzero_impulse);
-		if (cl.stats[STAT_ITEMS] & item)
+		if (snapshot && (snapshot->items_owned & item))
 			impulse_target = last_nonzero_impulse;
 	}
 
@@ -587,10 +587,12 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 		int fb_pos = (fb_avg >  QNN_SNAP_THRESHOLD) ? 1 : 0;
 		int lr_neg = (lr_avg < -QNN_SNAP_THRESHOLD) ? 1 : 0;
 		int lr_pos = (lr_avg >  QNN_SNAP_THRESHOLD) ? 1 : 0;
-		/* up-pos bit unifies any jump intent (BUTTON_JUMP or swim-up
-		 * upmove>0) — preserves the legacy ud_class label semantics.
-		 * up-neg bit captures swim-down (upmove<0). */
-		int up_pos = jump_any ? 1 : 0;
+		/* up-pos bit captures swim-up / jumppad upmove ONLY
+		 * (cmd->upmove > 0 in any cmd of the window).  Jump-button
+		 * presses are tracked separately via bit 7 (jump_act) so the
+		 * model can learn jump-via-button vs ambient-up as distinct
+		 * intents.  up-neg bit captures swim-down (upmove<0). */
+		int up_pos = upmove_pos_any ? 1 : 0;
 		int up_neg = (last_upmove < 0) ? 1 : 0;
 		action->move = QNN_PackInputMask(
 			/*alive=*/1,

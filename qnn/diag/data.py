@@ -39,13 +39,17 @@ def load_val_episodes(
         obs_arrays = {k: np.load(base / v, mmap_mode="r") for k, v in shard["obs"].items()}
         action_arrays = {k: np.load(base / v, mmap_mode="r") for k, v in shard["actions"].items()}
         # Unpack packed move byte → (T, 3) axis class indices like the trainer does.
-        # Format: bits 0-1 = fb, 2-3 = lr, 4-5 = ud, each value in {0=neg,1=none,2=pos}.
+        # Format: one-hot-per-direction (mirror of input_mask byte):
+        #   bit 0 = attack, bit 1 = fb_neg, bit 2 = fb_pos,
+        #   bit 3 = lr_neg, bit 4 = lr_pos, bit 5 = ud_neg, bit 6 = ud_pos,
+        #   bit 7 = jump.
+        # Per-axis class = 1 + pos_bit - neg_bit (in {0=neg, 1=none, 2=pos}).
         if "move" in action_arrays:
             arr = np.asarray(action_arrays["move"], dtype=np.uint8)
             if arr.ndim == 1:
-                fb = arr & 0x3
-                lr = (arr >> 2) & 0x3
-                ud = (arr >> 4) & 0x3
+                fb = (1 + ((arr >> 2) & 1) - ((arr >> 1) & 1)).astype(np.uint8)
+                lr = (1 + ((arr >> 4) & 1) - ((arr >> 3) & 1)).astype(np.uint8)
+                ud = (1 + ((arr >> 6) & 1) - ((arr >> 5) & 1)).astype(np.uint8)
                 action_arrays["move"] = np.ascontiguousarray(np.stack([fb, lr, ud], axis=-1))
 
         ep_lengths = shard.get("episode_lengths", [])

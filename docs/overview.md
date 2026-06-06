@@ -22,9 +22,9 @@ TransformerEncoder
   self_readout x_t           (slot 0 = CLS; pools self subtokens / spatial / entity)
   actor tokens e_i           (entity slots where type == ACTOR)
         │
-        ├──► TargetPointer:  query = linear(x_t)        (or GRU output if gru_target_query)
-        │      scores  = (e_i * query).sum(-1), non-actor slots masked
-        │      target_logits   (B, 16) — CE label vs labeler
+        ├──► TargetPointer:  scores_i = w2 · gelu(W1 · e_i + b1) + b2  (per-entity MLP, hidden = d_target)
+        │      non-enemy / padding slots masked to -1e9
+        │      target_logits   (B, 16) — soft-CE label vs labeler
         │      target_feat = softmax(scores) @ e_i  (soft pool)
         │
         └──► GRU input:      x_t -> h_t                  (sequence of cls_readouts)

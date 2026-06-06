@@ -345,15 +345,15 @@ class ObsEmbedding(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, ffn_dim: int, dropout: float) -> None:
+    def __init__(self, d_model: int, n_heads: int, d_ffn: int, dropout: float) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn_dim),
+            nn.Linear(d_model, d_ffn),
             nn.GELU(),
-            nn.Linear(ffn_dim, d_model),
+            nn.Linear(d_ffn, d_model),
         )
         self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
@@ -415,7 +415,7 @@ class TransformerEncoder(nn.Module):
         d_model: int,
         n_heads: int,
         n_layers: int,
-        ffn_dim: int,
+        d_ffn: int,
         dropout: float,
     ) -> None:
         super().__init__()
@@ -426,7 +426,7 @@ class TransformerEncoder(nn.Module):
                 TransformerBlock(
                     d_model=self.d_model,
                     n_heads=int(n_heads),
-                    ffn_dim=int(ffn_dim),
+                    d_ffn=int(d_ffn),
                     dropout=float(dropout),
                 )
                 for _ in range(int(n_layers))

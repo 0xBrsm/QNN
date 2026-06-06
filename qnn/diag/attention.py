@@ -135,19 +135,19 @@ def _zero_attention_head(mha: nn.MultiheadAttention, head_idx: int) -> Iterator[
     (so its attention output doesn't reach the residual). Either alone would
     be a valid ablation; doing both is robust.
     """
-    embed_dim = mha.embed_dim
+    d_model = mha.d_model
     n_heads = mha.num_heads
-    head_dim = embed_dim // n_heads
+    head_dim = d_model // n_heads
     start = head_idx * head_dim
     end = start + head_dim
 
-    # in_proj_weight is (3*embed_dim, embed_dim) — Q rows 0..E, K rows E..2E, V rows 2E..3E
+    # in_proj_weight is (3*d_model, d_model) — Q rows 0..E, K rows E..2E, V rows 2E..3E
     saved_in_w = mha.in_proj_weight.data.clone()
     saved_out_w = mha.out_proj.weight.data.clone()
     saved_in_b = mha.in_proj_bias.data.clone() if mha.in_proj_bias is not None else None
 
-    v_start = 2 * embed_dim + start
-    v_end = 2 * embed_dim + end
+    v_start = 2 * d_model + start
+    v_end = 2 * d_model + end
     mha.in_proj_weight.data[v_start:v_end].zero_()
     if mha.in_proj_bias is not None:
         mha.in_proj_bias.data[v_start:v_end].zero_()

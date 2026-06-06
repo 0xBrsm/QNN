@@ -21,19 +21,80 @@ import torch
 
 from qnn.model.policy import QNNPolicy
 
+
+# `engagement_ema` is a per-frame scalar in [0, 1] tracking how committed the
+# demonstrator is to attacking, derived from the op-frame attack stream:
+#
+#   e[t] = α · attack[t-1_op]  +  (1-α) · e[t-1_op]   (update only on op frames)
+#   e[t] = e[t-1]                                      (carries through cooldown)
+#
+# `op` = "operative", input_mask bit 0 — frames where the engine will honor
+# the attack input. Indexed at frame t to represent state ENTERING frame t
+# (uses attack decisions strictly prior to t). α = 0.5 was selected by
+# mutual-information analysis in scripts/attack_prior_methodical.py.
+_ENGAGEMENT_EMA_ALPHA: float = 0.5
+
+
+def _compute_engagement_ema(
+    attack: np.ndarray, op: np.ndarray, alpha: float = _ENGAGEMENT_EMA_ALPHA,
+) -> np.ndarray:
+    """Per-episode engagement EMA. Inputs and output are 1-D arrays of len T."""
+    n = len(attack)
+    out = np.zeros(n, dtype=np.float32)
+    e_val = 0.0
+    for i in range(n):
+        out[i] = e_val
+        if op[i]:
+            e_val = alpha * float(attack[i]) + (1.0 - alpha) * e_val
+    return out
+
+
+def _compute_attack_shifted(attack: np.ndarray, op: np.ndarray) -> np.ndarray:
+    """Per-episode +1 op-frame shifted attack label.
+
+    For each frame t:
+      - If t is an op-frame, ``attack_shifted[t] = attack[t] OR attack[t']``,
+        where ``t'`` is the next op-frame strictly after ``t`` in the same
+        episode. If no such ``t'`` exists (``t`` is the last op-frame in the
+        episode), ``attack_shifted[t] = attack[t]`` (no shift contribution).
+      - If t is NOT an op-frame, ``attack_shifted[t] = attack[t]`` (unchanged;
+        non-op frames are masked from loss anyway, so the value doesn't matter).
+
+    Inputs are 1-D arrays of length T (within one episode). The motivation is
+    to credit "anticipatory" attack predictions that lead the demo's actual
+    fire by one cooldown cycle (one op-frame): the BCE loss target sees a 1
+    on the op-frame immediately preceding the demo's first 1 in a run.
+    Asymmetric on purpose — leads are common, lags are rare.
+    """
+    attack_u8 = np.asarray(attack, dtype=np.uint8)
+    op_bool = np.asarray(op, dtype=bool)
+    n = len(attack_u8)
+    out = attack_u8.copy()
+    # Walk backwards once and remember the "next op-frame attack value"; for
+    # each op-frame t we OR that into out[t]. Single pass, O(T).
+    next_op_attack: int = 0
+    next_op_seen: bool = False
+    for i in range(n - 1, -1, -1):
+        if op_bool[i]:
+            if next_op_seen:
+                out[i] = out[i] | next_op_attack
+            next_op_attack = int(attack_u8[i])
+            next_op_seen = True
+    return out
+
 _RAW_SUM_METRIC_PREFIXES = (
     "n_", "correct_", "l1_sum_", "tp_", "fp_", "fn_", "target_pos_", "pred_pos_", "pred_target_",
 )
 _AVERAGED_METRIC_PREFIXES = (
     "acc_", "mae_", "cos_sim_", "f1_", "precision_", "recall_",
     "pos_rate_", "pred_rate_", "confidence_", "balanced_acc_",
-    # Per-head soft-distribution diagnostics on the target head — NLL
-    # (loss_target), present-weighted entropy / KL / Brier / top-1 mass.
-    # Listed explicitly so we don't accidentally average raw-sum
-    # target_* keys (those are caught above via the n_/tp_/fp_/fn_/etc.
-    # prefixes that fire first in the dispatch order).
-    "loss_", "target_present_", "target_entropy", "target_kl",
-    "target_brier", "target_top1_",
+    # Per-head target diagnostics: KL (selection metric),
+    # multi-candidate KL, present-mean.  All present-weighted means
+    # over the batch; the supervised loop averages them across
+    # batches.  Listed explicitly so the prefix matcher doesn't
+    # confuse them with raw-sum target counters (n_target_valid,
+    # n_target_valid_multi — caught above via the n_ prefix).
+    "loss_", "target_present_", "target_kl",
 )
 
 
@@ -206,43 +267,18 @@ def _stable_weapon_metrics_from_counts(result: Dict[str, float]) -> None:
 
 
 def _stable_target_metrics_from_counts(result: Dict[str, float]) -> None:
-    classes = sorted(
-        int(k[len("tp_target_idx_"):])
-        for k in result
-        if k.startswith("tp_target_idx_")
-    )
-    if not classes:
-        return
+    """Target-head epoch aggregation.
 
-    total = float(result.get("n_target_valid", 0.0))
-    correct = float(result.get("correct_target", 0.0))
-    if total > 0.0:
-        result["acc_target"] = correct / total
-
-    recalls: list[float] = []
-    for idx in classes:
-        tp = float(result.get(f"tp_target_idx_{idx}", 0.0))
-        fp = float(result.get(f"fp_target_idx_{idx}", 0.0))
-        fn = float(result.get(f"fn_target_idx_{idx}", 0.0))
-        support = float(result.get(f"n_target_idx_{idx}", 0.0))
-        pred_count = float(result.get(f"pred_target_idx_{idx}", 0.0))
-        precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
-        recall = tp / support if support > 0.0 else 0.0
-        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0
-        if support > 0.0:
-            recalls.append(recall)
-        result[f"precision_target_idx_{idx}"] = precision
-        result[f"recall_target_idx_{idx}"] = recall
-        result[f"f1_target_idx_{idx}"] = f1
-        result[f"pos_rate_target_idx_{idx}"] = support / total if total > 0.0 else 0.0
-        result[f"pred_rate_target_idx_{idx}"] = pred_count / total if total > 0.0 else 0.0
-
-    if recalls:
-        result["balanced_acc_target"] = float(sum(recalls) / len(recalls))
-    result["acc_target_idx0_baseline"] = (
-        float(result.get("n_target_idx_0", 0.0)) / total if total > 0.0 else 0.0
-    )
-    _stable_binary_metrics_from_counts(result, prefix="target_nonzero")
+    The slot-keyed metrics (acc_target, balanced_acc_target,
+    acc_target_idx0_baseline, per-idx f1/precision/recall, and the
+    target_nonzero binary derivatives) were all confounded by the
+    arbitrary edict-order emission of entity slots and were dropped.
+    The model emits ``target_kl`` (and ``target_kl_multi`` when an
+    obs entity stream is available) directly per-batch; both are
+    already epoch-mean-reducible scalars, so no per-epoch
+    aggregation is needed here.
+    """
+    return
 
 
 def _apply_stable_epoch_metrics(result: Dict[str, float]) -> None:
@@ -357,6 +393,7 @@ class Source(Protocol):
     episode_offsets: np.ndarray
     prefetch_depth: int
     n_workers: int
+    prefers_cpu_indices: bool
 
     @property
     def n_total_rows(self) -> int: ...
@@ -380,6 +417,7 @@ class ResidentSource:
     device: torch.device
     prefetch_depth: int = 0
     n_workers: int = 0
+    prefers_cpu_indices: bool = False
 
     @property
     def n_total_rows(self) -> int:
@@ -412,12 +450,17 @@ class ResidentSource:
             device=self.device,
             prefetch_depth=self.prefetch_depth,
             n_workers=self.n_workers,
+            prefers_cpu_indices=self.prefers_cpu_indices,
         )
 
 
 def make_resident_source(
     episodes: Sequence[PrecomputedEpisode],
     device: torch.device,
+    *,
+    engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
+    release_host: bool = False,
+    compact_dequantized: bool = False,
 ) -> ResidentSource:
     """Build a device-resident :class:`Source` from precomputed episodes.
 
@@ -443,7 +486,46 @@ def make_resident_source(
         np_arr = np.concatenate([np.asarray(a) for a in arr_list], axis=0)
         if dtype is not None and np_arr.dtype != dtype:
             np_arr = np_arr.astype(dtype, copy=False)
-        return torch.from_numpy(np_arr).to(device)
+        out = torch.from_numpy(np_arr).to(device)
+        del np_arr
+        return out
+
+    def _drop_episode_key(kind: str, key: str) -> None:
+        if not release_host:
+            return
+        for ep in episodes:
+            if kind == "obs":
+                ep.obs.pop(key, None)
+            else:
+                ep.actions.pop(key, None)
+
+    def _drop_dequant_inputs(obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if not compact_dequantized:
+            return obs
+        # Once the preload dequantizers have emitted the model-facing fields
+        # (self_scalars/split self fields, spatial_scalars, entity_scalars_raw,
+        # entity_ids, event tensors), these native inputs are no longer read by
+        # the policy. Dropping them cuts the resident path's steady unified-
+        # memory footprint instead of keeping both native and dequantized copies.
+        for key in (
+            "health", "effective_armor",
+            "ammo_shells", "ammo_nails", "ammo_rockets", "ammo_cells",
+            "vel", "attack_finished", "self_items", "view_pitch",
+            "spatial_dir",
+            "spatial_nearest_dist", "spatial_mean_dist",
+            "spatial_openness", "spatial_clearance", "spatial_traversable",
+            "spatial_dropoff", "spatial_solid_frac", "spatial_water_frac",
+            "spatial_slime_frac", "spatial_lava_frac",
+            "entity_count",
+            "entity_subject_id", "entity_modality_id", "entity_player_id",
+            "entity_half_extents", "entity_rel", "entity_vel",
+            "entity_path", "entity_path_dist", "entity_eta", "entity_recency",
+            "entity_facing", "entity_team", "entity_score",
+            "entity_amount", "entity_regen", "entity_state",
+            "entity_event_count",
+        ):
+            obs.pop(key, None)
+        return obs
 
     # Detect the global-buffer layout: every episode shares the same
     # ndarray .base for a given token-indexed key when they came from
@@ -466,6 +548,7 @@ def make_resident_source(
         # sub-episode views.
         for k in row_keys:
             gpu_obs[k] = _concat_arrays([ep.obs[k] for ep in episodes])
+            _drop_episode_key("obs", k)
         # Build a global token indptr by chaining each sub-episode's
         # rebased indptr. The token-indexed obs values are views into
         # a single underlying buffer per key (the _load_precomputed
@@ -476,14 +559,6 @@ def make_resident_source(
         global_indptr[0] = 0
         cursor_row = 0
         cursor_tok = 0
-        tok_total = 0
-        # First compute total token count to size the source buffer.
-        for ep in episodes:
-            ip = ep.entity_indptr
-            tok_total += int(ip[-1])
-        # Sanity: every token-indexed key's underlying buffer is the
-        # same length per key (all sub-episodes view the same global
-        # buffer). We can use one buffer per key for the pad.
         for ep in episodes:
             ip = ep.entity_indptr
             n = ep.n_samples
@@ -493,31 +568,38 @@ def make_resident_source(
             )
             cursor_row += n
             cursor_tok += int(ip[-1])
-        # Concatenate the unpadded token buffers (zero-copy if views
-        # of a shared underlying ndarray; per-episode copy otherwise).
-        unpadded_obs: dict[str, np.ndarray] = {}
+        # Pad and transfer one token-indexed key at a time. The old
+        # implementation built a dict containing every unpadded concat and
+        # every padded token tensor at once, briefly duplicating the largest
+        # resident corpus blocks on CPU while device tensors were already
+        # allocated. Keeping only one token key live bounds the CPU-side peak
+        # to one unpadded key plus one padded key.
         for k in tok_keys:
-            unpadded_obs[k] = np.concatenate(
-                [np.asarray(ep.obs[k]) for ep in episodes], axis=0,
-            )
-        # ONE global pad call per key.
-        padded_tok = _global_pad_entity_batch(
-            unpadded_obs, global_indptr, 0, total_rows, _MAX_TOKEN_OBJECTS,
-        )
-        for k in tok_keys:
-            gpu_obs[k] = torch.from_numpy(padded_tok[k]).to(device)
+            unpadded_obs = {
+                k: np.concatenate(
+                    [np.asarray(ep.obs[k]) for ep in episodes], axis=0,
+                )
+            }
+            padded_tok = _global_pad_entity_batch(
+                unpadded_obs, global_indptr, 0, total_rows, _MAX_TOKEN_OBJECTS,
+            )[k]
+            gpu_obs[k] = torch.from_numpy(padded_tok).to(device)
+            del padded_tok
+            del unpadded_obs
+            _drop_episode_key("obs", k)
+        del global_indptr
     else:
         # Compatibility path for synthetic tests or any episode with
         # entity_indptr=None.
         padded_eps = [ep.materialize_padded_obs(_MAX_TOKEN_OBJECTS) for ep in episodes]
         for k in obs_keys:
             gpu_obs[k] = _concat_arrays([ep_obs[k] for ep_obs in padded_eps])
+            _drop_episode_key("obs", k)
         del padded_eps
 
-    gpu_actions = {
-        k: _concat_arrays([ep.actions[k] for ep in episodes])
-        for k in action_keys
-    }
+    gpu_actions = {}
+    for k in action_keys:
+        gpu_actions[k] = _concat_arrays([ep.actions[k] for ep in episodes])
 
     # Pre-dequantize on-device: convert native widths to the legacy
     # float obs the policy / heads / target_labeler internals consume
@@ -541,6 +623,7 @@ def make_resident_source(
                     SelfDequantizer().to(device)(gpu_obs)
                 )
             )
+        gpu_obs = _drop_dequant_inputs(gpu_obs)
 
     # Precompute per-frame distance-to-nearest-positive WITHIN each
     # episode for the binary action streams that drive distance-
@@ -563,6 +646,37 @@ def make_resident_source(
             per_frame_distance_to_pos(np.asarray(ep.actions["attack"]).reshape(-1))
             for ep in episodes
         ])
+    if "look" in episodes[0].actions:
+        # Per-episode shifted look stack: look_prev[t, 3*k:3*(k+1)] = look[t-(k+1)]
+        # for k in 0..K_MAX-1, zero where t <= k. Stores K_MAX=5 previous
+        # frames so the bench look head can slice any prefix (configurable
+        # via probe.json:num_prev_frames). Frame-shuffled batching is fine
+        # because each frame carries its own stack column.
+        K_MAX = 5
+        look_prev_arrays = []
+        for ep in episodes:
+            look = np.asarray(ep.actions["look"], dtype=np.float32).reshape(ep.n_samples, -1)
+            prev = np.zeros((ep.n_samples, K_MAX, 3), dtype=np.float32)
+            for k in range(K_MAX):
+                if ep.n_samples > k + 1:
+                    prev[(k + 1):, k, :] = look[: ep.n_samples - (k + 1)]
+            look_prev_arrays.append(prev.reshape(ep.n_samples, K_MAX * 3))
+        gpu_actions["look_prev"] = _concat_arrays(look_prev_arrays)
+    if "attack" in episodes[0].actions and "input_mask" in episodes[0].actions:
+        # Per-episode engagement EMA over the op-frame attack stream. See
+        # _compute_engagement_ema for the recurrence.
+        eng_arrays: list[np.ndarray] = []
+        # Per-episode +1 op-frame shifted attack label (loss target only —
+        # val F1/precision/recall still use the original ``attack`` label).
+        # See _compute_attack_shifted for the recurrence.
+        att_shift_arrays: list[np.ndarray] = []
+        for ep in episodes:
+            attack = np.asarray(ep.actions["attack"]).reshape(-1).astype(np.uint8)
+            op = (np.asarray(ep.actions["input_mask"]).reshape(-1).astype(np.uint8) & 0x1) != 0
+            eng_arrays.append(_compute_engagement_ema(attack, op, alpha=engagement_ema_alpha))
+            att_shift_arrays.append(_compute_attack_shifted(attack, op))
+        gpu_actions["engagement_ema"] = _concat_arrays(eng_arrays)
+        gpu_actions["attack_shifted"] = _concat_arrays(att_shift_arrays)
     if "move" in episodes[0].actions:
         # move is (T, 3) uint8 with axes [fb, lr, ud]; ud=2 is the jump axis.
         # MOVE_CLASS_POS = 2 (neg/none/pos = 0/1/2). Build a 0/1 stream then
@@ -574,6 +688,9 @@ def make_resident_source(
             jump_pos = (ud == 2).astype(np.float32)
             jump_pos_arrays.append(per_frame_distance_to_pos(jump_pos))
         gpu_actions["jump_distance_to_pos"] = _concat_arrays(jump_pos_arrays)
+
+    for k in action_keys:
+        _drop_episode_key("actions", k)
 
     offsets = np.empty(len(episodes) + 1, dtype=np.int64)
     offsets[0] = 0
@@ -617,12 +734,15 @@ class StreamingSource:
         *,
         prefetch_depth: int = 4,
         n_workers: int = 1,
+        engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
     ) -> None:
         self._ll = ll
         self.device = device
+        self._engagement_ema_alpha = float(engagement_ema_alpha)
         self.episodes: list[Any] = list(ll.episodes)
         self.prefetch_depth = int(prefetch_depth)
         self.n_workers = int(n_workers)
+        self.prefers_cpu_indices = True
 
         offsets = np.empty(len(self.episodes) + 1, dtype=np.int64)
         offsets[0] = 0
@@ -655,6 +775,9 @@ class StreamingSource:
         # on device and avoid per-batch convolution work.
         self._attack_dist: torch.Tensor | None = None
         self._jump_dist: torch.Tensor | None = None
+        self._look_prev: torch.Tensor | None = None
+        self._engagement_ema: torch.Tensor | None = None
+        self._attack_shifted: torch.Tensor | None = None
         if self.episodes:
             self._precompute_distances()
 
@@ -681,32 +804,71 @@ class StreamingSource:
 
     def _precompute_distances(self) -> None:
         from qnn.bc.loss_shaping import per_frame_distance_to_pos
-        has_fire = "attack" in self._action_keys
+        has_attack = "attack" in self._action_keys
         has_move = "move" in self._action_keys
-        if not (has_fire or has_move):
+        has_look = "look" in self._action_keys
+        has_input_mask = "input_mask" in self._action_keys
+        if not (has_attack or has_move or has_look):
             return
         fire_parts: list[np.ndarray] = []
         jump_parts: list[np.ndarray] = []
-        any_fire = False
+        look_prev_parts: list[np.ndarray] = []
+        eng_parts: list[np.ndarray] = []
+        att_shift_parts: list[np.ndarray] = []
+        any_attack = False
         any_move = False
+        any_look = False
+        any_engagement = False
+        any_attack_shifted = False
+        K_MAX = 5
         for ep in self.episodes:
             view = self._open_shard(int(ep.shard_idx))
             row_lo = int(ep.row_start)
             row_hi = int(ep.row_end)
+            n = row_hi - row_lo
             if "attack" in view.actions:
-                any_fire = True
-                fire = np.asarray(view.actions["attack"][row_lo:row_hi]).reshape(-1)
-                fire_parts.append(per_frame_distance_to_pos(fire))
+                any_attack = True
+                attack = np.asarray(view.actions["attack"][row_lo:row_hi]).reshape(-1)
+                fire_parts.append(per_frame_distance_to_pos(attack))
+                if has_input_mask and "input_mask" in view.actions:
+                    any_engagement = True
+                    op_byte = np.asarray(view.actions["input_mask"][row_lo:row_hi]).reshape(-1).astype(np.uint8)
+                    op_bool = (op_byte & 0x1) != 0
+                    eng_parts.append(
+                        _compute_engagement_ema(
+                            attack.astype(np.uint8),
+                            op_bool,
+                            alpha=self._engagement_ema_alpha,
+                        )
+                    )
+                    any_attack_shifted = True
+                    att_shift_parts.append(
+                        _compute_attack_shifted(attack.astype(np.uint8), op_bool)
+                    )
             if "move" in view.actions:
                 any_move = True
                 move = np.asarray(view.actions["move"][row_lo:row_hi])
                 ud = move[..., 2] if move.ndim >= 2 else move
                 jump_pos = (ud == 2).astype(np.float32)
                 jump_parts.append(per_frame_distance_to_pos(jump_pos))
-        if any_fire:
+            if "look" in view.actions:
+                any_look = True
+                look = np.asarray(view.actions["look"][row_lo:row_hi], dtype=np.float32).reshape(n, -1)
+                prev = np.zeros((n, K_MAX, 3), dtype=np.float32)
+                for k in range(K_MAX):
+                    if n > k + 1:
+                        prev[(k + 1):, k, :] = look[: n - (k + 1)]
+                look_prev_parts.append(prev.reshape(n, K_MAX * 3))
+        if any_attack:
             self._attack_dist = torch.from_numpy(np.concatenate(fire_parts, axis=0)).to(self.device)
         if any_move:
             self._jump_dist = torch.from_numpy(np.concatenate(jump_parts, axis=0)).to(self.device)
+        if any_look:
+            self._look_prev = torch.from_numpy(np.concatenate(look_prev_parts, axis=0)).to(self.device)
+        if any_engagement:
+            self._engagement_ema = torch.from_numpy(np.concatenate(eng_parts, axis=0)).to(self.device)
+        if any_attack_shifted:
+            self._attack_shifted = torch.from_numpy(np.concatenate(att_shift_parts, axis=0)).to(self.device)
 
     def _ensure_dequant(self) -> None:
         if not self._needs_dequant or self._dequant_chain:
@@ -779,7 +941,12 @@ class StreamingSource:
         ``attack_distance_to_pos`` / ``jump_distance_to_pos`` slices when those
         signals were detected at construction.
         """
-        indices_np = indices.detach().cpu().numpy().astype(np.int64, copy=False)
+        if indices.device.type == "cpu":
+            indices_np = indices.numpy().astype(np.int64, copy=False)
+            indices_d: torch.Tensor | None = None
+        else:
+            indices_np = indices.detach().cpu().numpy().astype(np.int64, copy=False)
+            indices_d = indices
         n_rows = len(indices_np)
         if n_rows == 0:
             return (
@@ -828,10 +995,21 @@ class StreamingSource:
             with torch.no_grad():
                 for mod in self._dequant_chain:
                     obs_t = mod(obs_t)
+        def _device_indices() -> torch.Tensor:
+            nonlocal indices_d
+            if indices_d is None:
+                indices_d = indices.to(self.device, non_blocking=True)
+            return indices_d
         if self._attack_dist is not None:
-            act_t["attack_distance_to_pos"] = self._attack_dist.index_select(0, indices)
+            act_t["attack_distance_to_pos"] = self._attack_dist.index_select(0, _device_indices())
         if self._jump_dist is not None:
-            act_t["jump_distance_to_pos"] = self._jump_dist.index_select(0, indices)
+            act_t["jump_distance_to_pos"] = self._jump_dist.index_select(0, _device_indices())
+        if self._look_prev is not None:
+            act_t["look_prev"] = self._look_prev.index_select(0, _device_indices())
+        if self._engagement_ema is not None:
+            act_t["engagement_ema"] = self._engagement_ema.index_select(0, _device_indices())
+        if self._attack_shifted is not None:
+            act_t["attack_shifted"] = self._attack_shifted.index_select(0, _device_indices())
         return obs_t, act_t
 
     def _to_device(self, v: np.ndarray) -> torch.Tensor:
@@ -877,6 +1055,9 @@ class StreamingSource:
         """
         self._attack_dist = None
         self._jump_dist = None
+        self._look_prev = None
+        self._engagement_ema = None
+        self._attack_shifted = None
         self._dequant_chain = ()
 
     def head(self, n_episodes: int) -> "StreamingSource":
@@ -889,6 +1070,8 @@ class StreamingSource:
         view.episodes = list(self.episodes[:n_episodes])
         view.prefetch_depth = self.prefetch_depth
         view.n_workers = self.n_workers
+        view.prefers_cpu_indices = self.prefers_cpu_indices
+        view._engagement_ema_alpha = self._engagement_ema_alpha
         view.episode_offsets = self.episode_offsets[:n_episodes + 1].copy()
         view._ep_shard_idx = self._ep_shard_idx[:n_episodes]
         view._ep_shard_row_start = self._ep_shard_row_start[:n_episodes]
@@ -901,6 +1084,13 @@ class StreamingSource:
         n_rows_head = int(view.episode_offsets[-1])
         view._attack_dist = self._attack_dist[:n_rows_head] if self._attack_dist is not None else None
         view._jump_dist = self._jump_dist[:n_rows_head] if self._jump_dist is not None else None
+        view._look_prev = self._look_prev[:n_rows_head] if self._look_prev is not None else None
+        view._engagement_ema = (
+            self._engagement_ema[:n_rows_head] if self._engagement_ema is not None else None
+        )
+        view._attack_shifted = (
+            self._attack_shifted[:n_rows_head] if self._attack_shifted is not None else None
+        )
         return view
 
 
@@ -912,11 +1102,17 @@ def make_streaming_source(
     token_mask: dict | None = None,
     prefetch_depth: int = 4,
     n_workers: int = 1,
+    engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
 ) -> StreamingSource:
     """Build a :class:`StreamingSource` from a sharded BC cache directory."""
     from qnn.bc.streaming_source import StreamingSource as _LowLevel
     ll = _LowLevel.from_cache_dir(cache_dir, segment_mask=segment_mask, token_mask=token_mask)
-    return StreamingSource(ll, device, prefetch_depth=prefetch_depth, n_workers=n_workers)
+    return StreamingSource(
+        ll, device,
+        prefetch_depth=prefetch_depth,
+        n_workers=n_workers,
+        engagement_ema_alpha=engagement_ema_alpha,
+    )
 
 
 def parallel_prefetch_iter(
@@ -1215,10 +1411,11 @@ def frame_shuffled_batches(
     with the GPU step.
     """
     n_frames = source.n_total_rows
+    index_device = torch.device("cpu") if source.prefers_cpu_indices else source.device
     if training and rng is not None:
-        indices = torch.from_numpy(rng.permutation(n_frames)).to(source.device)
+        indices = torch.from_numpy(rng.permutation(n_frames)).to(index_device)
     else:
-        indices = torch.arange(n_frames, device=source.device)
+        indices = torch.arange(n_frames, device=index_device)
     bs = max(1, int(batch_size))
 
     def _prep(idx: torch.Tensor) -> Batch:
@@ -1291,7 +1488,7 @@ def lane_packed_batches(
         }
 
     lane_hidden = (
-        torch.zeros((n_lanes, model.gru_hidden), dtype=torch.float32, device=device)
+        torch.zeros((n_lanes, model.d_gru), dtype=torch.float32, device=device)
         if model.use_gru else None
     )
     if resume_state is not None and lane_hidden is not None:
@@ -1313,7 +1510,9 @@ def lane_packed_batches(
             base = int(offsets[sl.item.ep_idx]) + sl.src_start
             flat_src[cursor:cursor + sl.length] = np.arange(base, base + sl.length, dtype=np.int64)
             cursor += sl.length
-        src_idx = torch.from_numpy(flat_src).to(device)
+        src_idx = torch.from_numpy(flat_src)
+        if not source.prefers_cpu_indices:
+            src_idx = src_idx.to(device)
         dst_idx = plan.dst_indices_d  # pre-staged on device at plan-build time
         T = plan.length
         B = plan.batch_size

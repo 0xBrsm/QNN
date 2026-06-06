@@ -229,7 +229,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append("|------|---|--------|----|---------------|------|------|-----------|-----------|")
         for name, r in report["participation"].items():
             lines.append(
-                f"| `{name}` | {r['bottleneck_dim']} | {r['frames_analyzed']} | "
+                f"| `{name}` | {r['d_hidden']} | {r['frames_analyzed']} | "
                 f"{r['participation_ratio']:.1f} | {r['effective_rank_1pct']} | "
                 f"{r['dead_units']} | {r['rare_units']} | {r['always_on_units']} | "
                 f"{r['weak_cols_lt_10pct_max']} |"

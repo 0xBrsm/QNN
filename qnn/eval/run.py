@@ -598,7 +598,7 @@ def run_evaluation(
         "model": {
             "checkpoint": str(config.checkpoint_path),
             "architecture": (
-                f"transformer encoder + GRU({model_card_model.gru_hidden}) actor-critic"
+                f"transformer encoder + GRU({model_card_model.d_gru}) actor-critic"
                 if model_card_model.use_gru
                 else "transformer encoder actor-critic"
             ),

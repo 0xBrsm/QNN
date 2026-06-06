@@ -366,20 +366,14 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, char *error, size_t e
 	QNN_SyncEngineCompat();
 	QNN_SyncBaselines();
 
-	/* Detect the demo's native recording rate (QWD: 10–77 Hz, MVD: ~77 Hz).
-	 * If hello asked for tick_hz=0 ("emit at native"), resolve the
-	 * sentinel to the per-demo detected rate now; otherwise the
-	 * detection is informational only and fixed_tick_hz keeps the
-	 * hello-requested value. */
+	/* Detection runs purely for diagnostic logging — it samples only
+	 * the first few signon frames and is known to be inaccurate on
+	 * demos that start mid-session.  It's no longer load-bearing for
+	 * emit cadence: native-rate emission (tick_hz=0) drives off
+	 * cls.netchan.incoming_sequence advance in the pump loop, and
+	 * fixed-rate emission (tick_hz>0) gates at the explicit requested
+	 * value via qnn_tick_hz.  Don't overwrite either knob here. */
 	QNN_DetectNativeTickHz();
-	if (qnn_runtime.requested_tick_hz == 0
-		&& qnn_runtime.native_hz_detected > 0)
-	{
-		qnn_runtime.fixed_tick_hz = qnn_runtime.native_hz_detected;
-		qnn_runtime.fixed_dt = 1.0f / (float)qnn_runtime.native_hz_detected;
-		Cvar_SetValue("qnn_tick_hz",
-			(float)qnn_runtime.native_hz_detected);
-	}
 
 	/* Detect actual map from worldmodel */
 	if (cl.worldmodel != NULL && cl.worldmodel->name[0] != '\0')
@@ -513,6 +507,7 @@ static int QNN_HandleCollect(const char *line)
 {
 	qnn_action_t native_action;
 	qnn_snapshot_t snapshot;
+	qnn_snapshot_t label_snapshot;
 	char demo_path[MAX_OSPATH];
 	char error[256];
 	int mvd_player_num;
@@ -618,11 +613,13 @@ static int QNN_HandleCollect(const char *line)
 	 * matches qnn_tick_hz cvar; QNN_TickGate in cl_main.c lets every
 	 * Host_Frame(fixed_dt) call advance.  No resample aggregation. */
 
-	/* play_start / play_end arrive as native-frame indices from the
-	 * classifier.  qnn_runtime.tick increments per emit at fixed_tick_hz,
-	 * so we convert once now using the engine-detected native rate.
-	 * If detection failed (native_hz_detected==0), fall back to the
-	 * upstream defaults: 77 Hz QW, 72 Hz NQ. */
+	/* play_start / play_end arrive as native-frame indices.  In native
+	 * mode (tick_hz == 0) qnn_runtime.tick increments once per consumed
+	 * server frame, so the values are already in the right space —
+	 * skip the rescale.  In fixed-rate mode, qnn_runtime.tick increments
+	 * at fixed_tick_hz, so rescale by fixed_tick_hz / native_hz_detected.
+	 * Falls back to 77 Hz QW if detection produced no value. */
+	if (qnn_runtime.fixed_tick_hz > 0)
 	{
 		int native_hz = qnn_runtime.native_hz_detected > 0
 			? qnn_runtime.native_hz_detected
@@ -633,6 +630,11 @@ static int QNN_HandleCollect(const char *line)
 			play_end = (int)(((long long)play_end * qnn_runtime.fixed_tick_hz) / native_hz);
 		fprintf(stderr, "[qw-demo] play gate (native→emit @ %d Hz / %d Hz): play_start=%d play_end=%d\n",
 			native_hz, qnn_runtime.fixed_tick_hz, play_start, play_end);
+	}
+	else
+	{
+		fprintf(stderr, "[qw-demo] play gate (native emit, no rescale): play_start=%d play_end=%d\n",
+			play_start, play_end);
 	}
 
 	{
@@ -648,27 +650,86 @@ static int QNN_HandleCollect(const char *line)
 			qboolean emitting = false;
 
 		QNN_WatchdogBegin(10);
+		/* Native-rate emission (tick_hz=0): pump small Host_Frame steps
+		 * until cls.netchan.incoming_sequence advances (= the engine
+		 * consumed one DEM_READ record), then run the emit body once
+		 * with fixed_dt set to the actual elapsed cl.time.  This makes
+		 * the emit count track the demo's DEM_READ count independent
+		 * of QNN_DetectNativeTickHz's accuracy.
+		 *
+		 * Fixed-rate mode (tick_hz>0): one Host_Frame(fixed_dt) per
+		 * emit, engine consumes whatever DEM_READs land in that
+		 * interval (vendor behavior).  qnn_tick_hz cvar gates the
+		 * advance at the requested rate. */
+		const qboolean native_emit_mode = (qnn_runtime.requested_tick_hz == 0);
+		const float NATIVE_PROBE_DT = 0.001f;
+		const int NATIVE_PUMPS_PER_FRAME_MAX = 4096;  /* 4.1s cap */
 		while (!qnn_runtime.done)
 		{
+			float tick_start_attack_finished = 0.0f;
+
 			qnn_runtime.cmd_seq_window_start = cls.netchan.outgoing_sequence;
 			qnn_runtime.emit_start_native = (float)cl.time;
-			Host_Frame(qnn_runtime.fixed_dt);
+			if (!qnn_runtime.labeler_mode)
+			{
+				QNN_CaptureSnapshotLocal(&snapshot, false);
+				/* Snapshot the QC VM's attack_finished BEFORE Host_Frame
+				 * consumes this tick's demo cmd and before any action label
+				 * code advances the cooldown by this tick's fire. The obs
+				 * must record decision-time AF, not post-action AF. */
+				tick_start_attack_finished =
+					QNN_ProgsGetAttackFinished();
+			}
+			if (native_emit_mode)
+			{
+				int prev_seq = cls.netchan.incoming_sequence;
+				int pumps = 0;
+				while (cls.netchan.incoming_sequence == prev_seq
+					&& cls.demoplayback
+					&& cls.state != ca_disconnected
+					&& pumps < NATIVE_PUMPS_PER_FRAME_MAX)
+				{
+					Host_Frame(NATIVE_PROBE_DT);
+					pumps++;
+				}
+				/* Stamp fixed_dt with the actual server-frame period
+				 * for this emit so downstream consumers see real
+				 * elapsed time. */
+				float actual_dt = (float)cl.time - qnn_runtime.emit_start_native;
+				if (actual_dt > 0.0001f)
+					qnn_runtime.fixed_dt = actual_dt;
+			}
+			else
+			{
+				Host_Frame(qnn_runtime.fixed_dt);
+			}
 			QNN_WatchdogTick();
 			qnn_runtime.tick += 1;
 			qnn_runtime.steps += 1;
 
 			if (!cls.demoplayback || cls.state == ca_disconnected)
 				qnn_runtime.done = true;
+			if (!qnn_runtime.done)
+				QNN_CaptureSnapshotLocal(&label_snapshot, false);
+			else if (qnn_runtime.labeler_mode)
+				QNN_CaptureSnapshotLocal(&label_snapshot, false);
+			else
+			{
+				label_snapshot = snapshot;
+				snapshot.done = true;
+				label_snapshot.done = true;
+			}
+			if (qnn_runtime.labeler_mode)
+				snapshot = label_snapshot;
 
 			/* Frame-gated emission: play_start..play_end from the
 			 * offline analyzer.  Everything outside is skipped. */
 			if (qnn_runtime.tick > play_end)
 			{
 				snapshot.done = true;
+				label_snapshot.done = true;
 				qnn_runtime.done = true;
 			}
-
-			QNN_CaptureSnapshotLocal(&snapshot, false);
 
 			if (!emitting && qnn_runtime.tick >= play_start)
 			{
@@ -677,17 +738,23 @@ static int QNN_HandleCollect(const char *line)
 				QNN_SaveEmitAnchor(&snapshot);
 				fprintf(stderr, "[qw-demo] emitting from tick %d (play_start=%d play_end=%d)\n",
 					qnn_runtime.tick, play_start, play_end);
-				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
-				continue;
+				if (qnn_runtime.labeler_mode)
+				{
+					QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
+					continue;
+				}
 			}
 
 			if (!emitting && !qnn_runtime.done)
 			{
-				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
+				QNN_SavePrev(&label_snapshot, qnn_runtime.fixed_dt);
 				continue;
 			}
+			if (!emitting)
+				continue;
 
-			QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
+			if (emitting && qnn_runtime.tick > play_start)
+				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
 
 			if (qnn_runtime.store_dump != NULL)
 			{
@@ -743,7 +810,7 @@ static int QNN_HandleCollect(const char *line)
 			{
 				if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
 					QNN_MvdInferNativeAction(&native_action,
-						&snapshot);
+						&label_snapshot);
 			}
 
 			/* Emit-time action label.  QWD path is a pure usercmd-byte
@@ -755,27 +822,39 @@ static int QNN_HandleCollect(const char *line)
 				{
 					float phys_dt;
 					QNN_MvdInferEmitAction(
-						&snapshot.action_label,
-						&snapshot);
+						&label_snapshot.action_label,
+						&label_snapshot);
 					phys_dt = qnn_runtime.native_frame_count
 						* qnn_runtime.fixed_dt;
 					if (phys_dt > 0.0f)
 					{
 						QNN_MvdInferEmitMove(
-							&snapshot.action_label,
-							&snapshot, phys_dt);
-						qnn_runtime.prev_move = snapshot.action_label.move;
+							&label_snapshot.action_label,
+							&label_snapshot, phys_dt);
+						qnn_runtime.prev_move = label_snapshot.action_label.move;
 					}
 					else
 					{
-						snapshot.action_label.move = qnn_runtime.prev_move;
+						label_snapshot.action_label.move = qnn_runtime.prev_move;
 					}
+					snapshot.action_label = label_snapshot.action_label;
 				}
 				else
 				{
-					QNN_QwdBuildActionLabel(
-						&snapshot.action_label,
-						&snapshot);
+					if (qnn_runtime.labeler_mode)
+					{
+						QNN_QwdBuildActionLabel(
+							&snapshot.action_label,
+							&snapshot);
+					}
+					else
+					{
+						QNN_QwdBuildActionLabel(
+							&snapshot.action_label,
+							&snapshot);
+						QNN_FillLookAndSwitch(&snapshot.action_label,
+							&label_snapshot);
+					}
 				}
 			}
 			else
@@ -800,7 +879,9 @@ static int QNN_HandleCollect(const char *line)
 				qboolean mvd_path =
 					(cls.mvdplayback || qnn_runtime.force_mvd_emit);
 				uint8_t obs_bytes[QNN_OBS_BUFFER_SIZE];
-				int cur_weapon = snapshot.weapon_id;
+				int cur_weapon = mvd_path
+					? label_snapshot.weapon_id
+					: snapshot.weapon_id;
 
 				if (qnn_runtime.force_mvd_emit && !cls.mvdplayback)
 				{
@@ -821,8 +902,22 @@ static int QNN_HandleCollect(const char *line)
 				/* QWD path is a pure cmd-byte decoder — action.weapon
 				 * is already the canonical label, no rewriting needed.
 				 * Only the MVD path runs back-shift inference (weapon
-				 * via ping-shift + pickup gate, fire/jump per-event). */
-				QNN_PackSnapshotObs(&snapshot, obs_bytes);
+				 * via ping-shift + pickup gate, fire/jump per-event).
+				 *
+				 * AF restore: pack obs with the start-of-tick
+				 * attack_finished (captured before any action label
+				 * advanced cooldown). Without this, obs[t] would
+				 * contain the post-fire stamp from action[t], leaking
+				 * the BC label being predicted into the input. The
+				 * agent's live decision-time input is post-prev-action
+				 * == start-of-this-tick state; collect must match. */
+				{
+					float saved_af = QNN_ProgsGetAttackFinished();
+					QNN_ProgsSetAttackFinished(
+						tick_start_attack_finished);
+					QNN_PackSnapshotObs(&snapshot, obs_bytes);
+					QNN_ProgsSetAttackFinished(saved_af);
+				}
 
 				/* Maintain per-demo running median of svc_updateping
 				 * values (used by QNN_PressBackShiftFrames on the MVD
@@ -880,7 +975,9 @@ static int QNN_HandleCollect(const char *line)
 					obs_bytes, &snapshot.action_label,
 					snapshot.done,
 					qnn_runtime.tick, qnn_runtime.steps,
-					emit_hz, false, snapshot.grounded,
+					emit_hz, false,
+					mvd_path ? label_snapshot.grounded
+						: snapshot.grounded,
 					cur_weapon,
 					cl.stats[STAT_ITEMS]);
 
@@ -931,9 +1028,9 @@ static int QNN_HandleCollect(const char *line)
 				}
 			}
 			if (!snapshot.done)
-				QNN_SaveEmitAnchor(&snapshot);
+				QNN_SaveEmitAnchor(&label_snapshot);
 
-			QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
+			QNN_SavePrev(&label_snapshot, qnn_runtime.fixed_dt);
 		}
 		QNN_WatchdogEnd();
 

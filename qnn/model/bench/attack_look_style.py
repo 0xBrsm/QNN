@@ -48,12 +48,12 @@ def _build_attack_look_style(probe: Mapping[str, Any]) -> HeadBuildResult:
 
       d_model (int).
       self_weapon_embed_in_self (bool).
-      hidden (int): residual MLP bottleneck width.
+      d_hidden (int): residual MLP bottleneck width.
       alignment_scale (float): fixed prior scale (default 5.0).
     """
     d_model = int(_required(probe, "d_model"))
     self_weapon = bool(_required(probe, "self_weapon_embed_in_self"))
-    hidden = int(_required(probe, "hidden"))
+    d_hidden = int(_required(probe, "d_hidden"))
     alignment_scale = float(probe.get("alignment_scale", 5.0))
 
     model_config = neutral_model_config(
@@ -76,7 +76,7 @@ def _build_attack_look_style(probe: Mapping[str, Any]) -> HeadBuildResult:
             weapon_head=Off,
             attack_head=LookStyleAttackHead(
                 in_dim=dims["motor_in"],
-                bottleneck_dim=hidden,
+                d_hidden=d_hidden,
                 activation="gelu",
                 scale_init=alignment_scale,
             ),

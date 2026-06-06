@@ -13,8 +13,10 @@
  *          hold tail.
  *
  *   JUMP   sound (player/plyrjmp8.wav) → walkback by full ping → OR
- *          the ud-pos and jump bits into slot.action.move → grounded-
- *          count chain gate → forward log-normal hold tail.
+ *          the jump bit (bit 7) into slot.action.move → grounded-
+ *          count chain gate → forward log-normal hold tail.  Bit 6
+ *          (ud-pos) is reserved for actual swim-up / jumppad upmove
+ *          and is NOT set from jump-sound inference.
  *
  *   SWITCH per-emit `action.weapon = snapshot.weapon_id`.  On
  *          weapon_id transitions, rewrite the trailing K slots back to
@@ -435,7 +437,8 @@ static void QNN_BackShiftFillJumpBetween(qnn_backshift_ring_t *ring,
 		if (!QNN_BackShiftSlotAt(ring, i, &s))
 			break;
 		if (s->tick > from_tick && s->tick < to_tick)
-			s->action.move |= 0xC0; /* ud-pos | jump bits */
+			s->action.move |= 0x80; /* jump bit only — sound implies
+			                          * button press, not raw upmove */
 	}
 }
 
@@ -460,7 +463,8 @@ static int QNN_BackShiftJumpGroundedCount(qnn_backshift_ring_t *ring,
 
 static void qnn_press_set_jump(qnn_action_t *a)
 {
-	a->move |= 0xC0; /* ud-pos | jump bits */
+	a->move |= 0x80; /* jump bit only — sound implies button press,
+	                  * not raw upmove */
 }
 
 static qboolean qnn_press_chain_gate_jump(qnn_backshift_ring_t *ring,
@@ -687,7 +691,8 @@ void QNN_MvdBackShiftPush(qnn_tick_emit_state_t *emit, FILE *out,
 	}
 	if (mvd_state.jump_hold_remaining > 0)
 	{
-		slot->action.move |= 0xC0; /* ud-pos | jump bits */
+		slot->action.move |= 0x80; /* jump bit only — sound implies
+		                            * button press, not raw upmove */
 		mvd_state.jump_hold_remaining--;
 	}
 

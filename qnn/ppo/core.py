@@ -1,4 +1,13 @@
-"""Custom PPO recurrent core that fuses current transformer state with memory."""
+"""Custom PPO recurrent core that runs the GRU on the encoder's self readout.
+
+Matches the BC ``Network`` temporal layout: the transformer's ``cls_readout``
+slot is the per-step pool fed to the GRU; ``target_feat`` flows past the
+GRU unchanged. The fused output passed to the action / value heads is
+``cat(cls_readout, h_t, target_feat)`` — a strict superset of BC's motor
+features (``cat(h_t, target_feat)``), so warm-starting from a BC encoder
++ GRU stays meaningful and the new ``cls_readout`` slice picks up its
+gradient signal from PPO.
+"""
 
 from __future__ import annotations
 
@@ -10,17 +19,9 @@ from sample_factory.model.core import ModelCore, ModelCoreIdentity
 
 
 class QuakeConcatRNNCore(ModelCore):
-    """GRU core that splits cat(self, pool, target_feat) and fuses
-    cat(self, h_t, target_feat).
-
-    The encoder emits three d_model summaries:
-      * ``cls_readout`` — transformer self-token readout ("the now")
-      * ``pool``         — self + mean(actors) projection, fed to the GRU
-      * ``target_feat``  — attention-pooled entity feature for head conditioning
-
-    The core routes pool through the GRU and passes cls_readout and
-    target_feat through unchanged.  Action heads downstream read
-    cat(cls_readout, h_t, target_feat).
+    """RNN core that splits the encoder's ``cat(cls_readout, target_feat)``
+    output, runs the GRU on ``cls_readout``, and fuses
+    ``cat(cls_readout, h_t, target_feat)`` for downstream heads.
     """
 
     def __init__(self, cfg, input_size: int):
@@ -28,48 +29,48 @@ class QuakeConcatRNNCore(ModelCore):
 
         self.cfg = cfg
         self.input_size = int(input_size)
-        # Encoder packs three d_model-sized vectors in order.
-        assert self.input_size % 3 == 0, (
-            f"QuakeConcatRNNCore expects encoder output divisible by 3 (self, pool, target_feat); got {self.input_size}"
+        # Encoder packs two d_model-sized vectors in order: cls_readout, target_feat.
+        assert self.input_size % 2 == 0, (
+            f"QuakeConcatRNNCore expects encoder output divisible by 2 "
+            f"(cls_readout, target_feat); got {self.input_size}"
         )
-        self.d_model = self.input_size // 3
+        self.d_model = self.input_size // 2
         self.self_dim = self.d_model
-        self.pool_dim = self.d_model
         self.target_dim = self.d_model
         self.is_gru = False
 
         if cfg.rnn_type == "gru":
-            self.core = nn.GRU(self.pool_dim, cfg.rnn_size, cfg.rnn_num_layers)
+            self.core = nn.GRU(self.self_dim, cfg.rnn_size, cfg.rnn_num_layers)
             self.is_gru = True
         elif cfg.rnn_type == "lstm":
-            self.core = nn.LSTM(self.pool_dim, cfg.rnn_size, cfg.rnn_num_layers)
+            self.core = nn.LSTM(self.self_dim, cfg.rnn_size, cfg.rnn_num_layers)
         else:
             raise RuntimeError(f"Unknown RNN type {cfg.rnn_type}")
 
         self.rnn_num_layers = int(cfg.rnn_num_layers)
-        # Heads see self + gru_out + target_feat.
+        # Heads see cls_readout + gru_out + target_feat.
         self.core_output_size = self.self_dim + int(cfg.rnn_size) + self.target_dim
 
-    def _split(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.split(t, [self.self_dim, self.pool_dim, self.target_dim], dim=-1)
+    def _split(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.split(t, [self.self_dim, self.target_dim], dim=-1)
 
     def forward(self, head_output, rnn_states):
         is_packed = isinstance(head_output, PackedSequence)
         is_batched_sequence = torch.is_tensor(head_output) and head_output.ndim == 3
         if is_packed:
-            self_data, pool_data, target_data = self._split(head_output.data)
+            self_data, target_data = self._split(head_output.data)
             core_input = PackedSequence(
-                pool_data,
+                self_data,
                 head_output.batch_sizes,
                 head_output.sorted_indices,
                 head_output.unsorted_indices,
             )
         elif is_batched_sequence:
-            cls_readout, pool, target_feat = self._split(head_output)
-            core_input = pool
+            cls_readout, target_feat = self._split(head_output)
+            core_input = cls_readout
         else:
-            cls_readout, pool, target_feat = self._split(head_output)
-            core_input = pool.unsqueeze(0)
+            cls_readout, target_feat = self._split(head_output)
+            core_input = cls_readout.unsqueeze(0)
 
         if self.rnn_num_layers > 1:
             rnn_states = rnn_states.view(rnn_states.size(0), self.cfg.rnn_num_layers, -1)

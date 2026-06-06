@@ -499,6 +499,7 @@ static int QNN_HandleCollect(const char *line)
 {
 	qnn_action_t native_action;
 	qnn_snapshot_t snapshot;
+	qnn_snapshot_t label_snapshot;
 	char demo_path[MAX_OSPATH];
 	char error[256];
 	int play_start, play_end;
@@ -555,22 +556,30 @@ static int QNN_HandleCollect(const char *line)
 		while (!qnn_runtime.done)
 		{
 			qnn_runtime.emit_start_native = (float)cl.time;
+			QNN_CaptureSnapshotLocal(&snapshot, false);
 			Host_Frame(qnn_runtime.fixed_dt);
 			QNN_WatchdogTick();
 			qnn_runtime.tick += 1;
 			qnn_runtime.steps += 1;
 			if (!cls.demoplayback || cls.state == ca_disconnected)
 				qnn_runtime.done = true;
+			if (!qnn_runtime.done)
+				QNN_CaptureSnapshotLocal(&label_snapshot, false);
+			else
+			{
+				label_snapshot = snapshot;
+				snapshot.done = true;
+				label_snapshot.done = true;
+			}
 
 			/* Frame-gated emission: play_start..play_end from the
 			 * offline analyzer.  Everything outside is skipped. */
 			if (qnn_runtime.tick > play_end)
 			{
 				snapshot.done = true;
+				label_snapshot.done = true;
 				qnn_runtime.done = true;
 			}
-
-			QNN_CaptureSnapshotLocal(&snapshot, false);
 
 			if (!emitting && qnn_runtime.tick >= play_start)
 			{
@@ -579,17 +588,18 @@ static int QNN_HandleCollect(const char *line)
 				QNN_SaveEmitAnchor(&snapshot);
 				fprintf(stderr, "[demo] emitting from tick %d (play_start=%d play_end=%d)\n",
 					qnn_runtime.tick, play_start, play_end);
-				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
-				continue;
 			}
 
 			if (!emitting && !qnn_runtime.done)
 			{
-				QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
+				QNN_SavePrev(&label_snapshot, qnn_runtime.fixed_dt);
 				continue;
 			}
+			if (!emitting)
+				continue;
 
-			QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
+			if (emitting && qnn_runtime.tick > play_start)
+				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
 
 			if (qnn_runtime.store_dump != NULL)
 			{
@@ -621,24 +631,25 @@ static int QNN_HandleCollect(const char *line)
 			}
 
 			if (!snapshot.done)
-				QNN_InferNativeAction(&native_action, &snapshot);
+				QNN_InferNativeAction(&native_action, &label_snapshot);
 			else
 				QNN_ClearAction(&native_action);
 
 			if (!snapshot.done)
 			{
-				QNN_InferEmitAction(&snapshot.action_label, &snapshot);
+				QNN_InferEmitAction(&label_snapshot.action_label, &label_snapshot);
 				if (qnn_runtime.native_frame_count > 0)
 				{
 					float phys_dt = qnn_runtime.native_frame_count * qnn_runtime.fixed_dt;
-					QNN_InferEmitMove(&snapshot.action_label,
-						&snapshot, phys_dt);
-					qnn_runtime.prev_move = snapshot.action_label.move;
+					QNN_InferEmitMove(&label_snapshot.action_label,
+						&label_snapshot, phys_dt);
+					qnn_runtime.prev_move = label_snapshot.action_label.move;
 				}
 				else
 				{
-					snapshot.action_label.move = qnn_runtime.prev_move;
+					label_snapshot.action_label.move = qnn_runtime.prev_move;
 				}
+				snapshot.action_label = label_snapshot.action_label;
 			}
 			else
 				QNN_ClearAction(&snapshot.action_label);
@@ -647,9 +658,9 @@ static int QNN_HandleCollect(const char *line)
 				&snapshot, qnn_runtime.tick,
 				qnn_runtime.steps, emit_hz, false);
 			if (!snapshot.done)
-				QNN_SaveEmitAnchor(&snapshot);
+				QNN_SaveEmitAnchor(&label_snapshot);
 
-			QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
+			QNN_SavePrev(&label_snapshot, qnn_runtime.fixed_dt);
 		}
 		QNN_WatchdogEnd();
 

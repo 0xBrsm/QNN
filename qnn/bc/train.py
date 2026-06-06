@@ -124,6 +124,25 @@ class BCConfig:
     # Expected collection identity (qnn.collection_fingerprint). Empty =
     # log-only mode.
     collection_fingerprint: str
+    # Per-frame engagement EMA decay rate (see
+    # qnn.bc.supervised_loop._compute_engagement_ema). α=0.5 was picked by
+    # the MI analysis in scripts/attack_prior_methodical.py and is the
+    # historical default; head-probe runs can override per-run via
+    # probe.json["engagement_ema_alpha"].
+    engagement_ema_alpha: float = 0.5
+    # Opt-in: when true, the attack-head BCE LOSS is computed against
+    # ``actions["attack_shifted"]`` (per-episode ``attack[t] OR attack[next
+    # op-frame in same episode]``). Val precision/recall/F1 metrics still
+    # use the original ``actions["attack"]`` label so we can compare to
+    # the baseline apples-to-apples — only the loss-tensor target shifts.
+    # Motivation: signed-offset analysis showed the current best model
+    # has a systematic anticipatory bias, with ~31% of its predicted
+    # positives leading the demo's actual fires by exactly one op-frame
+    # (one cooldown cycle). The +1 op-frame target shift credits the
+    # model for those otherwise-penalized leads; asymmetric on purpose
+    # since lag is rare. Default False = bit-identical to current
+    # behavior.
+    attack_label_shift: bool = False
 
 
 from qnn.bc.loop import (
@@ -215,13 +234,17 @@ def _unpack_move_axes(packed: np.ndarray) -> np.ndarray:
       bit 0 = attack press
       bit 1 = fb neg            bit 2 = fb pos
       bit 3 = lr neg            bit 4 = lr pos
-      bit 5 = ud neg            bit 6 = ud pos (unified: swim-up OR jump)
-      bit 7 = jump press (explicit, diagnostic)
+      bit 5 = ud neg            bit 6 = ud pos (upmove > 0 — swim-up /
+                                                jumppad / ladder)
+      bit 7 = jump press (explicit jump button)
 
     Each axis returns a 3-class label in {0=neg, 1=none, 2=pos}:
       class = 1 + (pos_bit) - (neg_bit)
-    Both bits cleared → class=1 (none); only neg → 0; only pos → 2.
-    Both set (shouldn't happen for honest demos) → also 1.
+
+    For the ud axis the model treats jump and upmove>0 as the same
+    "press +Z" intent (only one ud_pos class in the action head), so
+    pos_bit = bit 6 OR bit 7.  Both bits cleared → class=1 (none);
+    only neg → 0; either pos → 2.
 
     Attack and jump are extracted separately by ``_unpack_attack_bit`` and
     ``_unpack_jump_bit``. Materializes a fresh array (no longer mmap-backed)
@@ -236,7 +259,9 @@ def _unpack_move_axes(packed: np.ndarray) -> np.ndarray:
     lr_neg = (arr >> 3) & one
     lr_pos = (arr >> 4) & one
     ud_neg = (arr >> 5) & one
-    ud_pos = (arr >> 6) & one
+    # ud_pos folds in jump (bit 7) so both swim/jumppad upmove and the
+    # explicit jump button supervise the same "press +Z" class.
+    ud_pos = ((arr >> 6) & one) | ((arr >> 7) & one)
     fb = (one + fb_pos - fb_neg).astype(np.uint8)
     lr = (one + lr_pos - lr_neg).astype(np.uint8)
     ud = (one + ud_pos - ud_neg).astype(np.uint8)
@@ -1413,11 +1438,7 @@ def run_behavior_cloning(
             segment_mask=config.segment_mask,
             token_mask=config.token_mask,
         )
-        val_episodes = _load_precomputed(
-            val_cache, required_actions=required_actions,
-            segment_mask=config.segment_mask,
-            token_mask=config.token_mask,
-        ) if val_cache.exists() else []
+        val_episodes: list = []
 
     # Configure mixed-precision autocast via the env var that QNNPolicy reads.
     os.environ["QNN_AUTOCAST_DTYPE"] = config.dtype
@@ -1452,44 +1473,74 @@ def run_behavior_cloning(
     # label is the engine outcome (act = max(usercmd − mask, 0)); when
     # false, the label is the raw demo button (usercmd).
     model.input_mask = bool(config.input_mask)
+    # attack_label_shift is also a training-time label-rewrite toggle
+    # (no model arch impact, no checkpoint meta). Off by default; when on,
+    # the attack-head LOSS reads actions["attack_shifted"] (built by the
+    # source above) and val metrics keep using the original attack label.
+    model.attack_label_shift = bool(config.attack_label_shift)
 
     # Build the Source. streaming=False (default) preloads the whole corpus
-    # to device once — the unified-memory APU win, no host duplicate. Drop
-    # the host-side numpy arrays unconditionally after preload.
-    # streaming=True keeps shard mmaps lazy and pads/dequants per batch.
+    # to device once; the resident builder consumes host episode arrays as
+    # each field is transferred and drops redundant native tensors after
+    # preload dequant. streaming=True keeps shard mmaps lazy and pads/dequants
+    # per batch.
     _t0 = _time.monotonic()
+    eng_alpha = float(config.engagement_ema_alpha)
     if bool(config.streaming):
         print(f"  [bc] streaming=true: lazy mmap reads from {train_cache}")
         train_source = _make_streaming_source(
             train_cache, model.device,
             segment_mask=config.segment_mask, token_mask=config.token_mask,
             prefetch_depth=max(2, int(config.prefetch)),
+            engagement_ema_alpha=eng_alpha,
         )
         val_source = (
             _make_streaming_source(
                 val_cache, model.device,
                 segment_mask=config.segment_mask, token_mask=config.token_mask,
                 prefetch_depth=max(2, int(config.prefetch)),
+                engagement_ema_alpha=eng_alpha,
             ) if val_cache.exists()
-            else _make_resident_source([], model.device)
+            else _make_resident_source([], model.device, engagement_ema_alpha=eng_alpha)
         )
     else:
-        print(
-            f"  [bc] preload: concatenating "
-            f"{sum(ep.n_samples for ep in train_episodes)} train + "
-            f"{sum(ep.n_samples for ep in val_episodes)} val frames to {model.device}"
-        )
-        train_source = _make_resident_source(train_episodes, model.device)
-        val_source = _make_resident_source(val_episodes, model.device)
-        # Drop host episode arrays — train_source owns the data on device now.
-        for _ep in train_episodes:
-            _ep.obs = {}
-            _ep.actions = {}
-        for _ep in val_episodes:
-            _ep.obs = {}
-            _ep.actions = {}
         import gc as _gc
+
+        train_frames = sum(ep.n_samples for ep in train_episodes)
+        print(
+            f"  [bc] preload: concatenating {train_frames} train frames "
+            f"to {model.device}"
+        )
+        train_source = _make_resident_source(
+            train_episodes, model.device,
+            engagement_ema_alpha=eng_alpha,
+            release_host=True,
+            compact_dequantized=True,
+        )
         _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if val_cache.exists():
+            print(f"  [bc] Loading validation data: {val_cache}")
+            val_episodes = _load_precomputed(
+                val_cache, required_actions=required_actions,
+                segment_mask=config.segment_mask,
+                token_mask=config.token_mask,
+            )
+        val_frames = sum(ep.n_samples for ep in val_episodes)
+        print(
+            f"  [bc] preload: concatenating {val_frames} val frames "
+            f"to {model.device}"
+        )
+        val_source = _make_resident_source(
+            val_episodes, model.device,
+            engagement_ema_alpha=eng_alpha,
+            release_host=True,
+            compact_dequantized=True,
+        )
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     print(f"  [bc] source ready in {_time.monotonic() - _t0:.1f}s")
 
     sample_counts = {
@@ -1511,7 +1562,10 @@ def run_behavior_cloning(
     if config.head_loss_weights:
         hlw = dict(head_loss_weights)
 
-    best_val_loss = float("inf")
+    # Best _selection_score seen so far — composite (1-acc_target) +
+    # 3*(1-f1_move) + (1-cos_sim_look) + (1-f1_attack) + (1-f1_weapon).
+    # NOT a loss; selection error, lower is better.
+    best_selection_score = float("inf")
     best_epoch = -1
     history: list[Dict[str, float]] = []
     start_epoch = 0
@@ -1561,7 +1615,11 @@ def run_behavior_cloning(
             optimizer=ckpt.get("optimizer_state_dict"),
         )
         model.model.load_state_dict(ckpt["model_state_dict"])
-        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        # Resume compat: accept new key, fall back to the old "best_val_loss"
+        # name (a misnomer that held the same selection score).
+        best_selection_score = float(ckpt.get(
+            "best_selection_score", ckpt.get("best_val_loss", float("inf")),
+        ))
         best_epoch = ckpt.get("best_epoch", -1)
         history = ckpt.get("history", [])
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -1577,7 +1635,7 @@ def run_behavior_cloning(
         _saved_rng_state = ckpt.get("rng_state")
         if _saved_rng_state is not None:
             rng.bit_generator.state = _saved_rng_state
-        print(f"  [bc] Resuming from epoch {start_epoch} (best_val={best_val_loss:.4f} at epoch {best_epoch})")
+        print(f"  [bc] Resuming from epoch {start_epoch} (best_selection={best_selection_score:.4f} at epoch {best_epoch})")
     else:
         _resume_optimizer_state = None
 
@@ -1806,7 +1864,7 @@ def run_behavior_cloning(
         # Composite selection: target acc + move/fire/weapon macro-F1 + look cos.
         val_selection_score = _selection_score(val_metrics)
         selection_metric = val_selection_score
-        improved = selection_metric < best_val_loss
+        improved = selection_metric < best_selection_score
 
         # Weight drift: L2 of (weights now) - (weights at epoch start).
         # Non-zero drift in a plateau = model still reorganizing; zero = stuck.
@@ -1911,8 +1969,8 @@ def run_behavior_cloning(
 
         # Checkpoint selection: best val MAE sum.  Regression gate is purely
         # for stopping, not model selection.
-        if selection_metric < best_val_loss:
-            best_val_loss = selection_metric
+        if selection_metric < best_selection_score:
+            best_selection_score = selection_metric
             best_epoch = epoch
             model.save(output / "bc_best_model.pth")
 
@@ -1933,7 +1991,7 @@ def run_behavior_cloning(
                 for k, v in model.model.state_dict().items()
             },
             "optimizer_state_dict": bc_opt.state_dict() if bc_opt else None,
-            "best_val_loss": best_val_loss,
+            "best_selection_score": best_selection_score,
             "best_epoch": best_epoch,
             "history": history,
             "_best_move": _best_move,
@@ -1988,6 +2046,13 @@ def run_behavior_cloning(
     final_model = QNNPolicy.load(
         output / "bc_best_model.pth", device=config.device, model_factory=model_factory,
     )
+    # Defensive: QNNPolicy.load restores input_mask from the checkpoint
+    # meta if present; for pre-fix checkpoints that lack the field the
+    # default is False, which would silently swap the val label distribution.
+    # Override from the BCConfig so the trainer's final-pass numbers always
+    # match the training-time val pass.
+    final_model.input_mask = bool(config.input_mask)
+    final_model.attack_label_shift = bool(config.attack_label_shift)
 
     if val_source.n_total_rows > 0:
         final_val_metrics = _run_epoch(
@@ -2003,7 +2068,7 @@ def run_behavior_cloning(
 
     summary: Dict[str, Any] = {
         "best_epoch": best_epoch,
-        "best_val_loss": best_val_loss,
+        "best_selection_score": best_selection_score,
         "final_val_loss": float(final_val_metrics["loss"]),
         "num_train_samples": int(sample_counts["train"]),
         "num_val_samples": int(sample_counts["val"]),

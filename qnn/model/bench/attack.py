@@ -81,14 +81,14 @@ def _build_attack(probe: Mapping[str, Any]) -> HeadBuildResult:
     """Build the flat-feature attack probe from probe.json. All keys required.
 
     Reads:
-      hidden (int), n_hidden_layers (int), dropout (float),
+      d_hidden (int), n_hidden_layers (int), dropout (float),
       feature_names (list of str), d_model (int — neutral ModelConfig
       width, inert here but required so probe.json reflects the full
       surface area), self_weapon_embed_in_self (bool — likewise inert
       under the flat-feature path but kept on the probe schema for
       symmetry with attack_preattn).
     """
-    hidden = int(_required(probe, "hidden"))
+    d_hidden = int(_required(probe, "d_hidden"))
     n_hidden_layers = int(_required(probe, "n_hidden_layers"))
     dropout = float(_required(probe, "dropout"))
     raw_names = _required(probe, "feature_names")
@@ -109,7 +109,7 @@ def _build_attack(probe: Mapping[str, Any]) -> HeadBuildResult:
         return FlatFeatureHead(
             feature_names=feature_names,
             output_route="attack",
-            hidden=hidden,
+            d_hidden=d_hidden,
             n_hidden_layers=n_hidden_layers,
             dropout=dropout,
         )

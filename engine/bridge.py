@@ -142,13 +142,21 @@ class NativeProcessBase:
         proc = self._ensure_running()
         proc.stdin.write(payload)
         proc.stdin.flush()
-        line = proc.stdout.readline()
-        if not line:
-            stderr = self._stderr_tail().strip()
-            raise NativeEngineError(
-                f"Native engine terminated unexpectedly: {stderr or 'no response'}"
-            )
-        return self._decode_json_response(line)
+        # Pre-protocol stdout chatter (engine init lines like "Added
+        # packfile…", "Quake Initialized") is suppressed by the
+        # QNN_STDOUT_PROTOCOL=1 env var ``start()`` sets; this loop is
+        # the belt-and-suspenders fallback for workers built before
+        # that change. Skip everything until a '{'-prefixed line, the
+        # canonical opener for every protocol response.
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                stderr = self._stderr_tail().strip()
+                raise NativeEngineError(
+                    f"Native engine terminated unexpectedly: {stderr or 'no response'}"
+                )
+            if line[:1] == b"{":
+                return self._decode_json_response(line)
 
     # -- Action helpers ------------------------------------------------------
 
@@ -230,6 +238,11 @@ class NativeProcessBase:
 
         env = os.environ.copy()
         env.update(self.env)
+        # Tell the worker that stdout is the protocol channel: Sys_Printf
+        # status messages (packfile init, "Quake Initialized", …) must
+        # route to stderr instead of polluting the binary obs / JSON
+        # response stream. See src/engine/nq/qnn_sys.c Sys_Printf.
+        env.setdefault("QNN_STDOUT_PROTOCOL", "1")
         self.proc = subprocess.Popen(
             [self.executable, *self.extra_args],
             stdin=subprocess.PIPE,

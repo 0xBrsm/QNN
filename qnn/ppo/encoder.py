@@ -19,7 +19,12 @@ except ImportError as exc:
 
 from qnn.model.target import TargetPointer, TargetPointerInput
 from qnn.model.transformer import ObsEmbedding, TransformerEncoder
-from qnn.schema import WEAPON_HEAD_SIZE
+from qnn.vocab import TOKEN_ACTOR
+
+
+# Mirror qnn.model.network._ACTOR_TEAM_OFFSET / _TEAM_TEAMMATE_VALUE.
+_ACTOR_TEAM_OFFSET = 16
+_TEAM_TEAMMATE_VALUE = 1.0
 
 
 class QuakeTransformerEncoder(Encoder):
@@ -31,8 +36,9 @@ class QuakeTransformerEncoder(Encoder):
         d_model: int = int(getattr(cfg, "quake_d_model"))
         n_heads: int = int(getattr(cfg, "quake_n_heads"))
         n_layers: int = int(getattr(cfg, "quake_n_layers"))
-        ffn_dim: int = int(getattr(cfg, "quake_ffn_dim"))
+        d_ffn: int = int(getattr(cfg, "quake_ffn_dim"))
         dropout: float = float(getattr(cfg, "quake_attn_dropout"))
+        d_target: int = int(getattr(cfg, "quake_d_target", d_model))
         self_weapon_embed_in_self: bool = bool(getattr(cfg, "quake_self_weapon_embed_in_self", False))
 
         self.obs_embedding = ObsEmbedding(
@@ -43,23 +49,13 @@ class QuakeTransformerEncoder(Encoder):
             d_model=d_model,
             n_heads=n_heads,
             n_layers=n_layers,
-            ffn_dim=ffn_dim,
+            d_ffn=d_ffn,
             dropout=dropout,
         )
-        # TargetPointer is no longer embedded in TransformerEncoder; the
-        # PPO wrapper owns its own pointer so it can soft-pool target_feat
-        # for the value/policy heads. Plain config — no GT teacher forcing,
-        # no weapon injection in the query (PPO has no labels at rollout).
-        self.target_pointer = TargetPointer(
-            d_model=d_model,
-            query_in_dim=d_model,
-            inject_weapon=False,
-            weapon_vocab=WEAPON_HEAD_SIZE,
-            hard_target=False,
-            linear_idx_prior=False,
-            gt_dist_target_feat=False,
-            prev_target_in_query=False,
-        )
+        # PPO owns its own MLP target pointer so it can soft-pool target_feat
+        # for the value/policy heads. ``d_target`` is the MLP hidden width;
+        # all other target-head variants live exclusively in qnn.model.bench.
+        self.target_pointer = TargetPointer(d_model=d_model, d_target=d_target)
         self.use_rnn: bool = bool(getattr(cfg, "use_rnn", False))
         self.d_model: int = d_model
         self.encoder_out_size: int = 2 * d_model
@@ -67,10 +63,14 @@ class QuakeTransformerEncoder(Encoder):
     def forward(self, obs_dict):
         import torch as _torch
         enc_out = self.encoder(self.obs_embedding(obs_dict))
+        actor_mask = (obs_dict["entity_types"].long() == TOKEN_ACTOR)
+        team = obs_dict["entity_scalars_raw"][..., _ACTOR_TEAM_OFFSET]
+        enemy_mask = actor_mask & (team != _TEAM_TEAMMATE_VALUE)
         tp_out = self.target_pointer(TargetPointerInput(
-            query=enc_out.self_readout,
             entity_outs=enc_out.entity_outs,
             entity_mask=enc_out.entity_mask,
+            enemy_mask=enemy_mask,
+            self_readout=enc_out.self_readout,
         ))
         return _torch.cat([enc_out.self_readout, tp_out.target_feat], dim=-1)
 

@@ -8,6 +8,16 @@
 > machine in `qnn_oracle.c` is unchanged and still mirrors the v2 cone
 > geometry; the agreement numbers below remain a useful reference for
 > the engine state machine.
+>
+> **Slot ordering is also stale.** The "bucket A = target == slot 0 /
+> bucket B = target ≠ slot 0" framing, the
+> `acc_target_slot0_baseline` metric, and the slot-0-prior class
+> weighting all assume a deterministic per-frame entity ordering
+> (pool → recency → team → threat). That ordering was dropped; entity
+> slots are now arbitrary (effectively engine edict order). Treat
+> every slot-0-keyed claim below as a historical artifact, not a live
+> baseline. For current target-head comparisons use `val_target_kl`
+> and restrict to multi-candidate frames.
 
 ## TL;DR
 

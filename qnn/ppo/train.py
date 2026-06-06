@@ -77,9 +77,31 @@ def _allow_numpy_in_torch_load() -> None:
 _allow_numpy_in_torch_load()
 
 
+def _module_level_patches() -> None:
+    """Re-apply patches at module import so they exist in subprocess copies.
+
+    SF spawns learner / inference / rollout workers as separate processes.
+    Each one imports ``qnn.ppo.train`` (via the model factory or the
+    registered env), so attaching the patches at import time is the most
+    reliable hook. ``register_quake_components`` is the main-process
+    callsite; the subprocess imports execute this block automatically.
+
+    Each patch self-guards via a Learner class attribute, so repeated
+    calls are no-ops. Action-distribution + look-cosine patches depend
+    on cfg fields that aren't yet bound at module import — they stay in
+    ``register_quake_components``.
+    """
+    _patch_lenient_warm_start_load()
+    _patch_save_best_keep()
+    _patch_learner_record_summaries()
+
+
 def _patch_sample_factory_checkpoint_loading() -> None:
     """Ensure numpy globals are allowed for SF checkpoint loading."""
     _allow_numpy_in_torch_load()
+
+
+# Defer the call until after _patch_lenient_warm_start_load is defined.
 
 
 def _patch_action_distribution_weights() -> None:
@@ -499,6 +521,98 @@ def _scrub_numpy(obj: Any) -> Any:
     return obj
 
 
+def _prepare_lenient_qnn_ckpt(ckpt: str, dest_dir: Path) -> str:
+    """Pre-process a QNN-format checkpoint so it loads with current ModelConfig.
+
+    Older BC checkpoints can carry meta.model in three legacy shapes:
+      * unknown fields the current frozen ModelConfig rejects
+        (e.g. legacy target-pointer flags like ``gru_target_query``,
+        ``hard_target_feat``, ``linear_idx_prior``,
+        ``gt_dist_target_feat``, ``prev_target_in_query``,
+        ``weapon_in_target_query``, or ablation-run fields like
+        ``attack_prior_mode``, ``attack_alignment_scale``)
+      * missing fields that the current ModelConfig requires
+        (post-v23 additions like ``d_target``,
+        ``weapon_use_self_readout``, ``self_weapon_embed_in_self``)
+      * renamed fields (``fire`` → ``attack`` in legacy
+        ``head_bottleneck_dims``; the dict was later split into four
+        per-action-head scalars ``d_move`` /
+        ``d_look`` / ``d_attack`` / ``d_weapon``)
+
+    For PPO warm-start we don't care about those flag values per se —
+    the value head + action heads are random-init regardless, and the
+    encoder + GRU weights are the real load target. Run the legacy
+    meta through ``migrate_legacy_flat_meta`` (the canonical
+    "synthesize defaults for missing fields + drop unknown" helper)
+    and re-save under ``dest_dir/<basename>.ppo_compat.pth``.
+
+    The source BC checkpoint dir is treated as read-only; the compat
+    copy lives under the PPO run's checkpoint dir so concurrent runs
+    against the same BC ckpt don't race on the same file.
+
+    Returns the (possibly rewritten) path to load.
+    """
+    from qnn.model.network import ModelConfig
+    from qnn.utils.checkpoint_converter import migrate_legacy_flat_meta
+    from qnn.utils.io import trusted_torch_load
+
+    payload = trusted_torch_load(ckpt, map_location="cpu")
+    if not (isinstance(payload, dict) and "meta" in payload and isinstance(payload["meta"], dict)):
+        return ckpt
+    meta = dict(payload["meta"])
+    model_meta = meta.get("model")
+    if not isinstance(model_meta, dict):
+        return ckpt
+    # Try the fast path: meta.model is already current ModelConfig
+    # shape. ``from_flat_dict`` filters unknown keys via the dataclass
+    # field set; if the cleaned result equals the input, no rewrite is
+    # needed.
+    try:
+        fast_cfg = ModelConfig.from_flat_dict(model_meta)
+    except TypeError:
+        fast_cfg = None
+    if fast_cfg is not None and set(model_meta) <= set(fast_cfg.to_dict()):
+        return ckpt
+    # Slow path: meta.model is missing required fields, has
+    # renamed keys, or carries unknown ones. Let
+    # ``migrate_legacy_flat_meta`` reconstruct a clean nested meta
+    # (it expects a flat dict-like map of all the same keys, which
+    # matches our nested model_meta one-to-one). Merge top-level
+    # training scalars (jump_pos_weight, attack_focal_*) back in so
+    # QNNPolicy.load downstream sees them.
+    migrated = migrate_legacy_flat_meta(dict(model_meta))
+    if migrated is None:
+        # Already-modern but ModelConfig rejected it — keep the
+        # original behavior of filtering unknown fields only.
+        if fast_cfg is None:
+            raise RuntimeError(
+                f"{ckpt}: meta.model neither matches current ModelConfig "
+                "nor any recognized legacy schema"
+            )
+        meta["model"] = fast_cfg.to_dict()
+    else:
+        meta["model"] = migrated["model"]
+        # Preserve top-level training scalars the source meta carries.
+        for key in ("jump_pos_weight", "attack_focal_gamma",
+                    "attack_focal_alpha", "attack_distance_sigma",
+                    "jump_distance_sigma", "input_mask"):
+            if key in meta:
+                continue
+            if key in migrated:
+                meta[key] = migrated[key]
+    payload["meta"] = meta
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    compat_path = str(dest_dir / f"{Path(ckpt).stem}.ppo_compat.pth")
+    _scrub_numpy(payload)
+    torch.save(payload, compat_path)
+    delta = sorted(set(model_meta) ^ set(meta["model"]))
+    print(
+        f"[quake_ppo] Normalized meta.model for {ckpt} (key delta {delta}); "
+        f"wrote PPO-compat copy to {compat_path}"
+    )
+    return compat_path
+
+
 def _warm_start_policy(
     pid: int,
     ckpt: str,
@@ -506,6 +620,7 @@ def _warm_start_policy(
 ) -> Path:
     """Seed a single policy dir from a checkpoint. Returns the dest path."""
     import shutil
+    ckpt = _prepare_lenient_qnn_ckpt(ckpt, exp_dir / "warm_start")
 
     policy_dir = exp_dir / f"checkpoint_p{pid}"
     policy_dir.mkdir(parents=True, exist_ok=True)
@@ -608,11 +723,69 @@ def _ensure_warm_start_checkpoint(cfg: Any) -> Optional[Path]:
         return first_path
 
 
+def _patch_lenient_warm_start_load() -> None:
+    """Allow SF's learner to load a partial warm-start checkpoint.
+
+    BC checkpoints only carry the encoder + GRU + target_pointer weights
+    we can map onto SF's actor-critic — the value head + flat action
+    parameterization layer (and possibly any later additions to SF's
+    own modules like obs_normalizer) need orthogonal init. SF defaults
+    to ``strict=True``, which turns a warm-start into a hard crash.
+
+    Patch ``Learner._load_state`` to load with ``strict=False`` and
+    log the missing / unexpected keys instead of raising.
+    """
+    try:
+        from sample_factory.algo.learning.learner import Learner
+    except Exception:
+        return
+    if getattr(Learner, "_qnn_lenient_warm_start", False):
+        return
+    _orig_load_state = Learner._load_state
+
+    def _lenient_load_state(self, checkpoint_dict, load_progress: bool = True):
+        try:
+            return _orig_load_state(self, checkpoint_dict, load_progress=load_progress)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "Missing key(s)" not in msg and "Unexpected key(s)" not in msg:
+                raise
+            print(
+                "[quake_ppo] strict warm-start load failed; retrying with "
+                "strict=False — missing keys will use orthogonal init. "
+                f"({msg.splitlines()[0]})"
+            )
+            missing, unexpected = self.actor_critic.load_state_dict(
+                checkpoint_dict["model"], strict=False,
+            )
+            if missing:
+                print(f"[quake_ppo] warm-start missing keys (orthogonal init): "
+                      f"{sorted(missing)[:8]}{'…' if len(missing) > 8 else ''}")
+            if unexpected:
+                print(f"[quake_ppo] warm-start unexpected keys (ignored): "
+                      f"{sorted(unexpected)[:8]}{'…' if len(unexpected) > 8 else ''}")
+            # The original _load_state also restores optimizer / train_step /
+            # env_steps; mirror that here so the rest of init proceeds.
+            if load_progress:
+                self.train_step = int(checkpoint_dict.get("train_step", 0))
+                self.env_steps = int(checkpoint_dict.get("env_steps", 0))
+                self.best_performance = float(checkpoint_dict.get("best_performance", -1e9))
+            if checkpoint_dict.get("optimizer") is not None:
+                # Skip optimizer restore on lenient load — param-group
+                # lengths will not match after structural mismatch.
+                print("[quake_ppo] warm-start optimizer state skipped (lenient mode)")
+            # Match _orig_load_state's None return contract.
+            return None
+
+    Learner._load_state = _lenient_load_state
+    Learner._qnn_lenient_warm_start = True
+
+
 def _patch_save_best_keep() -> None:
     """Fix SF's hardcoded keep=1 in save_best to use cfg.keep_checkpoints."""
     from sample_factory.algo.learning.learner import Learner
-
-    _original_save_best = Learner.save_best
+    if getattr(Learner, "_qnn_save_best_patched", False):
+        return
 
     def _save_best_keep_all(self, policy_id, metric, metric_value):
         if policy_id != self.policy_id:
@@ -624,6 +797,7 @@ def _patch_save_best_keep() -> None:
         return False
 
     Learner.save_best = _save_best_keep_all
+    Learner._qnn_save_best_patched = True  # type: ignore[attr-defined]
 
 
 def register_quake_components() -> None:
@@ -632,6 +806,7 @@ def register_quake_components() -> None:
     _patch_sample_factory_checkpoint_loading()
     _patch_learner_record_summaries()
     _patch_action_distribution_weights()
+    _patch_lenient_warm_start_load()
     register_env("quake_combat", make_quake_env)
     if _HAS_REGISTER_CUSTOM_ENCODER:
         # SF < 2.1: direct registration helper
@@ -761,12 +936,12 @@ def build_ppo_cfg(
     seed: int,
     device: str,
     encoder_hidden: int,
-    gru_hidden: int,
+    d_gru: int,
     use_gru: bool,
     d_model: int,
     n_heads: int,
     n_layers: int,
-    ffn_dim: int,
+    d_ffn: int,
     attn_dropout: float,
     ppo_epochs: int,
     lr: float,
@@ -815,7 +990,7 @@ def build_ppo_cfg(
         f"--env=quake_combat",
         f"--use_rnn={'True' if use_gru else 'False'}",
         f"--rnn_type=gru",
-        f"--rnn_size={gru_hidden}",
+        f"--rnn_size={d_gru}",
         f"--num_workers={num_workers}",
         f"--num_envs_per_worker={num_envs_per_worker}",
         f"--worker_num_splits={worker_num_splits}",
@@ -859,7 +1034,7 @@ def build_ppo_cfg(
         f"--quake_d_model={d_model}",
         f"--quake_n_heads={n_heads}",
         f"--quake_n_layers={n_layers}",
-        f"--quake_ffn_dim={ffn_dim}",
+        f"--quake_ffn_dim={d_ffn}",
         f"--quake_attn_dropout={attn_dropout}",
     ]
 
@@ -946,6 +1121,8 @@ def _patch_learner_record_summaries() -> None:
     """
     try:
         from sample_factory.algo.learning.learner import Learner
+        if getattr(Learner, "_qnn_record_summaries_patched", False):
+            return
         _orig_record = Learner._record_summaries
 
         def _safe_record(self, summary_vars, *args, **kwargs):
@@ -956,9 +1133,8 @@ def _patch_learner_record_summaries() -> None:
                     return None
                 raise
 
-        if not getattr(_safe_record, "_quake_patched", False):
-            _safe_record._quake_patched = True  # type: ignore[attr-defined]
-            Learner._record_summaries = _safe_record
+        Learner._record_summaries = _safe_record
+        Learner._qnn_record_summaries_patched = True  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -1035,6 +1211,10 @@ def main() -> None:
         status = runner.run()
     write_ppo_stage_artifacts(cfg, status, runner)
 
+
+
+# Apply module-level patches now that all helpers are defined.
+_module_level_patches()
 
 
 if __name__ == "__main__":

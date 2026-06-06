@@ -451,6 +451,29 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 	float now = (float)cl.mtime[0];
 	qboolean ephemeral_seen[MAX_EDICTS];
 
+	/* Map-change guard. cl.mtime is wiped by CL_ClearState during
+	 * svc_serverdata (new map within a demo), so the new segment's
+	 * `now` can be lower than stamps already in qnn_store from the
+	 * prior segment. QualifyEntity's `age = now - newest` then goes
+	 * negative, blowing up downstream exp(-recency/tau) in the target
+	 * labeler. When we detect cl.mtime moving backwards, wipe the
+	 * stamp fields so stale entries don't poison the age calc. */
+	{
+		static float prev_now = 0.0f;
+		if (now + 0.001f < prev_now)
+		{
+			int n_store = (int)(sizeof(qnn_store) / sizeof(qnn_store[0]));
+			for (i = 0; i < n_store; ++i)
+			{
+				qnn_store[i].pvs = 0.0f;
+				qnn_store[i].vis = 0.0f;
+				qnn_store[i].snd = 0.0f;
+				qnn_store[i].mem = 0.0f;
+			}
+		}
+		prev_now = now;
+	}
+
 	if (emit_dt < 0.001f)
 		emit_dt = 1.0f / 20.0f;
 	memset(ephemeral_seen, 0, sizeof(ephemeral_seen));

@@ -108,10 +108,26 @@ def fit_linear_probe(
     val_labels: np.ndarray,
     *,
     multi_class: bool = True,
+    feature_slice: tuple[int, int] | slice | None = None,
 ) -> float:
-    """Fit a logistic regression and return macro F1 on val."""
+    """Fit a logistic regression and return macro F1 on val.
+
+    ``feature_slice`` restricts the probe to a contiguous range of input
+    dims. Pass ``(0, d_model)`` to probe only the self/weapon half of the
+    canonical ``cat(self_readout, target_feat)`` head input, or
+    ``(d_model, 2*d_model)`` for the target-feat half. ``None`` (default)
+    probes the full feature.
+    """
     if not HAVE_SKLEARN:
         raise RuntimeError("sklearn not available — pip install scikit-learn")
+    if feature_slice is not None:
+        if isinstance(feature_slice, slice):
+            sl = feature_slice
+        else:
+            start, end = feature_slice
+            sl = slice(start, end)
+        train_feats = train_feats[:, sl]
+        val_feats = val_feats[:, sl]
     clf = LogisticRegression(
         max_iter=1000,
         C=1.0,
@@ -122,6 +138,58 @@ def fit_linear_probe(
     clf.fit(train_feats, train_labels)
     preds = clf.predict(val_feats)
     return float(f1_score(val_labels, preds, average="macro", zero_division=0))
+
+
+def attack_slice_probe_report(
+    policy,
+    train_episodes: list[dict],
+    val_episodes: list[dict],
+    *,
+    self_slice: tuple[int, int],
+    target_slice: tuple[int, int],
+    max_train_frames: int = 100_000,
+    max_val_frames: int = 50_000,
+) -> dict[str, float]:
+    """Three attack-head linear probes: full, self/weapon half only, target half only.
+
+    Pair with the bench look/attack parity ablations to answer: how much
+    of the fire signal lives in the self/weapon-token half of the head
+    input vs the target_feat half? F1 difference between the full probe
+    and the half probes localises where the linear-decodable signal is.
+
+    ``self_slice`` and ``target_slice`` are ``(start, end)`` ranges on
+    the head's first-Linear input. For the default look/attack parity
+    setup (``d_model=64``, no temporal), both halves are 64-wide:
+    self=``(0, 64)``, target=``(64, 128)``.
+    """
+    if not HAVE_SKLEARN:
+        return {"_error": "sklearn not available"}
+
+    train_feats, train_labels = extract_head_input_features(
+        policy, train_episodes, max_frames=max_train_frames,
+    )
+    val_feats, val_labels = extract_head_input_features(
+        policy, val_episodes, max_frames=max_val_frames,
+    )
+    if not train_labels["attack"].size or not val_labels["attack"].size:
+        return {"_error": "no attack labels"}
+
+    out: dict[str, float] = {}
+    for name, sl in (
+        ("attack_full", None),
+        ("attack_self_half", self_slice),
+        ("attack_target_half", target_slice),
+    ):
+        try:
+            out[name] = fit_linear_probe(
+                train_feats["attack"], train_labels["attack"].astype(int),
+                val_feats["attack"], val_labels["attack"].astype(int),
+                multi_class=False,
+                feature_slice=sl,
+            )
+        except Exception as e:  # noqa: BLE001
+            out[f"{name}_error"] = str(e)
+    return out
 
 
 def linear_probe_report(

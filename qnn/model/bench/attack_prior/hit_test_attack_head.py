@@ -31,9 +31,9 @@ _HALF_BEGIN, _HALF_END = 0, 3
 
 
 class HitTestAttackHead(nn.Module):
-    def __init__(self, in_dim: int, bottleneck_dim: int, activation: str) -> None:
+    def __init__(self, in_dim: int, d_hidden: int, activation: str) -> None:
         super().__init__()
-        self.mlp = make_head_mlp(in_dim, OUT_DIM, bottleneck_dim, activation)
+        self.mlp = make_head_mlp(in_dim, OUT_DIM, d_hidden, activation)
         # Zero-init final Linear so attack_logit starts at prior_logit.
         final = self.mlp[-1] if isinstance(self.mlp, nn.Sequential) else self.mlp
         if isinstance(final, nn.Linear):

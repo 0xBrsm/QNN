@@ -51,45 +51,33 @@ def target_metrics(
     logits: torch.Tensor,
     target_probs: torch.Tensor,
 ) -> dict[str, float]:
-    """Returns BC's target_* metric keys + acc_target / balanced_acc_target."""
+    """Returns the canonical target-head metrics: loss + KL.
+
+    Slot-keyed metrics (acc_target, balanced_acc_target, per-slot f1,
+    etc.) were dropped — entity slot index is engine emit-order
+    (effectively edict number), not a semantic property of the
+    target, so any metric keyed on slot identity is confounded by
+    that arbitrary ordering.  The selection metric is ``target_kl``;
+    the canonical training path (``qnn.model.policy``) additionally
+    emits ``target_kl_multi`` when the obs entity stream is
+    available — that path is the source of truth for run-time
+    metrics; this function is the bench head-spec mirror.
+    """
     with torch.no_grad():
         present = (1.0 - target_probs[:, NO_TARGET_INDEX]).clamp(min=0.0)
         idx_dist = target_probs[:, 1:]
         log_probs = F.log_softmax(logits, dim=-1)
-        soft = F.softmax(logits, dim=-1)
         idx_target = idx_dist / present.clamp(min=1e-6).unsqueeze(-1)
 
         per_frame_ce = -(idx_target * log_probs).sum(dim=-1)
         nll = (present * per_frame_ce).sum() / present.sum().clamp(min=1e-6)
         ent_per_frame = -(idx_target.clamp(min=1e-8) * idx_target.clamp(min=1e-8).log()).sum(dim=-1)
         entropy = (present * ent_per_frame).sum() / present.sum().clamp(min=1e-6)
-        brier_per_frame = ((soft - idx_target) ** 2).sum(dim=-1)
-        brier = (present * brier_per_frame).sum() / present.sum().clamp(min=1e-6)
-
-        pred = logits.argmax(dim=-1)
-        target_label = idx_dist.argmax(dim=-1)
-        batch_idx = torch.arange(pred.shape[0], device=pred.device)
-        top1_mass = (present * idx_target[batch_idx, pred]).sum() / present.sum().clamp(min=1e-6)
-
-        acc = (pred == target_label).float().mean()
-        recalls: list[float] = []
-        n_indices = logits.shape[-1]
-        for s in range(n_indices):
-            true_s = (target_label == s)
-            if bool(true_s.any().item()):
-                tp = ((pred == s) & true_s).float().sum()
-                recalls.append((tp / true_s.float().sum()).item())
-        bal = float(sum(recalls) / len(recalls)) if recalls else 0.0
 
     return {
         "loss_target": float(nll.item()),
-        "target_entropy": float(entropy.item()),
         "target_kl": float((nll - entropy).item()),
-        "target_brier": float(brier.item()),
-        "target_top1_mass": float(top1_mass.item()),
         "target_present_mean": float(present.mean().item()),
-        "acc_target": float(acc.item()),
-        "balanced_acc_target": bal,
     }
 
 
@@ -106,12 +94,12 @@ def _build_target(probe: Mapping[str, Any]) -> HeadBuildResult:
     """Build the flat-feature target probe from probe.json. All keys required.
 
     Reads:
-      hidden (int), n_hidden_layers (int), dropout (float),
+      d_hidden (int), n_hidden_layers (int), dropout (float),
       feature_names (list of str), d_model (int — inert under the
       flat-feature path but required so probe.json reflects the full
       probe surface), self_weapon_embed_in_self (bool — likewise).
     """
-    hidden = int(_required(probe, "hidden"))
+    d_hidden = int(_required(probe, "d_hidden"))
     n_hidden_layers = int(_required(probe, "n_hidden_layers"))
     dropout = float(_required(probe, "dropout"))
     raw_names = _required(probe, "feature_names")
@@ -132,7 +120,7 @@ def _build_target(probe: Mapping[str, Any]) -> HeadBuildResult:
         return FlatFeatureHead(
             feature_names=feature_names,
             output_route="target",
-            hidden=hidden,
+            d_hidden=d_hidden,
             n_hidden_layers=n_hidden_layers,
             dropout=dropout,
         )

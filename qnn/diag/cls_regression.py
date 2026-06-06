@@ -148,7 +148,7 @@ def extract_cls_gru_and_scalars(
     temporal context (h₀=0 at episode start, matching BC training).
 
     cls shape:   (N, d_model)
-    gru_h shape: (N, gru_hidden)
+    gru_h shape: (N, d_gru)
     scalars:     dict of name → (N,) float32
     """
     if not policy.model.use_gru:
@@ -176,8 +176,8 @@ def extract_cls_gru_and_scalars(
 
             # GRU: sequence-first, batch=1, h₀=zeros
             gru_in = cls_out.unsqueeze(1)                          # (T, 1, d_model)
-            gru_out, _ = policy.model.gru(gru_in)                  # (T, 1, gru_hidden)
-            gru_out = gru_out.squeeze(1)                           # (T, gru_hidden)
+            gru_out, _ = policy.model.gru(gru_in)                  # (T, 1, d_gru)
+            gru_out = gru_out.squeeze(1)                           # (T, d_gru)
 
             cls_list.append(cls_out.cpu().float().numpy())
             gru_list.append(gru_out.cpu().float().numpy())

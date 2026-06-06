@@ -318,6 +318,11 @@ typedef struct {
 	uint32_t ph_frame[8192];
 	uint16_t ph_ping[8192];
 	int ph_n;
+	/* Per-frame other-player histogram (QWD only).  Bucket k = number of
+	 * server frames where exactly k OTHER players (alive, slot != self)
+	 * had a svc_playerinfo update.  Counted over every DEM_READ frame.
+	 * QW supports up to 32 client slots; bucket 32 catches overflow. */
+	uint32_t actors_per_frame[33];
 } bounds_t;
 
 /* Global flag set in main() from QNN_EMIT_PING_HISTORY env var.  No
@@ -497,6 +502,12 @@ typedef struct {
 	 * wall-clock timestamp to each impulse / stat event. */
 	float current_demotime;
 	const char *current_demo_path;
+	/* Per-DEM_READ-frame player accounting (QWD only).  qw_parse_playerinfo
+	 * sets the slot bit on each svc_playerinfo; PF_DEAD/PF_GIB also sets
+	 * the dead bit.  walker resets both after each DEM_READ frame after
+	 * folding popcount(seen & ~dead & ~self) into bounds.actors_per_frame. */
+	uint32_t frame_player_seen;
+	uint32_t frame_player_dead;
 } label_state_t;
 
 static void lstate_init(label_state_t *s, labels_t *L)
@@ -534,6 +545,8 @@ static void lstate_init(label_state_t *s, labels_t *L)
 	s->ph_n = 0;
 	s->current_demotime = 0.0f;
 	s->current_demo_path = NULL;
+	s->frame_player_seen = 0;
+	s->frame_player_dead = 0;
 }
 
 static void lstate_health(label_state_t *s, int health, int frame)
@@ -842,6 +855,23 @@ static void walk_qwd(const uint8_t *data, size_t n,
 			active_input_commit(ai, &acc);
 			active_state_commit(as, &acc_state);
 			dem_cmd_pending = 0;
+
+			/* Fold the frame's playerinfo mask into the histogram:
+			 * count OTHER players that were alive this frame (seen &
+			 * ~dead, excluding self_slot).  Cap at bucket 32 — QW
+			 * supports up to 32 client slots so this only fires on
+			 * a malformed demo. */
+			{
+				uint32_t alive = ls.frame_player_seen & ~ls.frame_player_dead;
+				if (ls.self_slot >= 0 && ls.self_slot < 32)
+					alive &= ~(1u << ls.self_slot);
+				int n_others = __builtin_popcount(alive);
+				if (n_others > 32) n_others = 32;
+				bounds->actors_per_frame[n_others] += 1;
+				ls.frame_player_seen = 0;
+				ls.frame_player_dead = 0;
+			}
+
 			frame += 1;
 			continue;
 		}
@@ -864,6 +894,9 @@ static void walk_qwd(const uint8_t *data, size_t n,
 	{
 		active_input_commit(ai, &acc);
 		active_state_commit(as, &acc_state);
+		/* Synthetic trailing frame: no DEM_READ landed, so the
+		 * playerinfo mask has no fresh data — count as 0 others. */
+		bounds->actors_per_frame[0] += 1;
 		frame += 1;
 	}
 
@@ -1970,13 +2003,19 @@ static int dispatch_qw_message(reader_t *r, label_state_t *ls,
 			case QW_SVC_PLAYERINFO:
 			{
 				/* Variable-length opcode — must still parse to keep
-				 * the byte stream aligned, even though we no longer
-				 * track POV.  Protocol-version-aware skip lives in
-				 * qw_parse_playerinfo. */
+				 * the byte stream aligned.  Protocol-version-aware
+				 * skip lives in qw_parse_playerinfo.  We also fold
+				 * the slot into the per-frame seen mask so the walker
+				 * can emit an "other actors visible per frame"
+				 * histogram alongside the other tallies. */
 				int slot;
 				uint16_t pf;
 				qw_parse_playerinfo(r, &slot, &pf, ls->qw_protocol);
-				(void)slot; (void)pf;
+				if (slot >= 0 && slot < 32) {
+					ls->frame_player_seen |= (1u << slot);
+					if (pf & (PF_DEAD | PF_GIB))
+						ls->frame_player_dead |= (1u << slot);
+				}
 				continue;
 			}
 			case QW_SVC_NAILS: qw_skip_nails(r); continue;
@@ -2507,6 +2546,16 @@ static int classify_one(const char *demo_path, FILE *out)
 		}
 		fputc(']', out);
 	}
+	/* Per-frame other-player histogram (QWD only; MVD/NQ leave the
+	 * array zeroed).  Bucket k = number of DEM_READ frames where
+	 * exactly k OTHER players (alive, slot != self_slot) had a
+	 * svc_playerinfo update this frame. */
+	fputs(",\"actors_per_frame\":[", out);
+	for (int k = 0; k < 33; ++k) {
+		if (k > 0) fputc(',', out);
+		fprintf(out, "%u", bounds.actors_per_frame[k]);
+	}
+	fputc(']', out);
 	fputs("}\n", out);
 
 	munmap(map, n);
