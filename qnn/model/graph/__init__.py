@@ -4,15 +4,15 @@ See ``src/docs/model-graph.md``. The spec is pure data
 (:class:`GraphSpec`), the builder (:func:`build_network`) is the single
 model factory shared by BC, bench probes, eval, PPO, and export.
 
-Base graphs (committed JSON under ``bases/``) name the validated
-model lines; bench probes are overrides merged onto a base via
-:func:`merge_overrides`.
+Base graphs name the validated model lines and live *with their
+generation* (``qnn.model.bench.a24.graphs`` / ``a25.graphs`` register
+them into :mod:`qnn.model.node_registry`); bench probes are overrides
+merged onto a base via :func:`merge_overrides`.
 """
 
 from __future__ import annotations
 
 import json
-from importlib import resources
 from typing import Any, Mapping
 
 from qnn.model.graph.build import (
@@ -32,18 +32,18 @@ __all__ = [
 
 
 def base_graph_dict(name: str) -> dict[str, Any]:
-    """Raw dict of a committed base graph (``bases/<name>.json``)."""
-    base = resources.files("qnn.model.graph") / "bases" / f"{name}.json"
-    try:
-        text = base.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        available = sorted(
-            p.name.removesuffix(".json")
-            for p in (resources.files("qnn.model.graph") / "bases").iterdir()
-            if p.name.endswith(".json")
-        )
-        raise GraphSpecError(f"unknown base graph {name!r}; available: {available}") from None
-    return json.loads(text)
+    """Raw dict of a registered base graph (a fresh copy, safe to mutate).
+
+    Base graphs are registered by each generation's ``graphs`` module (imported
+    by ``qnn.model.graph.build``'s bootstrap), so importing this package has
+    populated the registry by the time this is called."""
+    from qnn.model import node_registry
+    graph = node_registry.base_graph(name)
+    if graph is None:
+        raise GraphSpecError(
+            f"unknown base graph {name!r}; available: "
+            f"{node_registry.registered_base_graphs()}")
+    return json.loads(json.dumps(graph))  # deep copy — callers merge/mutate
 
 
 def load_base_graph(name: str) -> GraphSpec:

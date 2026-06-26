@@ -92,3 +92,14 @@ class WeaponHead(nn.Module):
             probs = F.softmax(logits, dim=-1)
             context = probs @ self.embed.weight
         return WeaponHeadOutput(logits=logits, context=context)
+
+
+# -- graph node registration ------------------------------------------------
+from qnn.model.node_registry import register_head  # noqa: E402
+
+
+@register_head("weapon", "canonical")
+def _build_weapon_canonical(head, dims, d_model):
+    return WeaponHead(
+        selector_dim=dims["weapon_in"], d_model=d_model, d_hidden=head.d_hidden,
+        activation=head.activation, context_from_obs=head.context_from_obs)

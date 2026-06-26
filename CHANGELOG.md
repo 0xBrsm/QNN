@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.24.0
+
+### Changed
+
+- Model-graph machinery is now generation-agnostic: node builders self-register (one file per node; no central type table) and base graphs resolve through `node_registry` rather than hardcoded factories
+- Declarative token assembly extracted to `qnn.model.tokens`; cross-generation decode primitives split into a base `decode` module
+- Diagnostics unified under `qnn.diag` with a single `python -m qnn.diag analyze` CLI
+
+### Removed
+
+- Legacy bench head-probe registry (`cls_heads`, `move_joint`, `full_*` factories and the pre-graph reload path), superseded by the declarative graph
+
 ## 0.23.0
 
 ### Added

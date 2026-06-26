@@ -99,3 +99,12 @@ class Temporal(nn.Module):
         if h.dim() == 2:
             h = h.unsqueeze(0)
         return h.contiguous()
+
+
+# -- graph node registration ------------------------------------------------
+from qnn.model.node_registry import register_temporal  # noqa: E402
+
+
+@register_temporal("gru")
+def _build_temporal_gru(temporal, d_model):
+    return Temporal(d_model, temporal.d_gru)

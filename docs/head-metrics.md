@@ -4,10 +4,9 @@ The single source of truth for **how every action head is judged**. The five
 heads (move, look, target, attack, weapon) had each independently drifted onto a
 different headline metric — `f1`, `acc`, `kl`, `dll` — and the live trainer was
 still selecting on the argmax metrics every head's own findings doc rejects. This
-doc fixes the unit of measurement *once*; the per-head docs
-([move-head.md](move-head.md), [target-head.md](target-head.md),
-[attack-head.md](attack-head.md), [weapon-head.md](weapon-head.md),
-[persistence-and-changepoints.md](persistence-and-changepoints.md)) defer to it.
+doc fixes the unit of measurement *once*; the per-head design notes
+(`move-head`, `target-head`, `attack-head`, `weapon-head`,
+`persistence-and-changepoints`) defer to it.
 
 ## TL;DR
 
@@ -23,8 +22,8 @@ Three metric classes, identical shape across all five heads:
    optimise per epoch.
 3. **Argmax diagnostics (`<head>_f1`, `<head>_acc`).** Emitted for analysis,
    **never used for selection.** Under persistence-dominated streams argmax
-   point-accuracy is blind to calibration and over/under-switching (see
-   [persistence-and-changepoints.md](persistence-and-changepoints.md)).
+   point-accuracy is blind to calibration and over/under-switching (see the
+   `persistence-and-changepoints` design notes).
 
 ## The skill normalisation
 
@@ -116,13 +115,12 @@ they are not mistaken for solved:
 
 1. **Target output switch-dynamics.** The memoryless target head's chained
    output switch-rate vs the human 0.88% has never been measured; it may
-   over-switch at ambiguous boundaries. ([target-head.md](target-head.md),
-   [persistence-and-changepoints.md](persistence-and-changepoints.md) §Per-Head
-   Status)
+   over-switch at ambiguous boundaries. (`target-head`,
+   `persistence-and-changepoints` §Per-Head Status)
 2. **Attack leak-free switch-on/off audit.** No attack-frame leak-free audit
    exists analogous to the weapon switch-vs-hold metric; the ~0.59 `attack_f1` is
    continuation-inflated and the genuine burst-initiation skill (~51%) is the
-   consequential number. ([attack-head.md](attack-head.md) §8)
+   consequential number. (`attack-head` §8)
 
 ## What changed (migration)
 

@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from qnn.utils import artifacts
+from qnn.utils.artifacts import find_resume_checkpoint, new_run_id
+
 from qnn.env.planning import (
     RuntimePlan,
     resolve_asset_root,
@@ -128,6 +131,7 @@ def base_results(ctx: RunnerContext) -> dict[str, Any]:
     return {
         "run_dir": str(ctx.run_dir),
         "run_name": require_cfg_string(ctx.manifest, "name", "run.json"),
+        "run_id": str(ctx.manifest.get("run_id", "")),
         "mode": ctx.mode,
         "runtime_scale": ctx.runtime_scale,
         "resume": ctx.resume,
@@ -288,21 +292,23 @@ def prepare_ppo_run_outputs(run_cfg: dict[str, Any], *, resume: bool) -> bool:
 
 def prepare_bc_run_outputs(run_cfg: dict[str, Any], *, resume: bool) -> None:
     outputs = run_output_dirs(run_cfg)
-    checkpoint_path = outputs["checkpoints"] / "bc_training_checkpoint.pt"
     if resume:
-        if checkpoint_path.exists():
+        if find_resume_checkpoint(outputs["checkpoints"]) is not None:
             return
         # Nothing to resume from — start fresh.
 
     for path in (
-        outputs["checkpoints"] / "bc_training_checkpoint.pt",
-        outputs["checkpoints"] / "bc_best_model.pth",
+        outputs["checkpoints"] / artifacts.LEGACY_RESUME_NAME,
+        outputs["checkpoints"] / artifacts.LEGACY_BEST_NAME,
         outputs["checkpoints"] / "bc_history.json",
         outputs["checkpoints"] / "bc_summary.json",
         outputs["checkpoints"] / "bc_manifest.json",
         outputs["checkpoints"] / "checkpoints",
     ):
         archive_path_if_exists(path)
+    for pattern in ("ckpt_e*.pt", "best_*.pth", "best_*.json"):
+        for path in outputs["checkpoints"].glob(pattern):
+            archive_path_if_exists(path)
 
 
 def prepare_eval_outputs(run_cfg: dict[str, Any], *, resume: bool) -> None:
@@ -381,6 +387,9 @@ def materialize_child_run(
     parent_manifest = require_cfg_mapping(parent_run_cfg, "manifest", "run config")
     manifest = dict(parent_manifest)
     manifest["name"] = name
+    # A derived run is a new run: fresh identity, parent recorded for lineage.
+    manifest["run_id"] = new_run_id()
+    manifest["parent_run_id"] = str(parent_manifest.get("run_id", ""))
     manifest["mode"] = mode
     manifest["runtime_scale"] = runtime_scale or require_cfg_string(parent_run_cfg, "runtime_scale", "run config")
     manifest["resume"] = resume

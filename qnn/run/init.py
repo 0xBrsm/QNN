@@ -28,6 +28,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from qnn.utils.artifacts import new_run_id
+
 _RUNS_DIR = Path("runs")
 
 _TEMPLATE_DIRS = {
@@ -83,6 +85,7 @@ def main() -> None:
 
     # Overlay CLI args
     manifest["name"] = args.name
+    manifest["run_id"] = new_run_id()
     manifest["mode"] = args.mode
     if args.resume is not None:
         manifest["resume"] = args.resume == "true"
@@ -138,6 +141,46 @@ def main() -> None:
         if not src.exists():
             parser.error(f"Config file not found: {src}")
         shutil.copy2(src, config_dir / f"{name}.json")
+
+    # Pin the look turn-delta grid for look-bearing modes: copy the corpus's
+    # data-fit grid into config/look_grid.json so it lives with the model (no
+    # implicit code default). The trainer installs it at job start.
+    if args.mode in ("bc", "head_probe"):
+        from qnn.model import look_grid as _look_grid
+        machine = json.loads((config_dir / "machine.json").read_text())
+        bc_data_dir = machine.get("bc_data_dir")
+        if not bc_data_dir:
+            parser.error("machine.json missing bc_data_dir; cannot pin look grid")
+        grid = _look_grid.pinned_grid_from_collect(bc_data_dir)
+        grid["git_commit"] = manifest["git_commit"]
+        grid["created"] = manifest["created"]
+        (config_dir / "look_grid.json").write_text(json.dumps(grid, indent=2) + "\n")
+        print(f"  Look grid pinned from corpus fit: {bc_data_dir} "
+              f"(rms {grid.get('fit_rms_deg')} vs default {grid.get('default_rms_deg')})")
+
+        # Pin the move-axis dwell-hazard release table from the same corpus, beside
+        # the look grid. The move decode reads edges/fb/lr from this pinned table.
+        from qnn.model import move_hazard as _move_hazard
+        haz = _move_hazard.pinned_hazard_from_collect(bc_data_dir)
+        haz["git_commit"] = manifest["git_commit"]
+        haz["created"] = manifest["created"]
+        (config_dir / "move_hazard.json").write_text(json.dumps(haz, indent=2) + "\n")
+        print(f"  Move hazard pinned from corpus: {bc_data_dir} "
+              f"(tick_hz {haz.get('tick_hz')}, edges {haz.get('edges')})")
+
+        # Pin the weapon WHEN-hazard table from the same corpus. Best-effort: corpora
+        # collected before weapon_hazard was added won't carry the block until
+        # recollected/backfilled — don't fail run-init over it during the transition.
+        try:
+            from qnn.model import weapon_hazard as _weapon_hazard
+            whaz = _weapon_hazard.pinned_hazard_from_collect(bc_data_dir)
+            whaz["git_commit"] = manifest["git_commit"]
+            whaz["created"] = manifest["created"]
+            (config_dir / "weapon_hazard.json").write_text(json.dumps(whaz, indent=2) + "\n")
+            print(f"  Weapon hazard pinned from corpus: {bc_data_dir} "
+                  f"(tick_hz {whaz.get('tick_hz')}, axes {whaz.get('axes')})")
+        except Exception as exc:  # noqa: BLE001 — transitional; recollect/backfill to enable
+            print(f"  Weapon hazard pin skipped: {exc}")
 
     # Write manifest
     with open(run_dir / "run.json", "w") as f:

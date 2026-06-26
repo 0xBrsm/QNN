@@ -97,16 +97,15 @@ N_MAG = 12                        # foveated magnitude bins (excludes hold)
 N_DIR = 16                        # uniform direction bins over [0, 2π)
 
 
-def _build_mag_centers() -> torch.Tensor:
-    k = torch.arange(1, N_MAG + 1, dtype=torch.float64) / N_MAG
-    pos = (k ** _FOVEA_POWER) * _THETA_MAX            # foveated, dense near 0
-    return torch.cat([torch.zeros(1, dtype=torch.float64), pos]).to(torch.float32)  # (N_MAG+1,)
-
-
-MAG_CENTERS = _build_mag_centers()                    # (N_MAG+1,); [0]=0 (hold)
-DIR_CENTERS = ((torch.arange(N_DIR, dtype=torch.float32) + 0.5)
-               * (2.0 * torch.pi / N_DIR))            # (N_DIR,) bin-center angles
-_HOLD_MAX = float(MAG_CENTERS[1]) * 0.5               # θ below this → hold bin 0
+# NO IMPLICIT DEFAULT polar grid. The magnitude/direction centers are corpus-fit
+# (rate-dependent) and pinned per-run in config/look_grid.json; every job MUST call
+# install_polar_grid() at startup (runner/eval/export/decode_fit all do). Old models
+# trained before data-driven grids get the historical grid materialized into their
+# run dir via `qnn.model.look_grid --export-default` (source "code_default") and go
+# through the same install path — there is no runtime fallback to snap to.
+MAG_CENTERS: torch.Tensor | None = None               # (N_MAG+1,); [0]=0 (hold)
+DIR_CENTERS: torch.Tensor | None = None               # (N_DIR,) bin-center angles
+_HOLD_MAX: float | None = None                        # θ below this → hold bin 0
 
 # ── Precomputed geometry for tangent-density look_dll ──────────────────────
 # Bin Voronoi widths (per-axis; same for both axes). Used to convert per-axis
@@ -121,22 +120,25 @@ BIN_LOG_WIDTH: torch.Tensor = torch.tensor(
 # Polar cell log-areas in tangent space. Shape: (N_MAG+1,); index = mag_bin.
 # hold (mag_bin=0): disk of radius _HOLD_MAX → area = π × r²
 # turn (mag_bin k): annular sector → area = Δφ × (r_hi² − r_lo²) / 2
-_MC64 = MAG_CENTERS.numpy().astype("float64")
-_POLAR_MEDGE = _np_lb.concatenate(
-    [[_HOLD_MAX], (_MC64[1:-1] + _MC64[2:]) / 2, [_np_lb.pi]]
-)
-_DPHI = 2.0 * _np_lb.pi / N_DIR
-POLAR_LOG_CELL_AREA: torch.Tensor = torch.tensor(
-    _np_lb.log(_np_lb.concatenate([
-        [_np_lb.pi * _HOLD_MAX ** 2],
-        _DPHI * (_POLAR_MEDGE[1:] ** 2 - _POLAR_MEDGE[:-1] ** 2) / 2,
-    ])),
-    dtype=torch.float32,
-)  # (N_MAG+1,)
+# Computed from the installed grid in install_polar_grid() — no default (see above).
+_DPHI = 2.0 * _np_lb.pi / N_DIR                       # rate-invariant; used on install
+_MC64 = None
+_POLAR_MEDGE = None
+POLAR_LOG_CELL_AREA: torch.Tensor | None = None       # (N_MAG+1,)
+
+
+def _require_polar_grid() -> None:
+    """Raise a clear error if no polar grid has been installed (no default)."""
+    if MAG_CENTERS is None or DIR_CENTERS is None:
+        raise RuntimeError(
+            "look polar grid not installed — call look_bins.install_polar_grid() at "
+            "job start from the run's config/look_grid.json. There is NO code default; "
+            "old runs get one via `python -m qnn.model.look_grid --export-default <run>`.")
 
 
 def polar_targets(z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """2D tangent (..., 2) → (mag_bin, dir_bin) long. mag_bin 0 = hold (no turn)."""
+    _require_polar_grid()
     theta = torch.linalg.vector_norm(z, dim=-1)                       # (...,)
     phi = torch.atan2(z[..., 1], z[..., 0]) % (2.0 * torch.pi)        # (...,)
     mc = MAG_CENTERS.to(z.device)
@@ -150,6 +152,7 @@ def polar_targets(z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def polar_to_tangent(mag_bin: torch.Tensor, dir_bin: torch.Tensor) -> torch.Tensor:
     """(mag_bin, dir_bin) long → 2D tangent z (..., 2). hold → 0."""
+    _require_polar_grid()
     theta = MAG_CENTERS.to(mag_bin.device)[mag_bin]
     phi = DIR_CENTERS.to(dir_bin.device)[dir_bin]
     return torch.stack([theta * torch.cos(phi), theta * torch.sin(phi)], dim=-1)
@@ -178,3 +181,48 @@ def polar_log_prob(
     lpm = torch.log_softmax(mag_logits, dim=-1).gather(-1, mag_bin[..., None]).squeeze(-1)
     lpd = torch.log_softmax(dir_logits, dim=-1).gather(-1, dir_bin[..., None]).squeeze(-1)
     return lpm + (mag_bin > 0).to(lpm.dtype) * lpd
+
+
+def install_polar_grid(mag_centers_rad, dir_centers_rad=None) -> None:
+    """Rebind the module's polar grid to a pinned, data-fit grid.
+
+    The look head's loss target (``polar_targets``), the offline decode
+    (``qnn.model.policy.act`` → ``polar_to_tangent``/``polar_sample``), and the
+    look_dll density term (``POLAR_LOG_CELL_AREA``) all read these module globals
+    at call time (late-bound or local-import), so rebinding here propagates to
+    every polar consumer with no signature changes — and keeps loss-time and
+    decode-time on the SAME centers (train/serve parity).
+
+    The grid is process-global: call **once per job at startup**, before the
+    model is built/used, from the run's pinned ``config/look_grid.json`` (see
+    ``qnn.model.look_grid`` + ``run.init``). There is NO implicit default — a run
+    must pin its grid. Do not run parallel jobs with different grids in one
+    process (the daemon runs jobs sequentially; each installs its own grid).
+
+    Only the magnitude (and optionally direction) center *positions* move;
+    ``N_MAG``/``N_DIR`` are fixed (no shape/arch change). ``mag_centers_rad`` must
+    have ``N_MAG+1`` entries (leading hold center 0), matching ``MAG_CENTERS``.
+    """
+    global MAG_CENTERS, DIR_CENTERS, _HOLD_MAX, _MC64, _POLAR_MEDGE, POLAR_LOG_CELL_AREA
+    mag = torch.as_tensor(mag_centers_rad, dtype=torch.float32).flatten()
+    if mag.numel() != N_MAG + 1:
+        raise ValueError(
+            f"mag_centers_rad must have N_MAG+1={N_MAG + 1} entries "
+            f"(leading hold center 0), got {mag.numel()}")
+    MAG_CENTERS = mag
+    if dir_centers_rad is not None:
+        d = torch.as_tensor(dir_centers_rad, dtype=torch.float32).flatten()
+        if d.numel() != N_DIR:
+            raise ValueError(f"dir_centers_rad must have N_DIR={N_DIR} entries, got {d.numel()}")
+        DIR_CENTERS = d
+    # Recompute the hold threshold + polar cell log-areas from the new centers
+    # (mirror of the import-time block above).
+    _HOLD_MAX = float(MAG_CENTERS[1]) * 0.5
+    _MC64 = MAG_CENTERS.numpy().astype("float64")
+    _POLAR_MEDGE = _np_lb.concatenate(
+        [[_HOLD_MAX], (_MC64[1:-1] + _MC64[2:]) / 2, [_np_lb.pi]])
+    POLAR_LOG_CELL_AREA = torch.tensor(
+        _np_lb.log(_np_lb.concatenate([
+            [_np_lb.pi * _HOLD_MAX ** 2],
+            _DPHI * (_POLAR_MEDGE[1:] ** 2 - _POLAR_MEDGE[:-1] ** 2) / 2,
+        ])), dtype=torch.float32)

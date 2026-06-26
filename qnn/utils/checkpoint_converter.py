@@ -1355,51 +1355,6 @@ def checkpoint_model_graph(path: str | Path) -> dict[str, Any] | None:
     return graph if isinstance(graph, dict) else None
 
 
-def _checkpoint_has_graph(path: str | Path) -> bool:
-    """True when the checkpoint's sidecar meta carries a ``model_graph``.
-
-    Graph-described checkpoints are fully self-describing —
-    ``QNNPolicy.load`` rebuilds them via ``qnn.model.graph.build_network``
-    and no probe.json rehydration must run (the sidecar is authoritative
-    over whatever run-dir config happens to sit next to ``checkpoints/``).
-    """
-    return checkpoint_model_graph(path) is not None
-
-
-def _head_probe_model_factory(path: str | Path):
-    """Return the bench ``model_factory`` for a LEGACY head-probe checkpoint.
-
-    Pre-graph head-probe checkpoints (e.g. the retained ``full_4head`` /
-    ``full_5head`` runs) don't embed their assembly; they are rebuilt by
-    re-running ``HEADS[head].build(probe)`` against the run-dir's
-    ``config/probe.json``. New head-probe checkpoints carry
-    ``meta["model_graph"]`` and never reach this path — see
-    ``_checkpoint_has_graph``. Returns None when no legacy probe applies.
-    """
-    probe_path = Path(path).resolve().parents[1] / "config" / "probe.json"
-    if not probe_path.is_file():
-        return None
-    probe = json.loads(probe_path.read_text(encoding="utf-8"))
-    head = probe.get("head")
-    if not head:
-        return None
-    from qnn.model.bench.heads import HEADS
-    if head not in HEADS:
-        # Loud, not silent: falling through to the canonical loader would
-        # apply flat-checkpoint migrations to a bench-shaped state_dict and
-        # die with a cryptic key mismatch (or worse, partially map).
-        raise ValueError(
-            f"probe.json names head {head!r}, which is not in the legacy "
-            f"reload registry {sorted(HEADS)}. Its bench module was removed "
-            f"in the model-graph refactor (concluded ablation — findings in "
-            f"src/docs/). To reload this checkpoint, check out the pre-prune "
-            f"commit (9fd410d7's tree) or re-express the probe as a graph "
-            f"delta and retrain."
-        )
-    _model_config, model_factory = HEADS[head].build(probe)
-    return model_factory
-
-
 def load_checkpoint(
     path: str | Path,
     *,
@@ -1408,29 +1363,15 @@ def load_checkpoint(
 ) -> "QNNPolicy":
     """Load a checkpoint in either QNN or SF format.
 
-    Head-probe checkpoints (with a sibling ``config/probe.json``) are
-    reconstructed through their bench ``model_factory`` so the alternate
-    module loads strict; canonical checkpoints load as before.
+    Every checkpoint is self-describing: graph-described checkpoints rebuild
+    via ``meta["model_graph"]``; canonical flat checkpoints via ``meta["model"]``.
+    ``QNNPolicy.load`` picks the path from the embedded meta — no probe.json /
+    bench-factory rehydration (the legacy HEADS reload path was retired).
     """
     if is_sf_checkpoint(path):
         policy = load_sf_checkpoint_as_qnn(path, device=device, model_config=model_config)
     else:
-        try:
-            model_factory = (
-                None if _checkpoint_has_graph(path) else _head_probe_model_factory(path)
-            )
-        except ValueError as factory_err:
-            # The run dir names a removed legacy head — but the payload may
-            # still carry an embedded model_graph (sidecar lost/copied away).
-            # QNNPolicy.load rebuilds from embedded meta when present; only
-            # if that ALSO fails is the legacy-head explanation the answer.
-            try:
-                policy = QNNPolicy.load(str(path), device=device, model_factory=None)
-            except Exception:
-                raise factory_err from None
-            policy.contract = resolve_checkpoint_contract(path)
-            return policy
-        policy = QNNPolicy.load(str(path), device=device, model_factory=model_factory)
+        policy = QNNPolicy.load(str(path), device=device, model_factory=None)
     policy.contract = resolve_checkpoint_contract(path)
     return policy
 

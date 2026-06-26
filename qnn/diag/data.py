@@ -2,6 +2,13 @@
 
 Loads a small slice of precomputed BC val data — enough to compute losses, gradients,
 and ablation deltas reliably without paying full-corpus eval cost.
+
+NOTE — supported cache format: ``format="sharded_v1"`` +
+``format_version="native_v1"``.  Older caches (pre-native-obs, without
+``format_version`` in the manifest) are rejected loudly; they would appear to
+load but produce silently wrong obs arrays (the field layout changed in
+native_v1).  Recollect the corpus on a post-native-obs branch to get a
+compatible cache.
 """
 from __future__ import annotations
 
@@ -11,6 +18,9 @@ from typing import Iterator
 
 import numpy as np
 import torch
+
+_SUPPORTED_FORMAT = "sharded_v1"
+_SUPPORTED_FORMAT_VERSION = "native_v1"
 
 
 def load_val_episodes(
@@ -24,11 +34,24 @@ def load_val_episodes(
 
     Returns list of dicts with keys ``obs`` (dict of np arrays), ``actions`` (dict),
     and ``n_samples`` (int). Episodes are sliced from shard memmaps; no copy.
+
+    Supported cache format: ``format="sharded_v1"`` + ``format_version="native_v1"``.
+    Raises :class:`RuntimeError` on unsupported or missing format versions so that
+    stale caches fail loudly instead of producing silently wrong obs arrays.
     """
     base = Path(data_dir) / f"precomputed_{split}"
     manifest = json.loads((base / "manifest.json").read_text())
-    if manifest.get("format") != "sharded_v1":
-        raise RuntimeError(f"{base}/manifest.json: expected sharded_v1 format")
+    if manifest.get("format") != _SUPPORTED_FORMAT:
+        raise RuntimeError(
+            f"{base}/manifest.json: expected format={_SUPPORTED_FORMAT!r}, "
+            f"got {manifest.get('format')!r}"
+        )
+    if manifest.get("format_version") != _SUPPORTED_FORMAT_VERSION:
+        raise RuntimeError(
+            f"{base}/manifest.json: expected format_version={_SUPPORTED_FORMAT_VERSION!r}, "
+            f"got {manifest.get('format_version')!r} — recollect the corpus on a "
+            f"post-native-obs branch to get a compatible cache"
+        )
 
     shards = manifest.get("shards", [])
     if max_shards is not None:

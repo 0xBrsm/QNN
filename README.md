@@ -4,7 +4,7 @@ Transformer policy for competitive Quake PvP, trained via behavioral cloning
 from demos and PPO fine-tuning against bots. A native C worker observes game
 state and emits semantic tokens; a transformer encoder with a GRU temporal
 core attends over them, a supervised TargetPointer picks the engagement
-target, and factored heads (move, look, fire, weapon) drive the engine.
+target, and factored heads (move, look, attack, weapon) drive the engine.
 
 ## Quick Start
 
@@ -26,13 +26,13 @@ python -m qnn.run.router --run-dir runs/bc/bc_v1
 | Path | Purpose |
 |------|---------|
 | `qnn/` | Python model, training pipeline, observation contract |
-| `qnn/model/` | Observation embedding, transformer encoder, TargetPointer, GRU actor-critic policy |
+| `qnn/model/` | Declarative model graph (`graph/`, `node_registry`, `tokens/`): observation embedding, transformer encoder, GRU temporal core, TargetPointer, factored heads, and the decode layer |
 | `qnn/run/` | Run directory management, config, router |
 | `qnn/bc/` | Behavioral cloning — demo collection, target labeler, supervised loop |
 | `qnn/ppo/` | PPO — Sample Factory APPO integration and RL training |
 | `qnn/eval/` | Evaluation — run checkpoints against bots and live NQ servers |
 | `qnn/env/` | Live engine interface — NativeWorldEnv, reward, planning |
-| `qnn/diag/` | Capacity diagnostics for trained policies |
+| `qnn/diag/` | Per-head analysis (`qnn.diag analyze`) and capacity diagnostics |
 | `qnn/labeler/probes/` | Standalone target-head probes (causal TCN, GBT) |
 | `engine/` | C worker source — `common/` (shared), `nq/` (NetQuake), `qw/` (QuakeWorld) |
 | `engine/build/` | Build scripts for worker binaries (`ppo_worker`, `nq_demo_worker`, `nq_client`, `qw_demo_worker`, `qw_classifier`) |
@@ -50,6 +50,4 @@ python -m qnn.run.router --run-dir runs/bc/bc_v1
 | [Contract Registry](docs/contracts/README.md) | Wire / semantics / arch contract versions, ONNX I/O signatures, the load set |
 | [Semantic Vocabulary](docs/vocab.md) | Entity, action, modality IDs and event mapping |
 | [Vendored Dependencies](docs/vendor.md) | Third-party dependencies and upstream sources |
-| [Input Inference](docs/input-inference.md) | Recovering player-intent labels from server signals (fire/jump) |
-| [Target Labeler and Engine Sticky](docs/target_labeler_engine_alignment.md) | Adaptive-cone Schmitt-trigger labeler + engine alignment |
-| [Diagnostics](docs/diag.md) | `qnn.diag` capacity diagnostics for trained policies |
+| [Diagnostics](docs/diag.md) | `qnn.diag` per-head analysis + capacity diagnostics |

@@ -34,8 +34,10 @@ bin as the current model.
 | 12 | `hidden` | float32 | (64,) | GRU recurrent state in |
 
 ## Outputs (5)
-Same 5 as `wire.9`: `move_logits` (B,3,3), `look` (B,3), `fire_logit` (B,1),
-`weapon_logits` (B,8), `next_hidden` (B,64). **v17 vs v22:** v22's
+`move_logits` (B,3,3), `look` (B,3), `fire_logit` (B,1), `weapon_logits` (B,8),
+`next_hidden` (B,64). The engine runs per-axis argmax on `move_logits` and the
+sticky controller on `weapon_logits` (current `wire.9` instead bakes both
+decisions in-graph and emits a decided `move` / `weapon`). **v17 vs v22:** v22's
 `weapon_logits` second dim is concrete `8`; v17's is a symbolic export artifact —
 semantically 8 either way. **All inputs are byte-identical between v17 and v22.**
 

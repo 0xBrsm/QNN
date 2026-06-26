@@ -30,14 +30,25 @@ MAX_ENTITY_SCALAR_DIM = ACTOR_SCALAR_DIM  # largest per-type scalar count
 MAX_ENTITY_ID_DIM = ACTOR_ID_DIM          # largest per-type ID count
 
 OBS_BUFFER_SIZE = 4096
-# sizeof(qnn_action_t) — move (press byte) + weapon + input_mask + pad +
-# look[3]. The press byte mirrors the input_mask bit layout (attack at
-# bit 0, fb/lr/ud neg/pos in bits 1-6, jump at bit 7) so the engine's
-# in-memory representation matches the on-disk compacted form emitted by
-# qnn.bc.collect.
+# sizeof(qnn_action_t) — move (press byte) + weapon + input_mask +
+# op_input + look[3]. The press byte mirrors the input_mask bit layout
+# (attack at bit 0, fb/lr/ud neg/pos in bits 1-6, jump at bit 7) so the
+# engine's in-memory representation matches the on-disk compacted form
+# emitted by qnn.bc.collect.  op_input (offset 3, formerly the _pad byte)
+# is the strict per-axis OPERATIVENESS mask (press AND engine acted) —
+# additive: the struct size is unchanged at 16 B, so every pre-existing
+# field stays byte-identical.
 ACTION_SIZE = 16
 
 # Per-tick header emitted by demo worker collect mode.
+#
+# Header layout is "<IIIHH" = (tick, steps, tick_hz, flags, action_size).
+# The `steps` field is unused by the QOBS parser in normal collects
+# (_parse_qobs_frame reads only flags + obs + action).  In MATCHED-EMIT
+# mode (qnn_runtime.matched_emit), the worker REUSES `steps` to carry the
+# native frame index this 20 Hz QOBS frame was sampled at, so the slim
+# native-rate labeler stream (MLOB) can be resampled to 20 Hz by exact
+# index lookup.  No wire-size change — `steps` is repurposed, not added.
 TICK_HEADER_SIZE = 16
 TICK_HEADER_FORMAT = "<IIIHH"
 TICK_MAGIC = b"QOBS"
@@ -45,10 +56,51 @@ TICK_MAGIC_SIZE = 4
 FLAG_RESET = 0x01
 FLAG_DONE = 0x02
 
-# LOBS — labeler-mode slim per-native-tick frame.  See qnn.h
-# QNN_EmitLabelerTick docstring for the authoritative layout.
-LABELER_MAGIC = b"LOBS"
-LABELER_FRAME_SIZE = 39  # 4 magic + 10 header + 25 payload
+# ── Slim MLOB record (matched-emit mode) ─────────────────────────────
+#
+# Emitted once per native frame alongside the 20 Hz QOBS stream.  Framing
+# is "MLOB" magic + a fixed 24-byte payload (no obs buffer).  Must match
+# qnn_mlob_record_t in qnn.h / QNN_EmitMlob in qnn_collect_helpers.c:
+#
+#   off  field             dtype     bytes
+#     0  native_index      u32          4   = qnn_runtime.tick
+#     4  flags             u16          2   FLAG_DONE / FLAG_RESET
+#     6  vel[3]            i16 ×3        6   view-frame velocity, raw units
+#    12  self_movement_id   u8          1   0=ground 1=air 2..4=water
+#    13  self_weapon_id     u8          1   subject-form weapon id
+#    14  move               u8          1   press byte (usercmd-truth)
+#    15  weapon             u8          1   raw engine weapon byte
+#    16  input_mask         u8          1   per-axis feasibility byte
+#    17  op_input           u8          1   strict per-axis operativeness
+#    18  look[3]           f16 ×3        6   view-relative look delta
+# total                                24
+MLOB_MAGIC = b"MLOB"
+MLOB_RECORD_SIZE = 24
+
+
+def parse_mlob_frame(raw: bytes) -> dict:
+    """Parse one MLOB payload (the 24 bytes after the 4-byte magic).
+
+    Returns a tick dict with the slim labeler fields and a ``done`` flag.
+    ``vel`` is int16 (view-frame raw Quake units, ÷QNN_VELOCITY_SCALE to
+    normalize); ``look`` is float16. ``native_index`` is the frame index
+    that the matching 20 Hz QOBS frame stamps into its header ``steps``."""
+    native_index, flags = struct.unpack_from("<IH", raw, 0)
+    vel = np.frombuffer(raw, dtype=np.int16, offset=6, count=3).copy()
+    move, weapon, input_mask, op_input = struct.unpack_from("<BBBB", raw, 14)
+    look = np.frombuffer(raw, dtype=np.float16, offset=18, count=3).copy()
+    return {
+        "native_index":     int(native_index),
+        "self_movement_id": raw[12],
+        "self_weapon_id":   raw[13],
+        "vel":              vel,
+        "move":             move,
+        "weapon":           weapon,
+        "input_mask":       input_mask,
+        "op_input":         op_input,
+        "look":             look,
+        "done":             bool(flags & FLAG_DONE),
+    }
 
 # Legacy-shape constants kept for compat with qnn.schema. Used to
 # express the model-facing dense layout after the dequantizers run;
@@ -57,46 +109,6 @@ LABELER_FRAME_SIZE = 39  # 4 magic + 10 header + 25 payload
 SELF_SCALAR_DIM = 17
 SPATIAL_TOKEN_COUNT = 9
 SPATIAL_SCALAR_DIM = 13  # dir[3] + 10 measurement scalars
-
-
-def unpack_labeler_buffer(raw: bytes) -> dict[str, np.ndarray]:
-    """Unpack a LOBS payload (everything after the 4-byte magic and
-    10-byte header) into a model-facing dict.  Returns only the fields
-    in the shorter prefix (obs basics + usercmd + op_input); the full
-    31-byte payload is unpacked in qnn.labeler.collect._unpack_labeler_episode.
-
-    Layout (matches C-side QNN_EmitLabelerTick in qnn_labeler_collect.c):
-        pos_delta_vel[3]     fp16   offset 0,  6 bytes (body-frame, normalized)
-        movement_id          u8     offset 6,  1 byte
-        cmd_angles[3]        int16  offset 7,  6 bytes (QW 65536/360 quantization)
-        cmd_move[3]          int16  offset 13, 6 bytes (fb/lr/ud in QW units)
-        cmd_buttons          u8     offset 19, 1 byte (raw button byte)
-        cmd_impulse          u8     offset 20, 1 byte (last non-zero impulse)
-        op_input             u8     offset 21, 1 byte (strict per-axis op mask:
-                                                       bit0=fb, bit1=lr,
-                                                       bit2=ud, bit3=fire,
-                                                       bit4=impulse.  1 = press
-                                                       AND engine acted on it
-                                                       this tick.)
-    """
-    if len(raw) < 22:
-        raise ValueError(f"labeler payload too short: {len(raw)} bytes")
-    pos_delta_vel = np.frombuffer(raw, dtype=np.float16, offset=0,  count=3).astype(np.float32)
-    movement_id   = int(raw[6])
-    cmd_angles    = np.frombuffer(raw, dtype=np.int16,  offset=7,  count=3).copy()
-    cmd_move      = np.frombuffer(raw, dtype=np.int16,  offset=13, count=3).copy()
-    cmd_buttons   = int(raw[19])
-    cmd_impulse   = int(raw[20])
-    op_input      = int(raw[21])
-    return {
-        "pos_delta_vel": pos_delta_vel,
-        "movement_id":   movement_id,
-        "cmd_angles":    cmd_angles,
-        "cmd_move":      cmd_move,
-        "cmd_buttons":   cmd_buttons,
-        "cmd_impulse":   cmd_impulse,
-        "op_input":      op_input,
-    }
 
 
 # ─────────────────────────────────────────────────────────────────

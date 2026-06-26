@@ -3,7 +3,7 @@
 Competitive Quake PvP agent trained end-to-end: native C worker emits semantic
 tokens, a transformer encoder attends over them, a GRU maintains temporal
 state, supervised pointer attention picks an engagement target, and factored
-action heads (move, look, fire, weapon) drive the engine. The pipeline is
+action heads (move, look, attack, weapon) drive the engine. The pipeline is
 seeded by behavioral cloning on Quake demos and fine-tuned via Sample Factory
 APPO against FrikBotNex opponents.
 
@@ -11,14 +11,9 @@ Related docs: [head-metrics.md](head-metrics.md) (the canonical metric contract 
 how every action head is judged), [contracts/](contracts/README.md) (wire / semantics /
 arch contract versions + I/O signatures), [vocab.md](vocab.md) (IDs and event mapping), [run.md](run.md) (config schema),
 [vendor.md](vendor.md) (dependencies),
-[target_labeler_engine_alignment.md](target_labeler_engine_alignment.md)
-(target labeler + engine sticky design),
 [diag.md](diag.md) (capacity diagnostics on trained policies —
-`python -m qnn.diag`),
-[persistence-and-changepoints.md](persistence-and-changepoints.md)
-(why all heads are persistence-dominated and the when/what plan),
-[corpus-encounter-stats.md](corpus-encounter-stats.md)
-(measured encounter durations + temporal-horizon sizing).
+`python -m qnn.diag analyze` for unified per-head analysis,
+`python -m qnn.diag diagnostic` for the checkpoint-based suite).
 
 ## Policy Architecture
 
@@ -35,7 +30,7 @@ TransformerEncoder
         └──► GRU input:      x_t -> h_t                  (sequence of cls_readouts)
 
 Action features (per tick):
-  motor heads (move, look, fire):
+  motor heads (move, look, attack):
     features = cat(gru_out, target_feat, weapon_context)
   weapon head:
     features = cat(gru_out, cls_readout, target_feat)   (gru_out optional)
@@ -45,7 +40,7 @@ Action features (per tick):
 
   ├──► move    (3 categorical axes × 3 classes {neg, none, pos})
   ├──► look    target-anchored base direction + learned residual
-  ├──► fire    binary BCE
+  ├──► attack  binary BCE
   └──► weapon  8-way categorical → Quake impulse byte 1..8
 
   Target is supervised internally; it conditions action heads but is
@@ -54,7 +49,7 @@ Action features (per tick):
 ```
 
 Primary supervised heads: `target` (pointer over actor slots), `move`,
-`look`, `fire`, `weapon`. The weapon class index is converted to a Quake
+`look`, `attack`, `weapon`. The weapon class index is converted to a Quake
 impulse byte (1..8 = axe..lightning) by the engine bridge; no separate
 switch controller.
 
@@ -66,6 +61,10 @@ switch controller.
 | ffn_dim | 256 |
 | gru_hidden | 64 |
 
+### Model Assembly
+
+The model is assembled from a declarative `GraphSpec` (see `src/docs/model-graph.md`). Every pipeline — BC, bench probes, eval, PPO, and ONNX export — calls `qnn.model.graph.build_network(obs_dim, spec)` as the single factory. Node builders self-register into `qnn.model.node_registry` via `@register_head` / `@register_encoder` / `@register_pointer` / `@register_temporal` decorators declared beside each node class; `build_network` dispatches by the spec's type discriminators. Named base-graph compositions are registered by each model generation's `graphs` module via `register_base_graph`; probes are expressed as override dicts merged onto a base via `qnn.model.graph.merge_overrides`.
+
 Token sequence: `self(1) + spatial(9) + entities(up to 16) = up to 26 tokens`.
 Invalid entity rows masked via `key_padding_mask`. Action-history tokens are
 parked (templates set `action_history_tokens: 0`; no wire region in v11).
@@ -75,14 +74,13 @@ parked (templates set `action_history_tokens: 0`; no wire region in v11).
 Move is trained as three independent categorical axes; the up/down axis
 carries jump and can be reweighted via `jump_pos_weight` with linear decay.
 
-Fire is trained as binary BCE with corpus-derived positive weighting.
+Attack is trained as binary BCE with corpus-derived positive weighting.
 
 Weapon is trained as 8-class CE on the demonstrator's held-weapon impulse.
 No-weapon frames (pre-spawn, dead, transitional) carry 0 on disk and are
 masked from the CE loss via `ignore_index=-100`.
 
-Target is trained as 16-way CE on the labeler output described in
-[target_labeler_engine_alignment.md](target_labeler_engine_alignment.md);
+Target is trained as 16-way CE on the adaptive-cone target-labeler output;
 unlabeled frames carry `-100` and are skipped.
 
 Per-head loss weighting is configured via `head_loss_weights` in
@@ -127,9 +125,13 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 | `qnn/schema.py` | OBS_SCHEMA, observation-embedding input shapes |
 | `qnn/filter_dsl.py` | shared filter mini-language (collect + train) |
 | `qnn/collection_fingerprint.py` | collect-identity hash recorded at train time |
-| `qnn/model/transformer.py` | observation embedding + transformer encoder |
-| `qnn/model/target.py` | TargetPointer attention module |
+| `qnn/model/graph/` | declarative model assembly: `GraphSpec`, `build_network`, `merge_overrides`, `GraphObsEmbedding` |
+| `qnn/model/node_registry.py` | self-registering node-builder registry (`@register_head`, `@register_encoder`, etc.) |
+| `qnn/model/transformer.py` | transformer encoder block (registers via `@register_encoder`) |
+| `qnn/model/target.py` | TargetPointer attention module (registers via `@register_pointer`) |
 | `qnn/model/policy.py` | actor-critic with GRU + play heads |
+| `qnn/model/decode.py` | generation-stable decode primitives (attack sigmoid+thresh, move axis decode, sampling prims) |
+| `qnn/model/decode_config.py` | run-pinned JSON decode configuration schema |
 | `qnn/run/router.py` | run-dir router |
 | `qnn/run/config.py` | strict run-dir config loader and builders |
 | `qnn/{bc,ppo,eval}/` | mode runners (`bc`, `ppo`, `pbt`, `eval`, `optuna`) |
@@ -142,7 +144,7 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 | `qnn/ppo/encoder.py` | PPO encoder wrapper |
 | `qnn/ppo/train.py` | PPO registration + config builder |
 | `qnn/env/reward.py` | PvP reward shaping |
-| `qnn/diag/` | trained-policy diagnostics package |
+| `qnn/diag/` | unified trained-policy diagnostics: `analyze` (per-head) and `diagnostic` (checkpoint-based) subcommands; per-head modules `attack`, `look`, `move`, `weapon` consolidate all head-specific analysis scripts |
 | `qnn/labeler/probes/` | standalone target-head probes (causal TCN, GBT) |
 | `qnn/eval/live.py` | live-play entry point (NQ servers) |
 | `engine/common/` | shared C worker: store, oracle, entity, event, io, sound, spatial, fault, watchdog, tick |

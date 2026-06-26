@@ -158,6 +158,7 @@ MOVE_HEAD = "move"
 LOOK_HEAD = "look"
 ATTACK_HEAD = "attack"
 WEAPON_HEAD = "weapon"
+MOVE_HAZARD_HEAD = "move_hazard"  # a25 WHEN/termination head (opt-in)
 
 # Output sizes, exported for callers that build padded buffers or
 # downstream layers against these sizes. Heads define their own
@@ -256,7 +257,8 @@ def _weapon_source_dim(
     """
     if source == "gru":
         return int(d_gru) if has_temporal else 0
-    if source in ("self_readout", "target_feat"):
+    if source in ("self_readout", "target_feat") or source.startswith("token:"):
+        # a token:<name> source reads one encoder self-token output (d_model wide)
         return int(d_model)
     raise ValueError(f"unknown weapon source {source!r}")
 
@@ -356,6 +358,7 @@ class Network(nn.Module):
         look_head: "nn.Module | Off | None" = None,
         attack_head: "nn.Module | Off | None" = None,
         weapon_head: "nn.Module | Off | None" = None,
+        move_hazard_head: "nn.Module | Off | None" = Off,
     ) -> None:
         super().__init__()
         if obs_embedding is Off:
@@ -392,18 +395,34 @@ class Network(nn.Module):
         # ModelConfig.weapon_sources). The "gru" source contributes only when
         # a temporal slot is active; the others always contribute their width.
         self.weapon_sources = tuple(model.weapon_sources)
+        # A token:<name> source reads one encoder self-token output as the readout;
+        # resolve names → self_block indices from the obs embedding's token order.
+        self._self_token_index = {
+            n: i for i, n in enumerate(getattr(self.obs_embedding, "self_token_names", ()))
+        }
         _valid_sources = {"gru", "self_readout", "target_feat"}
-        _bad = [s for s in self.weapon_sources if s not in _valid_sources]
+        _bad = [
+            s for s in self.weapon_sources
+            if s not in _valid_sources and not s.startswith("token:")
+        ]
         if _bad:
             raise ValueError(
                 f"weapon_sources contains unknown source(s) {_bad}; "
-                f"valid sources are {sorted(_valid_sources)}"
+                f"valid sources are {sorted(_valid_sources)} or 'token:<name>'"
             )
-        if not ({"gru", "self_readout"} & set(self.weapon_sources)):
+        for s in self.weapon_sources:
+            if s.startswith("token:") and s[len("token:"):] not in self._self_token_index:
+                raise ValueError(
+                    f"weapon source {s!r} → unknown self-token; obs embedding has "
+                    f"{list(self._self_token_index)}"
+                )
+        if not ({"gru", "self_readout"} & set(self.weapon_sources)) and not any(
+            s.startswith("token:") for s in self.weapon_sources
+        ):
             raise ValueError(
-                "weapon head needs at least one of 'gru' / 'self_readout' in "
-                "weapon_sources — got "
-                f"{self.weapon_sources!r} (target_feat alone is too thin)"
+                "weapon head needs a readout — 'gru' / 'self_readout' or a "
+                f"'token:<name>' source; got {self.weapon_sources!r} "
+                "(target_feat alone is too thin)"
             )
         self.weapon_context_from_obs = bool(model.weapon_context_from_obs)
         self.d_target = int(model.d_target)
@@ -423,6 +442,10 @@ class Network(nn.Module):
         self._has_move_head = move_head is not Off
         self._has_look_head = look_head is not Off
         self._has_attack_head = attack_head is not Off
+        # a25 hazard head: opt-in only (no canonical fallback). Present iff
+        # build_network passed a real module — default Off keeps every existing
+        # Network construction (which never passes it) hazard-free.
+        self._has_move_hazard_head = isinstance(move_hazard_head, nn.Module)
 
         # Build the upstream slots (temporal, target pointer) FIRST so the
         # downstream dim contract reads their declared out_dim rather than a
@@ -491,6 +514,10 @@ class Network(nn.Module):
                 )
                 if attack_head is None else attack_head
             )
+
+        if self._has_move_hazard_head:
+            # No canonical fallback — always an override built by build_network.
+            self.move_hazard_head = move_hazard_head
 
         self._init_weights()
 
@@ -587,6 +614,16 @@ class Network(nn.Module):
             }
             if self._has_temporal:
                 _ws_available["gru"] = gru_flat
+            for _src in self.weapon_sources:
+                if _src.startswith("token:"):
+                    if enc_out.self_block is None:
+                        raise ValueError(
+                            f"weapon source {_src!r} needs per-token encoder outputs, "
+                            "but the encoder did not emit self_block"
+                        )
+                    _ws_available[_src] = enc_out.self_block[
+                        :, self._self_token_index[_src[len("token:"):]], :
+                    ]
             weapon_selector_flat = torch.cat(
                 [_ws_available[src] for src in self.weapon_sources if src in _ws_available],
                 dim=-1,
@@ -599,6 +636,27 @@ class Network(nn.Module):
 
         move_features_flat = self._with_weapon_context(features_base_flat, weapon_context)
         move_out = self.move_head(MoveHeadInput(features=move_features_flat)) if self._has_move_head else None
+
+        # a25 hazard head (opt-in): reads the SAME motor feature vector as the
+        # move head plus the semi-Markov decode state (held_class/dwell_age),
+        # which arrive as flat_obs fields (train: precomputed act_move columns;
+        # deploy: threaded from the engine's move-decode state). Local import
+        # keeps the canonical Network module free of a top-level bench dependency.
+        move_hazard_out = None
+        # The move-hazard (a25 WHEN-law) head is a TRAINING auxiliary: it consumes
+        # move_held_class / move_dwell_age, which the BC loader derives from
+        # act_move and exist only at train time. It is never a deploy head — the
+        # exported/live move decode uses the tabulated semi-Markov hazard, and the
+        # deploy graph is 5-head (see tools/export_onnx CORE_OUTPUT_NAMES). So run
+        # it only when its derived inputs are present; absent (export / live
+        # inference) it is cleanly skipped, letting a full_6head checkpoint export
+        # as a 5-head deploy graph.
+        if self._has_move_hazard_head and "move_held_class" in flat_obs:
+            move_hazard_out = self.move_hazard_head(self.move_hazard_head.Input(
+                cls_feat=move_features_flat,
+                held_class=flat_obs["move_held_class"],
+                dwell_age=flat_obs["move_dwell_age"],
+            ))
 
         # Look = target-anchored prior + learned residual. v17 checkpoints
         # set look_bypass_gru=True so the look head sees the same features
@@ -644,6 +702,10 @@ class Network(nn.Module):
         logits_flat: Dict[str, torch.Tensor] = {}
         if move_out is not None:
             logits_flat[MOVE_HEAD] = move_out.logits
+        if move_hazard_out is not None:
+            # Per-axis release-hazard logits — consumed by the loss (phase 3) and
+            # the move WHEN-decode; not an argmax-sampled action vector.
+            logits_flat[MOVE_HAZARD_HEAD] = move_hazard_out.hazard_logits
         if look_out is not None:
             logits_flat[LOOK_HEAD] = look_out.look_predict
             # Underscored keys are loss-only; not used for inference / sampling.

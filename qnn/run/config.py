@@ -227,6 +227,7 @@ def build_run_bc_config(
     # Legacy no-op key: global length bucketing is unconditional now.
     bc_cfg.pop("length_bucket_window", None)
     bc_cfg["model"] = ModelConfig.from_dict(model)
+    bc_cfg["run_id"] = str(_require_mapping(run_cfg, "manifest", "run config").get("run_id", ""))
 
     checkpoints_dir = run_output_dirs(run_cfg)["checkpoints"]
     bc_cfg["output_dir"] = str(checkpoints_dir)
@@ -270,6 +271,7 @@ def build_run_ppo_eval_config(
     ppo_cfg = dict(train)
     ppo_cfg.update(model)
     ppo_cfg.update(surface)
+    ppo_cfg["run_id"] = str(_require_mapping(run_cfg, "manifest", "run config").get("run_id", ""))
     ppo_cfg["output_dir"] = str(outputs["checkpoints"])
     ppo_cfg["reward_json_path"] = str(run_cfg["config_paths"]["reward"])
     ppo_cfg["device"] = requested_device
@@ -324,11 +326,29 @@ def build_run_ppo_eval_config(
         "procgen": surface["procgen"],
         "scenario_config_path": str(surface["scenario_config_path"]),
         "reward_json_path": str(run_cfg["config_paths"]["reward"]),
-        "record_demos": bool(_require_key(train, "eval_record_demos", "train.json")),
         "parallel_policy_modes": bool(_require_key(train, "eval_parallel_policy_modes", "train.json")),
         "device": requested_device,
     }
     return ppo_cfg, eval_cfg
+
+
+def _parse_weapon_ban(raw: Any) -> tuple[int, ...]:
+    """Normalize an ``eval_weapon_ban`` value to a tuple of impulses 1..8.
+
+    Accepts a csv string ("2,3"), an int list/tuple, or None/"" (→ ()). Mirrors
+    the ONNX export's --weapon-ban parsing so eval applies the same ban spec.
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        items = [x.strip() for x in raw.split(",") if x.strip()]
+    else:
+        items = list(raw)
+    ban = tuple(int(x) for x in items)
+    for imp in ban:
+        if not 1 <= imp <= 8:
+            raise ValueError(f"eval_weapon_ban: impulse {imp} out of range 1..8")
+    return ban
 
 
 def build_run_eval_config(
@@ -376,9 +396,63 @@ def build_run_eval_config(
         "procgen": surface["procgen"],
         "scenario_config_path": str(surface["scenario_config_path"]),
         "reward_json_path": str(run_cfg["config_paths"]["reward"]),
-        "record_demos": bool(_t("record_demos")),
         "parallel_policy_modes": bool(_t("parallel_policy_modes")),
         "device": requested_device,
+        # Optional: aim-prior gain override (0.0 = control arm). Absent →
+        # None → the model's baked decode-contract default.
+        "look_aim_prior_gain": (
+            float(train["eval_look_aim_prior_gain"])
+            if "eval_look_aim_prior_gain" in train else None
+        ),
+        # Optional: per-model weapon ban (impulses 1..8) — the same spec the
+        # ONNX export path applies, so eval predicts deployed behavior. Accepts
+        # a csv string ("2,3") or a list ([2, 3]); absent → () → no ban.
+        "weapon_ban": _parse_weapon_ban(train.get("eval_weapon_ban")),
+        # Optional: engine-parity sticky move decode (set both for live
+        # parity; absent → legacy per-frame sampling).
+        "move_sticky_tau_fb": (
+            float(train["eval_move_sticky_tau_fb"])
+            if "eval_move_sticky_tau_fb" in train else None
+        ),
+        "move_sticky_tau_lr": (
+            float(train["eval_move_sticky_tau_lr"])
+            if "eval_move_sticky_tau_lr" in train else None
+        ),
+        # Optional: dump per-episode decoded move streams (diagnostics).
+        "log_action_streams": bool(train.get("eval_log_action_streams", False)),
+        # Optional: semi-Markov hazard decode tables (dict with edges +
+        # per-axis fb/lr/ud release probabilities). Requires the sticky taus.
+        "move_hazard": (
+            dict(train["eval_move_hazard"])
+            if isinstance(train.get("eval_move_hazard"), Mapping) else None
+        ),
+        # Optional: latency-agnostic switch-back suppression (watermark on the
+        # abandoned class's softmax prob; see docs/move-head.md). Requires
+        # the sticky taus.
+        "move_switchback_eps": (
+            float(train["eval_move_switchback_eps"])
+            if "eval_move_switchback_eps" in train else None
+        ),
+        # Optional: stop-onset hazard symmetry — from a true stop (both held
+        # fb/lr = none) gate presses are suppressed; onsets come from the
+        # none-row hazard. Requires eval_move_hazard fb+lr tables.
+        "move_stop_onset": bool(train.get("eval_move_stop_onset", False)),
+        # Optional: engagement-gated sticky tau — tau=1 (table-only switching) on
+        # disengaged (no-target) frames, sticky_tau on engaged frames. Pairs with a
+        # non-combat baseline eval_move_hazard table (rc1o move scheme).
+        "move_tau_engagement_gated": bool(train.get("eval_move_tau_engagement_gated", False)),
+        # Optional: emulate the live client's obs latency — the policy sees
+        # obs from N ticks ago while actions land in real time. 0 = bridge
+        # semantics (every eval before 2026-06-11).
+        "obs_lag_ticks": int(train.get("eval_obs_lag_ticks", 0)),
+        # Optional: release-candidate decode regime for Python eval parity
+        # with export-time in-graph decode (e.g. "a24rc1").
+        "decode_regime": (
+            str(train["eval_decode_regime"])
+            if "eval_decode_regime" in train else None
+        ),
+        "look_aim_snap_thresholds_deg": train.get("eval_look_aim_snap_thresholds_deg"),
+        "look_aim_snap_scales":         train.get("eval_look_aim_snap_scales"),
     }
 
 

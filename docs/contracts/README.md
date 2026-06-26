@@ -26,6 +26,23 @@ data) → violating it is a *parse error*, loud. Semantics is what well-formed
 data means (scales, vocab) → violating it is a *misinterpretation*, silent. The
 two failure modes line up exactly with the two axes.
 
+**Semantics also pins the tick, not just the value.** The timeliness clause
+([`semantics/semantics.1.md`](semantics/semantics.1.md), "Temporal alignment")
+requires every protocol frontend to deliver server-time-aligned self-state —
+`obs(t)` reflects own commands through t−1, the training alignment. It is
+behavioral (not in `semantics_sig`), so it is enforced per frontend by a
+conformance layer (NQ: `qnn_predict.c`; QW: native prediction) plus a
+certification capture, not at model load.
+
+**Two more things ride the export but are NOT versioned axes.** The **decode
+config** (the decode/guard *behavior* layer — sampling, polar look, sticky
+weapon, aim-prior, hazard) and **`state.loopback`** (recurrent-state carrying)
+are both stamped into the ONNX at export time for provenance, but neither is a
+contract axis: decode is decoupled from training and A/B'd by pointing at a
+different JSON (no id, no retrain), and `state.loopback` rides the wire
+contract. See [Decode config](#decode-config--the-decodeguard-layer) and
+[`state.loopback`](#state-loopback--recurrent-state).
+
 Each axis bumps independently. The live id of record for a *freshly trained*
 model is the constant in `src/qnn/engine_norm.py` (`WIRE_CONTRACT_ID`,
 `SEMANTICS_CONTRACT_ID`). But the **source of truth for any given model is its
@@ -40,6 +57,97 @@ the generation→contract registry (`qnn.contracts`, keyed on the converter's ow
 schema markers) at load, or stamped offline with `tools/stamp_checkpoint.py`; an
 unrecognized generation is left unset (never guessed) and export FAILS loudly
 rather than falling back to a constant.
+
+## `state.loopback` — recurrent state {#state-loopback--recurrent-state}
+
+A **fourth, declarative** stamp (not a versioned axis — it rides the wire
+contract) tells the engine how to carry **recurrent state** across ticks
+*generically and opaquely*. The engine has **zero semantic knowledge** of any
+state tensor: it does not special-case `hidden` / `move_state` / `move_state_rng`,
+and it does **not** sniff input names to decide what to carry. It reads this
+declaration and builds a generic loop-back table.
+
+`tools/export_onnx.py` stamps `state.loopback` into ONNX metadata; the engine
+parses it at load (`qnn_loopback_parse` in `src/engine/common/qnn_onnx.c`).
+
+**Grammar.** Entries `;`-separated; fields `,`-separated `key=value`; init-CSV
+lanes space-separated:
+
+```
+in=<input> , out=<output> , init=<policy> , reset=<policy>   ; …next entry…
+```
+
+| field | values | meaning |
+|-------|--------|---------|
+| `in`  | tensor name | the recurrent INPUT the engine binds each tick from its carried buffer |
+| `out` | tensor name | the OUTPUT whose result is copied back into `in`'s buffer for next tick (distinct name — ONNX forbids an input/output sharing a name) |
+| `init` | `zeros` \| `entropy` \| `<csv lanes>` | buffer init at load (and on episode reset where `reset=episode`). `entropy` = seed once at load from wall-clock entropy; `<csv>` = write the space-separated lane values (tiled across the buffer) |
+| `reset` | `episode` \| `persist` | re-apply `init` on episode reset (`episode`) or keep the carried value across episodes (`persist`, e.g. an RNG stream) |
+
+The engine, per entry: at load allocates the buffer by the **ORT-reported
+shape/dtype** of `in` and applies `init`; each tick binds the buffer as the `in`
+input, runs, copies the `out` result back; on episode reset re-applies `init`
+only where `reset=episode`.
+
+**Adding a future state tensor is an export/contract change with ZERO engine
+change** — stamp another entry, no C edit.
+
+**Load validation (hard refusal).** The engine refuses if a declared `in`/`out`
+is missing from the graph I/O, if a graph input is neither an obs input nor a
+declared loop-back `in`, or if the `move` action output disagrees with the
+wire-version stamp (decided `move` vs raw `move_logits`). The wire version gates
+**only** that action interpretation — never state carrying.
+
+The current HEAD (`wire.9`) declaration is:
+
+```
+in=hidden,out=next_hidden,init=zeros,reset=episode;
+in=move_state,out=move_state_out,init=1 1 1 1 1 -1 -1 0 0 0 0,reset=episode;
+in=move_state_rng,out=move_state_rng_out,init=entropy,reset=persist
+```
+
+See [`wire/wire.9.md`](wire/wire.9.md#stateloopback--generic-recurrent-state-carrying).
+
+## Decode config — the decode/guard layer {#decode-config--the-decodeguard-layer}
+
+Decode is the model's **behavioral readout** — how raw head outputs become an
+action: sampling vs argmax, the polar-look hybrid, the sticky-weapon gate, the
+aim-prior blend, the move hazard/dwell supplement. It is **not a contract axis**
+and carries no `wire`/`semantics`/`arch`-style id, for one reason: **decode is
+decoupled from training** (you never backprop through it), so it is an
+EXPORT-time artifact, not part of the trained graph. You A/B a decode change by
+pointing the exporter at a different JSON — no retrain, no model-code change.
+
+A decode config (a JSON resolved by `src/qnn/model/decode_config.py`, shipped
+with its generation) is the self-describing, run-pinned record of that layer:
+
+| field | meaning |
+|-------|---------|
+| `decode_module` | dotted import path — the gen-coupled decode geometry (must read the head params) |
+| `guard_module`  | dotted path \| `"none"` — exposes `guard_fire_logit_for_export` + `policy_decode_action_postprocess` |
+| `params`        | flat `str→scalar\|list` map (`look.*`, `weapon.*`, `guard.*`, `weapon_ban`) |
+| `look_grid`     | run-relative path to the polar look grid (null = code default) |
+| `move_hazard`   | path to the hazard/dwell table JSON (null = none / head-driven) |
+
+**Two numbers, distinct** (this is the usual point of confusion):
+`decode_version` is the **schema** version of the JSON format itself (currently
+`1`); `version` is a **named build id** for provenance only (e.g. `a24rc2`),
+tied to the arch lineage — it is not enforced and never gates a load.
+
+**Provenance.** The exporter stamps the resolved config's **sha256 + the repo
+git sha** into the ONNX `metadata_props` (under the `decode.` namespace), so the
+exact decode/guard source of any shipped model is recoverable. The one
+training-fixed constraint `decode_config` enforces at resolve time: the look
+grid's **bin count** must equal the head's trained output width (center values
+are free to tune; the count is not — a count mismatch is an incompatible
+decode/checkpoint pairing).
+
+**Where the decode CODE lives** (a cross-gen split, not a version): the
+cross-gen-stable readout primitives (sampling, attack-bit, per-axis move) are in
+`src/qnn/model/decode.py`; each generation's *choices* (its decode geometry and
+any guard) live in that generation's own decode module, resolved through the
+config's `decode_module` / `guard_module`. A future generation replaces the gen
+module, not the base.
 
 ## Registry — release / checkpoint generation → contract
 
@@ -60,12 +168,23 @@ support feasibility (below).
 | 0.14–0.15 | `token-spec-v10` | `wire.6` | `semantics.0d` | move[3]/jump-collapse | v10 | No | B |
 | 0.17 | `token-spec.md` (v11) | **`wire.7`** | **`semantics.1`** | v11 packed | **v17, v22** | **Yes** | **A** |
 | 0.21 | (no doc bump) | `wire.8` | `semantics.1` | native split | — | No (never exported) | A |
-| HEAD | v11 + `look_delta` | **`wire.9`** | **`semantics.1`** | `full_4head` | **v24** | **Yes** | **A** |
+| HEAD | native 44-obs split + in-graph MOVE decode | **`wire.9`** | **`semantics.1`** | `full_4head` | **v24** | **Yes** | **A** |
 
 Distinct contracts across the full history: **9 wire × 5 semantics**. With a
 surviving runnable artifact: **2 wire** (`wire.7`, `wire.9`) **× 1 semantics**
 (`semantics.1`). `wire.8` is a reconstructed id — the native exporter postdates
-`look_delta`, so no 43-input graph was ever exported.
+`look_delta`, so no 43-input graph was ever exported. `wire.9` = the native
+44-obs split + the recurrent MOVE-decode state pair as I/O, with `move` the
+decided 3-axis class (the a24 stateful move decode runs in-graph; the engine no
+longer runs the move state machine, and the legacy `wire.7` logit-move path runs
+plain per-axis argmax). See [`wire/wire.9.md`](wire/wire.9.md).
+
+> **`wire.9` number reclaimed.** During active a24 development the in-graph
+> move-decode shape was briefly numbered `wire.10`, distinct from an
+> engine-side-argmax `wire.9`. That `wire.10` was never finalized as a release
+> and the old engine-argmax `wire.9` has no surviving artifact, so the number
+> was collapsed — we don't bump the wire number until a shape is finalized, so
+> the in-graph migration stayed **under** `wire.9`. There is no `wire.10`.
 
 ## Support bands & the wire.7 floor
 
@@ -106,7 +225,8 @@ census-level summary + dead-field annotation is enough for diagnosis.
 
 - `src/qnn/engine_norm.py` — the live contract ids + field table (the ids a new model is born with).
 - `src/qnn/contracts.py` — torch-free generation→contract registry + backfill/arch-id helpers.
-- `tools/export_onnx.py` — stamps the checkpoint's contract into the ONNX (+ `_wire_sig`/`_semantics_sig` fingerprints).
+- `tools/export_onnx.py` — `build_contract_manifest()` assembles the flat manifest (the checkpoint's contract ids + `_wire_sig`/`_semantics_sig` fingerprints); `_stamp_metadata()` writes it into the ONNX metadata (authoritative) and re-renders it via `_contract_document()` into a structured `<model>.contract.json` sidecar (the human-readable three-axis view — `wire`/`semantics`/`arch` sections, each with `id` + `sig`; cannot drift, it is a pure re-render of the stamped manifest).
+- `src/qnn/model/decode_config.py` — resolves a decode-config JSON → decode/guard modules + params; computes the config sha256 the exporter stamps. NOT a contract axis (decode is decoupled from training). The per-generation config templates ship with their generation.
 - `tools/stamp_checkpoint.py` — add/backfill a `meta["contract"]` block on an archived `.pth`.
 - `qnn/utils/checkpoint_converter.py` — the arch migration chain + `resolve_checkpoint_contract` (load-time backfill).
 - `docs/archive/` — the historical bundled snapshots (`token-spec-v*`, `obs-spec-v*`).

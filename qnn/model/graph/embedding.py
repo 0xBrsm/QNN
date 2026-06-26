@@ -55,6 +55,9 @@ class GraphObsEmbedding(ObsEmbedding):
         # _init_self_components, which needs the token specs.
         self._self_token_specs = self_specs
         self._N_SELF_TOKENS = len(self_specs)
+        # Ordered self-token names: index i ↔ encoder ``self_block[:, i]`` (CLS at
+        # 0). Lets a head read one token as its readout via a ``token.<name>`` edge.
+        self.self_token_names = tuple(t.name for t in self_specs)
         super().__init__(
             d_model=spec.encoder.d_model,
             self_weapon_embed_in_self=any(

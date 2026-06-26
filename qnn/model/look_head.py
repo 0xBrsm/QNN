@@ -70,3 +70,12 @@ class LookHead(nn.Module):
         out_norm = torch.linalg.vector_norm(unnormalized, dim=-1, keepdim=True).clamp(min=1e-6)
         look_predict = unnormalized / out_norm
         return LookHeadOutput(look_predict=look_predict, look_prior=look_prior, look_delta=look_delta)
+
+
+# -- graph node registration ------------------------------------------------
+from qnn.model.node_registry import register_head  # noqa: E402
+
+
+@register_head("look", "canonical")
+def _build_look_canonical(head, dims, d_model):
+    return LookHead(in_dim=dims["motor_in"], d_hidden=head.d_hidden, activation=head.activation)

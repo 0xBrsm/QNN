@@ -35,3 +35,12 @@ class MoveHead(nn.Module):
     def forward(self, inp: MoveHeadInput) -> MoveHeadOutput:
         logits = self.mlp(inp.features).reshape(-1, MOVE_AXES, MOVE_AXIS_CLASSES)
         return MoveHeadOutput(logits=logits)
+
+
+# -- graph node registration ------------------------------------------------
+from qnn.model.node_registry import register_head  # noqa: E402
+
+
+@register_head("move", "canonical")
+def _build_move_canonical(head, dims, d_model):
+    return MoveHead(in_dim=dims["motor_in"], d_hidden=head.d_hidden, activation=head.activation)

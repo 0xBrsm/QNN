@@ -59,8 +59,29 @@ WEAPON_EDGE_TO_SOURCE = {
 WEAPON_SOURCE_TO_EDGE = {v: k for k, v in WEAPON_EDGE_TO_SOURCE.items()}
 _WEAPON_EDGES = tuple(WEAPON_EDGE_TO_SOURCE)
 
-_HEAD_NAMES = ("move", "look", "attack", "weapon")
-_MOTOR_HEADS = ("move", "look", "attack")
+# A head may also read a single declared token as its readout via a
+# ``token.<name>`` edge (e.g. ``token.arsenal``) — resolved to the encoder's
+# per-self-token output at that token's index. The build maps it to a
+# ``token:<name>`` weapon source; existence (``<name>`` is a real self-token) is
+# checked at GraphSpec level where the token list is known.
+EDGE_TOKEN_PREFIX = "token."
+
+
+def _is_token_edge(edge: str) -> bool:
+    return edge.startswith(EDGE_TOKEN_PREFIX)
+
+
+def _token_edge_name(edge: str) -> str:
+    return edge[len(EDGE_TOKEN_PREFIX):]
+
+# ``move_hazard`` (a25) is a motor head: it reads the shared motor feature
+# vector (readout [+ target.feat]) like move/look/attack. Its additional
+# semi-Markov inputs (held_class / dwell_age) are NOT graph edges — they are
+# decode-state obs fields the Network passes straight through ``flat_obs`` (see
+# qnn.model.bench.a25.move_hazard_head and network.py), so the edge contract
+# here is unchanged.
+_HEAD_NAMES = ("move", "look", "attack", "weapon", "move_hazard")
+_MOTOR_HEADS = ("move", "look", "attack", "move_hazard")
 _ACTIVATIONS = ("none", "gelu", "relu")
 
 _WEAPON_DECODE_KEYS = ("sticky_confidence", "sticky_margin")
@@ -330,15 +351,26 @@ class HeadNodeSpec:
             raise GraphSpecError(f"{ctx}: inputs must be non-empty")
         if len(set(self.inputs)) != len(self.inputs):
             raise GraphSpecError(f"{ctx}: duplicate input edge")
-        allowed_edges = _WEAPON_EDGES if self.name == "weapon" else _MOTOR_EDGES
-        bad = [e for e in self.inputs if e not in allowed_edges]
+        if self.name == "weapon":
+            # weapon may also read a single token as its readout (token.<name>);
+            # the token's existence is checked at GraphSpec level.
+            bad = [e for e in self.inputs
+                   if e not in _WEAPON_EDGES and not _is_token_edge(e)]
+            allowed_edges = list(_WEAPON_EDGES) + [f"{EDGE_TOKEN_PREFIX}<name>"]
+        else:
+            allowed_edges = _MOTOR_EDGES
+            bad = [e for e in self.inputs if e not in allowed_edges]
         if bad:
             raise GraphSpecError(f"{ctx}: unknown edge(s) {bad}; allowed: {list(allowed_edges)}")
         if self.name in _MOTOR_HEADS and EDGE_READOUT not in self.inputs:
             raise GraphSpecError(f"{ctx}: motor heads must read {EDGE_READOUT!r}")
-        if self.name == "weapon" and not ({EDGE_GRU, EDGE_SELF_READOUT} & set(self.inputs)):
+        if self.name == "weapon" and not (
+            ({EDGE_GRU, EDGE_SELF_READOUT} & set(self.inputs))
+            or any(_is_token_edge(e) for e in self.inputs)
+        ):
             raise GraphSpecError(
-                f"{ctx}: weapon needs at least one of {EDGE_GRU!r} / {EDGE_SELF_READOUT!r}"
+                f"{ctx}: weapon needs a readout — one of {EDGE_GRU!r} / "
+                f"{EDGE_SELF_READOUT!r} or a {EDGE_TOKEN_PREFIX}<name> token edge"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -451,12 +483,20 @@ class GraphSpec:
             raise GraphSpecError(f"{ctx}: heads must share one activation, got {sorted(activations)}")
 
         # Edge resolution: no dangling edges, no silent drops.
+        self_token_names = {t.name for t in self.self_tokens}
         for h in self.heads:
             hctx = f"heads[{h.name!r}]"
             if EDGE_TARGET_FEAT in h.inputs and self.pointer is None:
                 raise GraphSpecError(f"{hctx}: {EDGE_TARGET_FEAT!r} requires a target pointer node")
             if EDGE_GRU in h.inputs and self.temporal is None:
                 raise GraphSpecError(f"{hctx}: {EDGE_GRU!r} requires a temporal node")
+            for e in h.inputs:
+                if _is_token_edge(e) and _token_edge_name(e) not in self_token_names:
+                    raise GraphSpecError(
+                        f"{hctx}: token edge {e!r} → unknown self-token "
+                        f"{_token_edge_name(e)!r}; declared self-tokens: "
+                        f"{sorted(self_token_names)}"
+                    )
         # Network feeds ONE motor feature vector to all motor heads.
         motor = [h for h in self.heads if h.name in _MOTOR_HEADS]
         if motor and len({h.inputs for h in motor}) != 1:

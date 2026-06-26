@@ -1,98 +1,137 @@
-# Wire contract `wire.9` — native split, 44 inputs (current)
+# Wire contract `wire.9` — native split + in-graph MOVE decode (current)
 
-The current wire contract — what `tools/export_onnx.py` produces and what the
-deployed **v24 / `full_4head`** model is. `wire.9` = [`wire.8`](wire.8.md) +
-`look_delta`. Stamped as `wire_contract=wire.9` in model metadata.
+The current wire contract — what `tools/export_onnx.py` produces for a
+`full_4head` model at HEAD. `wire.9` = [`wire.8`](wire.8.md) + `look_delta`
+(the native 44-obs split) **+** the recurrent **MOVE-decode state** threaded as
+I/O, with `move` being the **decided 3-axis class** (the a24 stateful decode runs
+in-graph) rather than raw logits. Stamped as `wire_contract=wire.9` in model
+metadata.
+
+> **Number reclaimed.** During active a24 development the in-graph move-decode
+> shape was briefly numbered `wire.10`, distinct from an engine-side-argmax
+> `wire.9`. That `wire.10` was never finalized as a release and the old
+> engine-argmax `wire.9` has no surviving artifact, so the number was collapsed:
+> we don't bump the wire number until a shape is finalized, so the in-graph
+> migration stayed **under** `wire.9`. There is no `wire.10`. Net wire set with a
+> surviving artifact: `wire.7`, `wire.9`.
 
 - **Lineage:** `engine_norm` field-table (native split). **Band A** (faithful).
 - **Semantics:** [`semantics.1`](../semantics/semantics.1.md). **Arch:** `full_4head`.
-- **Codec:** built (the current `QNN_ONNX_INPUTS` table in `qnn_onnx.c`).
+- **Codec:** built (`QNN_CODEC_WIRE_9` in `qnn_onnx.c` — the native obs pack +
+  the decided-`move` / decided-weapon decode; the move difference vs the legacy
+  logit-move path is keyed on the resolved **wire-version** `ctx->wire_major` —
+  ACTION interpretation only, never state).
 - **Artifacts:** `/tmp/qnn_v24*.onnx`, the deployed bot on `\\pi.local\qnn`,
-  `runs/head_probe/**` checkpoints.
-- **Source of truth:** `src/qnn/engine_norm.py` (`SELF_FIELDS`/`SPATIAL_FIELDS`/
-  `ENTITY_*_FIELDS`) and `NATIVE_INPUTS` in `tools/export_onnx.py`; C side
-  `src/engine/common/qnn_io.h` + `qnn_onnx.c`.
+  `runs/bc/bench/**` checkpoints.
+- **Source of truth:** `src/qnn/engine_norm.py` + `NATIVE_INPUTS` /
+  `_output_names` in `tools/export_onnx.py`; C side `src/engine/common/qnn_onnx.c`.
 
-## Inputs — 44 obs tensors (+ `hidden`)
+## The in-graph MOVE decode
 
-Per-field native dtypes; leading axis is dynamic `batch`. Per-row shape excludes
-batch. This ordered list (minus `hidden`) plus the output names is the
-`wire_sig` basis.
+The **a24 stateful MOVE decode** — the `fb`/`lr` sticky gate, switch-back
+watermark, dwell-hazard release, stop-onset suppression, and the
+continuous-weapon fire hold-tail — once ran **engine-side** (a
+`qnn_onnx_decode_core` state machine + the `decode.move_*` metadata params).
+It now runs **IN-GRAPH** (the export wrapper bakes
+`qnn.model.decode_a24.move_decode_step_graph`, with the taus/eps/hazard table as
+graph constants). The engine carries no move state machine; it just:
 
-### Self block (13)
-| # | name | dtype | shape | meaning |
-|---|------|-------|-------|---------|
-| 1 | `self_health` | uint8 | () | STAT_HEALTH (scale 100) |
-| 2 | `self_effective_armor` | uint8 | () | round(raw_armor × type_factor) (scale 160) |
-| 3 | `self_ammo_shells` | uint8 | () | scale 100 |
-| 4 | `self_ammo_nails` | uint8 | () | scale 200 |
-| 5 | `self_ammo_rockets` | uint8 | () | scale 100 |
-| 6 | `self_ammo_cells` | uint8 | () | scale 100 |
-| 7 | `self_vel` | int16 | (3,) | view-frame velocity, clamped ±2000 |
-| 8 | `self_attack_finished` | float16 | () | cooldown seconds (scale 60) |
-| 9 | `self_weapon_id` | uint8 | () | ENTITY_IDS-encoded (embedding) |
-| 10 | `self_movement_id` | uint8 | () | 0 ground / 1 air / 2-4 water (embedding) |
-| 11 | `self_items` | int32 | () | raw `cl.items` bitfield |
-| 12 | `view_pitch` | int8 | () | pitch_deg/90, ~[-1,1] |
-| 13 | `look_delta` | float16 | (3,) | look[t-1]−look[t-2]; realized look-vec change (~0 under steady turn). **`wire.9`-only** (absent in `wire.8`) |
+1. reads the **decided** `move` classes off the graph and packs the wire byte, and
+2. threads the recurrent move-decode state (`move_state` / `move_state_rng`)
+   frame-to-frame — but **generically**, via the [`state.loopback`](#stateloopback--generic-recurrent-state-carrying)
+   contract dimension, **exactly** like the GRU `hidden` / `next_hidden` pair and
+   with **zero engine knowledge** of what these tensors mean.
 
-### Spatial block (11 — 9 sectors)
+The legacy logit-move generation (`wire.7`) instead runs **plain per-axis
+argmax** in the engine (no sticky gate) — the original pre-2026-06-10 behavior
+(a17/a22 predate the sticky gate). This is gated on the resolved **wire-version
+major** (`ctx->wire_major`), the ONE thing the wire version gates — **ACTION
+interpretation only, never state carrying**.
+
+## `state.loopback` — generic recurrent-state carrying
+
+The engine does **not** know what `hidden`, `move_state`, or `move_state_rng`
+mean, and does **not** sniff input names to decide what state to carry. Instead
+the model stamps a **`state.loopback`** declaration into ONNX metadata, and the
+engine builds a generic, opaque loop-back table from it. Each entry pairs a
+recurrent INPUT with the OUTPUT that produces its next-tick value, plus an
+init + reset policy:
+
+```
+in=hidden,out=next_hidden,init=zeros,reset=episode;
+in=move_state,out=move_state_out,init=1 1 1 1 1 -1 -1 0 0 0 0,reset=episode;
+in=move_state_rng,out=move_state_rng_out,init=entropy,reset=persist
+```
+
+(entries `;`-separated, fields `,`-separated, init-CSV lanes space-separated).
+The engine, for each entry: at load allocates the buffer by the **ORT-reported
+shape/dtype** of `in`, applies `init`; each tick binds the buffer as the `in`
+input, runs, copies the `out` result back into the buffer; on episode reset
+re-applies `init` **only where `reset=episode`**. `init=entropy` seeds once at
+load from wall-clock entropy and (with `reset=persist`) keeps its stream across
+episodes — the RNG case.
+
+**Adding a future state tensor is an export/contract change with ZERO engine
+change.** See the [`state.loopback` contract dimension](../README.md#state-loopback--recurrent-state)
+for the full grammar and policies.
+
+**Load validation.** The engine refuses (hard load error) if a declared
+loop-back `in`/`out` is missing from the graph I/O, if a graph input is neither
+an obs input nor a declared loop-back input, or if the `move` action output
+disagrees with the wire-version stamp (a `wire.9` decided-`move` stamp on a
+`move_logits` graph, or vice versa).
+
+## Inputs — 44 obs (+ `hidden`) + the move-state pair
+
+The 44 native obs tensors are the [`wire.8`](wire.8.md) native split **+**
+`look_delta` (input #13, `float16 (3,)` — `look[t-1]−look[t-2]`, the realized
+look-vec change, ~0 under steady turn; inference-wire-only — dropped before the
+NPY cache and re-derived from the `look` column at BC preload). Per-field native
+dtypes, model-side dequant; leading axis is dynamic `batch`. The full obs field
+table is `src/qnn/engine_norm.py` (`SELF_FIELDS` / `SPATIAL_FIELDS` /
+`ENTITY_*_FIELDS`). `hidden` (float32 (64,), GRU state in) is appended last.
+
+Two recurrent move-decode state inputs are appended after `hidden`:
+
 | name | dtype | shape | meaning |
 |------|-------|-------|---------|
-| `spatial_dir` | int8 | (9,3) | view-frame unit dir (scale 127) |
-| `spatial_nearest_dist` | int32 | (9,) | raw units (scale 1000); widened from u16 (tracer rejects UInt16 input) |
-| `spatial_mean_dist` | int32 | (9,) | raw units (scale 1000); widened from u16 |
-| `spatial_openness` | uint8 | (9,) | [0,1] (scale 255) |
-| `spatial_clearance` | uint8 | (9,) | scale 255 |
-| `spatial_traversable` | uint8 | (9,) | scale 255 |
-| `spatial_dropoff` | uint8 | (9,) | scale 255 |
-| `spatial_solid_frac` | uint8 | (9,) | scale 255 |
-| `spatial_water_frac` | uint8 | (9,) | scale 255 |
-| `spatial_slime_frac` | uint8 | (9,) | scale 255 |
-| `spatial_lava_frac` | uint8 | (9,) | scale 255 |
+| `move_state` | float32 | (B, 11) | flat MOVE-decode state in: `[prev_move(3), dwell_age(2), swb_banned(2), swb_w(2), rng_float(unused), fire_hold(1)]` (layout = `qnn.model.decode_a24` `MOVE_STATE_DIM`) |
+| `move_state_rng` | int64 | (B,) | xorshift32 state in (uint32 held in int64; a float32 round-trip would lose it) |
 
-### Entity block (20 — 16 slots)
+**Episode reset / init** are declared by the `state.loopback` entry, NOT
+hardcoded: `move_state` re-inits to the lanes `[1,1,1, 1,1, -1,-1, 0,0, 0, 0]`
+(bit-for-bit with `move_decode_reset_flat`) on episode reset; `move_state_rng`
+is seeded **once at load** (`init=entropy`) and **persists across reset**
+(`reset=persist`, so episodes don't replay the same hazard switch timings).
+
+## Outputs (7)
+
 | name | dtype | shape | meaning |
 |------|-------|-------|---------|
-| `entity_types` | int8 | (16,) | TOKEN_* tag, −1 empty |
-| `entity_subject_id` | uint8 | (16,) | ENTITY_IDS (embedding) |
-| `entity_modality_id` | uint8 | (16,) | MODALITY_IDS (embedding) |
-| `entity_player_id` | uint8 | (16,) | actor identity (embedding) |
-| `entity_event_count` | uint8 | (16,) | 0..4 |
-| `entity_event_actions` | uint8 | (16,4) | ACTION_IDS (embedding) |
-| `entity_event_sources` | uint8 | (16,4) | ENTITY_IDS (embedding) |
-| `entity_half_extents` | uint8 | (16,3) | bbox half-sizes (scale 1000, saturating) |
-| `entity_rel` | int16 | (16,3) | view-frame position (scale 1000) |
-| `entity_vel` | int16 | (16,3) | view-frame velocity (clamped ±2000) |
-| `entity_path` | int16 | (16,3) | navmesh waypoint dir (scale 1000) |
-| `entity_path_dist` | int32 | (16,) | path length (scale 1000); widened from u16 |
-| `entity_eta` | float16 | (16,) | seconds (scale 60) |
-| `entity_recency` | float16 | (16,) | seconds (scale 60) |
-| `entity_facing` | uint8 | (16,) | [0,1] (scale 255) |
-| `entity_team` | uint8 | (16,) | {0,1} |
-| `entity_score` | uint8 | (16,) | [0,1] (scale 255) |
-| `entity_amount` | uint8 | (16,) | raw pickup amount (item-amount transform) |
-| `entity_regen` | float16 | (16,) | seconds (scale 60) |
-| `entity_state` | uint8 | (16,) | [0,1] (scale 255) |
-
-### State tensor
-`hidden` — float32 (64,) — GRU recurrent state in. Appended last. The GRU width
-(64) is an **arch** property, not part of `wire_sig`.
-
-## Outputs (5)
-| name | dtype | shape | meaning |
-|------|-------|-------|---------|
-| `move_logits` | float32 | (B,3,3) | per-axis (fb/lr/ud) logits; Gumbel-perturbed in the sampled export so the bin's argmax = a sample |
-| `look` | float32 | (B,3) | sampled look unit vector (polar mag×dir Gumbel-sampled + expmap in-graph) |
-| `fire_logit` | float32 | (B,1) | attack logit (name retained through the fire→attack rename) |
-| `weapon_logits` | float32 | (B,8) | 8 weapon classes (impulse 1..8 → class 0..7) |
+| `move` | int64 | (B,3) | **DECIDED** per-axis class (fb/lr/jump) `{0:neg,1:none,2:pos}`; the a24 stateful decode ran in-graph. Engine packs these into the press byte (`QNN_PackInputMask`) |
+| `look` | float32 | (B,3) | sampled look unit vector (polar mag×dir, expmap in-graph) |
+| `fire_logit` | float32 | (B,1) | attack logit — engine still decodes attack (sigmoid+threshold) + the continuous-weapon hold-tail from this, for every wire format |
+| `weapon` | int64 | (B,1) | decided impulse 1..8 (sticky gate in-graph, Pattern A) — OPTIONAL (present iff weapon head) |
 | `next_hidden` | float32 | (B,64) | GRU state out |
+| `move_state_out` | float32 | (B,11) | updated MOVE-decode state (thread back to `move_state` next tick) |
+| `move_state_rng_out` | int64 | (B,) | advanced xorshift32 state (thread back to `move_state_rng`) |
+
+`move_state_out` / `move_state_rng_out` are **distinct names** from the
+`move_state` / `move_state_rng` inputs (ONNX forbids an input and output sharing
+a name) — same pattern as `hidden` → `next_hidden`.
 
 ## Notes
-- **`look_delta` is inference-wire-only.** It is emitted on the live/ONNX wire
-  but **dropped before the NPY cache** (`qnn.bc.collect`); BC preload re-derives
-  it from the `look` column, so training and inference compute the identical
-  quantity and the cache schema is unaffected.
-- The `wire.8`→`wire.9` delta is *exactly* `+look_delta` (verified against
-  commit `7147e8f4` and the live `/tmp/qnn_v24.onnx` graph) — nothing else
-  changed, and outputs are identical.
+
+- **`fire_logit` stays a logit, attack stays engine-side.** The in-graph decode
+  computes an attack bit + hold-tail (in `move_state`) but the export discards
+  that and emits `fire_logit`, so the engine remains the single attack-decode
+  site across all wire formats (the f687cb1d continuous-fire hold-tail fix
+  applies to every generation).
+- **New-vs-legacy `move` interpretation is gated on the wire-version stamp**
+  (`ctx->wire_major` in `qnn_onnx.c`): wire.9 → in-graph decided `move`; wire.7 →
+  per-axis argmax of `move_logits`. State carrying is **separate** and
+  fully generic (the `state.loopback` table) — the engine no longer sniffs a
+  `move_state` input to decide behavior.
+- The `decode.move_*` metadata (taus / eps / hazard table / stop_onset) is still
+  **stamped for provenance** but the engine no longer reads it — those params
+  bake into the graph as constants.

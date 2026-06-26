@@ -81,3 +81,12 @@ class TargetPointer(nn.Module):
         target_feat = (probs.unsqueeze(-1) * inp.entity_outs).sum(dim=1) * has_any
 
         return TargetPointerOutput(target_logits=logits, target_feat=target_feat)
+
+
+# -- graph node registration ------------------------------------------------
+from qnn.model.node_registry import register_pointer  # noqa: E402
+
+
+@register_pointer("mlp")
+def _build_pointer_mlp(pointer, d_model):
+    return TargetPointer(d_model=d_model, d_target=pointer.d_target)

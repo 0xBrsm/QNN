@@ -2,7 +2,7 @@
 
 Intentionally minimal — no prior, no extra signals. Variants that add a
 prior (aim alignment, hit-test physics, feasibility gating, etc.) were
-concluded bench ablations (findings in ``src/docs/fire-discrimination.md``);
+concluded bench ablations (findings in ``docs/fire-discrimination.md``);
 any new variant is a standalone ``nn.Module`` implementing the same
 ``AttackHeadInput → AttackHeadOutput`` contract, slotted in via
 ``Network(attack_head=<variant>)``.
@@ -61,3 +61,12 @@ class AttackHead(nn.Module):
             prior_logit=prior_logit,
             delta_attack=delta_attack,
         )
+
+
+# -- graph node registration ------------------------------------------------
+from qnn.model.node_registry import register_head  # noqa: E402
+
+
+@register_head("attack", "canonical")
+def _build_attack_canonical(head, dims, d_model):
+    return AttackHead(in_dim=dims["motor_in"], d_hidden=head.d_hidden, activation=head.activation)
