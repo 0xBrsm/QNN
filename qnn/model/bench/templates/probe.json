@@ -1,10 +1,4 @@
 {
-  "head": "attack",
-  "d_model": 64,
-  "self_weapon_embed_in_self": true,
-  "strip_self_embeds": false,
-  "weapon_embed_concat": false,
-  "d_hidden": 128,
-  "n_hidden_layers": 1,
-  "dropout": 0.0
+  "base": "full_5head",
+  "overrides": {}
 }

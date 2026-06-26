@@ -24,7 +24,7 @@ from qnn.run.common import (
     require_cfg_value,
 )
 from qnn.run.config import build_run_ppo_eval_config
-from qnn.utils.checkpoint_converter import sf_to_qnn
+from qnn.utils.checkpoint_converter import checkpoint_model_graph, sf_to_qnn
 from qnn.utils.io import read_json, trusted_torch_load
 
 
@@ -82,8 +82,72 @@ def _validate_warm_start_arch(init_ckpt: str, ppo_cfg: dict[str, Any]) -> None:
         )
 
 
+def _warm_start_model_graph(init_ckpt: str) -> dict[str, Any] | None:
+    """The warm-start checkpoint's declarative model graph, if it carries one.
+
+    Thin alias over ``checkpoint_model_graph`` (sidecar read, tolerant of
+    missing/corrupt) — kept because ``select_seed.py`` imports it from here.
+    """
+    return checkpoint_model_graph(init_ckpt)
+
+
+def _resolve_model_graph(ppo_cfg: dict[str, Any], init_checkpoint: str) -> dict[str, Any] | None:
+    """Warm-start graph for this job; validates model.json agrees with it.
+
+    Graph-described seeds carry their architecture; the run's frozen
+    model.json must match (fail loud, never silently diverge). Multi-seed
+    PBT reads the first seed — all seeds must share one architecture
+    already (SF requirement).
+    """
+    graph = _warm_start_model_graph(init_checkpoint)
+    if graph is None:
+        ckpts = ppo_cfg.get("init_ckpts") or []
+        if ckpts:
+            graph = _warm_start_model_graph(str(ckpts[0]))
+    if graph is None:
+        return None
+
+    from qnn.model.graph import GraphSpec, model_config_from_graph
+
+    bridge = model_config_from_graph(GraphSpec.from_dict(graph))
+    expectations: dict[str, Any] = {
+        "d_model": bridge.d_model, "n_heads": bridge.n_heads,
+        "n_layers": bridge.n_layers, "d_ffn": bridge.d_ffn,
+        "attn_dropout": bridge.attn_dropout,
+        "d_gru": bridge.d_gru, "use_gru": bridge.use_gru,
+    }
+    mismatches = []
+    for key, graph_val in expectations.items():
+        cfg_val = ppo_cfg.get(key)
+        if cfg_val is None:
+            continue
+        try:
+            cfg_val = type(graph_val)(cfg_val)
+        except (TypeError, ValueError):
+            pass
+        if cfg_val != graph_val:
+            mismatches.append(f"  {key}: model.json={ppo_cfg.get(key)!r}  graph={graph_val!r}")
+    if mismatches:
+        raise RuntimeError(
+            "PPO model.json disagrees with the warm-start checkpoint's model graph.\n"
+            + "\n".join(mismatches)
+            + "\n\nUpdate the run's frozen model.json to match the seed checkpoint."
+        )
+    return graph
+
+
 def _detect_obs_dim_from_checkpoint(ppo_cfg: dict[str, Any], checkpoint_path: str | Path | None = None) -> int:
     init_ckpt = str(checkpoint_path or require_cfg_string(ppo_cfg, "init_ckpt", "PPO config"))
+    # Sidecar first — QNNPolicy.save writes the full meta there, so the
+    # multi-MB payload need not be deserialized just to read one int.
+    sidecar = Path(init_ckpt).with_suffix(".json")
+    if sidecar.is_file():
+        try:
+            meta = read_json(sidecar)
+            if isinstance(meta, dict) and "obs_dim" in meta:
+                return int(meta["obs_dim"])
+        except (OSError, ValueError):
+            pass
     try:
         payload = trusted_torch_load(str(init_ckpt), map_location="cpu")
         if isinstance(payload, dict) and "meta" in payload:
@@ -125,6 +189,7 @@ def run_training_job(
     procgen_cfg = require_cfg_value(ppo_cfg, "procgen", "PPO config")
     resume = bool(require_cfg_value(ppo_cfg, "resume", "PPO config"))
     init_checkpoint = str(ppo_cfg.get("init_ckpt", ""))
+    model_graph = _resolve_model_graph(ppo_cfg, init_checkpoint)
 
     cfg = build_ppo_cfg(
         scenario=scenario,
@@ -182,6 +247,7 @@ def run_training_job(
         reward_json_path=require_cfg_string(ppo_cfg, "reward_json_path", "PPO config"),
         head_loss_weights=str(ppo_cfg.get("head_loss_weights", "") or ""),
         initial_stddev=float(require_cfg_value(ppo_cfg, "initial_stddev", "PPO config")),
+        model_graph_json=json.dumps(model_graph) if model_graph is not None else "",
     )
 
     ppo_result = run_ppo(cfg)
@@ -196,16 +262,30 @@ def run_training_job(
         qnn_ckpt_path = best_dir / "best_model.pth"
         try:
             from qnn.model.network import ModelConfig
-            obs_dim = (
-                int(require_cfg_value(ppo_cfg, "obs_dim", "PPO config"))
-                if "obs_dim" in ppo_cfg
-                else _detect_obs_dim_from_checkpoint(ppo_cfg, ppo_ckpt)
-            )
+            # obs_dim comes from the config, the WARM-START seed's QNN meta,
+            # or the schema constant — never from the trained SF checkpoint
+            # (SF format carries no QNN meta; reading it failed every
+            # conversion and the error was swallowed into
+            # checkpoint_convert_error).
+            if "obs_dim" in ppo_cfg:
+                obs_dim = int(require_cfg_value(ppo_cfg, "obs_dim", "PPO config"))
+            elif init_checkpoint and Path(init_checkpoint).exists():
+                obs_dim = _detect_obs_dim_from_checkpoint(ppo_cfg, init_checkpoint)
+            else:
+                from qnn.schema import OBS_DIM
+                obs_dim = OBS_DIM
+            graph_spec = None
+            if model_graph is not None:
+                from qnn.model.graph import GraphSpec
+                graph_spec = GraphSpec.from_dict(model_graph)
             qnn_policy = sf_to_qnn(
                 sf_checkpoint_path=ppo_ckpt,
                 obs_dim=obs_dim,
-                model=ModelConfig.from_flat_dict(ppo_cfg),
+                # Graph runs derive the bridge config from the graph —
+                # one source of truth; flat runs use the run's config.
+                model=None if graph_spec is not None else ModelConfig.from_flat_dict(ppo_cfg),
                 device="cpu",
+                graph=graph_spec,
             )
             qnn_policy.save(qnn_ckpt_path)
             ppo_result["best_model_path"] = str(qnn_ckpt_path)

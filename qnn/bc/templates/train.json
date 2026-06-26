@@ -38,5 +38,5 @@
   "token_mask": null,
   "input_mask": true,
   "attack_op_only": false,
-  "collection_fingerprint": "sha256:82b0a3932f37a008114853354f621701c6bf289a8eb97973528c1b8aa21eed44"
+  "collection_fingerprint": "sha256:7347370ce441f209db933f01c0cd76d60b2a79ea0627bf799944e2d61248d851"
 }

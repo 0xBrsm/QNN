@@ -44,11 +44,55 @@ from qnn.run.config import (
 )
 
 
+_GRAPH_PROBE_KEYS = ("base", "overrides", "engagement_ema_alpha", "attack_label_shift")
+
+
+def _resolve_probe_model(probe: dict[str, Any]):
+    """Resolve probe.json into ``(model_config, model_factory, graph)``.
+
+    Canonical schema — a delta on a committed base graph:
+
+        {"base": "full_5head", "overrides": {...}}
+
+    ``overrides`` deep-merges onto the base (``null`` deletes a node) and
+    the merged graph is validated/built by ``qnn.model.graph``. The graph
+    is persisted into every checkpoint (self-describing — no probe.json
+    rehydration on load).
+
+    The legacy schema (``{"head": ..., <knobs>}``) dispatches through the
+    bench ``HEADS`` registry and keeps working for retained run-dirs.
+    """
+    if "base" in probe and "head" in probe:
+        raise RuntimeError("probe.json: pass either 'base' (graph delta) or 'head' (legacy), not both")
+    if "base" in probe:
+        from qnn.model.graph import (
+            GraphSpec, GraphSpecError, base_graph_dict, merge_overrides, model_config_from_graph,
+        )
+        from qnn.model.graph.spec import _reject_unknown
+        try:
+            _reject_unknown(probe, _GRAPH_PROBE_KEYS, "probe.json")
+        except GraphSpecError as exc:
+            # Same validation as the graph spec; runner callers expect RuntimeError.
+            raise RuntimeError(str(exc)) from None
+        raw = merge_overrides(base_graph_dict(str(probe["base"])), probe.get("overrides") or {})
+        graph = GraphSpec.from_dict(raw)
+        return model_config_from_graph(graph), None, graph
+
+    head_name = _require_string(probe, "head", "probe.json")
+    if head_name not in HEADS:
+        raise RuntimeError(
+            f"probe.json.head={head_name!r} not registered; "
+            f"available: {sorted(HEADS)}"
+        )
+    model_config, model_factory = HEADS[head_name].build(probe)
+    return model_config, model_factory, None
+
+
 def _build_head_probe_bc_config(
     run_cfg: dict[str, Any],
     device: str,
-) -> tuple[BCConfig, "Callable[[int, Any], Any]"]:  # noqa: F821 — Callable resolved at call time
-    """Translate a head_probe run-dir config into BCConfig + model_factory.
+) -> tuple[BCConfig, "Callable[[int, Any], Any] | None", "Any | None"]:  # noqa: F821
+    """Translate a head_probe run-dir config into BCConfig + model source.
 
     Mirrors ``qnn.run.config.build_run_bc_config``: copy train.json
     verbatim, augment with the output_dir + bc_data_dir + machine
@@ -61,13 +105,7 @@ def _build_head_probe_bc_config(
     machine = _require_mapping(run_cfg, "machine", "run config")
     probe = _require_mapping(run_cfg, "probe", "run config")
 
-    head_name = _require_string(probe, "head", "probe.json")
-    if head_name not in HEADS:
-        raise RuntimeError(
-            f"probe.json.head={head_name!r} not registered; "
-            f"available: {sorted(HEADS)}"
-        )
-    model_config, model_factory = HEADS[head_name].build(probe)
+    model_config, model_factory, graph = _resolve_probe_model(dict(probe))
 
     bc_cfg: dict[str, Any] = dict(train)
     bc_cfg["model"] = model_config
@@ -93,7 +131,7 @@ def _build_head_probe_bc_config(
     # runs that don't set it. See BCConfig.attack_label_shift.
     bc_cfg["attack_label_shift"] = bool(probe.get("attack_label_shift", False))
 
-    return BCConfig(**bc_cfg), model_factory
+    return BCConfig(**bc_cfg), model_factory, graph
 
 
 def run(ctx: RunnerContext) -> dict[str, object]:
@@ -101,7 +139,7 @@ def run(ctx: RunnerContext) -> dict[str, object]:
     results = base_results(ctx)
     stage_timings: dict[str, float] = {}
 
-    bc_config, model_factory = _build_head_probe_bc_config(ctx.run_cfg, ctx.device)
+    bc_config, model_factory, graph = _build_head_probe_bc_config(ctx.run_cfg, ctx.device)
     prepare_bc_run_outputs(ctx.run_cfg, resume=ctx.resume)
 
     bc_data_dir = Path(bc_config.bc_data_dir)
@@ -117,7 +155,7 @@ def run(ctx: RunnerContext) -> dict[str, object]:
     from qnn.model.bench.side_channels import bench_side_channel_scope
     results["bc"] = run_behavior_cloning(
         bc_config, seed_checkpoint=seed_checkpoint, model_factory=model_factory,
-        side_channel_provider=bench_side_channel_scope,
+        graph=graph, side_channel_provider=bench_side_channel_scope,
     )
     stage_timings["bc"] = _time.monotonic() - started
     results["stage_timings"] = stage_timings

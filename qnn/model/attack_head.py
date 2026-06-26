@@ -1,10 +1,11 @@
 """Canonical attack head: features → MLP → binary logit.
 
 Intentionally minimal — no prior, no extra signals. Variants that add a
-prior (aim alignment, hit-test physics, feasibility gating, etc.) live
-in :mod:`qnn.model.bench.attack_prior` as standalone ``nn.Module`` s that
-implement the same ``AttackHeadInput → AttackHeadOutput`` contract.
-``Network`` slots them in via ``attack_head=<variant>``.
+prior (aim alignment, hit-test physics, feasibility gating, etc.) were
+concluded bench ablations (findings in ``src/docs/fire-discrimination.md``);
+any new variant is a standalone ``nn.Module`` implementing the same
+``AttackHeadInput → AttackHeadOutput`` contract, slotted in via
+``Network(attack_head=<variant>)``.
 
 ``AttackHeadInput`` carries optional fields that variants may need
 (``look_prior``, ``weapon_id``, ``target_logits``, ``entity_scalars``,

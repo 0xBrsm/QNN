@@ -76,10 +76,21 @@ def sf_to_qnn(
     sf_checkpoint_path: str | Path,
     *,
     obs_dim: int,
-    model: "ModelConfig",
+    model: "ModelConfig | None",
     device: str,
+    graph: "Any | None" = None,
 ) -> QNNPolicy:
-    """Load an SF checkpoint and return a QNNPolicy with copied weights."""
+    """Load an SF checkpoint and return a QNNPolicy with copied weights.
+
+    ``graph`` (a ``qnn.model.graph.GraphSpec``) must be passed when the
+    PPO run was warm-started from a graph-described checkpoint — the QNN
+    module is then rebuilt via ``build_network`` so the SF state-dict
+    prefixes map onto the same token/encoder layout, and the converted
+    checkpoint stays self-describing (``meta.model_graph``). When a graph
+    is given the ModelConfig bridge is derived from it; a caller-supplied
+    ``model`` is ignored (one source of truth — a stale flat config must
+    not drive policy-layer behavior on a graph-built module).
+    """
     payload = trusted_torch_load(str(sf_checkpoint_path), map_location="cpu")
     if not _is_sf_checkpoint(payload):
         raise ValueError(
@@ -88,19 +99,51 @@ def sf_to_qnn(
         )
     sf_state: Dict[str, torch.Tensor] = payload["model"]
 
+    if graph is not None:
+        model = None
+    elif model is None:
+        raise ValueError("sf_to_qnn needs either model or graph")
+
+    # Loss-shaping knobs are training-time only — neutral values for a
+    # converted checkpoint that exists to be evaluated/exported/re-seeded.
     bc_policy = QNNPolicy(
         obs_dim=obs_dim,
         model=model,
+        graph=graph,
         jump_pos_weight=1.0,
+        attack_focal_gamma=0.0,
+        attack_focal_alpha=0.5,
+        attack_distance_sigma=0.0,
+        jump_distance_sigma=0.0,
         seed=0,
         device=device,
     )
     bc_state = bc_policy.model.state_dict()
 
-    _copy_encoder(sf_state, bc_state, device, reverse=True)
-    _copy_gru(sf_state, bc_state, device, reverse=True)
+    missed = _copy_encoder(sf_state, bc_state, device, reverse=True)
+    missed += _copy_gru(sf_state, bc_state, device, reverse=True)
+    if missed:
+        raise RuntimeError(
+            f"SF→QNN conversion left {len(missed)} trained weight(s) at random "
+            f"init (no matching SF key/shape). Causes: converting a graph-"
+            f"described run without its graph, an architecture mismatch, or a "
+            f"pre-rename SF checkpoint whose keys need the legacy migrations "
+            f"(reverse conversion does not apply them). First missed: {missed[:4]}"
+        )
     _copy_value_head(sf_state, bc_state, device, reverse=True)
-    _copy_sf_combined_to_bc_heads(sf_state, bc_state, device)
+    if "move_head.mlp.0.weight" in bc_state:
+        # Mirror of save_sf_format's forward warning: SF trains a single flat
+        # action linear; there is no projection back into bottleneck-MLP
+        # heads. The converted checkpoint carries the TRAINED encoder, GRU,
+        # and pointer — the action heads keep this policy's init and must be
+        # re-fit (BC head-tune or distill) before the model is playable.
+        print(
+            "[sf_to_qnn] bottleneck-MLP action heads cannot receive SF's flat "
+            "action linear — converted checkpoint has trained encoder/GRU/"
+            "pointer but UNTRAINED action heads."
+        )
+    else:
+        _copy_sf_combined_to_bc_heads(sf_state, bc_state, device)
 
     bc_policy.model.load_state_dict(bc_state)
     bc_policy.model.to(bc_policy.device)
@@ -1001,25 +1044,40 @@ def _copy_weight(src: Dict[str, torch.Tensor], dst: Dict[str, torch.Tensor], src
     return True
 
 
-def _copy_encoder(src: Dict, dst: Dict, device: str, reverse: bool = False) -> None:
+def _copy_encoder(
+    src: Dict, dst: Dict, device: str, reverse: bool = False,
+) -> "list[str]":
     """Copy encoder weights between BC and SF state dicts.
 
     BC keys split input embedding (``obs_embedding.*``) from transformer
     stack (``encoder.*``). SF wraps both under its actor-critic encoder:
     ``encoder.obs_embedding.*`` and ``encoder.encoder.*``.
+
+    In ``reverse`` mode returns the BC keys that found no matching SF
+    weight — a non-empty list means the converted policy would keep
+    random-init weights where trained ones were expected (e.g. converting
+    a graph-described run without its graph: every ``self_builders.*``
+    key misses). Callers must fail loud on it.
     """
     pairs = (
         ("obs_embedding.", "encoder.obs_embedding."),
+        # SF owns the pointer inside its encoder (QuakeTransformerEncoder
+        # builds it; save_sf_format ports it there) — copy it back too,
+        # else converted full_5head policies keep a random-init pointer.
+        ("target_pointer.", "encoder.target_pointer."),
         ("encoder.", f"{_SF_ENCODER_PREFIX}."),
     )
 
     if reverse:
+        missed: list[str] = []
         for bc_prefix, sf_prefix in pairs:
             for dst_key in list(dst.keys()):
                 if not dst_key.startswith(bc_prefix):
                     continue
                 sf_key = sf_prefix + dst_key[len(bc_prefix):]
-                _copy_weight(src, dst, sf_key, dst_key, device)
+                if not _copy_weight(src, dst, sf_key, dst_key, device):
+                    missed.append(dst_key)
+        return missed
     else:
         for bc_prefix, sf_prefix in pairs:
             for src_key in list(src.keys()):
@@ -1029,14 +1087,28 @@ def _copy_encoder(src: Dict, dst: Dict, device: str, reverse: bool = False) -> N
                 _copy_weight(src, dst, src_key, sf_key, device)
 
 
-def _copy_gru(src: Dict, dst: Dict, device: str, reverse: bool = False) -> None:
+def _copy_gru(src: Dict, dst: Dict, device: str, reverse: bool = False) -> "list[str]":
+    """Copy GRU weights. Modern checkpoints key the recurrence
+    ``temporal.gru.*`` (post-migrate_wrap_gru_in_temporal); pre-wrap ones
+    use bare ``gru.*``. In ``reverse`` mode returns the BC GRU keys that
+    received nothing (empty when the model has no temporal slot).
+    """
+    missed: list[str] = []
     for gru_param in ("weight_ih_l0", "weight_hh_l0", "bias_ih_l0", "bias_hh_l0"):
-        bc_key = f"gru.{gru_param}"
         sf_key = f"{_SF_GRU_PREFIX}.{gru_param}"
         if reverse:
-            _copy_weight(src, dst, sf_key, bc_key, device)
+            bc_keys = [
+                k for k in (f"temporal.gru.{gru_param}", f"gru.{gru_param}") if k in dst
+            ]
+            for bc_key in bc_keys:
+                if not _copy_weight(src, dst, sf_key, bc_key, device):
+                    missed.append(bc_key)
         else:
-            _copy_weight(src, dst, bc_key, sf_key, device)
+            for bc_prefix in ("temporal.gru.", "gru."):
+                if f"{bc_prefix}{gru_param}" in src:
+                    _copy_weight(src, dst, f"{bc_prefix}{gru_param}", sf_key, device)
+                    break
+    return missed
 
 
 def _copy_value_head(src: Dict, dst: Dict, device: str, reverse: bool = False) -> None:
@@ -1139,8 +1211,16 @@ def main() -> None:
     to_qnn.add_argument("--obs-dim", type=int, required=True)
     to_qnn.add_argument(
         "--model-json",
-        required=True,
-        help="Path to a model.json (ModelConfig-compatible) describing the SF model's arch.",
+        default=None,
+        help="Path to a model.json (ModelConfig-compatible) for flat runs. "
+             "Omit for graph-described runs — the model graph is read from "
+             "a --graph-json file or the warm-start seed's sidecar.",
+    )
+    to_qnn.add_argument(
+        "--graph-json",
+        default=None,
+        help="Path to a JSON file holding the run's model graph "
+             "(meta.model_graph of the warm-start seed checkpoint).",
     )
     to_qnn.add_argument("--device", default="cpu")
 
@@ -1152,13 +1232,25 @@ def main() -> None:
         print(f"Saved SF-format warm-start checkpoint: {ckpt}")
 
     elif args.cmd == "sf-to-qnn":
-        with open(args.model_json, "r", encoding="utf-8") as f:
-            model_cfg = ModelConfig.from_dict(json.load(f))
+        graph = None
+        model_cfg = None
+        if args.graph_json:
+            from qnn.model.graph import GraphSpec
+            with open(args.graph_json, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            # Accept either a bare graph or a full checkpoint sidecar meta.
+            graph = GraphSpec.from_dict(raw.get("model_graph", raw))
+        elif args.model_json:
+            with open(args.model_json, "r", encoding="utf-8") as f:
+                model_cfg = ModelConfig.from_dict(json.load(f))
+        else:
+            parser.error("sf-to-qnn needs --model-json (flat run) or --graph-json (graph run)")
         policy = sf_to_qnn(
             sf_checkpoint_path=args.sf_path,
             obs_dim=args.obs_dim,
             model=model_cfg,
             device=args.device,
+            graph=graph,
         )
         policy.save(args.output_path)
         print(f"Saved QNNPolicy checkpoint: {args.output_path}")
@@ -1195,52 +1287,94 @@ def load_sf_checkpoint_as_qnn(
     is converted via ``ModelConfig.from_dict``). When omitted, a sidecar
     JSON next to ``path`` with the same structure as a QNN checkpoint
     meta block is read; the sidecar must contain a ``"model"`` field plus
-    ``"obs_dim"``.
+    ``"obs_dim"``. A sidecar ``"model_graph"`` always wins — the QNN
+    module is rebuilt through the graph so SF weights map onto the same
+    token/encoder layout (graph-described runs would otherwise convert
+    with every self-token weight silently left at random init).
     """
     import json as _json
 
     p = Path(path)
-    if model_config is None:
-        sidecar = p.with_suffix(".json")
-        if not sidecar.exists():
-            raise RuntimeError(
-                f"SF checkpoint requires either a sidecar JSON ({sidecar}) or model_config"
-            )
+    graph = None
+    obs_dim = OBS_DIM
+    model: "ModelConfig | None" = None
+    sidecar = p.with_suffix(".json")
+    meta: "dict | None" = None
+    if sidecar.exists():
         meta = _json.loads(sidecar.read_text(encoding="utf-8"))
         if not isinstance(meta, dict):
             raise RuntimeError(f"SF checkpoint sidecar must be a JSON object: {sidecar}")
-        if "model" not in meta or "obs_dim" not in meta:
-            raise RuntimeError(
-                f"SF checkpoint sidecar must contain 'obs_dim' and 'model' fields: {sidecar}"
+        if meta.get("model_graph") is not None:
+            from qnn.model.graph import GraphSpec
+            graph = GraphSpec.from_dict(meta["model_graph"])
+        if "obs_dim" in meta:
+            obs_dim = int(meta["obs_dim"])
+
+    if graph is None:
+        if model_config is not None:
+            model = (
+                model_config
+                if isinstance(model_config, ModelConfig)
+                else ModelConfig.from_dict(model_config)
             )
-        obs_dim = int(meta["obs_dim"])
-        model = ModelConfig.from_dict(meta["model"])
-    else:
-        obs_dim = OBS_DIM
-        model = (
-            model_config
-            if isinstance(model_config, ModelConfig)
-            else ModelConfig.from_dict(model_config)
-        )
+        elif meta is not None and "model" in meta:
+            model = ModelConfig.from_dict(meta["model"])
+        else:
+            raise RuntimeError(
+                f"SF checkpoint requires a sidecar JSON with 'model'/'model_graph' "
+                f"({sidecar}) or an explicit model_config"
+            )
 
     return sf_to_qnn(
         sf_checkpoint_path=p,
         obs_dim=obs_dim,
         model=model,
         device=device,
+        graph=graph,
     )
 
 
-def _head_probe_model_factory(path: str | Path):
-    """Return the bench ``model_factory`` for a head-probe checkpoint, else None.
+def checkpoint_model_graph(path: str | Path) -> dict[str, Any] | None:
+    """The checkpoint's declarative model graph, if its sidecar carries one.
 
-    Head-probe / bench-assembled models (e.g. ``full_4head``) are alternate
-    ``nn.Module``s built by a per-head factory from ``probe.json``; the
-    checkpoint does not embed the factory identity, so the canonical
-    ``QNNPolicy.load`` cannot reconstruct them.  A run-dir keeps its
-    ``config/probe.json`` next to ``checkpoints/``; if one is present and names
-    a registered head, build and return its factory so the same module is
-    reconstructed for loading.
+    Reads the sidecar JSON next to the ``.pth`` (no torch load) and returns
+    the raw ``meta.model_graph`` dict. Tolerant by design: missing/empty
+    path, missing sidecar, unreadable/corrupt JSON, or a non-dict
+    ``model_graph`` all return None (legacy flat checkpoint).
+    """
+    if not str(path):
+        return None
+    sidecar = Path(path).with_suffix(".json")
+    if not sidecar.is_file():
+        return None
+    try:
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    graph = meta.get("model_graph") if isinstance(meta, dict) else None
+    return graph if isinstance(graph, dict) else None
+
+
+def _checkpoint_has_graph(path: str | Path) -> bool:
+    """True when the checkpoint's sidecar meta carries a ``model_graph``.
+
+    Graph-described checkpoints are fully self-describing —
+    ``QNNPolicy.load`` rebuilds them via ``qnn.model.graph.build_network``
+    and no probe.json rehydration must run (the sidecar is authoritative
+    over whatever run-dir config happens to sit next to ``checkpoints/``).
+    """
+    return checkpoint_model_graph(path) is not None
+
+
+def _head_probe_model_factory(path: str | Path):
+    """Return the bench ``model_factory`` for a LEGACY head-probe checkpoint.
+
+    Pre-graph head-probe checkpoints (e.g. the retained ``full_4head`` /
+    ``full_5head`` runs) don't embed their assembly; they are rebuilt by
+    re-running ``HEADS[head].build(probe)`` against the run-dir's
+    ``config/probe.json``. New head-probe checkpoints carry
+    ``meta["model_graph"]`` and never reach this path — see
+    ``_checkpoint_has_graph``. Returns None when no legacy probe applies.
     """
     probe_path = Path(path).resolve().parents[1] / "config" / "probe.json"
     if not probe_path.is_file():
@@ -1251,7 +1385,17 @@ def _head_probe_model_factory(path: str | Path):
         return None
     from qnn.model.bench.heads import HEADS
     if head not in HEADS:
-        return None
+        # Loud, not silent: falling through to the canonical loader would
+        # apply flat-checkpoint migrations to a bench-shaped state_dict and
+        # die with a cryptic key mismatch (or worse, partially map).
+        raise ValueError(
+            f"probe.json names head {head!r}, which is not in the legacy "
+            f"reload registry {sorted(HEADS)}. Its bench module was removed "
+            f"in the model-graph refactor (concluded ablation — findings in "
+            f"src/docs/). To reload this checkpoint, check out the pre-prune "
+            f"commit (9fd410d7's tree) or re-express the probe as a graph "
+            f"delta and retrain."
+        )
     _model_config, model_factory = HEADS[head].build(probe)
     return model_factory
 
@@ -1271,8 +1415,22 @@ def load_checkpoint(
     if is_sf_checkpoint(path):
         policy = load_sf_checkpoint_as_qnn(path, device=device, model_config=model_config)
     else:
-        policy = QNNPolicy.load(str(path), device=device,
-                                model_factory=_head_probe_model_factory(path))
+        try:
+            model_factory = (
+                None if _checkpoint_has_graph(path) else _head_probe_model_factory(path)
+            )
+        except ValueError as factory_err:
+            # The run dir names a removed legacy head — but the payload may
+            # still carry an embedded model_graph (sidecar lost/copied away).
+            # QNNPolicy.load rebuilds from embedded meta when present; only
+            # if that ALSO fails is the legacy-head explanation the answer.
+            try:
+                policy = QNNPolicy.load(str(path), device=device, model_factory=None)
+            except Exception:
+                raise factory_err from None
+            policy.contract = resolve_checkpoint_contract(path)
+            return policy
+        policy = QNNPolicy.load(str(path), device=device, model_factory=model_factory)
     policy.contract = resolve_checkpoint_contract(path)
     return policy
 

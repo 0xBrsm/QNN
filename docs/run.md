@@ -52,7 +52,6 @@ runs/<mode>/<name>/
     reward.json
     machine.json
     model.json
-    eval.json
   checkpoints/
   metrics/
   logs/
@@ -67,7 +66,6 @@ runs/<mode>/<name>/
 | `model.json` | policy architecture |
 | `train.json` | trainer and eval knobs for the run mode |
 | `reward.json` | reward weights (PPO/PBT/Optuna) |
-| `eval.json` | post-train eval pool, seeds, policy modes (PPO/PBT/Optuna) |
 | `run.json` | run metadata, mode, resume behavior, checkpoint path, output roots |
 
 ## run.json
@@ -221,20 +219,6 @@ Eval:
 | `holdout_seed_offset`, `sample_seed_offset` or `eval_*` variants | RNG offsets |
 | `map_features_path` or `eval_map_features_path` | eval map features path |
 | `record_demos`, `parallel_policy_modes` or `eval_*` variants | eval execution controls |
-
-## eval.json
-
-PPO / PBT / Optuna post-train eval pool.
-
-| Path | Purpose |
-|------|---------|
-| `seed_pool` | seeds available to eval |
-| `num_seeds` | seeds drawn per run |
-| `episodes_per_seed` | episodes per drawn seed |
-| `policy_mode` | `greedy` or `sample` |
-| `start_mode` | `holdout` or `randomized` |
-| `record_demos` | write demo files during eval |
-| `metric` | selection statistic across episodes (`median`, etc.) |
 
 ## PPO worker inference
 

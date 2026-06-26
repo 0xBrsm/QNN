@@ -1,17 +1,18 @@
-"""Forward-scoped engagement_ema context for attack-head ablations.
+"""Forward-scoped engagement_ema context.
 
-Mirrors the sibling forward-scoped side-channel contexts for bench attack-head variants that need
-the per-frame engagement EMA scalar without extending the core
+Mirrors the sibling forward-scoped side-channel contexts: it carries the
+per-frame engagement EMA scalar without extending the core
 ``AttackHeadInput`` dataclass. The trainer stashes the batch's
-``engagement_ema`` tensor on entry to the forward pass, and any bench
-attack head can read it from the contextvar during its ``forward``.
+``engagement_ema`` tensor on entry to the forward pass, and consumers
+(``ObsAccessor.aux("engagement")``) read it from the contextvar during
+``forward``.
 
 ``engagement_ema`` is a per-frame scalar in [0, 1] tracking how committed
 the demonstrator is to attacking, derived from the op-frame attack stream.
 Built once at preload in ``qnn.bc.supervised_loop`` (resident +
 streaming paths); the trainer enters the context before calling the
-model so any bench attack head consuming engagement signal sees it
-without per-frame plumbing through Network.forward.
+model so any consumer sees it without per-frame plumbing through
+``Network.forward``.
 """
 from __future__ import annotations
 

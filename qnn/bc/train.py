@@ -1030,6 +1030,7 @@ def run_behavior_cloning(
     seed_checkpoint: str = "",
     *,
     model_factory: Callable[[int, ModelConfig], "torch.nn.Module"] | None = None,
+    graph: Any | None = None,
     side_channel_provider: Callable[..., Any] | None = None,
     source_bundle: BCSourceBundle | None = None,
     release_sources: bool = True,
@@ -1047,9 +1048,14 @@ def run_behavior_cloning(
     ``qnn.model.bench``) without forking the trainer. When ``None`` the
     canonical ``Network`` is built from ``config.model``.
 
-    Fine-tuning from a seed checkpoint ignores ``model_factory`` because
-    ``QNNPolicy.load`` reconstructs the saved architecture; passing both
-    is rejected to fail loud rather than silently dropping the factory.
+    ``graph`` (a ``qnn.model.graph.GraphSpec``) is the declarative
+    assembly path — the model is built by ``build_network`` and the spec
+    is persisted into every checkpoint (``meta.model_graph``). Mutually
+    exclusive with ``model_factory``.
+
+    Fine-tuning from a seed checkpoint ignores ``model_factory``/``graph``
+    because ``QNNPolicy.load`` reconstructs the saved architecture; passing
+    either is rejected to fail loud rather than silently dropping it.
     """
     log_prefix = f"  [bc {log_label}]" if log_label else "  [bc]"
 
@@ -1090,9 +1096,9 @@ def run_behavior_cloning(
     # weights.
     with _MODEL_INIT_LOCK:
         if seed_checkpoint and Path(seed_checkpoint).exists():
-            if model_factory is not None:
+            if model_factory is not None or graph is not None:
                 raise RuntimeError(
-                    "model_factory is incompatible with seed_checkpoint — "
+                    "model_factory/graph are incompatible with seed_checkpoint — "
                     "QNNPolicy.load rebuilds the saved architecture itself."
                 )
             _log(f"Fine-tuning from seed: {seed_checkpoint}")
@@ -1110,6 +1116,7 @@ def run_behavior_cloning(
                 seed=config.seed,
                 device=config.device,
                 model_factory=model_factory,
+                graph=graph,
                 side_channel_provider=side_channel_provider,
             )
     # input_mask is a training-time toggle, not a ModelConfig field —

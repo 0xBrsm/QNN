@@ -92,7 +92,7 @@ class QNNPolicy:
         self,
         *,
         obs_dim: int,
-        model: ModelConfig,
+        model: ModelConfig | None,
         jump_pos_weight: float,
         attack_focal_gamma: float,
         attack_focal_alpha: float,
@@ -103,8 +103,17 @@ class QNNPolicy:
         device: str,
         model_factory: Callable[[int, ModelConfig], nn.Module] | None = None,
         side_channel_provider: Callable[..., Any] | None = None,
+        graph: Any | None = None,
     ) -> None:
         """Construct a BC policy.
+
+        ``graph`` (a :class:`qnn.model.graph.GraphSpec`) is the declarative
+        assembly path: the inner module is built by
+        ``qnn.model.graph.build_network`` and the spec is persisted in
+        checkpoint meta (``model_graph``) so the checkpoint is fully
+        self-describing — no factory rehydration on load. Mutually
+        exclusive with ``model_factory``. ``model`` may be ``None`` when
+        ``graph`` is given (derived via ``model_config_from_graph``).
 
         ``side_channel_provider(actions, masks) -> context manager`` is an
         optional hook the trainer enters around each forward pass. The
@@ -126,6 +135,15 @@ class QNNPolicy:
         policy-layer logic — hidden-state shaping, weapon-switch heuristics,
         head-loss gating — reads from ``model``, not from the module.
         """
+        if graph is not None:
+            if model_factory is not None:
+                raise ValueError("pass either graph or model_factory, not both")
+            from qnn.model.graph import build_network, model_config_from_graph
+
+            if model is None:
+                model = model_config_from_graph(graph)
+            model_factory = lambda _obs_dim, _cfg: build_network(_obs_dim, graph)  # noqa: E731
+        self.graph = graph
         self.obs_dim = int(obs_dim)
         self._side_channel_provider = side_channel_provider or _null_side_channel_scope
         self.config = model
@@ -974,10 +992,9 @@ class QNNPolicy:
 
         weapon_loss_fn = getattr(getattr(self.model, "weapon_head", None), "weapon_loss", None)
         if weapon_loss_fn is not None and WEAPON_HEAD in logits and WEAPON_HEAD in actions:
-            # Bench head owns its loss (mirrors look_head.look_loss): the
-            # weapon_switch head computes its hazard(WHEN)+CE(WHAT) loss from
-            # _weapon_switch_when + the weapon_switch_context. Production heads
-            # lack the method, so they fall through to the canonical CE below.
+            # A head may own its loss (mirrors look_head.look_loss) by
+            # exposing a ``weapon_loss`` method. Production heads lack the
+            # method, so they fall through to the canonical CE below.
             weapon_loss, _wm = weapon_loss_fn(logits, actions, valid_flat, compute_metrics)
             losses.append(weapon_loss * weights_map.get(WEAPON_HEAD, 1.0))
             loss_is_real.append(True)
@@ -1810,6 +1827,11 @@ class QNNPolicy:
         meta = {
             "obs_dim": self.obs_dim,
             "model": model_cfg,
+            # Declarative assembly spec (None for legacy flat/factory
+            # checkpoints). When present, loaders rebuild the module via
+            # qnn.model.graph.build_network — the checkpoint is fully
+            # self-describing and no probe.json / factory rehydration runs.
+            "model_graph": self.graph.to_dict() if self.graph is not None else None,
             # Self-versioning contract block (model↔engine). wire/semantics are
             # the LIVE engine_norm ids (what this code produces); arch is derived
             # from the ModelConfig. The checkpoint is the source of truth — the
@@ -1878,10 +1900,25 @@ class QNNPolicy:
                     "and migrate_legacy_flat_meta did not recognize the schema."
                 )
             meta = migrated
-        model_cfg = ModelConfig.from_dict(meta["model"])
+        # Graph-described checkpoints rebuild through the declarative
+        # assembly path; flat/legacy checkpoints stay on the ModelConfig
+        # path with the state-dict migrations below. An embedded graph
+        # ALWAYS wins — even over a passed model_factory (a legacy
+        # probe.json sitting next to a graph checkpoint must not demote
+        # it back to factory-dependent), and the ModelConfig bridge is
+        # re-derived from the graph so meta.model can never silently
+        # diverge from the module actually built.
+        graph = None
+        if meta.get("model_graph") is not None:
+            from qnn.model.graph import GraphSpec
+
+            graph = GraphSpec.from_dict(meta["model_graph"])
+            model_factory = None
+        model_cfg = None if graph is not None else ModelConfig.from_dict(meta["model"])
         policy = cls(
             obs_dim=int(meta["obs_dim"]),
             model=model_cfg,
+            graph=graph,
             jump_pos_weight=float(meta["jump_pos_weight"]),
             attack_focal_gamma=float(meta["attack_focal_gamma"]),
             attack_focal_alpha=float(meta["attack_focal_alpha"]),
@@ -1896,7 +1933,7 @@ class QNNPolicy:
         # pre-fix checkpoints that didn't carry the field).
         policy.input_mask = bool(meta.get("input_mask", False))
         policy.attack_op_only = bool(meta.get("attack_op_only", False))
-        if model_factory is None:
+        if model_factory is None and graph is None:
             from qnn.utils.checkpoint_converter import (
                 migrate_drop_action_history,
                 migrate_drop_fire_align_scalar,
@@ -1951,7 +1988,7 @@ class QNNPolicy:
             #  - encoder.gru_input_proj weight (pre-v20 mean-actors pool) is
             #    silently dropped
             missing, unexpected = policy.model.load_state_dict(payload["state_dict"], strict=False)
-            if model_factory is None:
+            if model_factory is None and graph is None:
                 allowed_missing_prefixes: tuple[str, ...] = (
                     # Pre-v21 checkpoints predate the weapon head; the
                     # whole WeaponHead component (mlp + embed) starts fresh.
@@ -1974,8 +2011,8 @@ class QNNPolicy:
                     "target_pointer.query_proj.",
                 )
             else:
-                # No legacy migrations for factory-built modules — they
-                # save and load their own state_dict shape.
+                # No legacy allowances for factory- or graph-built modules —
+                # they save and load their own exact state_dict shape.
                 allowed_missing_prefixes = ()
                 allowed_unexpected_prefixes = ()
             missing_keep = [k for k in missing if not k.startswith(allowed_missing_prefixes)]

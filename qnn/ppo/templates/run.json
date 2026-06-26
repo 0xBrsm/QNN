@@ -14,8 +14,7 @@
     "scenario": "config/scenario.json",
     "reward": "config/reward.json",
     "machine": "config/machine.json",
-    "model": "config/model.json",
-    "eval": "config/eval.json"
+    "model": "config/model.json"
   },
   "output": {
     "checkpoints": "checkpoints/",

@@ -33,15 +33,12 @@ import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
-import torch
 from torch import nn
 
-from qnn.model.bench.spec import HeadBuildResult, HeadLossSpec, HeadSpec, neutral_model_config
+from qnn.model.bench.spec import HeadBuildResult, HeadSpec, neutral_model_config
 from qnn.model.bench.inputs.held_weapon_split_obs_embedding import HeldWeaponSplitObsEmbedding
-from qnn.model.bench.move_cls_transformer import CLSMoveHead
-from qnn.model.bench.attack_cls_transformer import CLSAttackHead
-from qnn.model.bench.weapon_cls_transformer import CLSWeaponHead
-from qnn.model.bench.look_head_polar import PurePolarLookHead
+from qnn.model.cls_heads import CLSAttackHead, CLSMoveHead, CLSWeaponHead
+from qnn.model.look_head_polar import PurePolarLookHead
 from qnn.model.network import Network, ModelConfig, slot_dims
 from qnn.model.temporal import Temporal
 from qnn.model.transformer import TransformerEncoder
@@ -113,21 +110,7 @@ def _build_full_5head(probe: Mapping[str, Any]) -> HeadBuildResult:
     return model_config, factory
 
 
-def _stub(*_a: Any, **_k: Any) -> torch.Tensor:
-    return torch.zeros(())
-
-
 FULL_5HEAD = HeadSpec(
     name="full_5head",
-    loss=HeadLossSpec(
-        # Multi-head: QNNPolicy computes every head's loss (incl. the target
-        # soft-CE / target_kl path); this stub is never dispatched.
-        loss_fn=_stub,
-        metrics_fn=lambda *_a, **_k: {},
-        label_key="look",
-        output_dim=0,
-        selection_metric="loss",
-        selection_lower_is_better=True,
-    ),
     build=_build_full_5head,
 )

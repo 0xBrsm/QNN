@@ -25,7 +25,7 @@ Hidden-state contract: the policy sizes the recurrent hidden from
 and pack/split the N GRU states along the last dim, so the canonical recurrent
 loop drives N trunks unchanged. Per-head losses are dispatched by
 QNNPolicy._compute_head_losses_and_metrics (move CE / attack BCE / weapon CE;
-look carries PurePolarLookHead.look_loss). HeadLossSpec.loss_fn is a no-op stub.
+look carries PurePolarLookHead.look_loss).
 """
 from __future__ import annotations
 
@@ -36,12 +36,10 @@ from typing import Any
 import torch
 from torch import nn
 
-from qnn.model.bench.spec import HeadBuildResult, HeadLossSpec, HeadSpec, neutral_model_config
+from qnn.model.bench.spec import HeadBuildResult, HeadSpec, neutral_model_config
 from qnn.model.bench.inputs.held_weapon_split_obs_embedding import HeldWeaponSplitObsEmbedding
-from qnn.model.bench.move_cls_transformer import CLSMoveHead
-from qnn.model.bench.attack_cls_transformer import CLSAttackHead
-from qnn.model.bench.weapon_cls_transformer import CLSWeaponHead
-from qnn.model.bench.look_head_polar import PurePolarLookHead
+from qnn.model.cls_heads import CLSAttackHead, CLSMoveHead, CLSWeaponHead
+from qnn.model.look_head_polar import PurePolarLookHead
 from qnn.model.network import (
     ModelConfig, MOVE_HEAD, LOOK_HEAD, ATTACK_HEAD, WEAPON_HEAD,
     _flatten_obs, _restore_outputs,
@@ -240,19 +238,7 @@ def _build_full_multitrunk(probe: Mapping[str, Any]) -> HeadBuildResult:
     return model_config, factory
 
 
-def _stub(*_a: Any, **_k: Any) -> torch.Tensor:
-    return torch.zeros(())
-
-
 FULL_MULTITRUNK = HeadSpec(
     name="full_multitrunk",
-    loss=HeadLossSpec(
-        loss_fn=_stub,
-        metrics_fn=lambda *_a, **_k: {},
-        label_key="look",
-        output_dim=0,
-        selection_metric="loss",
-        selection_lower_is_better=True,
-    ),
     build=_build_full_multitrunk,
 )

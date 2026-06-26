@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.23.0
+
+### Added
+
+- Declarative model assembly (`qnn.model.graph`): one JSON GraphSpec — tokens as scalar/vocab field dicts, encoder/temporal/pointer nodes, heads with named input edges — builds the model for BC, bench, eval, PPO, and export through a single factory; committed base graphs `full_4head` / `full_5head`
+- Self-describing checkpoints: `meta.model_graph` rides in every checkpoint and rebuilds strict on load — no run-dir probe.json needed; an embedded graph always wins over legacy factories
+- Bench probes as graph deltas: `probe.json` is `{"base": <graph>, "overrides": {...}}` with strict validation (unknown keys, dangling edges, typo'd null-deletes, and inexpressible motor wiring all fail loud)
+- `sf-to-qnn` CLI accepts `--graph-json` for graph-described PPO runs
+
+### Changed
+
+- PPO's SF encoder builds from the warm-start seed's model graph (`--quake_model_graph`), with fail-loud validation when the run's frozen model.json disagrees
+- Winner heads promoted into `qnn.model` (`cls_heads`, `look_head_polar`); legacy bench registry kept only to reload retained pre-graph head-probe runs
+- BC/bench templates: corpus fingerprint refreshed to the current collect
+
+### Removed
+
+- Concluded bench ablations (attack prior/oracle/bundle family, weapon_aim, target query variants, look distribution variants, prev_look probes) and ~37 orphaned analysis scripts — findings preserved in `docs/`; net −12k lines
+- The dead `eval.json` config path (template, `--eval` flag, optional run.json key) — the eval surface is train.json's `eval_*` keys
+
+### Fixed
+
+- SF→QNN checkpoint conversion: was silently failing on every PPO run (obs_dim read from the trained SF checkpoint; missing required args), and the reverse weight copy dropped the GRU and target pointer (modern key names) — conversions now carry encoder/GRU/pointer bit-identically and fail loud on any missed weight
+- PPO post-train eval, seed selection, and the conversion CLI now thread the model graph (previously rebuilt flat modules that could not receive graph-shaped weights)
+- `qnn.run.init` for ppo/pbt/optuna modes (template still referenced the deleted eval.json)
+
+
 ## 0.22.0
 
 ### Added

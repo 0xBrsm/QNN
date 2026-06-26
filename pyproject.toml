@@ -29,4 +29,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["demo", "engine", "mapgen", "qnn", "qnn.model", "qnn.bc", "qnn.ppo", "qnn.eval", "qnn.env", "qnn.run", "qnn.utils"]
+packages = ["demo", "engine", "mapgen", "qnn", "qnn.model", "qnn.model.graph", "qnn.model.tokens", "qnn.bc", "qnn.ppo", "qnn.eval", "qnn.env", "qnn.run", "qnn.utils"]
+
+[tool.setuptools.package-data]
+"qnn.model.graph" = ["bases/*.json"]

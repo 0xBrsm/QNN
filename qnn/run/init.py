@@ -67,7 +67,6 @@ def main() -> None:
     parser.add_argument("--reward", help="Path to reward.json (overrides template)")
     parser.add_argument("--machine", help="Path to machine.json (overrides template)")
     parser.add_argument("--model", help="Path to model.json (overrides template)")
-    parser.add_argument("--eval", help="Path to eval.json (overrides template)")
     parser.add_argument("--probe", help="Path to probe.json (overrides template; head_probe mode)")
     args = parser.parse_args()
 

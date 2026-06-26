@@ -184,9 +184,8 @@ def current_obs_accessor() -> ObsAccessor:
     acc = _CTX.get()
     if acc is None:
         raise RuntimeError(
-            "ObsAccessor requested but no scope set — a bench Network wrapper "
-            "(BenchObsNetwork / MoveAimNetwork) must enter the accessor scope "
-            "before calling the head."
+            "ObsAccessor requested but no scope set — the Network must enter "
+            "the accessor scope (obs_accessor_scope) before calling the head."
         )
     return acc
 

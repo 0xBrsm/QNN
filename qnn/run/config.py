@@ -140,7 +140,7 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
         required_keys = ["train", "machine", "model"]
     if mode in {"ppo", "pbt", "optuna", "eval"}:
         required_keys.extend(["scenario", "reward"])
-    optional_keys = ["eval", "scenario", "reward"]
+    optional_keys = ["scenario", "reward"]
 
     for name in required_keys:
         rel_path = _require_string(config_section, name, "run.json.config")

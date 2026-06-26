@@ -15,7 +15,7 @@ weapon aggregate wash; see src/docs/{attack,weapon,target}-head.md). Each head r
 GRU readout at the canonical selector dims (motor_in for move/look/attack, weapon_in for
 weapon). Per-head losses are dispatched by QNNPolicy._compute_head_losses_and_metrics
 (canonical move multi-axis CE / attack BCE / weapon 8-way CE; look carries its own
-PurePolarLookHead.look_loss). The HeadLossSpec.loss_fn is a no-op stub (multi-head).
+PurePolarLookHead.look_loss).
 """
 from __future__ import annotations
 
@@ -23,15 +23,12 @@ import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
-import torch
 from torch import nn
 
-from qnn.model.bench.spec import HeadBuildResult, HeadLossSpec, HeadSpec, neutral_model_config
+from qnn.model.bench.spec import HeadBuildResult, HeadSpec, neutral_model_config
 from qnn.model.bench.inputs.held_weapon_split_obs_embedding import HeldWeaponSplitObsEmbedding
-from qnn.model.bench.move_cls_transformer import CLSMoveHead
-from qnn.model.bench.attack_cls_transformer import CLSAttackHead
-from qnn.model.bench.weapon_cls_transformer import CLSWeaponHead
-from qnn.model.bench.look_head_polar import PurePolarLookHead
+from qnn.model.cls_heads import CLSAttackHead, CLSMoveHead, CLSWeaponHead
+from qnn.model.look_head_polar import PurePolarLookHead
 from qnn.model.network import Network, ModelConfig, Off, slot_dims
 from qnn.model.temporal import Temporal
 from qnn.model.transformer import TransformerEncoder
@@ -97,22 +94,7 @@ def _build_full_4head(probe: Mapping[str, Any]) -> HeadBuildResult:
     return model_config, factory
 
 
-def _stub(*_a: Any, **_k: Any) -> torch.Tensor:
-    return torch.zeros(())
-
-
 FULL_4HEAD = HeadSpec(
     name="full_4head",
-    loss=HeadLossSpec(
-        # Multi-head: QNNPolicy computes every head's loss; this stub is never
-        # dispatched (mirrors weapon_aim). Best-epoch uses the composite
-        # _selection_score, not this field.
-        loss_fn=_stub,
-        metrics_fn=lambda *_a, **_k: {},
-        label_key="look",
-        output_dim=0,
-        selection_metric="loss",
-        selection_lower_is_better=True,
-    ),
     build=_build_full_4head,
 )

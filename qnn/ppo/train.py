@@ -871,6 +871,10 @@ def add_quake_cli_args(parser: Any) -> None:
                         help="FFN inner dimension (transformer only)")
     parser.add_argument("--quake_attn_dropout", type=float, default=None,
                         help="Attention dropout rate (transformer only)")
+    parser.add_argument("--quake_model_graph", type=str, default="",
+                        help="JSON model graph (qnn.model.graph.GraphSpec) the encoder "
+                             "builds from — set automatically from the warm-start "
+                             "checkpoint's meta.model_graph; empty = legacy flat layout")
     # BC warm-start
     parser.add_argument("--quake_bc_checkpoint", type=str, default=None,
                         help="Path to BC/PPO checkpoint for warm-start initialisation")
@@ -980,6 +984,7 @@ def build_ppo_cfg(
     resume: bool = False,
     head_loss_weights: str = "",
     initial_stddev: float = 0.2,
+    model_graph_json: str = "",
     extra_argv: Optional[List[str]] = None,
 ) -> Any:
     """Build a PPO cfg namespace without command-line parsing.
@@ -1071,6 +1076,9 @@ def build_ppo_cfg(
 
     if head_loss_weights:
         argv.append(f"--head_loss_weights={head_loss_weights}")
+
+    if model_graph_json:
+        argv.append(f"--quake_model_graph={model_graph_json}")
 
     if extra_argv:
         argv.extend(extra_argv)

@@ -187,6 +187,10 @@ def canonical_self_fields(include_weapon_id: bool) -> tuple:
     This mirrors the pre-TokenBuilder ObsEmbedding self block exactly:
     full-width self scalar projection, self kind tag, armor type, movement,
     optional held-weapon identity, and all powerups.
+
+    The TokenSpec twin is ``qnn.model.graph.spec.monolithic_self_token``;
+    a unit test asserts ``token_fields(monolithic_self_token(x))`` equals
+    this tuple (tokens must not import graph, so they cannot share code).
     """
     fields: list[object] = [
         ScalarGroup(["self_scalars"]),

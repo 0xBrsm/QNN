@@ -205,11 +205,18 @@ def prepare_eval_checkpoint(checkpoint_path: str, output_dir: str) -> str:
     converted_sidecar_path = converted_dir / f"{path.stem}_qnn.json"
 
     if not converted_path.exists() or converted_path.stat().st_mtime < path.stat().st_mtime:
+        # Graph-described runs rebuild through the sidecar's model_graph —
+        # a flat-built module cannot receive graph-shaped SF weights.
+        graph = None
+        if meta.get("model_graph") is not None:
+            from qnn.model.graph import GraphSpec
+            graph = GraphSpec.from_dict(meta["model_graph"])
         policy = sf_to_qnn(
             sf_checkpoint_path=path,
             obs_dim=int(meta["obs_dim"]),
-            model=ModelConfig.from_flat_dict(meta),
+            model=None if graph is not None else ModelConfig.from_flat_dict(meta),
             device="cpu",
+            graph=graph,
         )
         policy.save(converted_path)
         converted_sidecar_path.write_text(

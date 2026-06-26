@@ -1,7 +1,8 @@
-"""HeadSpec / HeadLossSpec dataclasses — shared types for per-head modules.
+"""HeadSpec dataclass — shared types for per-head modules.
 
-Each per-head file (``qnn.model.bench.target``, ``qnn.model.bench.attack``,
-``qnn.model.bench.attack_preattn``, …) constructs its own ``HeadSpec`` and
+Each kept assembly file (``qnn.model.bench.full_4head``,
+``qnn.model.bench.full_5head``, ``qnn.model.bench.full_multitrunk``)
+constructs its own ``HeadSpec`` and
 registers it in ``qnn.model.bench.heads.HEADS``. The runner in
 ``qnn.model.bench.runner`` reads the spec to wire the head into the
 canonical BC training pipeline via ``QNNPolicy``'s ``model_factory``
@@ -15,29 +16,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import torch
 import torch.nn as nn
 
 from qnn.model.network import ModelConfig
-
-
-@dataclass(frozen=True, slots=True)
-class HeadLossSpec:
-    """Loss + metrics bundle — same shape regardless of model architecture.
-
-    ``loss_fn(logits, labels) -> scalar`` — head-specific loss
-    (BCE for fire, soft-CE for target, multi-axis CE for move, …).
-    ``metrics_fn(logits, labels) -> dict[str, float]`` — returns
-    metrics under the same key names BC training uses
-    (``target_kl``, ``f1_attack`` …) so probe JSON diffs cleanly
-    against BC ``bc_history.json``.
-    """
-    loss_fn: Callable[..., torch.Tensor]
-    metrics_fn: Callable[..., dict[str, float]]
-    label_key: str           # which array in the loaded shard dict is the label
-    output_dim: int          # MLP output width
-    selection_metric: str    # which metric drives best-epoch tracking
-    selection_lower_is_better: bool = True
 
 
 # A head builder takes the probe-side knobs (everything from probe.json)
@@ -102,17 +83,11 @@ class HeadSpec:
     """One head's complete probe configuration.
 
     ``build`` is the per-head factory that translates probe.json into
-    the (model_config, model_factory, head_loss_weights) triple the
-    runner feeds to ``run_behavior_cloning``. Each head module owns its
-    own ``build`` so adding a new probe is a single file + one entry in
-    ``HEADS``.
-
-    ``default_features`` is a legacy hook retained for the flat-feature
-    heads (``fire`` / ``target``) so their builders can look up the
-    default per-frame feature list when probe.json doesn't override it.
-    Pre-attention heads (``attack_preattn``) leave it empty.
+    the (model_config, model_factory) pair the runner feeds to
+    ``run_behavior_cloning``. All losses/metrics are computed by
+    ``QNNPolicy._compute_head_losses_and_metrics`` — the spec carries
+    no loss plumbing. Each head module owns its own ``build`` so a
+    probe is a single file + one entry in ``HEADS``.
     """
     name: str
-    loss: HeadLossSpec
     build: HeadBuilder
-    default_features: tuple[str, ...] = ()

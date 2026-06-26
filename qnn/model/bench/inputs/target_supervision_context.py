@@ -4,9 +4,8 @@ Mirrors :mod:`engagement_ema_context`: the
 trainer derives privileged target supervision (``target_gt``,
 ``target_probs_idx``, ``prev_target_probs``) from BC labels and enters
 this context before the model forward. Bench pointer modules that
-consume any of these (``CanonicalTargetPointer`` hard / gt-dist / prev
-modes, ``GTTargetPointer`` oracle) read from the contextvar instead of
-receiving them via Network.forward.
+consume any of these (``GTTargetPointer`` oracle) read from the
+contextvar instead of receiving them via Network.forward.
 
 The canonical model (``qnn.model.target.TargetPointer``) ignores this
 context — these tensors only feed bench-resident variants. Keeping the

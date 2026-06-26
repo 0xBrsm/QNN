@@ -41,21 +41,56 @@ class QuakeTransformerEncoder(Encoder):
         d_target: int = int(getattr(cfg, "quake_d_target", d_model))
         self_weapon_embed_in_self: bool = bool(getattr(cfg, "quake_self_weapon_embed_in_self", False))
 
-        self.obs_embedding = ObsEmbedding(
-            d_model=d_model,
-            self_weapon_embed_in_self=self_weapon_embed_in_self,
-        )
-        self.encoder = TransformerEncoder(
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            d_ffn=d_ffn,
-            dropout=dropout,
-        )
-        # PPO owns its own MLP target pointer so it can soft-pool target_feat
-        # for the value/policy heads. ``d_target`` is the MLP hidden width;
-        # all other target-head variants live exclusively in qnn.model.bench.
-        self.target_pointer = TargetPointer(d_model=d_model, d_target=d_target)
+        graph_json: str = str(getattr(cfg, "quake_model_graph", "") or "")
+        if graph_json:
+            # Declarative path — the warm-start checkpoint's model graph
+            # drives token layout / encoder / pointer so BC weights map
+            # 1:1 into the SF encoder. The flat quake_* scalars must agree
+            # (qnn.ppo.pipeline derives them from the same graph).
+            import json as _json
+
+            from qnn.model.graph import GraphSpec
+            from qnn.model.graph.embedding import GraphObsEmbedding
+
+            spec = GraphSpec.from_dict(_json.loads(graph_json))
+            if spec.encoder.type != "transformer":
+                raise RuntimeError("PPO requires a transformer encoder graph")
+            pointer = spec.pointer
+            if pointer is None or pointer.type != "mlp":
+                raise RuntimeError(
+                    "PPO requires an mlp target pointer node — the value/policy "
+                    "heads read target_feat from the encoder output"
+                )
+            if int(spec.encoder.d_model) != d_model:
+                raise RuntimeError(
+                    f"quake_d_model={d_model} disagrees with the model graph's "
+                    f"d_model={spec.encoder.d_model}"
+                )
+            self.obs_embedding = GraphObsEmbedding(spec)
+            self.encoder = TransformerEncoder(
+                d_model=spec.encoder.d_model,
+                n_heads=spec.encoder.n_heads,
+                n_layers=spec.encoder.n_layers,
+                d_ffn=spec.encoder.d_ffn,
+                dropout=spec.encoder.attn_dropout,
+            )
+            self.target_pointer = TargetPointer(d_model=d_model, d_target=pointer.d_target)
+        else:
+            # Legacy flat path — canonical monolithic-self embedding.
+            self.obs_embedding = ObsEmbedding(
+                d_model=d_model,
+                self_weapon_embed_in_self=self_weapon_embed_in_self,
+            )
+            self.encoder = TransformerEncoder(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                d_ffn=d_ffn,
+                dropout=dropout,
+            )
+            # PPO owns its own MLP target pointer so it can soft-pool target_feat
+            # for the value/policy heads. ``d_target`` is the MLP hidden width.
+            self.target_pointer = TargetPointer(d_model=d_model, d_target=d_target)
         self.use_rnn: bool = bool(getattr(cfg, "use_rnn", False))
         self.d_model: int = d_model
         self.encoder_out_size: int = 2 * d_model

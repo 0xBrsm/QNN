@@ -620,8 +620,8 @@ class Network(nn.Module):
             ))
         else:
             look_out = None
-        # look_prior is consumed by bench AimPrior variants; canonical
-        # AttackHead ignores it. Substitute zeros when look is off.
+        # look_prior is consumed by prior-style attack-head variants;
+        # canonical AttackHead ignores it. Substitute zeros when look is off.
         look_prior_for_attack = (
             look_out.look_prior if look_out is not None
             else torch.zeros((batch_flat, 3), dtype=self_readout.dtype, device=self_readout.device)
@@ -649,11 +649,10 @@ class Network(nn.Module):
             # Underscored keys are loss-only; not used for inference / sampling.
             logits_flat["_look_prior"] = look_out.look_prior
             logits_flat["_look_delta"] = look_out.look_delta
-            # Distributional head outputs (binned / polar / vMF) forwarded
-            # generically so a new look head's LOSS can live entirely in bench:
+            # Distributional head outputs (binned / polar) forwarded
+            # generically so a new look head's LOSS can live with the head:
             # QNNPolicy dispatches to look_head.look_loss, which reads these.
-            for _f in ("look_bins", "look_mag_logits", "look_dir_logits",
-                       "look_vmf_mix", "look_vmf_mu", "look_vmf_kappa"):
+            for _f in ("look_bins", "look_mag_logits", "look_dir_logits"):
                 _v = getattr(look_out, _f, None)
                 if _v is not None:
                     logits_flat["_" + _f] = _v

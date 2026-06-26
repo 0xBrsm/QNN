@@ -46,20 +46,6 @@ class LookHeadOutput:
     # None for non-polar heads. See qnn.model.look_bins.
     look_mag_logits: torch.Tensor | None = None
     look_dir_logits: torch.Tensor | None = None
-    # Mixture-of-vMF look heads emit a directional mixture over S²: weights
-    # (B*, K), unit mean directions (B*, K, 3), concentrations (B*, K). Continuous
-    # + multimodal (no quantization). None for non-vMF heads. See qnn.model.vmf.
-    look_vmf_mix: torch.Tensor | None = None
-    look_vmf_mu: torch.Tensor | None = None
-    look_vmf_kappa: torch.Tensor | None = None
-    # Polar+offset (discretized mixture) look heads emit, in addition to the
-    # mag/dir categoricals above, a continuous 2D Gaussian over the tangent
-    # residual within the chosen (mag,dir) cell: mean (B*, 2) + log-std (B*, 2).
-    # The Gaussian replaces polar's −log(cell_area) term with a true within-cell
-    # density (continuous resolution while keeping the multimodal polar structure).
-    # None for non-offset heads. See qnn.model.bench.look_head_polar_offset.
-    look_off_mean: torch.Tensor | None = None
-    look_off_logstd: torch.Tensor | None = None
 
 
 class LookHead(nn.Module):

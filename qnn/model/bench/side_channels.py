@@ -12,9 +12,8 @@ This module owns that logic so it lives in ``bench``, not in the canonical
 hook and the bench runner wires :func:`bench_side_channel_scope` into it. The
 canonical model passes no provider and pays nothing.
 
-The obs-derived accessor scope is entered separately, at the ``Network`` layer
-where obs is already tensorized/flattened — see
-``qnn.model.bench.inputs.obs_network.BenchObsNetwork``.
+The obs-derived accessor scope is entered separately, at the ``Network``
+layer where obs is already tensorized/flattened.
 """
 
 from __future__ import annotations
@@ -101,45 +100,4 @@ def bench_side_channel_scope(actions: Any, masks: Any) -> ContextManager:
     stack = contextlib.ExitStack()
     stack.enter_context(_engagement_ema_scope(actions))
     stack.enter_context(_target_supervision_scope(actions, masks))
-    stack.enter_context(_weapon_switch_scope(actions, masks))
     return stack
-
-
-def _weapon_switch_scope(actions: Any, masks: Any) -> ContextManager:
-    """Enter the weapon-switch supervision context for the weapon_switch head.
-
-    Prefers PRECOMPUTED per-frame label columns (``weapon_dwell`` /
-    ``weapon_switch`` / ``weapon_newtgt``, generated per-episode at data-prep time
-    by ``scripts/analysis/_gen_weapon_switch_labels.py``). These ride along through
-    frame_shuffled batches, which is the ONLY correct source in the non-temporal
-    bench path: that path has no temporal neighbours at train time, so batch-time
-    derivation produces garbage (see src/docs/weapon-head.md). Falls back to
-    on-the-fly derivation along the time axis when a temporal ``(T,B)`` batch +
-    ``reset_mask`` is available. No-op when ``weapon`` is absent."""
-    if not isinstance(actions, Mapping) or "weapon" not in actions:
-        return contextlib.nullcontext()
-    from qnn.model.bench.inputs.weapon_switch_context import (
-        WeaponSwitchContext, derive_weapon_switch_labels, weapon_switch_context,
-    )
-
-    def _t(x):
-        return x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
-
-    pre = ("weapon_dwell", "weapon_switch", "weapon_newtgt")
-    if all(k in actions for k in pre):
-        w = _t(actions["weapon"]).reshape(-1).long()
-        dwell = _t(actions["weapon_dwell"]).reshape(-1).float()
-        sw = _t(actions["weapon_switch"]).reshape(-1).float()
-        nt = _t(actions["weapon_newtgt"]).reshape(-1).long()
-        valid = torch.ones_like(sw, dtype=torch.bool)   # last-of-episode contamination ~0.2%, immaterial
-        return weapon_switch_context(WeaponSwitchContext(
-            dwell_age=dwell, held_weapon=w, switch_next=sw,
-            new_weapon_target=nt, valid=valid,
-        ))
-
-    # Fallback: derive along the time axis of a temporal (T,B) batch.
-    w = _t(actions["weapon"])
-    rm = None
-    if isinstance(masks, Mapping) and "reset_mask" in masks:
-        rm = _t(masks["reset_mask"])
-    return weapon_switch_context(derive_weapon_switch_labels(w, rm))
