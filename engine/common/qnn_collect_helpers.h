@@ -129,6 +129,15 @@ typedef struct
 	int		emit_waterlevel;
 	int		emit_weapon_id;
 	qboolean	has_emit_anchor;
+	/* look_delta self-contained carry (QNN_SelfEmitToken): the previous
+	 * emit's view angles + realized look vector, so look_delta = the change
+	 * between the two most recent realized looks. Reset on episode boundary
+	 * (reset_flag in QNN_IOUpdate). Path-independent — every obs path goes
+	 * through QNN_IOEmit → QNN_SelfEmitToken. */
+	vec3_t		ld_prev_view;
+	vec3_t		ld_prev_realized;
+	qboolean	ld_has_prev_view;
+	qboolean	ld_has_prev_realized;
 	int		native_frame_count;
 	/* NQ-only: physics groundedness seed for inference. */
 	qboolean	phys_grounded;

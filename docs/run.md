@@ -93,7 +93,7 @@ Common:
 
 | Path | Purpose |
 |------|---------|
-| `device` | requested device, usually `gpu` or `cpu` |
+| `device` | requested device, usually `gpu` or `cpu`; `gpu` is the portable accelerator alias and may resolve to PyTorch `cuda` on CUDA/ROCm hosts |
 | `asset_root` | Quake asset root |
 | `worker_binary` | native worker binary |
 

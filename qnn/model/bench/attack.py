@@ -143,7 +143,7 @@ ATTACK = HeadSpec(
         metrics_fn=attack_metrics,
         label_key="attack",
         output_dim=1,
-        selection_metric="f1_attack",
+        selection_metric="attack_skill",
         selection_lower_is_better=False,
     ),
     build=_build_attack,

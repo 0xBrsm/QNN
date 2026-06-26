@@ -10,8 +10,10 @@ formula handles all three weapon classes by parameterization:
 * Linear projectile: ``v_horiz < QNN_VEL_SCALE``, ``gravity = 0``. Lead
   time is the smallest positive root of the standard intercept
   quadratic.
-* Ballistic (GL): ``gravity > 0``. Lead time solved with linear
-  approximation; ``½·g·t²`` added to the view-frame z component.
+* Ballistic (GL): ``gravity > 0``. Lead time from the intercept
+  quadratic; z-axis applies two corrections: ``+0.25·g_weapon·t²``
+  (projectile arc) and ``−0.25·g_world·t²`` (target fall). For GL
+  (g_weapon == g_world == 800/VEL_SCALE) the terms cancel exactly.
 
 Closed form, fully differentiable, no model parameters.
 
@@ -29,6 +31,11 @@ Implementation notes:
 from __future__ import annotations
 
 import torch
+
+# Quake world gravity (sv_gravity default = 800 u/s²), normalized by VEL_SCALE.
+# Used to correct for free-flying targets falling faster than constant-velocity
+# extrapolation predicts (they accumulate an extra 0.5·g·t² of downward drop).
+_QUAKE_GRAVITY_NORM: float = 800.0 / 2000.0  # = 0.4
 
 
 def compute_lead_aim(
@@ -88,19 +95,20 @@ def _compute_lead_aim_impl(
     # Lead point: r + v·t (view-frame, all axes).
     aim_point = entity_rel + entity_vel * t_lead.unsqueeze(-1)   # (B, N, 3)
 
-    # Gravity compensation on view-frame z-axis (only nonzero for GL).
-    # Inputs are normalized by DIST_SCALE=1000 / VEL_SCALE=2000, so the
-    # closed-form solver returns t in units of (VEL_SCALE/DIST_SCALE) = 2
-    # raw seconds. The linear ``entity_vel * t_lead`` term is self-correcting
-    # (the 2× absorbs into VEL_SCALE-normalized v). The t² gravity term is
-    # not: ``0.5·g·t²`` with normalized g and t-prime gives 2× the correct
-    # DIST_SCALE-normalized drop. Compensate with 0.25 (= 0.5 ÷
-    # (VEL_SCALE/DIST_SCALE)) so the drop lands in DIST_SCALE units.
-    z_compensate = 0.25 * g * t_lead * t_lead                    # (B, N)
-    # In-place z-axis add — avoids materializing a (B, N, 2) zero pad and the
-    # subsequent cat allocation.
+    # Z-axis correction — two effects, same unit factor 0.25
+    # (= 0.5 ÷ (VEL_SCALE/DIST_SCALE), because t is in normalized units).
+    #
+    #   +0.25·g_weapon·t²  projectile arc: GL shell drops in flight, so aim up.
+    #   −0.25·g_world·t²   target fall: a free-flying entity accumulates extra
+    #                       downward displacement beyond what vel·t predicts.
+    #
+    # For GL (g_weapon == g_world == 800/VEL_SCALE) the terms cancel exactly —
+    # projectile and target fall together, so no z bias is needed.
+    # For RL/NG against airborne targets (g_weapon == 0), the target-fall term
+    # alone applies: aim_point shifts down by 0.25·g_world·t².
+    net_z = (0.25 * g - 0.25 * _QUAKE_GRAVITY_NORM) * t_lead * t_lead  # (B, N)
     aim_point = aim_point.clone()
-    aim_point[..., 2] = aim_point[..., 2] + z_compensate
+    aim_point[..., 2] = aim_point[..., 2] + net_z
     return aim_point
 
 

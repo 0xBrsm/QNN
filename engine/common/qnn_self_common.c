@@ -119,4 +119,36 @@ void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot)
 	 * the result stays well inside the i8 range. Used by the model's
 	 * self.motion subtoken; spatial dirs no longer carry pitch. */
 	out->view_pitch = snapshot->player_view_angles[0] * (1.0f / 90.0f);
+
+	/* look_delta = realized_look[t] - realized_look[t-1], where
+	 * realized_look = forward(current view) expressed in the PREVIOUS
+	 * emit's view basis — i.e. the turn just made (== the act_look label
+	 * one frame back). The difference is the change in that turn (~0 under
+	 * steady rotation). Self-contained 2-deep carry in qnn_runtime. Live
+	 * inference calls QNN_IOEmit once per Host_Frame, so the carry advances
+	 * once per frame and look_delta is exact — verified byte-for-byte against
+	 * the BC preload's look[t-1]-look[t-2] on a real demo (99.94% of frames).
+	 * CAVEAT: the demo-COLLECTION loop runs several snapshot/emit passes per
+	 * frame (label snapshots, pmove re-emits) which can double-advance the
+	 * carry and transiently corrupt look_delta for ~2 frames around those
+	 * events. Harmless: collection drops look_delta before caching
+	 * (qnn.bc.collect) and the preload re-derives it per-episode from the
+	 * cached look column — so don't trust the collection-path look_delta, use
+	 * the preload. Reset across episodes via QNN_IOUpdate's reset_flag; out is
+	 * memset to 0 above, so the first frame(s) emit a zero look_delta. */
+	{
+		vec3_t cur_forward, realized;
+		QNN_ForwardFromAngles(snapshot->player_view_angles, cur_forward);
+		if (qnn_runtime.ld_has_prev_view)
+		{
+			QNN_RelativeFrame(qnn_runtime.ld_prev_view, cur_forward, realized);
+			if (qnn_runtime.ld_has_prev_realized)
+				VectorSubtract(realized, qnn_runtime.ld_prev_realized,
+					out->look_delta);
+			VectorCopy(realized, qnn_runtime.ld_prev_realized);
+			qnn_runtime.ld_has_prev_realized = true;
+		}
+		VectorCopy(snapshot->player_view_angles, qnn_runtime.ld_prev_view);
+		qnn_runtime.ld_has_prev_view = true;
+	}
 }

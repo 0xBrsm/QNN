@@ -12,7 +12,7 @@ Pattern:
 
     inp = make_look_head_input(batch=8, in_dim=192)
     out = LookHead(in_dim=192, d_hidden=128, activation="gelu")(inp)
-    assert out.pred_look.shape == (8, 3)
+    assert out.look_predict.shape == (8, 3)
 
 The builders intentionally produce *valid* inputs (e.g. actor masks have
 at least one true entry per row, target_logits are pre-masked to -1e9
@@ -208,11 +208,11 @@ def make_attack_head_input(
 ) -> AttackHeadInput:
     gen = _gen(seed)
     actor_mask = _actor_mask(batch, n_entities, gen)
-    base_look = torch.randn(batch, 3, generator=gen)
-    base_look = base_look / base_look.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    look_prior = torch.randn(batch, 3, generator=gen)
+    look_prior = look_prior / look_prior.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     return AttackHeadInput(
         features=torch.randn(batch, in_dim, generator=gen),
-        base_look=base_look,
+        look_prior=look_prior,
         weapon_id=torch.full((batch,), ENTITY_IDS["NAILGUN"], dtype=torch.long),
         target_logits=_masked_logits(batch, n_entities, actor_mask, gen),
         entity_scalars=torch.randn(batch, n_entities, actor_scalar_dim, generator=gen) * 0.1,

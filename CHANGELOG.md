@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.22.0
+
+### Added
+
+- Canonical target pointer (per-entity MLP scorer): `target_feat` conditions the move/look/attack heads on the engaged enemy — live verdict: fixes tracking/aim, not fire gating (rep3 true-seed replications)
+- Polar look head (magnitude × direction with explicit hold bin) and in-model **hybrid look decode** (sampled magnitude × continuous circular-mean direction) — eliminates the v24 spin artifact; decode params stamped into ONNX metadata
+- In-graph sticky weapon gate (confidence + margin thresholds carried by the model, applied in-graph at export); engine-side sticky fb/lr move decode with stamped tau and decoded-action log
+- Model↔engine contract registry (`docs/contracts/`): the checkpoint is the source of truth; `tools/stamp_onnx.py` / `tools/stamp_checkpoint.py` write KNOWN contracts; the client refuses unstamped models
+- Fire-discrimination eval: obs-side blind-fire metrics plus engine-side fire × LOS-alignment correlation; `--model-diag-log` Python-in-the-loop model diagnostics during live eval
+- `qnn_fov` cvar for the perception cone (clamped in place, tied to live `fov`); `model <name>` resolves to `models/<name>.onnx`
+- full_4head / full_5head bench assemblies (split-self + held-weapon token, CLS+GRU trunk) behind the head-probe registry
+
+### Changed
+
+- ONNX I/O fully head-agnostic: outputs self-declare, weapon head optional, no required heads; the engine consumes final action vectors and never decides decode
+- w7/w9 weapon decode decoupled; compact a/s/w version render in the client
+- Engine-state log JSON-escapes player names and model paths
+
+### Fixed
+
+- Double model-load in the client (single clean load line, arch included)
+- v24 look spins and lateral jitter — both decode artifacts, fixed in-model (hybrid look decode, sticky move decode)
+
+
 ## 0.21.0
 
 ### Added

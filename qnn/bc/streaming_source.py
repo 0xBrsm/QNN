@@ -1,10 +1,9 @@
 """Metadata-first access to sharded BC caches.
 
-``StreamingSource`` is the disk-streaming counterpart to the resident
-``_load_precomputed`` path.  It opens shard arrays lazily as memmaps,
-keeps only episode metadata in memory, and can read row ranges on demand
-without constructing ``PrecomputedEpisode`` objects or copying whole
-shards through the parent process.
+``StreamingSource`` opens shard arrays lazily as memmaps, keeps only
+episode metadata in memory, and can read row ranges on demand without
+constructing episode objects or copying whole shards through the parent
+process.
 """
 
 from __future__ import annotations

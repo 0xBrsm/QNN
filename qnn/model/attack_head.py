@@ -7,7 +7,7 @@ implement the same ``AttackHeadInput → AttackHeadOutput`` contract.
 ``Network`` slots them in via ``attack_head=<variant>``.
 
 ``AttackHeadInput`` carries optional fields that variants may need
-(``base_look``, ``weapon_id``, ``target_logits``, ``entity_scalars``,
+(``look_prior``, ``weapon_id``, ``target_logits``, ``entity_scalars``,
 ``actor_mask``, ``self_scalars``). The canonical head reads only
 ``features``; variants pick what they need.
 """
@@ -30,7 +30,7 @@ class AttackHeadInput:
     # Optional fields consumed by bench variants. Canonical AttackHead
     # ignores them. Network.forward populates all of them so any variant
     # slotted in receives a uniform input dataclass.
-    base_look: torch.Tensor | None = None               # (B*, 3) unit vec to target
+    look_prior: torch.Tensor | None = None               # (B*, 3) unit vec to target
     weapon_id: torch.Tensor | None = None               # (B*, 1) raw obs ID
     target_logits: torch.Tensor | None = None           # (B*, N)
     entity_scalars: torch.Tensor | None = None          # (B*, N, ACTOR_SCALAR_DIM)

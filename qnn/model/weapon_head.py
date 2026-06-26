@@ -58,6 +58,10 @@ class WeaponHeadInput:
 class WeaponHeadOutput:
     logits: torch.Tensor   # (B*, WEAPON_HEAD_SIZE)
     context: torch.Tensor  # (B*, d_model)
+    # Optional loss-only output forwarded generically by Network as an underscored
+    # key (not used for inference/sampling) so a bench head's LOSS can live entirely
+    # in bench — mirrors LookHeadOutput's distributional fields.
+    when_logit: torch.Tensor | None = None  # (B*, 1) switch hazard, for weapon_switch
 
 
 class WeaponHead(nn.Module):

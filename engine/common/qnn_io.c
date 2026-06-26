@@ -10,6 +10,7 @@
 #include "qnn_store.h"
 #include "qnn_map.h"
 #include "qnn_route.h"
+#include "qnn_collect_helpers.h"  /* qnn_runtime — look_delta carry reset */
 
 #include <ctype.h>
 #include <stdint.h>
@@ -20,6 +21,12 @@
 
 void QNN_IOInit(const qnn_map_state_t *map_state)
 {
+	/* Register the perception cone cvar once. IOInit re-runs per map
+	 * load; the guard keeps Cvar_RegisterVariable from warning on the
+	 * repeats and preserves any console-set value across map changes. */
+	if (Cvar_FindVar("qnn_fov") == NULL)
+		Cvar_RegisterVariable(&qnn_fov);
+
 	QNN_PlayersResetTeamCache();
 	QNN_EventInit(map_state);
 }
@@ -38,7 +45,13 @@ void QNN_IOUpdate(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag)
 	QNN_StoreUpdate(snapshot, dt);
 	QNN_EventTick(snapshot, dt, reset_flag);
 	if (reset_flag)
+	{
 		QNN_OracleResetState();
+		/* Drop the look_delta carry so the first frame(s) of a new
+		 * episode don't difference across the boundary. */
+		qnn_runtime.ld_has_prev_view = false;
+		qnn_runtime.ld_has_prev_realized = false;
+	}
 }
 
 /* ── Token emission ──────────────────────────────────────────────
@@ -88,7 +101,7 @@ void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 
 	memset(obs, 0, QNN_OBS_BUFFER_SIZE);
 
-	/* ── Self block (20 B) ───────────────────────────────────── */
+	/* ── Self block (27 B) ───────────────────────────────────── */
 	{
 		const qnn_self_token_t *tok = &r->self;
 		float eff_armor = (float)tok->raw_armor * tok->armor_type;
@@ -124,6 +137,10 @@ void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 
 		QNN_BufWriteI8 (obs, QNN_OBS_OFF_SELF_VIEW_PITCH,
 			QNN_QuantizeI8(tok->view_pitch));
+
+		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_LOOK_DELTA + 0, tok->look_delta[0]);
+		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_LOOK_DELTA + 2, tok->look_delta[1]);
+		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_LOOK_DELTA + 4, tok->look_delta[2]);
 	}
 
 	/* ── Spatial block (135 B = field-major across 9 sectors) ─

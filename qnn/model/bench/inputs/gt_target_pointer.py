@@ -14,6 +14,14 @@ it recover the GT mass); ``target_feat`` is the GT-pooled feature.
 Requires the BC supervised loop to have entered a
 :class:`TargetSupervisionContext` carrying ``target_probs_idx`` —
 without it, the oracle has no signal and raises on forward.
+
+``detach_entity_grad=True`` (default) stops gradients from flowing back
+through entity tokens into the entity embeddings. For bench probes that
+test whether target_feat *carries signal* for a downstream head, this is
+almost always correct: the entity embeddings should not receive gradient
+from the probe head via the pointer. Without detach, backward through the
+weighted pool is 3× more expensive than the forward pass because autograd
+must differentiate through the full entity embedding construction.
 """
 
 from __future__ import annotations
@@ -28,9 +36,10 @@ from qnn.model.target import TargetPointerInput, TargetPointerOutput
 
 
 class GTTargetPointer(nn.Module):
-    def __init__(self, *, d_model: int) -> None:
+    def __init__(self, *, d_model: int, detach_entity_grad: bool = True) -> None:
         super().__init__()
         self.d_model = int(d_model)
+        self.detach_entity_grad = bool(detach_entity_grad)
         # No learned parameters.
 
     def forward(self, inp: TargetPointerInput) -> TargetPointerOutput:
@@ -42,10 +51,14 @@ class GTTargetPointer(nn.Module):
                 "target_supervision_context — the BC supervised loop must "
                 "enter the scope before calling the model."
             )
-        mask_f = inp.entity_mask.to(inp.entity_outs.dtype)
-        has_any = (mask_f.sum(dim=-1, keepdim=True) > 0).to(inp.entity_outs.dtype)
-        weights = target_probs_idx.to(inp.entity_outs.dtype) * mask_f
-        target_feat = (weights.unsqueeze(-1) * inp.entity_outs).sum(dim=1) * has_any
+        entity_outs = inp.entity_outs.detach() if self.detach_entity_grad else inp.entity_outs
+        mask_f = inp.entity_mask.to(entity_outs.dtype)
+        has_any = (mask_f.sum(dim=-1, keepdim=True) > 0).to(entity_outs.dtype)
+        weights = target_probs_idx.to(entity_outs.dtype) * mask_f
+        # Fused soft-pool: einsum avoids materializing the (B, N, d_model)
+        # product before reducing — one kernel, no large intermediate (matters
+        # on ROCm where dispatch/alloc churn dominates this loop).
+        target_feat = torch.einsum("bn,bnd->bd", weights, entity_outs) * has_any
 
         # target_logits: log-prob recovers the GT distribution under softmax.
         # eps-clamp keeps it finite at 0.

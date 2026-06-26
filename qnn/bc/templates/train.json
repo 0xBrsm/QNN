@@ -11,6 +11,11 @@
   "warmup_epochs": 0,
   "regression_threshold": 0.01,
   "regression_patience": 5,
+  "autostop_patience": 8,
+  "autostop_min_improve": 0.001,
+  "autostop_drift_frac": 0.5,
+  "autostop_min_epoch": 6,
+  "autostop_catastrophic_margin": 0.5,
   "train_eval_interval": 10,
   "train_eval_gap_threshold": 0.08,
   "train_eval_val_regression_threshold": 0.01,
@@ -32,5 +37,6 @@
   },
   "token_mask": null,
   "input_mask": true,
+  "attack_op_only": false,
   "collection_fingerprint": "sha256:82b0a3932f37a008114853354f621701c6bf289a8eb97973528c1b8aa21eed44"
 }

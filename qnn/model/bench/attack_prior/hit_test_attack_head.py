@@ -21,13 +21,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from qnn.bc.weapon_physics import (
+    ACTOR_HALFEXT_OFFSET, ACTOR_REL_OFFSET, ACTOR_VEL_OFFSET,
+)
 from qnn.model._mlp import make_head_mlp
 from qnn.model.attack_head import OUT_DIM, AttackHeadInput, AttackHeadOutput
 
-# ACTOR scalar layout (dequant.py:290+): HALFEXT 0:3, REL 3:6, VEL 7:10.
-_REL_BEGIN, _REL_END = 3, 6
-_VEL_BEGIN, _VEL_END = 7, 10
-_HALF_BEGIN, _HALF_END = 0, 3
+# ACTOR scalar layout — offsets owned by qnn.bc.weapon_physics.
+_REL_BEGIN, _REL_END = ACTOR_REL_OFFSET, ACTOR_REL_OFFSET + 3
+_VEL_BEGIN, _VEL_END = ACTOR_VEL_OFFSET, ACTOR_VEL_OFFSET + 3
+_HALF_BEGIN, _HALF_END = ACTOR_HALFEXT_OFFSET, ACTOR_HALFEXT_OFFSET + 3
 
 
 class HitTestAttackHead(nn.Module):

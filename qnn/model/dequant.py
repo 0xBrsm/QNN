@@ -59,7 +59,7 @@ _SUBJECT_MEGAHEALTH   = ENTITY_IDS["MEGAHEALTH"]
 # These pair with the per-weapon readiness vector (B, 8) the dequant
 # emits — the ObsEmbedding looks each up in `entity_embed` and weights
 # it by the readiness scalar to form the arsenal subtoken contribution.
-_WEAPON_SUBJECT_IDS = (
+WEAPON_SUBJECT_IDS = (
     ENTITY_IDS["AXE"],
     ENTITY_IDS["SHOTGUN"],
     ENTITY_IDS["SUPER_SHOTGUN"],
@@ -69,39 +69,48 @@ _WEAPON_SUBJECT_IDS = (
     ENTITY_IDS["ROCKET_LAUNCHER"],
     ENTITY_IDS["THUNDERBOLT"],
 )
-_N_WEAPONS = len(_WEAPON_SUBJECT_IDS)
+# Back-compat private alias (this module + downstream historically read the
+# underscore name). Bench's obs-field catalog re-exports the public name.
+_WEAPON_SUBJECT_IDS = WEAPON_SUBJECT_IDS
+_N_WEAPONS = len(WEAPON_SUBJECT_IDS)
 
-# Legacy 17-wide self_scalars layout. The ObsEmbedding no longer uses
-# this tensor (it reads the three subtoken tensors below instead) but
-# downstream ablation heads / feature registry entries / labeler probes
-# still index it by these positions, so the dequant keeps emitting it
-# as-is. Do not reorder without an architectural retrain.
+# Canonical 17-wide self_scalars layout. The production ObsEmbedding projects
+# this full bundle through TokenBuilder's monolithic self ScalarGroup, and
+# downstream ablation heads / feature registry entries / labeler probes still
+# index it by these positions. Do not reorder without an architectural retrain.
 _SELF_SCALAR_DIM = 17
-_IDX_HEALTH          = 0
-_IDX_ARMOR           = 1
-_IDX_WEAPON_SG       = 2
-_IDX_WEAPON_SSG      = 3
-_IDX_WEAPON_NG       = 4
-_IDX_WEAPON_SNG      = 5
-_IDX_WEAPON_GL       = 6
-_IDX_WEAPON_RL       = 7
-_IDX_WEAPON_LG       = 8
-# Public — bench heads (e.g. weapon_aim) read these indices off self_scalars
-# directly; keep the source-of-truth here so an obs-layout change can't drift
-# between the dequantizer that writes them and the bench consumers that read.
+# Public — bench heads + the obs-field catalog read these indices off
+# self_scalars directly; keep the source-of-truth here so an obs-layout
+# change can't drift between the dequantizer that writes them and the bench
+# consumers that read. (qnn.model.tokens.obs_fields re-exports these.)
+IDX_HEALTH           = 0
+IDX_ARMOR            = 1
+IDX_WEAPON_SG        = 2
+IDX_WEAPON_SSG       = 3
+IDX_WEAPON_NG        = 4
+IDX_WEAPON_SNG       = 5
+IDX_WEAPON_GL        = 6
+IDX_WEAPON_RL        = 7
+IDX_WEAPON_LG        = 8
 IDX_AMMO_SHELLS      = 9
 IDX_AMMO_NAILS       = 10
 IDX_AMMO_ROCKETS     = 11
 IDX_AMMO_CELLS       = 12
-_IDX_VEL_X           = 13
-_IDX_VEL_Y           = 14
-_IDX_VEL_Z           = 15
+IDX_VEL_X            = 13
+IDX_VEL_Y            = 14
+IDX_VEL_Z            = 15
 IDX_ATTACK_FINISHED  = 16
 # Back-compat private aliases for the dequantizer's internal writes.
+_IDX_HEALTH          = IDX_HEALTH
+_IDX_ARMOR           = IDX_ARMOR
+_IDX_WEAPON_SG       = IDX_WEAPON_SG
+_IDX_WEAPON_LG       = IDX_WEAPON_LG
 _IDX_AMMO_SHELLS     = IDX_AMMO_SHELLS
 _IDX_AMMO_NAILS      = IDX_AMMO_NAILS
 _IDX_AMMO_ROCKETS    = IDX_AMMO_ROCKETS
 _IDX_AMMO_CELLS      = IDX_AMMO_CELLS
+_IDX_VEL_X           = IDX_VEL_X
+_IDX_VEL_Z           = IDX_VEL_Z
 _IDX_ATTACK_FINISHED = IDX_ATTACK_FINISHED
 
 # Self subtoken scalar widths, consumed by the three projections in
@@ -124,6 +133,24 @@ class SelfDequantizer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
+    @staticmethod
+    def _ensure_look_delta(
+        out: dict[str, torch.Tensor], ref: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Guarantee a ``look_delta`` (B*, 3) obs key, zeros if the producer
+        didn't supply one. ``ref`` is any same-shape-prefix self tensor."""
+        if "look_delta" not in out:
+            out["look_delta"] = torch.zeros(
+                (*ref.shape[:-1], 3), dtype=torch.float32, device=ref.device,
+            )
+        elif out["look_delta"].dtype != torch.float32:
+            # The engine wire packs look_delta as f16 (see qnn.wire); the
+            # motion ScalarGroup cats it with f32 vel/pitch, so upcast here
+            # to keep that concat single-dtype (matters for the ONNX export
+            # path, which feeds the raw f16 wire field straight in).
+            out["look_delta"] = out["look_delta"].to(torch.float32)
+        return out
+
     def forward(
         self, obs: Mapping[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -134,7 +161,8 @@ class SelfDequantizer(nn.Module):
         dequant once at startup), pass through unchanged.
         """
         if "self_state_scalars" in obs:
-            return dict(obs)
+            out = dict(obs)
+            return self._ensure_look_delta(out, out["self_motion_scalars"])
         out: dict[str, torch.Tensor] = dict(obs)
 
         # All native self fields share batch dim 0.
@@ -173,6 +201,10 @@ class SelfDequantizer(nn.Module):
         out["self_motion_scalars"] = torch.cat(
             [vel_f, pitch_f.unsqueeze(-1)], dim=1,
         )                                                              # (B, 4)
+        # look_delta has no native wire field yet — the
+        # producer (preload from look-labels; env/worker from realized Δview)
+        # supplies it. Default to zeros so the obs always carries the key.
+        self._ensure_look_delta(out, out["self_motion_scalars"])
 
         # ── Legacy flat self_scalars (kept for downstream consumers) ─
         scalars = torch.zeros(batch, _SELF_SCALAR_DIM, device=device, dtype=torch.float32)

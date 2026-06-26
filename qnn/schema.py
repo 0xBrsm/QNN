@@ -54,6 +54,13 @@ OBS_SCHEMA: dict[str, tuple[int, ...]] = {
     "self_state_scalars":   (SELF_STATE_SCALAR_DIM,),
     "self_arsenal_scalars": (SELF_ARSENAL_SCALAR_DIM,),
     "self_motion_scalars":  (SELF_MOTION_SCALAR_DIM,),
+    # Frame-to-frame change in the anchor-relative look vector
+    # (look[t-1] - look[t-2]); ~0 under steady rotation, ≈ angular
+    # acceleration. A first-class self-motion field sourced at the obs
+    # boundary (look-label Δ at preload; engine-computed at inference) —
+    # never reconstructed in-model. NOT angular velocity (a single look
+    # vector is that); see qnn.model.tokens.obs_fields.
+    "look_delta": (3,),
     "self_weapon_id": (1,),
     "self_weapon_readiness": (WEAPON_HEAD_SIZE,),
     "self_armor_type_id": (1,),

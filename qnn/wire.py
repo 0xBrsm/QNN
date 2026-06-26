@@ -117,8 +117,9 @@ def unpack_labeler_buffer(raw: bytes) -> dict[str, np.ndarray]:
 #    15    self_movement_id         u8          ()             1
 #    16    self_items               u32         ()             4
 #    20    view_pitch               i8          ()             1  (deg / 90)
-#    21    spatial_dir              i8          (9, 3)        27
-#    47    spatial_nearest_dist     u16         (9,)          18
+#    21    look_delta               f16         (3,)           6
+#    27    spatial_dir              i8          (9, 3)        27
+#    53    spatial_nearest_dist     u16         (9,)          18
 #    65    spatial_mean_dist        u16         (9,)          18
 #    83    spatial_openness         u8          (9,)           9
 #    92    spatial_clearance        u8          (9,)           9
@@ -155,11 +156,11 @@ def unpack_labeler_buffer(raw: bytes) -> dict[str, np.ndarray]:
 # the EntityDequantizer at the model boundary.
 
 NATIVE_SELF_OFFSET           = 0
-NATIVE_SELF_BYTES            = 21
+NATIVE_SELF_BYTES            = 27   # 21 + look_delta (f16 × 3)
 
-NATIVE_SPATIAL_OFFSET        = NATIVE_SELF_OFFSET + NATIVE_SELF_BYTES   # 21
+NATIVE_SPATIAL_OFFSET        = NATIVE_SELF_OFFSET + NATIVE_SELF_BYTES   # 27
 NATIVE_SPATIAL_BYTES         = 135                                      # 9 sectors × 15 B
-NATIVE_ENTITY_STREAM_OFFSET  = NATIVE_SPATIAL_OFFSET + NATIVE_SPATIAL_BYTES  # 156
+NATIVE_ENTITY_STREAM_OFFSET  = NATIVE_SPATIAL_OFFSET + NATIVE_SPATIAL_BYTES  # 162
 
 # Token-type tags on the wire — mirror qnn.vocab TOKEN_* constants.
 _TOK_PROJECTILE = TOKEN_PROJECTILE
@@ -196,6 +197,7 @@ def _unpack_native_self(raw: bytes) -> dict[str, np.ndarray]:
         "self_movement_id": _read_scalar(raw, o + 15, np.uint8),
         "self_items":       _read_scalar(raw, o + 16, np.int32),
         "view_pitch":       _read_scalar(raw, o + 20, np.int8),
+        "look_delta":       _read_array(raw,  o + 21, np.float16, 3),
     }
 
 

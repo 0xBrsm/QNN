@@ -67,7 +67,7 @@ def copy_previous_baseline(episodes: Sequence[dict[str, np.ndarray]]) -> Dict[st
     total_frames = 0
     # Continuous heads: collect angular errors for look, component L1 for move
     look_errors: list[np.ndarray] = []
-    look_target_deg: list[np.ndarray] = []
+    look_label_raw_deg: list[np.ndarray] = []
     move_l1: list[np.ndarray] = []
     # Discrete heads: count tp/fp/fn
     discrete_counts: Dict[str, list[int]] = {h: [0, 0, 0] for h in ACTION_HEADS if h not in CONTINUOUS_ACTION_HEADS}
@@ -80,10 +80,10 @@ def copy_previous_baseline(episodes: Sequence[dict[str, np.ndarray]]) -> Dict[st
 
         # Look: copy previous
         look = ep["look"]
-        pred_look = look[:-1]  # frame T-1 as prediction for frame T
+        look_predict = look[:-1]  # frame T-1 as prediction for frame T
         tgt_look = look[1:]
-        look_errors.append(_angular_error_deg(pred_look, tgt_look))
-        look_target_deg.append(_target_turn_deg(tgt_look))
+        look_errors.append(_angular_error_deg(look_predict, tgt_look))
+        look_label_raw_deg.append(_target_turn_deg(tgt_look))
 
         # Move: copy previous, L1 error
         move = ep["move"]
@@ -106,7 +106,7 @@ def copy_previous_baseline(episodes: Sequence[dict[str, np.ndarray]]) -> Dict[st
             discrete_counts[head][2] += int((pos_tgt & ~match).sum())  # fn
 
     all_look_err = np.concatenate(look_errors)
-    all_look_tdeg = np.concatenate(look_target_deg)
+    all_look_tdeg = np.concatenate(look_label_raw_deg)
     all_move_l1 = np.concatenate(move_l1)
 
     result: Dict[str, Any] = {

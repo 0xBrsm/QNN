@@ -7,13 +7,18 @@ action heads (move, look, fire, weapon) drive the engine. The pipeline is
 seeded by behavioral cloning on Quake demos and fine-tuned via Sample Factory
 APPO against FrikBotNex opponents.
 
-Related docs: [token-spec.md](token-spec.md) (wire format, head shapes),
-[vocab.md](vocab.md) (IDs and event mapping), [run.md](run.md) (config schema),
+Related docs: [head-metrics.md](head-metrics.md) (the canonical metric contract —
+how every action head is judged), [contracts/](contracts/README.md) (wire / semantics /
+arch contract versions + I/O signatures), [vocab.md](vocab.md) (IDs and event mapping), [run.md](run.md) (config schema),
 [vendor.md](vendor.md) (dependencies),
 [target_labeler_engine_alignment.md](target_labeler_engine_alignment.md)
 (target labeler + engine sticky design),
 [diag.md](diag.md) (capacity diagnostics on trained policies —
-`python -m qnn.diag`).
+`python -m qnn.diag`),
+[persistence-and-changepoints.md](persistence-and-changepoints.md)
+(why all heads are persistence-dominated and the when/what plan),
+[corpus-encounter-stats.md](corpus-encounter-stats.md)
+(measured encounter durations + temporal-horizon sizing).
 
 ## Policy Architecture
 

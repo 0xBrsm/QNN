@@ -36,6 +36,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from qnn.model.tokens.obs_accessor import ObsAccessor
+from qnn.model.tokens.obs_fields import canonical_self_fields
+from qnn.model.tokens.token_builder import TokenBuilder
 from qnn.vocab import (
     TOKEN_PROJECTILE, TOKEN_ACTOR, TOKEN_ITEM, TOKEN_MOVER,
     ENTITY_VOCAB_SIZE, ACTION_VOCAB_SIZE, MODALITY_VOCAB_SIZE,
@@ -43,7 +46,7 @@ from qnn.vocab import (
     PROJECTILE_SCALAR_DIM, ACTOR_SCALAR_DIM, ITEM_SCALAR_DIM, MOVER_SCALAR_DIM,
 )
 from qnn.schema import (
-    SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM, SELF_SCALAR_DIM,
+    SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM,
 )
 
 # Token-kind embedding rows. ObsEmbedding tags each output token with
@@ -59,30 +62,6 @@ _TOKEN_KIND_SPATIAL = 2
 #   slot 1+spatial..        entity tokens (MAX_TOKEN_OBJECTS)
 # Subclasses (see ``ObsEmbedding._N_SELF_TOKENS``) can change the self-block
 # width.
-
-
-def _collect_powerup_ids(obs_dict: dict[str, torch.Tensor]) -> torch.Tensor | None:
-    """Return the (B, 5) powerup-id tensor.
-
-    Prefer the single 5-wide ``self_powerup_ids`` field if the dataloader
-    produces it; otherwise compose from the bench-schema split fields
-    (``self_{state,arsenal,motion}_powerup_ids``). Returns None when neither
-    is present so callers can no-op the powerup contribution.
-    """
-    pids = obs_dict.get("self_powerup_ids")
-    if pids is None:
-        parts = [
-            obs_dict[k] for k in (
-                "self_state_powerup_ids",
-                "self_arsenal_powerup_ids",
-                "self_motion_powerup_ids",
-            ) if k in obs_dict
-        ]
-        if parts:
-            pids = torch.cat(parts, dim=1)
-    if pids is None:
-        return None
-    return pids.long()
 
 
 # ── ObsEmbedding ─────────────────────────────────────────────────
@@ -123,6 +102,8 @@ class ObsEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
+        # out_dim — width of every token vector this embedding emits.
+        self.out_dim = self.d_model
         self.self_weapon_embed_in_self = bool(self_weapon_embed_in_self)
         self.include_spatial = bool(include_spatial)
 
@@ -167,9 +148,13 @@ class ObsEmbedding(nn.Module):
 
     def _init_self_components(self) -> None:
         """Declare self-block submodules. Override to change the self design."""
-        # Monolithic self projection — the whole 17-wide self_scalars
-        # bundle into one d_model vector.
-        self.self_proj = nn.Linear(SELF_SCALAR_DIM, self.d_model)
+        self.self_token_builder = TokenBuilder(
+            self.d_model,
+            canonical_self_fields(self.self_weapon_embed_in_self),
+            entity_embed=self.entity_embed,
+            movement_embed=self.movement_embed,
+            kind_embed=self.kind_embed,
+        )
 
     def _project_entity_scalars(
         self,
@@ -212,43 +197,14 @@ class ObsEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Build the monolithic self token. Shape (B, 1, d_model).
 
-        Sum-of-additive-contributions: stack all (B, 1, D) parts and
-        reduce in one kernel instead of N-1 sequential adds. Cuts ROCm
-        dispatch-queue churn that dominated this loop on AMD.
+        The declarative TokenBuilder preserves the old stack+sum reduction
+        shape for the monolithic token to avoid ROCm dispatch-queue churn.
 
         Subclasses override to emit a different (B, _N_SELF_TOKENS, D)
         block.
         """
-        contribs: list[torch.Tensor] = [
-            self.self_proj(obs_dict["self_scalars"]).unsqueeze(1),
-        ]
-        kind_self = torch.full((batch, 1), _TOKEN_KIND_SELF, dtype=torch.long, device=device)
-        contribs.append(self.kind_embed(kind_self))
-
-        if "self_armor_type_id" in obs_dict:
-            aid = obs_dict["self_armor_type_id"].long().squeeze(-1).clamp(0, vocab_max)
-            amask = (aid > 0).float().unsqueeze(-1).unsqueeze(-1)
-            contribs.append(self.entity_embed(aid).unsqueeze(1) * amask)
-        if "self_movement_id" in obs_dict:
-            mid = obs_dict["self_movement_id"].long().squeeze(-1).clamp(0, 4)
-            contribs.append(self.movement_embed(mid).unsqueeze(1))
-        # Optional identity-weapon embed. The held weapon's subject already
-        # appears in arsenal readiness signals; this re-enables a redundant
-        # unweighted copy as an ablation knob.
-        if self.self_weapon_embed_in_self and "self_weapon_id" in obs_dict:
-            wid = obs_dict["self_weapon_id"].long().squeeze(-1).clamp(0, vocab_max)
-            wmask = (wid > 0).float().unsqueeze(-1).unsqueeze(-1)
-            contribs.append(self.entity_embed(wid).unsqueeze(1) * wmask)
-
-        pids = _collect_powerup_ids(obs_dict)
-        if pids is not None:
-            pids = pids.clamp(0, vocab_max)
-            pmask = (pids > 0).float().unsqueeze(-1)
-            contribs.append((self.entity_embed(pids) * pmask).sum(dim=1, keepdim=True))
-
-        if len(contribs) > 1:
-            return torch.stack(contribs, dim=0).sum(dim=0)
-        return contribs[0]
+        del batch, device, vocab_max
+        return self.self_token_builder(ObsAccessor(obs_dict)).unsqueeze(1)
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> "EncoderInput":
         """Build transformer input tokens from parsed observation dict.
@@ -420,7 +376,9 @@ class TransformerEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
-        self.output_dim = self.d_model
+        # out_dim — the width of self_readout / entity_outs this encoder emits.
+        # Single dim contract every temporal/target/head slot sizes against.
+        self.out_dim = self.d_model
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(

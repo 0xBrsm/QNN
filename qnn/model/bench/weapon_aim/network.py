@@ -138,18 +138,12 @@ class WeaponAimNetwork(Network):
         obs: Dict[str, torch.Tensor],
         hidden: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
-        target_gt: torch.Tensor | None = None,
-        target_probs_idx: torch.Tensor | None = None,
-        prev_target_probs: torch.Tensor | None = None,
     ):
+        # Signature mirrors the current Network.forward (obs, hidden,
+        # reset_mask). The GT target pointer sources its target the same way
+        # bare Network does — no forward kwargs needed. (Older signature passed
+        # target_gt/target_probs_idx/prev_target_probs, removed upstream.)
         _, flat_obs = _flatten_obs(obs)
         ctx = self._build_context(flat_obs)
         with weapon_aim_context(ctx):
-            return super().forward(
-                obs=obs,
-                hidden=hidden,
-                reset_mask=reset_mask,
-                target_gt=target_gt,
-                target_probs_idx=target_probs_idx,
-                prev_target_probs=prev_target_probs,
-            )
+            return super().forward(obs=obs, hidden=hidden, reset_mask=reset_mask)

@@ -5,9 +5,9 @@ LookHeadOutput`` contract — but computes ``aim_vec`` (lead-corrected,
 weapon-aware base direction) internally from its inputs + the
 forward-scoped ``WeaponAimContext``.
 
-  base_look = aim_vec
-  delta_look = mlp(features)
-  pred_look  = normalize(base_look + delta_look)
+  look_prior = aim_vec
+  look_delta = mlp(features)
+  look_predict  = normalize(look_prior + look_delta)
 
 The residual path intentionally keeps the canonical feature contract:
 ``inp.features`` is passed directly to the MLP. The ablation changes the
@@ -37,8 +37,8 @@ class WeaponAimLookHead(nn.Module):
     def __init__(self, in_dim: int, d_hidden: int, activation: str) -> None:
         super().__init__()
         # MLP input is the canonical features (= cat(self_readout,
-        # target_feat) when temporal Off). aim_vec goes into base_look,
-        # the MLP learns delta_look the same way canonical does — keeping
+        # target_feat) when temporal Off). aim_vec goes into look_prior,
+        # the MLP learns look_delta the same way canonical does — keeping
         # the canonical input shape avoids ROCm/MIOpen issues we hit with
         # non-canonical MLP widths.
         self._motor_in = int(in_dim)
@@ -51,18 +51,18 @@ class WeaponAimLookHead(nn.Module):
         per_entity_aim = compute_lead_aim(
             inp.entity_rel, ctx.entity_vel, v_horiz, gravity,
         )                                                              # (B, N, 3)
-        base_look = pooled_aim_vec(
+        look_prior = pooled_aim_vec(
             per_entity_aim, inp.target_logits, inp.actor_mask,
         )                                                              # (B, 3) unit
 
-        delta_look = self.mlp(inp.features)                            # (B, 3)
+        look_delta = self.mlp(inp.features)                            # (B, 3)
 
-        unnormalized = base_look + delta_look
+        unnormalized = look_prior + look_delta
         out_norm = torch.linalg.vector_norm(
             unnormalized, dim=-1, keepdim=True,
         ).clamp(min=1e-6)
-        pred_look = unnormalized / out_norm
+        look_predict = unnormalized / out_norm
 
         return LookHeadOutput(
-            pred_look=pred_look, base_look=base_look, delta_look=delta_look,
+            look_predict=look_predict, look_prior=look_prior, look_delta=look_delta,
         )

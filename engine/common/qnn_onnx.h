@@ -1,12 +1,21 @@
 /*
  * qnn_onnx.h — in-process ONNX inference for the live NQ client.
  *
- * Loads a v23 .onnx policy via the ONNX Runtime C API, runs one
- * inference per game tick from the engine's qnn_tick_result_t,
- * decodes the model outputs into the engine's qnn_action_t
- * (sticky-weapon controller + greedy argmax). All schema concepts
- * (qnn_tick_result_t, qnn_action_t, QNN_MAX_TOKEN_OBJECTS, ...) come
- * from the engine headers — there's no parallel obs/action shape.
+ * Loads an .onnx policy via the ONNX Runtime C API, runs one inference
+ * per game tick from the engine's qnn_tick_result_t, decodes the model
+ * outputs into the engine's qnn_action_t (sticky-weapon controller +
+ * greedy argmax). All schema concepts (qnn_tick_result_t, qnn_action_t,
+ * QNN_MAX_TOKEN_OBJECTS, ...) come from the engine headers — there's no
+ * parallel obs/action shape.
+ *
+ * Multiple wire contracts are supported through ONE binary via a
+ * per-model obs codec (qnn_obs_codec_t, internal to qnn_onnx.c). A
+ * codec is the bin-side implementation of a wire contract (see
+ * src/docs/contracts/README.md — "wire vs codec"). The codec is
+ * selected at model-load time (QNN_OnnxInit) from the model's
+ * `wire_contract` metadata or its ORT input-name set, and every tick
+ * dispatches through it. The stable seam is qnn_tick_result_t in /
+ * qnn_action_t out; emit, packing, and decode are the codec's job.
  *
  * One context per bot. Not thread-safe; QNN_OnnxLastError is
  * thread-local.
@@ -19,8 +28,9 @@
 
 typedef struct qnn_onnx_ctx qnn_onnx_ctx_t;
 
-/* Create a context bound to a v23 .onnx export. Returns NULL on error;
- * call QNN_OnnxLastError for the reason. */
+/* Create a context bound to an .onnx export. Selects the obs codec for
+ * the model's wire contract; returns NULL on error (including "no codec
+ * handles this model") — call QNN_OnnxLastError for the reason. */
 qnn_onnx_ctx_t *QNN_OnnxInit(const char *onnx_path);
 
 /* Reset the recurrent (GRU) hidden state. Call between episodes. */

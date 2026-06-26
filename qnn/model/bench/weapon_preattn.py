@@ -26,7 +26,7 @@ from qnn.model.bench.spec import (
     neutral_model_config,
 )
 from qnn.model.bench.inputs.gt_target_pointer import GTTargetPointer
-from qnn.model.network import Network, compute_slot_dims
+from qnn.model.network import Network, slot_dims
 from qnn.model.network import Off
 from qnn.model.bench.inputs.preattn_encoder import PreAttnEncoder
 from qnn.model.transformer import ObsEmbedding
@@ -63,8 +63,10 @@ def _build_weapon_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
     model_config = neutral_model_config(
         d_model=d_model, self_weapon_embed_in_self=self_weapon,
     )
-    dims = compute_slot_dims(
-        model_config, has_temporal=False, has_weapon_head=True,
+    dims = slot_dims(
+        d_model=model_config.d_model, d_gru=model_config.d_gru,
+        has_temporal=False, has_target_pointer=True, has_weapon_head=True,
+        weapon_sources=model_config.weapon_sources,
     )
 
     def factory(obs_dim: int, model_cfg) -> Network:
@@ -102,7 +104,7 @@ WEAPON_PREATTN = HeadSpec(
         metrics_fn=lambda *_a, **_k: {},  # not called
         label_key="weapon",
         output_dim=WEAPON_HEAD_SIZE,
-        selection_metric="f1_weapon_global",
+        selection_metric="weapon_skill",
         selection_lower_is_better=False,
     ),
     build=_build_weapon_preattn,

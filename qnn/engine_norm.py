@@ -162,6 +162,42 @@ from typing import Optional, Tuple
 import numpy as np
 
 
+# ── Contract identity ────────────────────────────────────────────
+# The model↔engine contract is versioned on THREE INDEPENDENT axes. Two are
+# stamped into every exported model (tools/export_onnx.py) and checked at load;
+# the registry is src/docs/contracts/.
+#
+# WIRE_CONTRACT_ID — the WIRE contract = the SYNTAX of the exchange: the set /
+#   order / dtypes / shapes of the ONNX I/O tensors. The LOAD-BREAKER — a wrong
+#   wire is a parse error ("Invalid input name"). A model DECLARES a wire
+#   contract; a bin-side CODEC implements one (spec vs impl, like PNG vs libpng
+#   — so we version the contract, not the codec). BUMP on any I/O tensor added /
+#   removed / retyped / reshaped. Monotonic across the full history; the load set:
+#     wire.7  packed scalars (self_scalars[17] / entity_scalars_raw /
+#             spatial_scalars), 13 ONNX inputs — token-spec ~v11 (v17/v22).
+#     wire.8  native split, 43 inputs — engine/Python wire at 0.21.0; NO ONNX
+#             graph was ever exported at 43 inputs (the native exporter postdates
+#             look_delta), so this id is reconstructed.
+#     wire.9  native split, 44 inputs = wire.8 + look_delta. Current HEAD; what
+#             this exporter produces; the deployed v24/full_4head.
+#   (wire.1–6 = older flat + packed lineages, pre-v11, out of the load set. The
+#    faithful-load floor is wire.7: below it action_history / recall / cluster
+#    are no longer emitted by the engine. See the registry.)
+#
+# SEMANTICS_CONTRACT_ID — the SEMANTICS contract = the MEANING behind those
+#   tensors: normalization scales + vocab id mappings (see _semantics_sig in
+#   tools/export_onnx.py). Same syntax, different meaning (vocab renumber, scale
+#   change) is a SILENT failure — the bin turns it loud by refusing on a
+#   semantics_sig mismatch. BUMP on any scale constant or vocab id mapping change
+#   (tensors unchanged). One version across the load set (wire.7→.9 / v17→v24);
+#   it DID move earlier (token-spec v11: entity vocab 42→44, weapon renumber).
+#
+# (The third axis, ARCH — model internals / weight layout — is checkpoint-side
+#  only; the live bin ignores it. Tracked by qnn/utils/checkpoint_converter.py.)
+WIRE_CONTRACT_ID = "wire.9"
+SEMANTICS_CONTRACT_ID = "semantics.1"
+
+
 # ── Engine resource caps ─────────────────────────────────────────
 # Must equal the matching #defines in src/engine/common/qnn_vocab.h
 # and src/engine/common/qnn_io.h. A parity test enforces this.
@@ -370,13 +406,26 @@ SELF_FIELDS: Tuple[Field, ...] = (
                "the pitch signal that used to live implicitly in "
                "the 9 spatial sectors' dir vectors.",
     ),
+    Field(
+        name="look_delta",
+        dtype=np.float16, shape=(3,),
+        scale=1.0, transform=None,
+        source="look[t-1] - look[t-2]: the change between the two most "
+               "recent realized look vectors (cur_forward · anchor_basis "
+               "dots), computed in QNN_ComputeLookDelta. ~0 under steady "
+               "rotation; ≈ angular acceleration, NOT velocity. f16 for the "
+               "same near-zero precision rationale as act_look. WIRE-ONLY: "
+               "dropped before the NPY cache (the BC preload re-derives it "
+               "from the look column); feeds inference (bridge + ONNX).",
+    ),
 )
 
 
 SELF_BLOCK_BYTES: int = sum(f.bytes_per_frame for f in SELF_FIELDS)
-# Computed at import time; expect 21 bytes:
+# Computed at import time; expect 27 bytes:
 #   health 1 + effective_armor 1 + ammo×4 4 + vel 6 + attack_finished 2
 #   + weapon_id 1 + movement_id 1 + items 4 + view_pitch 1 = 21
+#   + look_delta 6 = 27
 
 
 # ── Spatial block ────────────────────────────────────────────────

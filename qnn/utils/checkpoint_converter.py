@@ -300,6 +300,15 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
     """
     if "model" in meta:
         return None
+    # Oldest flat checkpoints (pre `d_*` rename, commit 5dc0d41) stored the
+    # transformer/GRU widths under their pre-rename names. Normalize those
+    # aliases up front so the recognition check and field reads below — which
+    # use the modern `d_*` names — accept them. (`trunk_hidden` is not consumed
+    # by the modern ModelConfig, so it is intentionally dropped.)
+    meta = dict(meta)
+    for _old, _new in (("ffn_dim", "d_ffn"), ("gru_hidden", "d_gru")):
+        if _old in meta and _new not in meta:
+            meta[_new] = meta[_old]
     required = ("d_model", "n_heads", "n_layers", "d_ffn", "attn_dropout",
                 "use_gru", "d_gru", "look_bypass_gru")
     if any(k not in meta for k in required):
@@ -321,16 +330,15 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
             "use_weapon_head":          False,
             "weapon_switch_confidence": 0.5,
             "weapon_switch_margin":     0.0,
-            "weapon_use_gru":           False,
             "weapon_context_from_obs":  False,
             "look_bypass_gru":          bool(meta["look_bypass_gru"]),
             # MLP target pointer hidden width — d_model is the historical
             # default. v17 had no MLP pointer; weights are random-init at
             # load time for the new score module.
             "d_target":                 int(meta["d_model"]),
-            # Required by invariant even when use_weapon_head=False
-            # (weapon_head module isn't built so the value is inert).
-            "weapon_use_self_readout":  True,
+            # Inert when use_weapon_head=False (weapon_head module isn't
+            # built); set to canonical so the spec is well-formed.
+            "weapon_sources":           ["self_readout", "target_feat"],
             "self_weapon_embed_in_self": False,
             "d_move":      0,
             "d_look":      0,
@@ -374,6 +382,21 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
         d_attack = int(meta.get("d_attack", 0))
         d_weapon = int(meta.get("d_weapon", 0))
 
+    # Weapon-selector composition. New checkpoints carry weapon_sources
+    # directly; pre-rename ones carry the weapon_use_gru / weapon_use_self_readout
+    # bools (with the older weapon_use_cls_readout alias). Historical defaults
+    # were both True → canonical [gru, self_readout, target_feat].
+    if "weapon_sources" in meta:
+        weapon_sources = list(meta["weapon_sources"])
+    else:
+        _w_gru = bool(meta.get("weapon_use_gru", True))
+        _w_self = bool(meta.get("weapon_use_self_readout", meta.get("weapon_use_cls_readout", True)))
+        weapon_sources = (
+            (["gru"] if _w_gru else [])
+            + (["self_readout"] if _w_self else [])
+            + ["target_feat"]
+        )
+
     model_cfg = {
         "d_model":                   int(meta["d_model"]),
         "n_heads":                   int(meta["n_heads"]),
@@ -385,7 +408,7 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
         "use_weapon_head":           bool(meta.get("use_weapon_head", True)),
         "weapon_switch_confidence":  float(meta.get("weapon_switch_confidence", 0.65)),
         "weapon_switch_margin":      float(meta.get("weapon_switch_margin", 0.15)),
-        "weapon_use_gru":            bool(meta.get("weapon_use_gru", True)),
+        "weapon_sources":            weapon_sources,
         "weapon_context_from_obs":   bool(meta.get("weapon_context_from_obs", False)),
         "look_bypass_gru":           bool(meta["look_bypass_gru"]),
         # MLP target pointer hidden width — falls back to d_model when
@@ -395,12 +418,6 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
         # MLP score module is random-init at load.
         "d_target":                  int(
             meta.get("d_target", meta.get("d_model"))
-        ),
-        # Historical default (true) — weapon head trained with
-        # cat(gru_flat, self_readout, target_feat) selector. Legacy
-        # temporary feature-branch alias was ``weapon_use_cls_readout``.
-        "weapon_use_self_readout":   bool(
-            meta.get("weapon_use_self_readout", meta.get("weapon_use_cls_readout", True))
         ),
         "self_weapon_embed_in_self": bool(meta.get("self_weapon_embed_in_self", False)),
         "d_move":             d_move,
@@ -481,7 +498,7 @@ def migrate_drop_fire_align_scalar(state: Dict[str, torch.Tensor]) -> bool:
     """Strip the trailing alignment-scalar column from pre-v21 fire heads.
 
     Pre-v21 fire heads were Linear(fire_in + 1, …) — the +1 was the
-    cosine of pred_look against the target-anchored base_look,
+    cosine of look_predict against the target-anchored look_prior,
     concatenated as the last feature dim.  Settled-null in ablation
     and removed from the architecture; v17/v20-era checkpoints still
     carry the 129-wide first-layer weight (128 fused features + 1
@@ -535,6 +552,35 @@ def migrate_drop_weapon_embed_self(state: Dict[str, torch.Tensor]) -> bool:
         if key.endswith("weapon_embed_self.weight"):
             del state[key]
             migrated = True
+    return migrated
+
+
+def migrate_obs_embedding_self_token_builder(state: Dict[str, torch.Tensor]) -> bool:
+    """Rename canonical self_proj tensors into TokenBuilder's scalar Linear.
+
+    Option B moved the production monolithic self token from
+    ``ObsEmbedding.self_proj`` to ``ObsEmbedding.self_token_builder`` while
+    preserving a single full-width Linear over ``self_scalars``. The parameter
+    mapping is therefore exact:
+
+      ``*.obs_embedding.self_proj.weight`` -> ``*.obs_embedding.self_token_builder.projs.0.weight``
+      ``*.obs_embedding.self_proj.bias``   -> ``*.obs_embedding.self_token_builder.projs.0.bias``
+    """
+    rewrites = {
+        "self_proj.weight": "self_token_builder.projs.0.weight",
+        "self_proj.bias": "self_token_builder.projs.0.bias",
+    }
+    migrated = False
+    for key in list(state.keys()):
+        for old_suffix, new_suffix in rewrites.items():
+            if not key.endswith(old_suffix):
+                continue
+            new_key = key[: -len(old_suffix)] + new_suffix
+            if new_key not in state:
+                state[new_key] = state[key]
+            del state[key]
+            migrated = True
+            break
     return migrated
 
 
@@ -1185,13 +1231,103 @@ def load_sf_checkpoint_as_qnn(
     )
 
 
+def _head_probe_model_factory(path: str | Path):
+    """Return the bench ``model_factory`` for a head-probe checkpoint, else None.
+
+    Head-probe / bench-assembled models (e.g. ``full_4head``) are alternate
+    ``nn.Module``s built by a per-head factory from ``probe.json``; the
+    checkpoint does not embed the factory identity, so the canonical
+    ``QNNPolicy.load`` cannot reconstruct them.  A run-dir keeps its
+    ``config/probe.json`` next to ``checkpoints/``; if one is present and names
+    a registered head, build and return its factory so the same module is
+    reconstructed for loading.
+    """
+    probe_path = Path(path).resolve().parents[1] / "config" / "probe.json"
+    if not probe_path.is_file():
+        return None
+    probe = json.loads(probe_path.read_text(encoding="utf-8"))
+    head = probe.get("head")
+    if not head:
+        return None
+    from qnn.model.bench.heads import HEADS
+    if head not in HEADS:
+        return None
+    _model_config, model_factory = HEADS[head].build(probe)
+    return model_factory
+
+
 def load_checkpoint(
     path: str | Path,
     *,
     device: str,
     model_config: "dict | ModelConfig | None" = None,
 ) -> "QNNPolicy":
-    """Load a checkpoint in either QNN or SF format."""
+    """Load a checkpoint in either QNN or SF format.
+
+    Head-probe checkpoints (with a sibling ``config/probe.json``) are
+    reconstructed through their bench ``model_factory`` so the alternate
+    module loads strict; canonical checkpoints load as before.
+    """
     if is_sf_checkpoint(path):
-        return load_sf_checkpoint_as_qnn(path, device=device, model_config=model_config)
-    return QNNPolicy.load(str(path), device=device)
+        policy = load_sf_checkpoint_as_qnn(path, device=device, model_config=model_config)
+    else:
+        policy = QNNPolicy.load(str(path), device=device,
+                                model_factory=_head_probe_model_factory(path))
+    policy.contract = resolve_checkpoint_contract(path)
+    return policy
+
+
+def resolve_checkpoint_contract(path: str | Path) -> "dict | None":
+    """Resolve a checkpoint's model↔engine contract, backfilling if absent.
+
+    The checkpoint is the SOURCE OF TRUTH. Returns ``meta["contract"]`` verbatim
+    when present; otherwise BACKFILLS from the generation→contract registry
+    (:mod:`qnn.contracts`) for the recognized generation. Returns ``None`` (and
+    warns) when the checkpoint carries no contract AND its generation is
+    unrecognized — never invents a value.
+
+    The QNN ``meta`` block is read from ``payload["meta"]`` (QNN/BC format) or,
+    for SF warm-start checkpoints (no embedded meta), from the sibling
+    ``.json`` sidecar that holds the same ``{"model", "obs_dim", ...}`` schema.
+    Reads only those schema markers; never inspects an ONNX graph, tensor
+    shapes, or the filename.
+    """
+    import json as _json
+    import warnings
+
+    from qnn.contracts import backfill_contract
+
+    p = Path(path)
+    payload = trusted_torch_load(p, map_location="cpu")
+    meta: Dict[str, Any] | None = None
+    if isinstance(payload, dict) and isinstance(payload.get("meta"), dict):
+        meta = payload["meta"]
+    else:
+        # SF warm-start checkpoints carry the QNN config in a sibling .json
+        # sidecar (see load_sf_checkpoint_as_qnn), not in payload["meta"].
+        sidecar = p.with_suffix(".json")
+        if sidecar.exists():
+            try:
+                loaded = _json.loads(sidecar.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    meta = loaded
+            except (ValueError, OSError):
+                meta = None
+    if meta is None:
+        warnings.warn(
+            f"{p}: no QNN meta (payload['meta'] or sidecar .json); cannot resolve contract.",
+            stacklevel=2,
+        )
+        return None
+    existing = meta.get("contract")
+    if isinstance(existing, dict):
+        return dict(existing)
+    backfilled = backfill_contract(meta)
+    if backfilled is None:
+        warnings.warn(
+            f"{path}: checkpoint has no 'contract' block and its generation is "
+            "unrecognized by the contract registry — leaving contract unset. "
+            "Stamp it explicitly with tools/stamp_checkpoint.py before export.",
+            stacklevel=2,
+        )
+    return backfilled

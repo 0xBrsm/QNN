@@ -248,6 +248,10 @@ void QNN_EventTick(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag
  * with at minimum fraction (1.0 = no obstruction) and endpos. */
 void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace);
 
+/* Model view-cone aperture (total degrees, [0,360]); read by QNN_InFov,
+ * registered in QNN_IOInit. See qnn_entity.c. */
+extern cvar_t qnn_fov;
+
 qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target);
 qboolean QNN_EntityInPvs(const vec3_t viewer, const vec3_t target);
 

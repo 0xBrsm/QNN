@@ -5,14 +5,14 @@
  * Usage:
  *   qnn [standard quake args]
  *
- *   qnn +model onnx/qnn_v22.onnx +connect 192.168.1.50  # load + auto-connect
+ *   qnn +model qnn_v22 +connect 192.168.1.50              # load + auto-connect
  *   qnn                                                   # idle; load via
- *                                                           `model <path>` at
+ *                                                           `model <name>` at
  *                                                           the console
  *
  * The model is loaded via the `model` console command (registered after
- * Host_Init); paths are resolved relative to cwd (= WORKDIR /app in the
- * shipped image), so `model onnx/qnn_v22.onnx` -> /app/onnx/qnn_v22.onnx.
+ * Host_Init); the name always resolves to models/<name>.onnx (the /app/models
+ * bind mount in the shipped image), so `model qnn_v22` -> models/qnn_v22.onnx.
  * The same command swaps models at runtime; hidden state resets on swap.
  *
  * Quake's standard "+command" argv injection is honored via stuffcmds,
@@ -44,6 +44,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <math.h>   /* acos / atan2 / M_PI for the decoded-action log */
 
 #define QNN_CLIENT_TICK_HZ 20
 
@@ -51,6 +52,7 @@ static float qnn_client_fixed_dt = 1.0f / (float)QNN_CLIENT_TICK_HZ;
 static double qnn_client_next_tick_time = 0.0;
 static char qnn_client_map_id[QNN_MAX_MAP_ID];
 static FILE *qnn_client_engine_log = NULL;
+static FILE *qnn_client_action_log = NULL;
 static int qnn_client_tick_index = 0;
 
 /* Active ONNX policy.  NULL until `model <path>` (or `+model <path>` on
@@ -78,15 +80,16 @@ static void QNN_Cmd_Model_f(void)
 
 	if (Cmd_Argc() < 2)
 	{
-		Con_Printf("usage: model <path[.onnx]>\n");
+		Con_Printf("usage: model <name>  (always resolves to models/<name>.onnx)\n");
 		Con_Printf("current: %s\n", qnn_client_onnx_ctx != NULL ? "(loaded)" : "(none)");
 		return;
 	}
 	path = Cmd_Argv(1);
 
-	/* Append `.onnx` if absent so `model foo` works as shorthand for
-	 * `model foo.onnx`.  Case-insensitive so FOO.ONNX is also accepted
-	 * as already-extensioned. */
+	/* Resolve the model name -> models/<name>.onnx, always.  The model dir is
+	 * the /app/models bind mount in compose.live.yaml, so `model v17` loads
+	 * models/v17.onnx.  `.onnx` is appended if absent (case-insensitive) so an
+	 * explicit `model v17.onnx` does not become v17.onnx.onnx. */
 	len = strlen(path);
 	has_ext = false;
 	if (len >= 5)
@@ -98,16 +101,13 @@ static void QNN_Cmd_Model_f(void)
 		           tolower((unsigned char)suf[3]) == 'n' &&
 		           tolower((unsigned char)suf[4]) == 'x');
 	}
-	if (!has_ext)
+	if ((int)snprintf(path_buf, sizeof(path_buf), "models/%s%s",
+	                  path, has_ext ? "" : ".onnx") >= (int)sizeof(path_buf))
 	{
-		if (len + 5 >= sizeof(path_buf))
-		{
-			Con_Printf("model: path too long\n");
-			return;
-		}
-		snprintf(path_buf, sizeof(path_buf), "%s.onnx", path);
-		path = path_buf;
+		Con_Printf("model: path too long\n");
+		return;
 	}
+	path = path_buf;
 
 	new_ctx = QNN_OnnxInit(path);
 	if (new_ctx == NULL)
@@ -118,7 +118,39 @@ static void QNN_Cmd_Model_f(void)
 	if (qnn_client_onnx_ctx != NULL)
 		QNN_OnnxFree(qnn_client_onnx_ctx);
 	qnn_client_onnx_ctx = new_ctx;
-	Con_Printf("model: loaded %s\n", path);
+	/* The clean load line ("model: loaded <path> [wire / semantics]") is
+	 * printed by QNN_OnnxInit, which knows the stamp-selected codec. */
+}
+
+/* Escape an engine string (player name, model path) into a JSON-safe,
+   pure-ASCII buffer.  Player names are peer-controlled and can carry ",
+   \, control bytes, or Quake high-bit color chars — any of which would
+   break the JSONL line.  Output is NUL-terminated and truncated to fit
+   `out_size` (worst case 6 bytes per input char for \uXXXX). */
+static void QNN_JsonEscape(char *out, size_t out_size, const char *in, size_t in_max)
+{
+	size_t r, w = 0;
+
+	if (out_size == 0)
+		return;
+	for (r = 0; r < in_max && in[r] != '\0'; ++r)
+	{
+		unsigned char c = (unsigned char)in[r];
+		char esc[7];
+		const char *seg;
+		size_t seg_len;
+
+		if (c == '"')        { seg = "\\\""; seg_len = 2; }
+		else if (c == '\\')  { seg = "\\\\"; seg_len = 2; }
+		else if (c >= 0x20 && c < 0x7f) { esc[0] = (char)c; esc[1] = '\0'; seg = esc; seg_len = 1; }
+		else { snprintf(esc, sizeof(esc), "\\u%04x", c); seg = esc; seg_len = 6; }
+
+		if (w + seg_len >= out_size)
+			break;
+		memcpy(out + w, seg, seg_len);
+		w += seg_len;
+	}
+	out[w] = '\0';
 }
 
 /* Dump per-tick engine state so we can see what cl.* actually contains
@@ -151,12 +183,14 @@ static void QNN_LogEngineState(void)
 		n = cl.maxclients < 16 ? cl.maxclients : 16;
 		for (i = 0; i < n; ++i)
 		{
+			char name_esc[16 * 6 + 1];
 			if (cl.scores[i].name[0] == 0) continue;
 			if (reported > 0)
 				fprintf(qnn_client_engine_log, ",");
+			QNN_JsonEscape(name_esc, sizeof(name_esc), cl.scores[i].name, 16);
 			fprintf(qnn_client_engine_log,
-				"{\"slot\":%d,\"name\":\"%.16s\",\"frags\":%d,\"colors\":%d}",
-				i + 1, cl.scores[i].name, cl.scores[i].frags, cl.scores[i].colors);
+				"{\"slot\":%d,\"name\":\"%s\",\"frags\":%d,\"colors\":%d}",
+				i + 1, name_esc, cl.scores[i].frags, cl.scores[i].colors);
 			reported++;
 		}
 	}
@@ -166,17 +200,52 @@ static void QNN_LogEngineState(void)
 	for (i = 1; i < n; ++i)
 	{
 		entity_t *e = &cl_entities[i];
+		char model_esc[32 * 6 + 1];
 		const char *mname = (e->model != NULL) ? e->model->name : "(null)";
 		if (e->model == NULL) continue;
 		if (reported > 0)
 			fprintf(qnn_client_engine_log, ",");
+		QNN_JsonEscape(model_esc, sizeof(model_esc), mname, 32);
 		fprintf(qnn_client_engine_log,
-			"{\"i\":%d,\"model\":\"%.32s\",\"origin\":[%.0f,%.0f,%.0f],\"skin\":%d}",
-			i, mname, e->origin[0], e->origin[1], e->origin[2], e->skinnum);
+			"{\"i\":%d,\"model\":\"%s\",\"origin\":[%.0f,%.0f,%.0f],\"skin\":%d}",
+			i, model_esc, e->origin[0], e->origin[1], e->origin[2], e->skinnum);
 		reported++;
 	}
 	fprintf(qnn_client_engine_log, "]}\n");
 	fflush(qnn_client_engine_log);
+}
+
+/* Dump the model's DECODED action per tick (the decision, not the engine-state
+   result): move signs, attack, look turn magnitude + heading, decided weapon vs
+   the currently-held weapon. JSONL, one record per tick. Triggered by the
+   QNN_CLIENT_ACTION_LOG env var. This is what separates move-jitter (fb/lr
+   flipping) from look-spin (heading sweeping) and shows whether the weapon head
+   ever decides to switch (decided != held). */
+static void QNN_LogAction(const qnn_action_t *a)
+{
+	float turn_deg, heading_deg;
+
+	if (qnn_client_action_log == NULL || a == NULL)
+		return;
+
+	/* look[0]=cos(turn), look[1]=yaw comp (right), look[2]=pitch comp (up). */
+	turn_deg = (float)(acos((double)QNN_Clamp(a->look[0], -1.0f, 1.0f)) * 180.0 / M_PI);
+	heading_deg = (float)(atan2((double)a->look[2], (double)a->look[1]) * 180.0 / M_PI);
+
+	/* `held` must be the same 1..8 weapon id as a->weapon, so the
+	   decided!=held comparison is meaningful.  cl.stats[STAT_ACTIVEWEAPON]
+	   is an IT_ item bitflag (IT_AXE=4096, IT_SHOTGUN=1, ...), not a 1..8
+	   id — QNN_WeaponId() does the canonical mapping. */
+	fprintf(qnn_client_action_log,
+		"{\"t\":%d,\"move\":[%d,%d,%d],\"attack\":%d,"
+		"\"turn_deg\":%.1f,\"heading_deg\":%.1f,"
+		"\"weapon\":%d,\"held\":%d}\n",
+		qnn_client_tick_index,
+		QNN_ActionAxisSign(a->move, 0), QNN_ActionAxisSign(a->move, 1),
+		QNN_ActionAxisSign(a->move, 2), (a->move & 1) ? 1 : 0,
+		turn_deg, heading_deg,
+		(int)a->weapon, QNN_WeaponId());
+	fflush(qnn_client_action_log);
 }
 
 static qboolean QNN_NetClientReady(void)
@@ -293,6 +362,7 @@ int main(int argc, char **argv)
 
 	{
 		const char *engine_log = getenv("QNN_CLIENT_ENGINE_LOG");
+		const char *action_log = getenv("QNN_CLIENT_ACTION_LOG");
 		if (engine_log != NULL && engine_log[0] != 0)
 		{
 			qnn_client_engine_log = fopen(engine_log, "w");
@@ -300,6 +370,14 @@ int main(int argc, char **argv)
 				fprintf(stderr, "qnn_client: failed to open engine log %s\n", engine_log);
 			else
 				fprintf(stderr, "qnn_client: engine state log -> %s\n", engine_log);
+		}
+		if (action_log != NULL && action_log[0] != 0)
+		{
+			qnn_client_action_log = fopen(action_log, "w");
+			if (qnn_client_action_log == NULL)
+				fprintf(stderr, "qnn_client: failed to open action log %s\n", action_log);
+			else
+				fprintf(stderr, "qnn_client: decoded-action log -> %s\n", action_log);
 		}
 	}
 
@@ -319,8 +397,9 @@ int main(int argc, char **argv)
 	QNN_TickRegister();
 	cls.demonum = -1;
 
-	/* Register the runtime model-swap cmd before stuffcmds runs so that
-	 * `+model <path>` on argv is honored as the initial load. */
+	/* Register the model-swap cmd before the command buffer is flushed below,
+	 * so quake.rc's `stuffcmds` (queued by Host_Init's `exec quake.rc`) honors
+	 * `+model <path>` on argv as the initial load. */
 	Cmd_AddCommand("model", QNN_Cmd_Model_f);
 
 	/* Sound-subsystem no-ops (see QNN_Cmd_SoundStub_f comment). */
@@ -330,7 +409,9 @@ int main(int argc, char **argv)
 	Cmd_AddCommand("soundlist", QNN_Cmd_SoundStub_f);
 	Cmd_AddCommand("soundinfo", QNN_Cmd_SoundStub_f);
 
-	Cbuf_AddText("stuffcmds\n");
+	/* Flush quake.rc (queued by Host_Init) — its `stuffcmds` runs the +args,
+	 * including `+model`. We deliberately do NOT add a second `stuffcmds`: that
+	 * ran `+model` twice and loaded the model twice. */
 	Cbuf_Execute();
 
 	if (qnn_client_onnx_ctx == NULL)
@@ -409,6 +490,8 @@ int main(int argc, char **argv)
 			was_ready = false;
 			continue;
 		}
+
+		QNN_LogAction(next_action);   /* the decoded decision this tick */
 
 		swap = cur_action;
 		cur_action = next_action;

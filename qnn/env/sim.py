@@ -229,6 +229,14 @@ def _write_self_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any]) -> None:
     obs["self_arsenal_scalars"][:] = obs["self_scalars"][16:17]
     obs["self_motion_scalars"][:3] = obs["self_scalars"][13:16]
     obs["self_motion_scalars"][3]  = float(tok.get("view_pitch", 0.0))
+    # look_delta = the engine-computed change in the look vector
+    # (look[t-1] - look[t-2]), supplied by the worker when available;
+    # otherwise left at the zero default (see SelfDequantizer._ensure_look_delta).
+    if "look_delta" in tok:
+        rv = np.asarray(tok["look_delta"], dtype=np.float32)
+        if rv.size != 3:
+            raise ValueError(f"self.look_delta must have 3 values, got {rv.size}")
+        obs["look_delta"][:] = rv
 
 
 def _write_spatial_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: int) -> None:
@@ -961,8 +969,7 @@ def main() -> int:
         use_weapon_head=False,
         weapon_switch_confidence=0.65,
         weapon_switch_margin=0.15,
-        weapon_use_gru=False,
-        weapon_use_self_readout=True,
+        weapon_sources=("self_readout", "target_feat"),
         weapon_context_from_obs=False,
         look_bypass_gru=False,
         d_target=args.d_model,

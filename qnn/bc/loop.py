@@ -13,6 +13,7 @@ from qnn.bc.supervised_loop import (
     Source,
     StreamingSource,
     make_resident_source,
+    make_resident_source_from_cache,
     make_streaming_source,
     run_epoch,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "Source",
     "StreamingSource",
     "make_resident_source",
+    "make_resident_source_from_cache",
     "make_streaming_source",
     "run_epoch",
 ]

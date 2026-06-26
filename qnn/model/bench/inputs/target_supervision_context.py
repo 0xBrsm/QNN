@@ -1,6 +1,6 @@
 """Forward-scoped target-supervision context for bench pointer ablations.
 
-Mirrors :mod:`engagement_ema_context` / :mod:`prev_look_context`: the
+Mirrors :mod:`engagement_ema_context`: the
 trainer derives privileged target supervision (``target_gt``,
 ``target_probs_idx``, ``prev_target_probs``) from BC labels and enters
 this context before the model forward. Bench pointer modules that

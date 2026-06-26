@@ -2,7 +2,7 @@
   "seed_pool": [23, 42, 77, 83, 89, 97, 101, 113],
   "num_seeds": 3,
   "episodes_per_seed": 10,
-  "policy_mode": "greedy",
+  "policy_mode": "sampled",
   "start_mode": "randomized",
   "record_demos": false,
   "metric": "median"

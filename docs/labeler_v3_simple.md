@@ -482,8 +482,8 @@ arrays and costs almost nothing.
 
 Source:
 
-- `obs_self_scalars[:, 0]` is normalized health (`health / 100`) per
-  `token-spec.md`.
+- `obs_self_scalars[:, 0]` is normalized health (`health / MAX_HEALTH`) per
+  `src/docs/contracts/semantics/semantics.1.md`.
 - The analysis scripts use `_HEALTH = 0` and `DEAD_THR = 0.05`.
 
 Rules:

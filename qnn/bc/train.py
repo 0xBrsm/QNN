@@ -6,6 +6,7 @@ import faulthandler as _faulthandler
 import json
 import os
 import sys as _sys
+import threading as _threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -26,9 +27,19 @@ from qnn.vocab import MAX_TOKEN_OBJECTS, TOKEN_ACTOR
 from qnn.bc.class_weights import attack_class_weights
 from qnn.schema import OBS_DIM
 from qnn.model.network import ModelConfig
-from qnn.model.policy import HEAD_LOSS_WEIGHTS, QNNPolicy
+from qnn.model.policy import QNNPolicy
+from qnn.bc.container import (
+    BCSourceBundle,
+    build_behavior_cloning_sources,
+    effective_head_loss_weights,
+    validate_cache_for_training,
+    validate_source_bundle_compatible,
+)
 from qnn.utils.io import write_json
 from qnn.utils.repro import set_global_seed, write_experiment_manifest
+
+
+_MODEL_INIT_LOCK = _threading.Lock()
 
 
 @dataclass(slots=True)
@@ -143,13 +154,45 @@ class BCConfig:
     # since lag is rare. Default False = bit-identical to current
     # behavior.
     attack_label_shift: bool = False
+    # Opt-in: when true, the attack-head LOSS and val precision/recall/F1
+    # metric only see op=1 frames (input_mask bit 0 == 1). op=0 frames
+    # contribute no gradient and don't count in the confusion matrix;
+    # pos_weight is computed from op=1 counts only. When false (default
+    # = historical behavior), op=0 frames stay in the loss with label
+    # forced to 0 by `feasibility * demo_press`, pos_weight is corpus-
+    # wide, and the metric scores all frames. See QNNPolicy.attack_op_only.
+    attack_op_only: bool = False
+    # >0 swaps the binned look head's hard-argmin cross-entropy for a
+    # distance-aware Gaussian soft-target CE with this σ (radians). Smooths
+    # the foveated sub-degree center bins; 0 = standard one-hot CE. Only the
+    # binned look_cls probe consumes it. See QNNPolicy.look_label_smoothing_sigma.
+    look_label_smoothing_sigma: float = 0.0
+    # --- Autostop: stop when the run is clearly neither learning nor
+    # reorganizing. Replaces the inert regression_patience (which keyed on
+    # mae_move/mae_look — never emitted for distributional heads). A run is
+    # killed only when BOTH hold for `autostop_patience` consecutive epochs:
+    #   (1) not learning  — val _selection_score did not beat the running best
+    #                        by at least autostop_min_improve, AND
+    #   (2) not reorganizing — weight_drift_l2 fell to ≤ autostop_drift_frac ×
+    #                        the drift measured at the last improving epoch
+    #                        (the learning-phase reference). High drift on a
+    #                        val plateau = still reorganizing → keep going.
+    # autostop_patience<=0 disables. Never fires before autostop_min_epoch.
+    autostop_patience: int = 0
+    autostop_min_improve: float = 0.001
+    autostop_drift_frac: float = 0.5
+    autostop_min_epoch: int = 6
+    # Catastrophic hard-stop: if val_selection regresses > this margin ABOVE the
+    # running best, stop immediately regardless of drift/patience/min_epoch (catches
+    # divergence the reorganizing-veto would otherwise mask). 0 disables; always on
+    # (independent of autostop_patience) since divergence should stop even runs that
+    # left the normal autostop off. 0.5 is well above normal epoch-to-epoch noise.
+    autostop_catastrophic_margin: float = 0.5
 
 
 from qnn.bc.loop import (
     MidEpochState as _MidEpochState,
-    PrecomputedEpisode as _PrecomputedEpisode,
-    make_resident_source as _make_resident_source,
-    make_streaming_source as _make_streaming_source,
+    make_resident_source_from_cache as _make_resident_source_from_cache,
     run_epoch as _run_epoch,
 )
 
@@ -157,26 +200,36 @@ from qnn.bc.loop import (
 def _selection_score(metrics: Mapping[str, float]) -> float:
     """Composite selection metric for combat-objective BC.
 
-    Lower is better. Each head contributes additively; missing metrics default
-    to a neutral value so runs with subsets of heads still produce monotonic
-    improvement signals.
+    Lower is better. Every head contributes ``(1 − <head>_skill)`` — the
+    fraction of that head's marginal entropy it did NOT capture. Skill is the
+    common ruler (``<head>_dll / H_marg``, a proper scoring rule normalised to
+    [.,1)); summing the normalised terms weights all five heads equally, unlike
+    raw nats/KL/BCE whose scales differ ~20×. argmax F1/acc are diagnostics and
+    are NOT used here. The single source of truth is src/docs/head-metrics.md.
+
+    Heads absent from a run contribute a neutral 0 (skill defaults to 1). The
+    fallbacks below only fire on the train-proxy path, where the distributional
+    sufficient stats may not have been emitted; the val path that actually
+    selects checkpoints always has ``<head>_skill``.
     """
-    target_error = 1.0 - float(metrics.get("acc_target", 1.0))
-    # Move: 3-axis macro-F1 (each axis macro-averages the 3 classes
-    # neg/none/pos).  Scaled by 3 to match the magnitude of the historical
-    # axis-sum-of-error form so selection scores line up with prior runs.
-    move_err = 3.0 * (1.0 - float(metrics.get("f1_move", 1.0)))
-    # Look: cos_sim ranges in [-1, 1]; convert to a "1 - cos" error in [0, 2].
-    look_err = 1.0 - float(metrics.get("cos_sim_look", 1.0))
-    # Fire: F1 ranges in [0, 1]; convert to a "1 - f1" error in [0, 1].
-    attack_f1 = float(metrics.get("f1_attack", 1.0))
-    attack_err = 1.0 - attack_f1
-    # Weapon: macro-F1 across 8 classes — equal weight regardless of
-    # frequency so rare-weapon failures don't disappear into the dominant
-    # rocket-launcher class.
-    weapon_f1 = float(metrics.get("f1_weapon_global", metrics.get("f1_weapon", 1.0)))
-    weapon_err = 1.0 - weapon_f1
-    return target_error + move_err + look_err + attack_err + weapon_err
+    def head_error(head: str, *, loss_key: str | None = None) -> float:
+        skill = metrics.get(f"{head}_skill")
+        if skill is not None:
+            return 1.0 - float(skill)
+        # Train-proxy fallback only: a clean skill wasn't emitted, so fall back
+        # to the raw NLL (lower=better) as a rough monotone proxy. Never used
+        # for checkpoint selection.
+        if loss_key is not None and loss_key in metrics:
+            return float(metrics[loss_key])
+        return 0.0  # neutral — head not present this run
+
+    return (
+        head_error("move", loss_key="loss_move")
+        + head_error("look", loss_key="loss_look")
+        + head_error("target", loss_key="loss_target")
+        + head_error("attack", loss_key="loss_attack")
+        + head_error("weapon", loss_key="loss_weapon")
+    )
 
 
 def _train_eval_schedule(
@@ -221,6 +274,84 @@ def _train_eval_schedule(
     return train_proxy_sum, proxy_gap, reasons
 
 
+def _autostop_decision(
+    *,
+    selection_metric: float,
+    prev_best: float,
+    weight_drift_l2: float,
+    drift_ref: "float | None",
+    stall: int,
+    epoch: int,
+    patience: int,
+    min_improve: float,
+    drift_frac: float,
+    min_epoch: int,
+    catastrophic_margin: float = 0.0,
+) -> "tuple[bool, int, float | None, str]":
+    """Decide whether to stop a BC run that is neither learning nor reorganizing.
+
+    Pure function of this epoch's signals + carried state. Returns
+    ``(stop, new_stall, new_drift_ref, reason)``:
+
+      * learning      — ``selection_metric`` beat ``prev_best`` (the running best
+                        BEFORE this epoch's update) by ≥ ``min_improve``. On an
+                        improving epoch the stall counter resets and the drift
+                        reference is refreshed to this epoch's ``weight_drift_l2``
+                        (the learning-phase drift at the current LR).
+      * reorganizing  — ``weight_drift_l2`` is still > ``drift_frac`` × the
+                        reference drift. High weight motion on a val plateau means
+                        the model is still moving and may yet break out → keep going.
+
+    Stop only when BOTH fail for ``patience`` consecutive epochs (and not before
+    ``min_epoch``). ``patience<=0`` disables. The reference being the *last
+    improving* epoch's drift makes the test scale-free and LR-decay aware: it
+    compares plateau motion to how much the weights moved while this same model
+    was still learning, not to the big epoch-0 init-settle.
+
+    CATASTROPHIC hard-stop (``catastrophic_margin>0``): if val_selection regresses
+    more than ``catastrophic_margin`` ABOVE the running best, stop IMMEDIATELY —
+    bypassing the reorganizing-veto, patience, and min_epoch. This catches
+    divergence/blow-ups, which the drift-veto otherwise masks: a gradient explosion
+    produces *huge* weight drift that reads as "productive reorganization", so the
+    normal stop never fires while val craters. (Real failure mode: a run diverged
+    ~ep19, val_selection shot positive, drift spiked — and the normal stop held it.)
+    """
+    improved = selection_metric < (prev_best - min_improve)
+    if improved:
+        new_stall = 0
+        new_drift_ref = weight_drift_l2
+    else:
+        new_stall = stall + 1
+        new_drift_ref = drift_ref
+    # Catastrophic regression: val collapsed far below the best (divergence). prev_best
+    # is inf until a best exists, so `> inf + margin` is False at the first epoch.
+    if catastrophic_margin > 0.0 and selection_metric > prev_best + catastrophic_margin:
+        return (
+            True, new_stall, new_drift_ref,
+            f"CATASTROPHIC: val_selection {selection_metric:+.4f} regressed "
+            f">{catastrophic_margin:g} above best {prev_best:+.4f} (divergence — "
+            f"drift-veto/patience bypassed)",
+        )
+    reorganizing = (
+        new_drift_ref is not None
+        and new_drift_ref > 0.0
+        and weight_drift_l2 > drift_frac * new_drift_ref
+    )
+    stop = (
+        patience > 0
+        and (epoch + 1) >= min_epoch
+        and new_stall >= patience
+        and not reorganizing
+    )
+    reason = ""
+    if stop:
+        _ref = new_drift_ref if new_drift_ref is not None else float("nan")
+        reason = (
+            f"{new_stall} epochs without ≥{min_improve:g} val-selection improvement; "
+            f"drift {weight_drift_l2:.3f} ≤ {drift_frac:g}×{_ref:.3f} "
+            f"(settled — not reorganizing)"
+        )
+    return stop, new_stall, new_drift_ref, reason
 
 
 
@@ -393,47 +524,6 @@ def _compute_target_probs(
     legacy_obs = _densify_obs_for_labeler(obs_padded)
     return label_enemy_target_probs(
         legacy_obs, actions, config=DEFAULT_LABELER_CONFIG,
-    )
-
-
-def _madvise_sequential(arr: np.ndarray) -> None:
-    """Hint the kernel to read-ahead and drop pages behind the cursor.
-
-    Mmap'd training shards can be tens of GB.  Without this hint the
-    page cache fills with every page ever touched, competing with WSL2
-    VM memory.  MADV_SEQUENTIAL lets the kernel reclaim pages that the
-    training loop has already consumed.
-    """
-    import mmap as mmap_mod
-    mm = getattr(arr, '_mmap', None)
-    if mm is not None and hasattr(mm, 'madvise'):
-        mm.madvise(mmap_mod.MADV_SEQUENTIAL)
-
-
-def _effective_head_loss_weights(raw: str) -> Dict[str, float]:
-    weights = dict(HEAD_LOSS_WEIGHTS)
-    if not raw:
-        return weights
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"head_loss_weights must be a JSON object, got {type(parsed).__name__}")
-    for head, value in parsed.items():
-        weights[str(head)] = float(value)
-    return weights
-
-
-def _require_action_files(
-    action_files: Mapping[str, str],
-    required_actions: frozenset[str],
-    *,
-    cache_dir: Path,
-) -> None:
-    missing = sorted(required_actions.difference(action_files))
-    if not missing:
-        return
-    raise RuntimeError(
-        f"{cache_dir} is missing required action arrays {missing}. "
-        "Recollect BC data on this branch before training."
     )
 
 
@@ -742,251 +832,6 @@ def _pad_entity_batch(
     return out
 
 
-def _load_precomputed(
-    cache_dir: Path,
-    *,
-    required_actions: frozenset[str] = frozenset(),
-    segment_mask: dict | None = None,
-    token_mask: dict | None = None,
-) -> list[_PrecomputedEpisode]:
-    """Load precomputed episodes with real memory-mapped .npy arrays.
-
-    Episodes are returned sorted globally by ``(demo_idx, episode_idx,
-    segment_idx)``.  ``demo_idx`` is the position of each demo in the
-    collector's canonical sorted demo list; ``episode_idx`` is the
-    0-based ordinal of each surviving run when the collector segmented
-    the demo on the filter config's ``drop_tick_labels`` mask;
-    ``segment_idx`` is the 0-based ordinal of each surviving run inside
-    that episode after applying the train-time ``segment_mask``
-    predicate (or 0 if no mask is set).  This makes training-time
-    shuffle a pure function of the seed, the dataset, and the mask —
-    independent of which worker finished first during collection.
-
-    No ``segment_mask`` keeps each episode as one ``segment_idx=0``
-    trajectory. ``segment_mask`` and ``token_mask`` both use the
-    shared training filter DSL; native-v1 caches supply cached
-    ``target_probs`` so common action masks do not rerun the labeler.
-    """
-    manifest = json.loads((cache_dir / "manifest.json").read_text())
-    if not isinstance(manifest, dict) or manifest.get("format") != "sharded_v1":
-        raise RuntimeError(
-            f"{cache_dir}/manifest.json: expected sharded_v1 format. "
-            "Recollect BC data with the current collector."
-        )
-    # engine_norm phase 2 explicit version gate. Legacy f16 shards have
-    # no `format_version` key — refuse them loudly; in-place migration is
-    # not supported (per the no-backcompat directive). Recollect via
-    # `python -m qnn.bc.collect` to produce native_v1 shards.
-    format_version = manifest.get("format_version")
-    if format_version != "native_v1":
-        raise RuntimeError(
-            f"{cache_dir}/manifest.json: expected format_version='native_v1', "
-            f"got {format_version!r}. Legacy f16 caches must be recollected "
-            f"with the current collector — no silent migration."
-        )
-
-    import time as _time
-    import os
-    from concurrent.futures import ProcessPoolExecutor
-    import multiprocessing as _mp
-
-    shards = manifest.get("shards", [])
-
-    required = set(required_actions)
-    required.add("target_probs")
-    _validate_loader_options(cache_dir, shards, segment_mask, token_mask, required)
-
-    shard_args = []
-    fallback_idx = 0
-    for shard_idx, shard in enumerate(shards):
-        n_eps = len(shard.get("episode_lengths", []))
-        shard_args.append((
-            str(cache_dir), shard_idx, shard, fallback_idx,
-            frozenset(required), segment_mask, token_mask,
-        ))
-        fallback_idx += n_eps
-
-    _t_load_start = _time.perf_counter()
-    # Use os.cpu_count() capped to a reasonable max — labeler is python-
-    # bound so we need one worker per logical core to actually parallelize
-    # it. fork() context inherits the imports already done by the parent
-    # so workers start near-instantly.
-    n_workers = min(os.cpu_count() or 4, 30)
-    ctx = _mp.get_context("fork")
-    completed = 0
-    total_shards = len(shard_args)
-    _t_last_report = _t_load_start
-
-    from concurrent.futures import as_completed
-
-    pass1_results: list[tuple[int, int, list[_ShardEpisodeMeta]] | None] = [None] * total_shards
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
-        fut_to_idx = {
-            ex.submit(_process_shard_work_count_only, shard_args[i]): i
-            for i in range(total_shards)
-        }
-        for fut in as_completed(fut_to_idx):
-            idx = fut_to_idx[fut]
-            pass1_results[idx] = fut.result()
-            completed += 1
-            _now = _time.perf_counter()
-            if _now - _t_last_report >= 5.0 or completed == total_shards:
-                _elapsed = _now - _t_load_start
-                eps_so_far = sum(
-                    len(r[2]) for r in pass1_results if r is not None
-                )
-                print(
-                    f"  [bc/load] {completed}/{total_shards} shards "
-                    f"(counts)  {eps_so_far} eps  {_elapsed:.1f}s",
-                    flush=True,
-                )
-                _t_last_report = _now
-
-    keep_idxs = [i for i, r in enumerate(pass1_results) if r is not None]
-    if not keep_idxs:
-        print(f"  [bc/load] DONE 0 eps in "
-              f"{_time.perf_counter() - _t_load_start:.1f}s "
-              f"({total_shards} shards × {n_workers} workers)", flush=True)
-        return []
-
-    all_meta: list[tuple[tuple[int, int, int], int, int, int, int, np.ndarray | None]] = []
-    shard_offsets: dict[int, tuple[int, int, int, int]] = {}
-    # shard_offsets[idx] = (row_offset, row_count, tok_offset, tok_count)
-    row_cursor = 0
-    tok_cursor = 0
-    for idx in keep_idxs:
-        n_rows, n_toks, ep_metas = pass1_results[idx]  # type: ignore[misc]
-        shard_offsets[idx] = (row_cursor, n_rows, tok_cursor, n_toks)
-        for ep in ep_metas:
-            all_meta.append((
-                ep.sort_key,
-                row_cursor + ep.row_start,
-                row_cursor + ep.row_end,
-                tok_cursor + ep.tok_start,
-                tok_cursor + ep.tok_end,
-                ep.ep_indptr,
-            ))
-        row_cursor += n_rows
-        tok_cursor += n_toks
-    total_rows = row_cursor
-    total_toks = tok_cursor
-    pass1_results = []  # drop refs; ep_metas now live in all_meta
-
-    _t_pass1_done = _time.perf_counter()
-    in_flight_cap = max(2 * n_workers, 8)
-    global_obs_row: dict[str, np.ndarray] = {}
-    global_obs_tok: dict[str, np.ndarray] = {}
-    global_acts: dict[str, np.ndarray] = {}
-
-    pass2_completed = 0
-    pass2_total = len(keep_idxs)
-    _t_last_report = _t_pass1_done
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
-        pending: dict[Any, int] = {}
-        submit_iter = iter(keep_idxs)
-        # Prime the pool.
-        for _ in range(in_flight_cap):
-            try:
-                idx = next(submit_iter)
-            except StopIteration:
-                break
-            fut = ex.submit(_process_shard_work, shard_args[idx])
-            pending[fut] = idx
-        while pending:
-            fut = next(iter(as_completed(pending.keys())))
-            shard_idx = pending.pop(fut)
-            batch = fut.result()
-            if batch is not None:
-                r_off, n_rows, t_off, n_toks = shard_offsets[shard_idx]
-                # First non-empty batch allocates globals.
-                if not global_obs_row and not global_obs_tok and not global_acts:
-                    for key, arr in batch.obs_row.items():
-                        target_dtype = (
-                            np.int32 if arr.dtype in (np.uint16, np.uint32) else arr.dtype
-                        )
-                        global_obs_row[key] = np.empty(
-                            (total_rows,) + arr.shape[1:], dtype=target_dtype,
-                        )
-                    for key, arr in batch.obs_tok.items():
-                        target_dtype = (
-                            np.int32 if arr.dtype in (np.uint16, np.uint32) else arr.dtype
-                        )
-                        global_obs_tok[key] = np.empty(
-                            (total_toks,) + arr.shape[1:], dtype=target_dtype,
-                        )
-                    for head_k, arr in batch.acts.items():
-                        global_acts[head_k] = np.empty(
-                            (total_rows,) + arr.shape[1:], dtype=arr.dtype,
-                        )
-                for key, buf in global_obs_row.items():
-                    np.copyto(
-                        buf[r_off:r_off + n_rows],
-                        batch.obs_row[key], casting="same_kind",
-                    )
-                for head_k, buf in global_acts.items():
-                    np.copyto(
-                        buf[r_off:r_off + n_rows],
-                        batch.acts[head_k], casting="same_kind",
-                    )
-                for key, buf in global_obs_tok.items():
-                    np.copyto(
-                        buf[t_off:t_off + n_toks],
-                        batch.obs_tok[key], casting="same_kind",
-                    )
-                batch.obs_row.clear()
-                batch.obs_tok.clear()
-                batch.acts.clear()
-            del batch
-            pass2_completed += 1
-            try:
-                next_idx = next(submit_iter)
-                fut2 = ex.submit(_process_shard_work, shard_args[next_idx])
-                pending[fut2] = next_idx
-            except StopIteration:
-                pass
-            _now = _time.perf_counter()
-            if _now - _t_last_report >= 5.0 or pass2_completed == pass2_total:
-                _elapsed = _now - _t_load_start
-                print(
-                    f"  [bc/load] {pass2_completed}/{pass2_total} shards "
-                    f"(data)  {_elapsed:.1f}s",
-                    flush=True,
-                )
-                _t_last_report = _now
-
-    _t_global_alloc = _t_pass1_done
-    indexed: list[tuple[tuple[int, int, int], _PrecomputedEpisode]] = []
-    for sort_key, row_lo, row_hi, tok_lo, tok_hi, ep_indptr in all_meta:
-        sub_obs: dict[str, np.ndarray] = {}
-        for key, buf in global_obs_row.items():
-            sub_obs[key] = buf[row_lo:row_hi]
-        for key, buf in global_obs_tok.items():
-            sub_obs[key] = buf[tok_lo:tok_hi]
-        sub_act: dict[str, np.ndarray] = {}
-        for head, buf in global_acts.items():
-            sub_act[head] = buf[row_lo:row_hi]
-        indexed.append((
-            sort_key,
-            _PrecomputedEpisode(
-                obs=sub_obs,
-                actions=sub_act,
-                n_samples=row_hi - row_lo,
-                sort_key=sort_key,
-                entity_indptr=ep_indptr,
-            ),
-        ))
-
-    indexed.sort(key=lambda item: item[0])
-    _t_total = _time.perf_counter() - _t_load_start
-    print(
-        f"  [bc/load] DONE {len(indexed)} eps in {_t_total:.1f}s "
-        f"({total_shards} shards × {n_workers} workers; "
-        f"global_alloc={_t_global_alloc - _t_load_start:.1f}s)",
-        flush=True,
-    )
-    return [ep for _, ep in indexed]
-
-
 @dataclass(slots=True)
 class _ShardEpisodeMeta:
     row_start: int
@@ -1002,31 +847,6 @@ class _ShardSegment:
     src_row_start: int
     src_row_end: int
     meta: _ShardEpisodeMeta
-
-
-@dataclass(slots=True)
-class _ShardBatch:
-    obs_row: dict[str, np.ndarray]
-    obs_tok: dict[str, np.ndarray]
-    acts: dict[str, np.ndarray]
-    episodes: list[_ShardEpisodeMeta]
-
-
-def _validate_loader_options(
-    cache_dir: Path,
-    shards: Sequence[Mapping[str, Any]],
-    segment_mask: dict | None,
-    token_mask: dict | None,
-    required_actions: frozenset[str],
-) -> None:
-    del segment_mask, token_mask
-    for shard in shards:
-        _require_action_files(shard["actions"], required_actions, cache_dir=cache_dir)
-        if "entity_count" not in shard.get("obs", {}):
-            raise RuntimeError(
-                f"{cache_dir} contains a native_v1 shard without obs.entity_count; "
-                "recollect with the current collector."
-            )
 
 
 def _episode_ids(
@@ -1139,156 +959,6 @@ def _shard_segments(
     return segments
 
 
-def _process_shard_work_count_only(
-    args: tuple,
-) -> "tuple[int, int, list[_ShardEpisodeMeta]] | None":
-    (cache_dir_str, shard_idx, shard, fallback_idx_start,
-     required_actions, segment_mask, token_mask) = args
-    cache_dir = Path(cache_dir_str)
-    del shard_idx, required_actions
-    obs_arrays = {
-        key: np.load(cache_dir / fname, mmap_mode="r")
-        for key, fname in shard["obs"].items()
-    }
-    action_arrays = {
-        head: np.load(cache_dir / fname, mmap_mode="r")
-        for head, fname in shard["actions"].items()
-    }
-    if "move" in action_arrays:
-        refs = _filter_referenced_keys(segment_mask)
-        if "act.move" in refs or "act.attack" in refs:
-            move_packed = action_arrays["move"]
-            action_arrays["move"] = _unpack_move_axes(move_packed)
-            action_arrays["attack"] = _unpack_attack_bit(move_packed)
-    shard_indptr = _build_indptr(obs_arrays["entity_count"])
-    keep = _token_keep_mask(obs_arrays, token_mask)
-    action_arrays["target_probs"] = _mask_target_probs_for_tokens(
-        action_arrays["target_probs"], shard_indptr, keep,
-    )
-    segments = _shard_segments(
-        shard, fallback_idx_start, obs_arrays, action_arrays, shard_indptr, segment_mask,
-    )
-    if not segments:
-        return None
-    return (
-        segments[-1].meta.row_end,
-        segments[-1].meta.tok_end,
-        [seg.meta for seg in segments],
-    )
-
-
-def _process_shard_work(
-    args: tuple,
-):
-    """Worker entrypoint: process one shard's episodes end-to-end.
-
-    Returns one ``_ShardBatch`` (or ``None`` if the shard contributed
-    no surviving rows). The shard batch carries the surviving rows /
-    tokens as concatenated per-key arrays plus per-episode offset
-    metadata; the parent merges all worker batches into global
-    per-key buffers and materializes ``_PrecomputedEpisode`` records
-    that view those globals.
-
-    fork() context means imports / constants from the parent are
-    inherited at zero startup cost.
-    """
-    (cache_dir_str, shard_idx, shard, fallback_idx_start,
-     required_actions, segment_mask, token_mask) = args
-    cache_dir = Path(cache_dir_str)
-    del shard_idx, required_actions
-
-    obs_arrays = {
-        key: np.load(cache_dir / fname, mmap_mode="r")
-        for key, fname in shard["obs"].items()
-    }
-    obs_arrays = _inject_view_pitch_from_spatial_dir(obs_arrays)
-    # PyTorch CPU lacks index_copy_ for uint16/uint32, which the
-    # chunked-prefetch path uses for lane-packed batch staging. The
-    # GPU-resident path is unaffected (it uses index_select). Upcast
-    # u16/u32 fields to signed equivalents at the load boundary so the
-    # downstream training code is dtype-agnostic.
-    obs_arrays = {
-        key: (np.asarray(arr).astype(np.int32, copy=False)
-              if arr.dtype in (np.uint16, np.uint32)
-              else arr)
-        for key, arr in obs_arrays.items()
-    }
-    action_arrays = {
-        head: np.load(cache_dir / fname, mmap_mode="r")
-        for head, fname in shard["actions"].items()
-    }
-    if "move" in action_arrays:
-        move_packed = action_arrays["move"]
-        action_arrays["move"] = _unpack_move_axes(move_packed)
-        action_arrays["attack"] = _unpack_attack_bit(move_packed)
-    for arr in obs_arrays.values():
-        _madvise_sequential(arr)
-    for arr in action_arrays.values():
-        if isinstance(arr, np.memmap):
-            _madvise_sequential(arr)
-
-    shard_indptr = _build_indptr(obs_arrays["entity_count"])
-    keep = _token_keep_mask(obs_arrays, token_mask)
-    if keep is not None:
-        action_arrays["target_probs"] = _mask_target_probs_for_tokens(
-            action_arrays["target_probs"], shard_indptr, keep,
-        )
-    segments = _shard_segments(
-        shard, fallback_idx_start, obs_arrays, action_arrays, shard_indptr, segment_mask,
-    )
-    total_kept_rows = segments[-1].meta.row_end if segments else 0
-    if total_kept_rows == 0:
-        return None
-
-    def _gather_rows(arr: np.ndarray) -> np.ndarray:
-        out = np.empty((total_kept_rows,) + arr.shape[1:], dtype=arr.dtype)
-        cursor = 0
-        for seg in segments:
-            n = seg.src_row_end - seg.src_row_start
-            if n:
-                out[cursor:cursor + n] = arr[seg.src_row_start:seg.src_row_end]
-                cursor += n
-        return out
-
-    shard_obs_row: dict[str, np.ndarray] = {}
-    for key, arr in obs_arrays.items():
-        if key in _NATIVE_TOKEN_INDEXED_OBS_FIELDS:
-            continue
-        shard_obs_row[key] = _gather_rows(arr)
-
-    shard_acts: dict[str, np.ndarray] = {}
-    for head, arr in action_arrays.items():
-        shard_acts[head] = _gather_rows(arr)
-
-    total_kept_toks = segments[-1].meta.tok_end
-
-    def _gather_toks(arr: np.ndarray) -> np.ndarray:
-        out = np.empty((total_kept_toks,) + arr.shape[1:], dtype=arr.dtype)
-        cursor = 0
-        for seg in segments:
-            s = int(shard_indptr[seg.src_row_start])
-            e = int(shard_indptr[seg.src_row_end])
-            n = e - s
-            if n:
-                out[cursor:cursor + n] = arr[s:e]
-                cursor += n
-        return out
-
-    shard_obs_tok: dict[str, np.ndarray] = {}
-    for key, arr in obs_arrays.items():
-        if key in _NATIVE_TOKEN_INDEXED_OBS_FIELDS:
-            source = _mask_token_array(key, arr, keep) if keep is not None else arr
-            shard_obs_tok[key] = _gather_toks(source)
-
-    return _ShardBatch(
-        obs_row=shard_obs_row,
-        obs_tok=shard_obs_tok,
-        acts=shard_acts,
-        episodes=[seg.meta for seg in segments],
-    )
-
-
-
 # ---------------------------------------------------------------------------
 # Prometheus pushgateway integration (optional).
 # ---------------------------------------------------------------------------
@@ -1360,8 +1030,17 @@ def run_behavior_cloning(
     seed_checkpoint: str = "",
     *,
     model_factory: Callable[[int, ModelConfig], "torch.nn.Module"] | None = None,
+    side_channel_provider: Callable[..., Any] | None = None,
+    source_bundle: BCSourceBundle | None = None,
+    release_sources: bool = True,
+    log_label: str = "",
+    cancel_event: "_threading.Event | None" = None,
 ) -> Dict[str, float]:
     """Run BC training.
+
+    ``side_channel_provider`` is forwarded to ``QNNPolicy``; bench probe runs
+    pass ``qnn.model.bench.side_channels.bench_side_channel_scope`` so the
+    label-derived bench contexts are entered around each forward pass.
 
     ``model_factory`` is the same hook ``QNNPolicy.__init__`` takes; pass
     one to swap in an ablation module (e.g. a per-head probe from
@@ -1372,6 +1051,11 @@ def run_behavior_cloning(
     ``QNNPolicy.load`` reconstructs the saved architecture; passing both
     is rejected to fail loud rather than silently dropping the factory.
     """
+    log_prefix = f"  [bc {log_label}]" if log_label else "  [bc]"
+
+    def _log(message: str) -> None:
+        print(f"{log_prefix} {message}")
+
     set_global_seed(config.seed)
     # Episode shuffle uses a fixed seed (42) independent of the model init
     # seed, so all ablation runs see the same episode ordering per epoch.
@@ -1385,7 +1069,7 @@ def run_behavior_cloning(
         env_url = os.environ.get("PUSHGATEWAY_URL", "")
         if env_url:
             object.__setattr__(config, "prometheus_pushgateway_url", env_url)
-            print(f"  [bc] Prometheus pushgateway: {env_url}")
+            _log(f"Prometheus pushgateway: {env_url}")
 
     if not str(config.output_dir).strip():
         raise RuntimeError("Behavior cloning requires output_dir")
@@ -1393,79 +1077,41 @@ def run_behavior_cloning(
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    # Load precomputed .npy caches (produced by python -m qnn.bc.collect)
-    bc_data_dir = Path(config.bc_data_dir) if hasattr(config, "bc_data_dir") else Path(config.output_dir).parent
-    train_cache = bc_data_dir / "precomputed_train"
-    val_cache = bc_data_dir / "precomputed_val"
-    if not train_cache.exists():
-        raise RuntimeError(f"BC training data not found at {train_cache}. Run python -m qnn.bc.collect first.")
-
-    # Verify the dataset identity matches what the run expects. The check
-    # is strict (raises FingerprintMismatch on mismatch or absent
-    # fingerprint.json); empty fingerprint strings are rejected at config
-    # load via _require_string in build_run_bc_config.
-    from qnn import collection_fingerprint
-    actual_fp = collection_fingerprint.verify(
-        expected_fingerprint=config.collection_fingerprint,
-        data_dir=bc_data_dir,
-    )
-    print(f"  [bc] collection fingerprint: {actual_fp['fingerprint']}")
-
-    head_loss_weights = _effective_head_loss_weights(config.head_loss_weights)
-    required_actions_set: set[str] = set()
-    if config.model.use_weapon_head and head_loss_weights.get("weapon", 1.0) > 0.0:
-        required_actions_set.add("weapon")
-    # input_mask is required only when the input_mask toggle is enabled
-    # (label switches to engine outcome). Corpora without it (pre-
-    # emission) still train cleanly when the toggle is off.
-    if config.input_mask:
-        required_actions_set.add("input_mask")
-    required_actions = frozenset(required_actions_set)
-
-    print(f"  [bc] Loading training data: {train_cache}")
-    if config.segment_mask:
-        print(f"  [bc] segment_mask: {config.segment_mask}")
-    if config.token_mask:
-        print(f"  [bc] token_mask: {config.token_mask}")
-    if bool(config.streaming):
-        # Streaming mode: no host RAM materialization. Episodes live as
-        # mmap-backed EpisodeRef metadata; per-batch gather reads shards.
-        train_episodes: list = []
-        val_episodes: list = []
-    else:
-        train_episodes = _load_precomputed(
-            train_cache, required_actions=required_actions,
-            segment_mask=config.segment_mask,
-            token_mask=config.token_mask,
-        )
-        val_episodes: list = []
+    head_loss_weights = effective_head_loss_weights(config.head_loss_weights)
 
     # Configure mixed-precision autocast via the env var that QNNPolicy reads.
     os.environ["QNN_AUTOCAST_DTYPE"] = config.dtype
-    print(f"  [bc] dtype={config.dtype}")
+    _log(f"dtype={config.dtype}")
 
     obs_dim = OBS_DIM
-    if seed_checkpoint and Path(seed_checkpoint).exists():
-        if model_factory is not None:
-            raise RuntimeError(
-                "model_factory is incompatible with seed_checkpoint — "
-                "QNNPolicy.load rebuilds the saved architecture itself."
+    # QNNPolicy construction intentionally seeds torch's global RNG for
+    # deterministic init. Keep that short section serialized so
+    # in-process parallel ablations do not race each other's initial
+    # weights.
+    with _MODEL_INIT_LOCK:
+        if seed_checkpoint and Path(seed_checkpoint).exists():
+            if model_factory is not None:
+                raise RuntimeError(
+                    "model_factory is incompatible with seed_checkpoint — "
+                    "QNNPolicy.load rebuilds the saved architecture itself."
+                )
+            _log(f"Fine-tuning from seed: {seed_checkpoint}")
+            model = QNNPolicy.load(seed_checkpoint, device=config.device)
+        else:
+            model = QNNPolicy(
+                obs_dim=obs_dim,
+                model=config.model,
+                jump_pos_weight=config.jump_pos_weight,
+                attack_focal_gamma=config.attack_focal_gamma,
+                attack_focal_alpha=config.attack_focal_alpha,
+                attack_distance_sigma=config.attack_distance_sigma,
+                jump_distance_sigma=config.jump_distance_sigma,
+                look_label_smoothing_sigma=config.look_label_smoothing_sigma,
+                seed=config.seed,
+                device=config.device,
+                model_factory=model_factory,
+                side_channel_provider=side_channel_provider,
             )
-        print(f"  [bc] Fine-tuning from seed: {seed_checkpoint}")
-        model = QNNPolicy.load(seed_checkpoint, device=config.device)
-    else:
-        model = QNNPolicy(
-            obs_dim=obs_dim,
-            model=config.model,
-            jump_pos_weight=config.jump_pos_weight,
-            attack_focal_gamma=config.attack_focal_gamma,
-            attack_focal_alpha=config.attack_focal_alpha,
-            attack_distance_sigma=config.attack_distance_sigma,
-            jump_distance_sigma=config.jump_distance_sigma,
-            seed=config.seed,
-            device=config.device,
-            model_factory=model_factory,
-        )
     # input_mask is a training-time toggle, not a ModelConfig field —
     # set after construction so the same checkpoint can be retrained
     # either way (and so seed_checkpoint resumes pick up the run's
@@ -1473,80 +1119,25 @@ def run_behavior_cloning(
     # label is the engine outcome (act = max(usercmd − mask, 0)); when
     # false, the label is the raw demo button (usercmd).
     model.input_mask = bool(config.input_mask)
+    model.attack_op_only = bool(config.attack_op_only)
     # attack_label_shift is also a training-time label-rewrite toggle
     # (no model arch impact, no checkpoint meta). Off by default; when on,
     # the attack-head LOSS reads actions["attack_shifted"] (built by the
     # source above) and val metrics keep using the original attack label.
     model.attack_label_shift = bool(config.attack_label_shift)
 
-    # Build the Source. streaming=False (default) preloads the whole corpus
-    # to device once; the resident builder consumes host episode arrays as
-    # each field is transferred and drops redundant native tensors after
-    # preload dequant. streaming=True keeps shard mmaps lazy and pads/dequants
-    # per batch.
-    _t0 = _time.monotonic()
-    eng_alpha = float(config.engagement_ema_alpha)
-    if bool(config.streaming):
-        print(f"  [bc] streaming=true: lazy mmap reads from {train_cache}")
-        train_source = _make_streaming_source(
-            train_cache, model.device,
-            segment_mask=config.segment_mask, token_mask=config.token_mask,
-            prefetch_depth=max(2, int(config.prefetch)),
-            engagement_ema_alpha=eng_alpha,
-        )
-        val_source = (
-            _make_streaming_source(
-                val_cache, model.device,
-                segment_mask=config.segment_mask, token_mask=config.token_mask,
-                prefetch_depth=max(2, int(config.prefetch)),
-                engagement_ema_alpha=eng_alpha,
-            ) if val_cache.exists()
-            else _make_resident_source([], model.device, engagement_ema_alpha=eng_alpha)
-        )
+    if source_bundle is None:
+        source_bundle = build_behavior_cloning_sources(config, head_loss_weights=head_loss_weights)
     else:
-        import gc as _gc
+        validate_source_bundle_compatible(
+            config, source_bundle, head_loss_weights=head_loss_weights,
+        )
 
-        train_frames = sum(ep.n_samples for ep in train_episodes)
-        print(
-            f"  [bc] preload: concatenating {train_frames} train frames "
-            f"to {model.device}"
-        )
-        train_source = _make_resident_source(
-            train_episodes, model.device,
-            engagement_ema_alpha=eng_alpha,
-            release_host=True,
-            compact_dequantized=True,
-        )
-        _gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if val_cache.exists():
-            print(f"  [bc] Loading validation data: {val_cache}")
-            val_episodes = _load_precomputed(
-                val_cache, required_actions=required_actions,
-                segment_mask=config.segment_mask,
-                token_mask=config.token_mask,
-            )
-        val_frames = sum(ep.n_samples for ep in val_episodes)
-        print(
-            f"  [bc] preload: concatenating {val_frames} val frames "
-            f"to {model.device}"
-        )
-        val_source = _make_resident_source(
-            val_episodes, model.device,
-            engagement_ema_alpha=eng_alpha,
-            release_host=True,
-            compact_dequantized=True,
-        )
-        _gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    print(f"  [bc] source ready in {_time.monotonic() - _t0:.1f}s")
+    train_source = source_bundle.train_source
+    val_source = source_bundle.val_source
+    actual_fp = source_bundle.actual_fingerprint
 
-    sample_counts = {
-        "train": train_source.n_total_rows,
-        "val": val_source.n_total_rows,
-    }
+    sample_counts = source_bundle.sample_counts
     if sample_counts["train"] <= 0:
         raise RuntimeError("No training samples available")
     weights = attack_class_weights(
@@ -1554,6 +1145,7 @@ def run_behavior_cloning(
         head_loss_weights=head_loss_weights,
         override=float(config.attack_pos_weight_override),
         device=model.device,
+        op_only=bool(config.attack_op_only),
     )
     _train_eval_n_eps = len(val_source.episodes)
 
@@ -1562,13 +1154,16 @@ def run_behavior_cloning(
     if config.head_loss_weights:
         hlw = dict(head_loss_weights)
 
-    # Best _selection_score seen so far — composite (1-acc_target) +
-    # 3*(1-f1_move) + (1-cos_sim_look) + (1-f1_attack) + (1-f1_weapon).
-    # NOT a loss; selection error, lower is better.
+    # Best _selection_score seen so far — composite Σ_head (1 − head_skill).
+    # NOT a loss; selection error, lower is better. See src/docs/head-metrics.md.
     best_selection_score = float("inf")
     best_epoch = -1
     history: list[Dict[str, float]] = []
     start_epoch = 0
+    # Running peak weight drift — the reference for the headline ``reorg``
+    # scalar (current drift ÷ peak; ~1 = reorganizing as hard as ever, →0 =
+    # converged/stuck). Raw weight_drift_l2 stays in bc_history.
+    _max_weight_drift = 0.0
 
     # Regression-based stopping state.
     _best_move = float("inf")
@@ -1576,6 +1171,10 @@ def run_behavior_cloning(
     _best_max_reg = float("inf")  # for checkpoint selection: min of max(move_reg, look_reg)
     _best_reg_epoch = -1
     _reg_violations = 0
+
+    # Autostop state (not-learning + not-reorganizing). See _autostop_decision.
+    _autostop_stall = 0
+    _autostop_drift_ref: "float | None" = None
 
     # NAS archive: save every epoch checkpoint to SMB share for offsite backup.
     _NAS_CHECKPOINTS = r"\\pi.local\nqcorpus\bc_checkpoints"
@@ -1591,10 +1190,10 @@ def run_behavior_cloning(
         _variant_dir = _NAS_CHECKPOINTS + "\\" + _variant_name
         smbclient.makedirs(_variant_dir, exist_ok=True)
         _smb_available = True
-        print(f"  [bc] NAS archive available: {_variant_dir}")
+        _log(f"NAS archive available: {_variant_dir}")
     except Exception:
         _smb_available = False
-        print("  [bc] NAS archive not available — skipping offsite backup")
+        _log("NAS archive not available — skipping offsite backup")
 
     # Mid-epoch state: rolling file for deterministic resume within an epoch.
     mid_epoch_path = output / "snapshot.pt"
@@ -1604,7 +1203,11 @@ def run_behavior_cloning(
     checkpoint_path = output / "bc_training_checkpoint.pt"
     if checkpoint_path.exists():
         import torch as _torch_resume
-        from qnn.utils.checkpoint_converter import migrate_entity_embed, migrate_self_scalars
+        from qnn.utils.checkpoint_converter import (
+            migrate_entity_embed,
+            migrate_obs_embedding_self_token_builder,
+            migrate_self_scalars,
+        )
         ckpt = _torch_resume.load(checkpoint_path, map_location=model.device, weights_only=False)
         migrate_entity_embed(
             ckpt["model_state_dict"],
@@ -1614,6 +1217,7 @@ def run_behavior_cloning(
             ckpt["model_state_dict"],
             optimizer=ckpt.get("optimizer_state_dict"),
         )
+        migrate_obs_embedding_self_token_builder(ckpt["model_state_dict"])
         model.model.load_state_dict(ckpt["model_state_dict"])
         # Resume compat: accept new key, fall back to the old "best_val_loss"
         # name (a misnomer that held the same selection score).
@@ -1628,6 +1232,8 @@ def run_behavior_cloning(
         _best_max_reg = ckpt.get("_best_max_reg", float("inf"))
         _best_reg_epoch = ckpt.get("_best_reg_epoch", -1)
         _reg_violations = ckpt.get("_reg_violations", 0)
+        _autostop_stall = ckpt.get("_autostop_stall", 0)
+        _autostop_drift_ref = ckpt.get("_autostop_drift_ref", None)
         # Optimizer state restored after first supervised step creates it.
         _resume_optimizer_state = ckpt.get("optimizer_state_dict")
         # Restore rng state so resume produces the same episode ordering
@@ -1635,7 +1241,7 @@ def run_behavior_cloning(
         _saved_rng_state = ckpt.get("rng_state")
         if _saved_rng_state is not None:
             rng.bit_generator.state = _saved_rng_state
-        print(f"  [bc] Resuming from epoch {start_epoch} (best_selection={best_selection_score:.4f} at epoch {best_epoch})")
+        _log(f"Resuming from epoch {start_epoch} (best_selection={best_selection_score:.4f} at epoch {best_epoch})")
     else:
         _resume_optimizer_state = None
 
@@ -1651,13 +1257,15 @@ def run_behavior_cloning(
                 _resume_optimizer_state = _mid_ckpt.get("optimizer_state_dict")
                 _mid_epoch_resume = _mid_ckpt["mid_epoch_state"]
                 rng.bit_generator.state = _mid_ckpt["rng_state"]
-                print(f"  [bc] Mid-epoch resume: epoch {start_epoch}, "
-                      f"step {_mid_epoch_resume.opt_steps}, "
-                      f"chunk {_mid_epoch_resume.next_episode}")
+                _log(
+                    f"Mid-epoch resume: epoch {start_epoch}, "
+                    f"step {_mid_epoch_resume.opt_steps}, "
+                    f"chunk {_mid_epoch_resume.next_episode}"
+                )
             else:
                 mid_epoch_path.unlink()
         except Exception as exc:
-            print(f"  [bc] Mid-epoch state load failed: {exc}")
+            _log(f"Mid-epoch state load failed: {exc}")
             mid_epoch_path.unlink(missing_ok=True)
 
     # torch.compile: tested but net negative for this model size (189K params).
@@ -1682,9 +1290,11 @@ def run_behavior_cloning(
         step_metrics["epoch"] = float(epoch)
         _step_log.append(step_metrics)
         mae_parts = [f"{k}={v:.4f}" for k, v in sorted(step_metrics.items()) if k.startswith("mae_")]
-        print(f"  [bc]   step {int(step_metrics.get('opt_step', 0)):>5d}  "
-              f"loss={step_metrics.get('loss', 0):.4f}  "
-              f"{'  '.join(mae_parts)}")
+        _log(
+            f"  step {int(step_metrics.get('opt_step', 0)):>5d}  "
+            f"loss={step_metrics.get('loss', 0):.4f}  "
+            f"{'  '.join(mae_parts)}"
+        )
         # Flush step log to disk every report interval for live monitoring.
         write_json(output / "bc_step_log.json", {"steps": _step_log})
 
@@ -1726,7 +1336,7 @@ def run_behavior_cloning(
             alpha = float(epoch) / float(config.epochs - 1)
             current_pw = (1.0 - alpha) * float(config.jump_pos_weight) + alpha * float(config.jump_pos_weight_end)
             model.jump_pos_weight = current_pw
-            print(f"  [bc] jump_pos_weight (decay): epoch {epoch}/{config.epochs - 1}  alpha={alpha:.3f}  pw={current_pw:.3f}")
+            _log(f"jump_pos_weight (decay): epoch {epoch}/{config.epochs - 1}  alpha={alpha:.3f}  pw={current_pw:.3f}")
         # Snapshot weights at the start of this epoch so we can compute
         # L2 drift from the end-of-last-epoch state as a "is the model still
         # actively changing?" signal.
@@ -1739,9 +1349,9 @@ def run_behavior_cloning(
                 _ovr = _json.loads(_lr_override_path.read_text())
                 _lr = float(_ovr.get("lr", _lr))
                 _lr_min = float(_ovr.get("lr_min", _lr_min))
-                print(f"  [bc] lr_override.json: lr={_lr}, lr_min={_lr_min}")
+                _log(f"lr_override.json: lr={_lr}, lr_min={_lr_min}")
             except Exception as exc:
-                print(f"  [bc] lr_override.json parse error: {exc}")
+                _log(f"lr_override.json parse error: {exc}")
 
         # LR schedule: optional linear warmup then optional cosine decay.
         _warmup = config.warmup_epochs
@@ -1759,7 +1369,7 @@ def run_behavior_cloning(
             _active_lr = _lr
 
         if epoch == start_epoch or epoch > start_epoch:
-            print(f"  [bc] LR={_active_lr:.6f}")
+            _log(f"LR={_active_lr:.6f}")
 
         _t_train_start = _time.monotonic()
         train_metrics = _run_epoch(
@@ -1815,8 +1425,8 @@ def run_behavior_cloning(
             # Clean train eval (model.eval mode, no dropout) on a train subset
             # only when scheduled or when proxy metrics suggest a gap issue.
             _t_train_eval_start = _time.monotonic()
-            # Reuse the train source by truncating to the first len(val_episodes)
-            # episodes — works for both resident and streaming sources.
+            # Reuse the train source by truncating to the validation episode
+            # count — works for both resident and streaming sources.
             train_eval_source = train_source.head(_train_eval_n_eps)
             train_eval_metrics = _run_epoch(
                 model,
@@ -1840,28 +1450,26 @@ def run_behavior_cloning(
         train_eval_rows_per_sec = train_eval_rows / _train_eval_secs if _train_eval_secs > 0 else 0.0
         _wall_clock = _datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         if train_eval_ran:
-            print(
-                f"  [bc] timing: train={_train_secs:.1f}s  val={_val_only_secs:.1f}s  "
+            _log(
+                f"timing: train={_train_secs:.1f}s  val={_val_only_secs:.1f}s  "
                 f"train_eval={_train_eval_secs:.1f}s  total={_train_secs + _val_secs:.1f}s  [{_wall_clock}]"
             )
         else:
-            print(f"  [bc] timing: train={_train_secs:.1f}s  val={_val_only_secs:.1f}s  total={_train_secs + _val_secs:.1f}s  [{_wall_clock}]")
-        # Headline per-head summary: one number per head (F1 where the
-        # class imbalance makes accuracy misleading), plus per-axis move F1
-        # so axis-specific regressions surface in the log.
+            _log(f"timing: train={_train_secs:.1f}s  val={_val_only_secs:.1f}s  total={_train_secs + _val_secs:.1f}s  [{_wall_clock}]")
+        # Headline per-head summary: one normalised skill per head — the
+        # fraction of that head's marginal entropy it captures (0 = base rate,
+        # →1 = fully determined). Comparable across heads and the terms of the
+        # selection composite. All raw metrics (dll/kl/nll/loss/f1/per-class)
+        # stay in bc_history.json for analysis. See src/docs/head-metrics.md.
         _headline_keys = (
-            "acc_target",
-            "f1_move", "f1_move_fb", "f1_move_lr", "f1_move_ud",
-            "cos_sim_look",
-            "f1_attack",
-            "f1_weapon",
+            "move_skill", "look_skill", "target_skill", "attack_skill", "weapon_skill",
         )
-        mae_str = "  ".join(
+        skill_str = "  ".join(
             f"{k}={float(val_metrics[k]):.4f}"
             for k in _headline_keys if k in val_metrics
         )
 
-        # Composite selection: target acc + move/fire/weapon macro-F1 + look cos.
+        # Composite selection: Σ_head (1 − head_skill), lower is better.
         val_selection_score = _selection_score(val_metrics)
         selection_metric = val_selection_score
         improved = selection_metric < best_selection_score
@@ -1878,29 +1486,28 @@ def run_behavior_cloning(
         _grad_mean = train_metrics.get("grad_norm_mean")
         _grad_max = train_metrics.get("grad_norm_max")
 
+        # Two interpretable summaries replace the raw
+        # train_proxy/proxy_gap/train_eval/gap/grad/drift clutter on the line
+        # (all of which remain in bc_history.json):
+        #   overfit = val selection error − the train reference (held-out
+        #     train_eval when it ran, else the noisier train proxy). >0 = val
+        #     worse than train (memorising); ~0 = generalising; <0 = val ahead.
+        #   reorg   = this epoch's weight drift ÷ the running peak drift.
+        #     ~1 = reorganising as hard as ever; →0 = converged / stuck.
+        _train_ref = train_eval_sum if (train_eval_ran and train_eval_sum is not None) else train_proxy_sum
+        _overfit = val_selection_score - _train_ref
+        _max_weight_drift = max(_max_weight_drift, _weight_drift_l2)
+        _reorg = _weight_drift_l2 / _max_weight_drift if _max_weight_drift > 0.0 else 1.0
+
         epoch_line = (
-            f"  [bc] Epoch {epoch + 1}/{config.epochs}  "
-            f"train_proxy={train_proxy_sum:.4f}  "
-            f"val={val_selection_score:.4f}  "
-            f"proxy_gap={train_proxy_gap:+.4f}  "
+            f"{log_prefix} Epoch {epoch + 1}/{config.epochs}  "
+            f"sel={val_selection_score:.4f}  "
+            f"overfit={_overfit:+.4f}  "
+            f"reorg={_reorg:.2f}  "
+            f"{'*' if improved else ''}  "
+            f"train_rps={train_rows_per_sec:.1f}  val_rps={val_rows_per_sec:.1f}  "
+            f"{skill_str}"
         )
-        if train_eval_ran and train_eval_sum is not None:
-            epoch_line += (
-                f"train_eval={train_eval_sum:.4f}  "
-                f"gap={val_selection_score - train_eval_sum:+.4f}  "
-                f"[{','.join(train_eval_reasons)}]  "
-            )
-        else:
-            epoch_line += "train_eval=skipped  "
-        epoch_line += f"{'*' if improved else ''}  "
-        if _grad_mean is not None:
-            epoch_line += (
-                f"grad_mean={_grad_mean:.3f}  "
-                f"grad_max={_grad_max:.3f}  "
-            )
-        epoch_line += f"drift={_weight_drift_l2:.3f}  "
-        epoch_line += f"train_rps={train_rows_per_sec:.1f}  val_rps={val_rows_per_sec:.1f}  "
-        epoch_line += mae_str
         print(epoch_line)
 
         # Assemble and record per-epoch metrics.
@@ -1968,7 +1575,9 @@ def run_behavior_cloning(
         look_reg = val_look - _best_look
 
         # Checkpoint selection: best val MAE sum.  Regression gate is purely
-        # for stopping, not model selection.
+        # for stopping, not model selection. Capture the pre-update best so the
+        # autostop "did we improve?" test sees this epoch's running best.
+        _autostop_prev_best = best_selection_score
         if selection_metric < best_selection_score:
             best_selection_score = selection_metric
             best_epoch = epoch
@@ -1979,8 +1588,33 @@ def run_behavior_cloning(
         else:
             _reg_violations = 0
 
-        print(f"  [bc]   regression: move={move_reg:+.4f} look={look_reg:+.4f} "
-              f"violations={_reg_violations}/{config.regression_patience}")
+        _log(
+            f"  regression: move={move_reg:+.4f} look={look_reg:+.4f} "
+            f"violations={_reg_violations}/{config.regression_patience}"
+        )
+
+        # Autostop: not-learning + not-reorganizing (the live replacement for
+        # the inert regression_patience). Updates carried (_autostop_stall,
+        # _autostop_drift_ref); break handled below, after the checkpoint save.
+        _autostop_now, _autostop_stall, _autostop_drift_ref, _autostop_reason = _autostop_decision(
+            selection_metric=val_selection_score,
+            prev_best=_autostop_prev_best,
+            weight_drift_l2=_weight_drift_l2,
+            drift_ref=_autostop_drift_ref,
+            stall=_autostop_stall,
+            epoch=epoch,
+            patience=config.autostop_patience,
+            min_improve=config.autostop_min_improve,
+            drift_frac=config.autostop_drift_frac,
+            min_epoch=config.autostop_min_epoch,
+            catastrophic_margin=config.autostop_catastrophic_margin,
+        )
+        if config.autostop_patience > 0:
+            _ref_str = (f"{_autostop_drift_ref:.3f}" if _autostop_drift_ref is not None else "n/a")
+            _log(
+                f"  autostop: stall={_autostop_stall}/{config.autostop_patience} "
+                f"drift={_weight_drift_l2:.3f} ref={_ref_str}"
+            )
 
         # Save resumable checkpoint every epoch (latest + epoch-stamped).
         bc_opt = model._optimizers.get("bc")
@@ -1999,6 +1633,8 @@ def run_behavior_cloning(
             "_best_max_reg": _best_max_reg,
             "_best_reg_epoch": _best_reg_epoch,
             "_reg_violations": _reg_violations,
+            "_autostop_stall": _autostop_stall,
+            "_autostop_drift_ref": _autostop_drift_ref,
             "rng_state": rng.bit_generator.state,
         }
         torch.save(ckpt_data, checkpoint_path)
@@ -2021,23 +1657,34 @@ def run_behavior_cloning(
                             with _smb.open_file(nas_dest, mode="wb") as remote_f:
                                 _shutil.copyfileobj(local_f, remote_f)
             except Exception as exc:
-                print(f"  [bc] NAS archive failed: {exc}")
+                _log(f"NAS archive failed: {exc}")
+
+        if cancel_event is not None and cancel_event.is_set():
+            _log(f"Cancellation requested — stopping after epoch {epoch + 1}")
+            break
 
         if _reg_violations >= config.regression_patience:
-            print(f"  [bc] Regression stop: {config.regression_patience} consecutive epochs "
-                  f"above threshold {config.regression_threshold}. Best epoch: {best_epoch + 1}")
+            _log(
+                f"Regression stop: {config.regression_patience} consecutive epochs "
+                f"above threshold {config.regression_threshold}. Best epoch: {best_epoch + 1}"
+            )
+            break
+
+        if _autostop_now:
+            _log(f"Autostop: {_autostop_reason}. Best epoch: {best_epoch + 1}")
             break
 
     if best_epoch < 0:
         model.save(output / "bc_best_model.pth")
 
-    # Free the training model + optimizer state + the device-resident TRAIN
-    # tensors before we load the best checkpoint for the final val pass.
-    # Without this, we briefly hold (training model + final_model + train
-    # data + val data) all on device, and the val forward's activation
-    # allocation OOMs. The val source is reused below.
+    # Free the training model + optimizer state before loading the best
+    # checkpoint for the final val pass. In normal single-run mode we also
+    # release the device-resident TRAIN tensors to avoid briefly holding
+    # training model + final_model + train data + val data. Shared-source
+    # ablation runs keep those tensors alive on purpose.
     del model
-    train_source.release_device_tensors()
+    if release_sources:
+        train_source.release_device_tensors()
     import gc as _gc
     _gc.collect()
     if torch.cuda.is_available():
@@ -2046,6 +1693,12 @@ def run_behavior_cloning(
     final_model = QNNPolicy.load(
         output / "bc_best_model.pth", device=config.device, model_factory=model_factory,
     )
+    # QNNPolicy.load builds a fresh policy without the side-channel provider, so
+    # re-attach it — otherwise side-channel-dependent heads (GTTargetPointer,
+    # engagement_ema, …) fail in the final eval pass. (The per-epoch `model` got it
+    # at construction.)
+    if side_channel_provider is not None:
+        final_model._side_channel_provider = side_channel_provider
     # Defensive: QNNPolicy.load restores input_mask from the checkpoint
     # meta if present; for pre-fix checkpoints that lack the field the
     # default is False, which would silently swap the val label distribution.
@@ -2053,6 +1706,7 @@ def run_behavior_cloning(
     # match the training-time val pass.
     final_model.input_mask = bool(config.input_mask)
     final_model.attack_label_shift = bool(config.attack_label_shift)
+    final_model.attack_op_only = bool(config.attack_op_only)
 
     if val_source.n_total_rows > 0:
         final_val_metrics = _run_epoch(
@@ -2065,6 +1719,8 @@ def run_behavior_cloning(
         )
     else:
         final_val_metrics = {"loss": 0.0}
+    if release_sources:
+        val_source.release_device_tensors()
 
     summary: Dict[str, Any] = {
         "best_epoch": best_epoch,
@@ -2166,10 +1822,10 @@ def _eval_only(run_dir: Path, data_dir: Path | None, device: str, batch_size: in
     model = QNNPolicy.load(str(checkpoint), device=device)
     model.model.eval()
 
-    val_episodes = _load_precomputed(val_cache)
-    print(f"  val episodes: {len(val_episodes)}")
+    validate_cache_for_training(val_cache, required_actions=frozenset())
+    source = _make_resident_source_from_cache(val_cache, model.device)
+    print(f"  val episodes: {len(source.episodes)}")
 
-    source = _make_resident_source(val_episodes, model.device)
     metrics = _run_epoch(
         model,
         source,

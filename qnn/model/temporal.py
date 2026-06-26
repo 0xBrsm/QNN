@@ -41,6 +41,8 @@ class Temporal(nn.Module):
         super().__init__()
         self.d_model = int(d_model)
         self.hidden_dim = int(hidden_dim)
+        # out_dim — width of flat_out, the temporal feature handed downstream.
+        self.out_dim = self.hidden_dim
         self.gru = nn.GRU(self.d_model, self.hidden_dim, batch_first=False)
 
     def forward(self, inp: TemporalInput) -> TemporalOutput:

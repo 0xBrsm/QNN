@@ -42,16 +42,22 @@ def attack_class_weights(
     head_loss_weights: dict[str, float],
     override: float = 0.0,
     device: torch.device | str | None = None,
+    op_only: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Return ``{"attack": pos_weight_tensor}`` if the head is enabled.
 
     Source-driven so both resident and streaming pipelines use the same
     call site. The attack head is currently the only head using this idx;
     if its loss weight is 0 the idx is skipped entirely.
+
+    ``op_only=True`` restricts the pos/neg counts to op=1 frames (matches
+    the loss's op-mask when ``QNNPolicy.attack_op_only`` is on). Default
+    ``False`` counts the full corpus for back-compat.
     """
     if head_loss_weights.get("attack", 0.0) <= 0.0:
         return {}
-    pos, neg = source.attack_pos_neg_counts()
+    pos, neg = source.attack_pos_neg_counts(op_only=op_only)
     tensor, line = attack_pos_weight_from_counts(pos, neg, override=override, device=device)
-    print(f"  [bc] {line}")
+    suffix = " (op-only)" if op_only else ""
+    print(f"  [bc] {line}{suffix}")
     return {"attack": tensor} if tensor is not None else {}

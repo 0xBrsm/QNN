@@ -66,7 +66,7 @@ The labeler still uses opt3 as a fallback prior, but opt3 is no longer the cente
 | training damage records | Available in training sidecar | Strong hit attribution |
 | QWD `svc_damage` victim extraction | Not currently wired | Future strongest demo signal |
 
-The token spec already exposes event arrays: `entity_event_actions`, `entity_event_sources`, and `entity_event_counts` (`token-spec.md:90` through `token-spec.md:92`).  Each event is an `(action_id, source_id)` pair (`token-spec.md:213` through `token-spec.md:214`).
+The wire contract already exposes event arrays: `entity_event_actions`, `entity_event_sources`, and `entity_event_count` (see the entity block in `src/docs/contracts/wire/wire.9.md`).  Each event is an `(action_id, source_id)` pair.
 
 Training sidecars already include exact damage records.  `TrainingDamageRecordV1` stores attacker entity, target entity, weapon id, flags, and before/after health and armor (`engine/training_protocol.py:36` through `engine/training_protocol.py:49`), and the parser decodes them per frame at `engine/training_protocol.py:175` through `engine/training_protocol.py:178`.
 

@@ -114,8 +114,10 @@ def run(ctx: RunnerContext) -> dict[str, object]:
 
     started = _time.monotonic()
     seed_checkpoint = str(ctx.run_cfg.get("checkpoint_path", "") or "")
+    from qnn.model.bench.side_channels import bench_side_channel_scope
     results["bc"] = run_behavior_cloning(
         bc_config, seed_checkpoint=seed_checkpoint, model_factory=model_factory,
+        side_channel_provider=bench_side_channel_scope,
     )
     stage_timings["bc"] = _time.monotonic() - started
     results["stage_timings"] = stage_timings

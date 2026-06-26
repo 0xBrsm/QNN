@@ -47,7 +47,7 @@ python -m qnn.run.router --run-dir runs/bc/bc_v1
 | [Setup Guide](docs/setup.md) | Prerequisites, building, demo corpus, training walkthrough |
 | [Overview](docs/overview.md) | Architecture, heads, reward system, training surface, source file map |
 | [Training Config Matrix](docs/run.md) | Run directory schema and config reference |
-| [Token Specification](docs/token-spec.md) | Wire format, obs buffer layout, head shapes, action struct |
+| [Contract Registry](docs/contracts/README.md) | Wire / semantics / arch contract versions, ONNX I/O signatures, the load set |
 | [Semantic Vocabulary](docs/vocab.md) | Entity, action, modality IDs and event mapping |
 | [Vendored Dependencies](docs/vendor.md) | Third-party dependencies and upstream sources |
 | [Input Inference](docs/input-inference.md) | Recovering player-intent labels from server signals (fire/jump) |

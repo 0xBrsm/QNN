@@ -3,16 +3,16 @@
 Both bench head variants emit a structured forward output:
 
   LookHead / WeaponAimLookHead:
-      pred_look  = normalize(base_look + delta_look)
-      base_look  = geometric prior (target-anchored or aim_vec)
-      delta_look = MLP residual
+      look_predict  = normalize(look_prior + look_delta)
+      look_prior  = geometric prior (target-anchored or aim_vec)
+      look_delta = MLP residual
 
   LookStyleAttackHead:
       attack_logit = prior_logit + delta_attack
-      prior_logit  = alignment_scale * base_look[..., 0]
+      prior_logit  = alignment_scale * look_prior[..., 0]
       delta_attack = MLP residual (zero-initialised)
 
-The trainer logs only ``cos_sim_look`` and ``f1_attack`` — single-number
+The trainer logs only ``look_r2`` and ``f1_attack`` — single-number
 mean-cosine / mean-F1. Those numbers average across frames, so they hide
 two things:
 
@@ -62,7 +62,7 @@ def _collect_head_outputs(
 
     bufs: dict[str, list[torch.Tensor]] = {
         k: [] for k in (
-            "pred_look", "base_look", "delta_look", "look_target_unit", "look_valid",
+            "look_predict", "look_prior", "look_delta", "look_label_raw_unit", "look_valid",
             "attack_logit", "prior_logit", "delta_attack",
             "masked_fire", "weapon_impulse",
         )
@@ -84,14 +84,14 @@ def _collect_head_outputs(
                 target_probs_idx=tpi,
             )
             # --- look ---
-            if "look" in logits and "_look_base" in logits and "_look_delta" in logits:
-                bufs["pred_look"].append(logits["look"].reshape(-1, 3).float().cpu())
-                bufs["base_look"].append(logits["_look_base"].reshape(-1, 3).float().cpu())
-                bufs["delta_look"].append(logits["_look_delta"].reshape(-1, 3).float().cpu())
+            if "look" in logits and "_look_prior" in logits and "_look_delta" in logits:
+                bufs["look_predict"].append(logits["look"].reshape(-1, 3).float().cpu())
+                bufs["look_prior"].append(logits["_look_prior"].reshape(-1, 3).float().cpu())
+                bufs["look_delta"].append(logits["_look_delta"].reshape(-1, 3).float().cpu())
                 lt = policy._tensor(b.actions["look"], dtype=torch.float32).reshape(-1, 3)
                 lt_n = torch.linalg.vector_norm(lt, dim=-1, keepdim=True)
                 lt_u = (lt / lt_n.clamp(min=1e-6)).cpu()
-                bufs["look_target_unit"].append(lt_u)
+                bufs["look_label_raw_unit"].append(lt_u)
                 bufs["look_valid"].append((lt_n.squeeze(-1) > 1e-6).cpu())
             # --- attack ---
             if "attack" in logits:
@@ -140,20 +140,20 @@ def look_decomposition(
     """Prior-vs-MLP cos_sim decomposition for the look head.
 
     ``source`` is a BC :class:`Source` — build it with
-    ``qnn.bc.loop.make_resident_source(_load_precomputed(val_cache), device)``.
+    the streaming=false resident source built directly from ``val_cache``.
 
     Returns:
-      overall:                   prior-alone vs full-head cos summaries + |delta_look|
+      overall:                   prior-alone vs full-head cos summaries + |look_delta|
       per_weapon:                same, conditioned on held weapon (impulse-indexed)
       per_fire_state:            same, conditioned on masked_fire {0, 1}
       mlp_gain:                  full - prior, top-line scalar
     """
     data = _collect_head_outputs(policy, source, batch_size=batch_size, max_frames=max_frames)
     valid = data["look_valid"].bool()
-    pred = data["pred_look"][valid]
-    base = data["base_look"][valid]
-    delta = data["delta_look"][valid]
-    tu = data["look_target_unit"][valid]
+    pred = data["look_predict"][valid]
+    base = data["look_prior"][valid]
+    delta = data["look_delta"][valid]
+    tu = data["look_label_raw_unit"][valid]
     wid = data["weapon_impulse"][valid]
     mf = data["masked_fire"][valid]
 

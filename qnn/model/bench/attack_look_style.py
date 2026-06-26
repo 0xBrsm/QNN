@@ -30,7 +30,7 @@ from qnn.model.bench.spec import (
     HeadSpec,
     neutral_model_config,
 )
-from qnn.model.network import Network, Off, compute_slot_dims
+from qnn.model.network import Network, Off, slot_dims
 from qnn.model.transformer import ObsEmbedding
 
 
@@ -59,7 +59,11 @@ def _build_attack_look_style(probe: Mapping[str, Any]) -> HeadBuildResult:
     model_config = neutral_model_config(
         d_model=d_model, self_weapon_embed_in_self=self_weapon,
     )
-    dims = compute_slot_dims(model_config, has_temporal=False, has_weapon_head=False)
+    dims = slot_dims(
+        d_model=model_config.d_model, d_gru=model_config.d_gru,
+        has_temporal=False, has_target_pointer=True, has_weapon_head=False,
+        weapon_sources=model_config.weapon_sources,
+    )
 
     def factory(obs_dim: int, model_cfg) -> Network:
         return Network(
@@ -92,7 +96,7 @@ ATTACK_LOOK_STYLE = HeadSpec(
         metrics_fn=attack_metrics,
         label_key="attack",
         output_dim=1,
-        selection_metric="f1_attack",
+        selection_metric="attack_skill",
         selection_lower_is_better=False,
     ),
     build=_build_attack_look_style,

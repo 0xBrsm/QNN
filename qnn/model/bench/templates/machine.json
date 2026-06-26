@@ -5,6 +5,6 @@
   "batch_size": 4096,
   "pin_memory": true,
   "prefetch": 2,
-  "snapshot_interval": 0,
+  "snapshot_interval": 60,
   "streaming": false
 }

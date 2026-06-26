@@ -206,12 +206,14 @@ Key settings to check:
 ### BC Training
 
 ```bash
-python -m qnn.run.router --run-dir runs/bc/bc_v1
+docker compose -f src/docker/compose.yaml run -d --rm trainer \
+    agents/skills/train/scripts/train.sh runs/bc/bc_v1
 ```
 
-BC mode collects demo data (if not already collected), precomputes episode
-caches, and trains. Checkpoints, metrics, and history are written to the run
-directory.
+BC mode trains from the existing `precomputed_train/` and `precomputed_val/`
+shard caches under `bc_data_dir`. Collect or recollect separately with
+`qnn.bc.collect` when the C worker's label or observation code changes.
+Checkpoints, metrics, and history are written to the run directory.
 
 ### PPO Fine-Tuning
 
@@ -222,7 +224,8 @@ python -m qnn.run.init \
     --checkpoint-path runs/bc/bc_v1/checkpoints/bc_best.pth \
     --resume true
 
-python -m qnn.run.router --run-dir runs/ppo/ppo_v1
+docker compose -f src/docker/compose.yaml run -d --rm trainer \
+    agents/skills/train/scripts/train.sh runs/ppo/ppo_v1
 ```
 
 PPO runs the live engine with bots, using the BC checkpoint as the initial

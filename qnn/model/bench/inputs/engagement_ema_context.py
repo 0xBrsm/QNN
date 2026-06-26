@@ -1,6 +1,6 @@
 """Forward-scoped engagement_ema context for attack-head ablations.
 
-Mirrors :mod:`prev_look_context` for bench attack-head variants that need
+Mirrors the sibling forward-scoped side-channel contexts for bench attack-head variants that need
 the per-frame engagement EMA scalar without extending the core
 ``AttackHeadInput`` dataclass. The trainer stashes the batch's
 ``engagement_ema`` tensor on entry to the forward pass, and any bench

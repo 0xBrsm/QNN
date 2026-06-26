@@ -4,7 +4,7 @@ Extends :class:`EngagedGeomWeaponEmbedAttackHead` (the current OFAT
 winner) by appending one additional scalar to the MLP input: a
 **predicted target-presence** signal derived from the target head's
 output. This tests whether the "target acquired" cue carries
-fire-prediction information beyond what ``base_look`` (the geometric
+fire-prediction information beyond what ``look_prior`` (the geometric
 direction to the soft target) already provides.
 
 The predicted target-presence scalar is:
@@ -22,8 +22,8 @@ The geometric prior is unchanged from :class:`LookStyleAttackHead`:
 
   probs        = softmax(target_logits)
   rel_soft     = Σ probs · entity_rel
-  base_look    = normalize(rel_soft * has_actor)
-  prior_logit  = aim_scale · base_look[..., 0]
+  look_prior    = normalize(rel_soft * has_actor)
+  prior_logit  = aim_scale · look_prior[..., 0]
 
 The MLP input is the concatenation:
 
@@ -62,7 +62,7 @@ shares that behaviour.)
 ``engagement_ema`` is sourced from the forward-scoped
 :class:`EngagementEMAContext` set by the trainer
 (:func:`qnn.model.policy._engagement_ema_scope`) — same plumbing pattern
-as ``prev_look``.
+as the other forward-scoped bench side channels.
 """
 from __future__ import annotations
 
@@ -70,14 +70,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from qnn.bc.weapon_physics import QNN_DIST_SCALE, QNN_VEL_SCALE
+from qnn.bc.weapon_physics import (
+    ACTOR_REL_OFFSET, ACTOR_VEL_OFFSET, QNN_DIST_SCALE, QNN_VEL_SCALE,
+)
 from qnn.model._mlp import make_head_mlp
 from qnn.model.attack_head import OUT_DIM, AttackHeadInput, AttackHeadOutput
 from qnn.model.bench.inputs.engagement_ema_context import current_engagement_ema_context
 from qnn.vocab import self_weapon_id_to_impulse
 
-_ESC_REL_BEGIN, _ESC_REL_END = 3, 6    # entity_scalars_raw ACTOR layout
-_ESC_VEL_BEGIN, _ESC_VEL_END = 7, 10
+# entity_scalars_raw ACTOR layout — offsets owned by qnn.bc.weapon_physics.
+_ESC_REL_BEGIN, _ESC_REL_END = ACTOR_REL_OFFSET, ACTOR_REL_OFFSET + 3
+_ESC_VEL_BEGIN, _ESC_VEL_END = ACTOR_VEL_OFFSET, ACTOR_VEL_OFFSET + 3
 
 _GEOM_NORM = 1000.0                    # game-unit normalizer for dist / radial / tang
 _WEAPON_IMPULSE_COUNT = 9              # impulses 0..8 (0 = no weapon)
@@ -130,8 +133,8 @@ class FullStackTargetAttackHead(nn.Module):
 
         # --- Geometric prior (LookStyle) ---
         soft_norm = torch.linalg.vector_norm(soft_target_rel, dim=-1, keepdim=True).clamp(min=1e-6)
-        base_look = soft_target_rel / soft_norm                                       # (B*, 3)
-        prior_logit = (self.scale_init * base_look[..., 0:1]).to(inp.features.dtype)
+        look_prior = soft_target_rel / soft_norm                                       # (B*, 3)
+        prior_logit = (self.scale_init * look_prior[..., 0:1]).to(inp.features.dtype)
 
         # --- Physical-units geometry scalars ---
         rel_w = soft_target_rel * QNN_DIST_SCALE                                      # (B*, 3) game units

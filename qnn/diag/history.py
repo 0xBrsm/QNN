@@ -25,7 +25,7 @@ def per_head_curves(history: list[dict[str, Any]]) -> dict[str, list[tuple[int, 
     keys = [
         "val_loss", "train_loss", "train_eval_loss", "train_proxy_gap",
         "val_f1_move", "val_f1_attack", "val_f1_weapon",
-        "val_cos_sim_look", "val_acc_target",
+        "val_look_r2", "val_acc_target",
         "val_f1_move_fb", "val_f1_move_lr", "val_f1_move_ud",
     ]
     out: dict[str, list[tuple[int, float]]] = {k: [] for k in keys}

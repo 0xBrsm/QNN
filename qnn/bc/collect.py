@@ -1285,6 +1285,10 @@ class _ShardWriter:
         episode_idx: int = 0,
     ) -> None:
         for key, arr in obs.items():
+            # look_delta is a wire-only inference field — the BC preload
+            # re-derives it from the look column, so don't bloat the cache.
+            if key == "look_delta":
+                continue
             self._obs_bufs.setdefault(key, []).append(arr)
         for key, arr in actions.items():
             self._act_bufs.setdefault(key, []).append(arr)
@@ -1336,7 +1340,7 @@ class _ShardWriter:
             # for this string and refuses caches without it — legacy f16
             # shards have no format_version and must be recollected
             # (no in-place migration support, per the no-backcompat
-            # directive). See qnn.bc.train._load_precomputed.
+            # directive). See the native-v1 cache validation in qnn.bc.train.
             "format_version": "native_v1",
             "episodes": total_episodes,
             "shard_rows": self.shard_rows,

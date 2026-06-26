@@ -5,7 +5,7 @@ alternative to :class:`EngagedLookStyleAttackHead`, which appends
 ``engagement_ema`` to the MLP input. Here we instead route the scalar
 through a learnable bias on the prior:
 
-  prior_logit  = aim_scale * base_look[..., 0]
+  prior_logit  = aim_scale * look_prior[..., 0]
                  + engagement_scale * engagement_ema           # NEW term
   delta_attack = mlp(features)                                  # in_dim unchanged
   attack_logit = prior_logit + delta_attack
@@ -27,7 +27,7 @@ codebase.
 ``engagement_ema`` is sourced from the forward-scoped
 :class:`EngagementEMAContext` set by the trainer
 (:func:`qnn.model.policy._engagement_ema_scope`) — same plumbing pattern
-as ``prev_look``.
+as the other forward-scoped bench side channels.
 """
 from __future__ import annotations
 
@@ -35,11 +35,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from qnn.bc.weapon_physics import ACTOR_REL_OFFSET
 from qnn.model._mlp import make_head_mlp
 from qnn.model.attack_head import OUT_DIM, AttackHeadInput, AttackHeadOutput
 from qnn.model.bench.inputs.engagement_ema_context import current_engagement_ema_context
 
-_ESC_REL_BEGIN, _ESC_REL_END = 3, 6   # entity_scalars_raw ACTOR layout
+# entity_scalars_raw ACTOR layout — offset owned by qnn.bc.weapon_physics.
+_ESC_REL_BEGIN, _ESC_REL_END = ACTOR_REL_OFFSET, ACTOR_REL_OFFSET + 3
 
 
 class EngagedPriorAttackHead(nn.Module):
@@ -79,9 +81,9 @@ class EngagedPriorAttackHead(nn.Module):
         has_actor = inp.actor_mask.any(dim=-1, keepdim=True).to(soft_target_rel.dtype)
         soft_target_rel = soft_target_rel * has_actor
         soft_norm = torch.linalg.vector_norm(soft_target_rel, dim=-1, keepdim=True).clamp(min=1e-6)
-        base_look = soft_target_rel / soft_norm                              # (B*, 3)
+        look_prior = soft_target_rel / soft_norm                              # (B*, 3)
 
-        aim_term = (self.scale_init * base_look[..., 0:1]).to(inp.features.dtype)
+        aim_term = (self.scale_init * look_prior[..., 0:1]).to(inp.features.dtype)
 
         engagement = current_engagement_ema_context().engagement_ema.to(inp.features.dtype)
         if engagement.dim() == 0:

@@ -342,6 +342,47 @@ int QNN_SubjectPickupCategory(int subject_id)
 
 #define QNN_VIEW_OFS_Z 22.0f
 
+/* Model's view-cone aperture. Decoupled from the renderer's "fov" cvar
+ * (which the engine clamps to [10,170] in SCR_CalcRefdef) so we can open
+ * the perception cone past a hemisphere. Registered in QNN_IOInit. */
+cvar_t qnn_fov = {"qnn_fov", "120"};
+
+/*
+ * Emit FOV cone aperture, in total degrees, read live from "qnn_fov".
+ *
+ * qnn_fov is the *total* apex angle of the model's view cone, read every
+ * call so it can be changed at the console mid-game:
+ *   0    SIGHT disabled entirely — QNN_InFov always false. Lets us test
+ *        the bot on non-sight modalities only (proximity/sound/memory).
+ *   120  the training-time emit geometry (default).
+ *   360  full all-around; only the line-of-sight trace gates visibility.
+ *
+ * Out-of-range values are clamped to [0, 360] in place via Cvar_Set (NQ
+ * cvars have no set-time hook), the same idiom SCR_CalcRefdef uses for
+ * fov/viewsize, so the console value always reflects the real aperture.
+ *
+ * Defaults to 120 when the cvar isn't registered (a build path that never
+ * calls QNN_IOInit), so a missing registration degrades to the trained
+ * geometry rather than silently zeroing sight. The cached pointer's
+ * ->value tracks console changes live.
+ */
+static float QNN_EmitFovDeg(void)
+{
+	static cvar_t *cv = NULL;
+
+	if (cv == NULL)
+		cv = Cvar_FindVar("qnn_fov");
+	if (cv == NULL)
+		return 120.0f; /* unregistered -> trained default */
+
+	if (cv->value < 0.0f)
+		Cvar_Set("qnn_fov", "0");
+	else if (cv->value > 360.0f)
+		Cvar_Set("qnn_fov", "360");
+
+	return cv->value;
+}
+
 qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target)
 {
 	vec3_t forward;
@@ -352,7 +393,12 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 	float dist;
 	float dot;
 	float cos_half;
+	float fov_deg;
 	trace_t trace;
+
+	fov_deg = QNN_EmitFovDeg();
+	if (fov_deg <= 0.0f)
+		return false; /* qnn_fov 0 -> no SIGHT, ever (before the close-range path) */
 
 	AngleVectors(view_angles, forward, right, up);
 	VectorSubtract(target, player_origin, delta);
@@ -360,7 +406,7 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 	if (dist < 1.0f)
 		return true;
 	dot = DotProduct(forward, delta) / dist;
-	cos_half = 0.5f; /* cos(60°) */
+	cos_half = cosf(fov_deg * 0.5f * (float)(M_PI / 180.0));
 	if (dot < cos_half)
 		return false;
 

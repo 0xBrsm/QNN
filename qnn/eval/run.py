@@ -23,6 +23,7 @@ from qnn.run.metrics import (
 )
 from qnn.model.policy import QNNPolicy
 from qnn.schema import SELF_SCALAR_DIM
+from qnn.vocab import TOKEN_ACTOR
 from qnn.env.world import NativeWorldEnv
 from qnn.utils.io import trusted_torch_load, write_json
 from qnn.utils.repro import set_global_seed, write_experiment_manifest
@@ -223,6 +224,12 @@ def _episode_rng(config: EvalConfig, mode: str, episode_index: int, device: torc
     return generator
 
 
+# Optional per-tick model-internals dump (debug). Set from --model-diag-log;
+# closed-loop diagnostics (weapon desired-vs-held echo-lock, look/move streams)
+# go straight to JSONL from Python. Single-mode runs only (no thread race).
+_MODEL_DIAG_LOG: str | None = None
+
+
 def _select_actions_batch(
     model: QNNPolicy,
     obs_batch: np.ndarray | Dict[str, np.ndarray],
@@ -231,12 +238,14 @@ def _select_actions_batch(
 ) -> tuple[List[Mapping[str, object]], np.ndarray]:
     hidden_batch = np.stack([state.hidden for state in states], axis=0) if states else model.zero_hidden(0)
     if mode == "greedy":
-        action_batch = model.act(obs_batch, mode=mode, hidden=hidden_batch)
+        action_batch = model.act(obs_batch, mode=mode, hidden=hidden_batch,
+                                 diag_log_path=_MODEL_DIAG_LOG)
     elif mode == "sampled":
         row_generators = [state.rng for state in states]
         if any(generator is None for generator in row_generators):
             raise RuntimeError("Sampled evaluation requires a persistent per-episode RNG")
-        action_batch = model.act(obs_batch, mode=mode, hidden=hidden_batch, row_generators=row_generators)
+        action_batch = model.act(obs_batch, mode=mode, hidden=hidden_batch,
+                                 row_generators=row_generators, diag_log_path=_MODEL_DIAG_LOG)
     else:
         raise ValueError(f"Unsupported policy mode {mode}")
 
@@ -309,6 +318,38 @@ def _iter_aux_metric_items(info: Mapping[str, object], keys: tuple[str, ...]) ->
     return pairs
 
 
+# --- obs-side fire discrimination ("fires into the void") metric --------------
+# At each fire tick, the best aim alignment (crosshair->actor cosine) is read
+# from the model's OWN observation tokens. entity_rel is view-frame (forward=
+# +x), so cos = rel_x / |rel|. A fire with no actor token at all, or with the
+# best actor outside the aim cone, is a "blind fire" — the live analog of the
+# offline fire-by-crosshair-angle table. Mirrors scripts/analysis/
+# fire_target_conditional.py so live numbers compare to the human reference.
+# This is the obs-side view ("did the model fire when its own perception showed
+# nothing aligned?"); a future engine-side version uses ground-truth world
+# positions + LOS, and the divergence between the two is the discrimination gap.
+_FIRE_CONE_DEG = 10.0
+_FIRE_ANGLE_EDGES_DEG = (2.0, 5.0, 10.0, 20.0, 45.0)
+_FIRE_ANGLE_LABELS = ("[0,2)", "[2,5)", "[5,10)", "[10,20)", "[20,45)", "[45,180]")
+
+
+def _fire_aim_best_cos(obs: object) -> float | None:
+    """Best crosshair->actor cosine from one env's obs tokens; None if no actor."""
+    if not isinstance(obs, Mapping) or "entity_rel" not in obs or "entity_types" not in obs:
+        return None
+    rel = np.asarray(obs["entity_rel"], dtype=np.float32).reshape(-1, 3)
+    et = np.asarray(obs["entity_types"]).reshape(-1).astype(np.int64)
+    actor = et == TOKEN_ACTOR
+    if not actor.any():
+        return None
+    r = rel[actor]
+    n = np.linalg.norm(r, axis=-1)
+    valid = n > 1e-6
+    if not valid.any():
+        return None
+    return float((r[valid, 0] / n[valid]).max())
+
+
 def _evaluate_mode(
     config: EvalConfig,
     model: QNNPolicy,
@@ -330,6 +371,21 @@ def _evaluate_mode(
     episode_metric_values: Dict[str, List[float]] = {}
     stuck_steps = 0
     total_steps = 0
+    # obs-side fire-discrimination counters
+    fire_ticks = 0
+    blind_no_actor = 0
+    blind_offcone = 0
+    fire_cos_sum = 0.0
+    fire_cos_n = 0
+    fire_angle_hist = [0] * len(_FIRE_ANGLE_LABELS)
+    # engine-side fire x LOS alignment (ground-truth tracking_cos) counters
+    los_n = 0
+    los_fire = 0
+    los_cos_sum = 0.0
+    los_cos2_sum = 0.0
+    los_cosfire_sum = 0.0
+    los_tick_bucket = [0] * len(_FIRE_ANGLE_LABELS)
+    los_fire_bucket = [0] * len(_FIRE_ANGLE_LABELS)
     checked_obs_dim = False
     scenario_done_reasons: Dict[str, Dict[str, int]] = {}
     scenario_episode_counts: Dict[str, int] = {}
@@ -403,6 +459,25 @@ def _evaluate_mode(
                 states=states,
             )
 
+            # obs-side fire discrimination: at each fire tick, score the model's
+            # crosshair alignment to the nearest-aligned actor in its OWN obs.
+            for _i, _st in enumerate(states):
+                if not int(actions[_i].get("attack", 0)):
+                    continue
+                fire_ticks += 1
+                _cos = _fire_aim_best_cos(_st.obs)
+                if _cos is None:
+                    blind_no_actor += 1
+                    fire_angle_hist[-1] += 1  # no actor → treat as widest bin
+                    continue
+                _ang = float(np.degrees(np.arccos(np.clip(_cos, -1.0, 1.0))))
+                fire_cos_sum += _cos
+                fire_cos_n += 1
+                if _ang > _FIRE_CONE_DEG:
+                    blind_offcone += 1
+                _b = int(np.digitize(_ang, _FIRE_ANGLE_EDGES_DEG, right=False))
+                fire_angle_hist[min(_b, len(_FIRE_ANGLE_LABELS) - 1)] += 1
+
             if executor is None:
                 results = [_step_env(envs[idx], action) for idx, action in zip(idx_ids, actions)]
             else:
@@ -423,6 +498,25 @@ def _evaluate_mode(
                 state.last_info = info
                 state.metrics.add_step(reward=float(reward), info=info, terminal=terminal)
                 total_steps += 1
+                # engine-side fire x LOS alignment: tracking_cos is PVS +
+                # traceline gated, so it's aim alignment to the nearest in-LOS
+                # enemy this tick. Pair it with the fire decision that produced
+                # this step to measure whether the bot fires when actually
+                # aimed at a visible target (cos=0 default = no visible enemy →
+                # widest angle bin).
+                _los_cos = float(info.get("tracking_cos", 0.0))
+                _los_fired = int(actions[batch_idx].get("attack", 0))
+                _los_ang = float(np.degrees(np.arccos(np.clip(_los_cos, -1.0, 1.0))))
+                los_n += 1
+                los_cos_sum += _los_cos
+                los_cos2_sum += _los_cos * _los_cos
+                _lb = int(np.digitize(_los_ang, _FIRE_ANGLE_EDGES_DEG, right=False))
+                _lb = min(_lb, len(_FIRE_ANGLE_LABELS) - 1)
+                los_tick_bucket[_lb] += 1
+                if _los_fired:
+                    los_fire += 1
+                    los_cosfire_sum += _los_cos
+                    los_fire_bucket[_lb] += 1
                 scenario_id = str(info.get("scenario_id", state.scenario_id))
                 state.scenario_id = scenario_id
                 scenario_total_steps[scenario_id] = scenario_total_steps.get(scenario_id, 0) + 1
@@ -493,6 +587,42 @@ def _evaluate_mode(
     }
     for metric_key in _AUX_INFO_KEYS + _WEAPON_AUX_KEYS:
         summary[f"{metric_key}_mean"] = float(aux_metric_sums.get(metric_key, 0.0) / max(total_steps, 1))
+    # obs-side fire discrimination (compare to human reference fire-by-angle curve)
+    _blind = blind_no_actor + blind_offcone
+    _hist_tot = max(sum(fire_angle_hist), 1)
+    summary["obs_fire_ticks"] = int(fire_ticks)
+    summary["obs_fire_rate"] = float(fire_ticks / max(total_steps, 1))
+    summary["obs_blind_fire_rate"] = float(_blind / max(fire_ticks, 1))
+    summary["obs_blind_fire_no_actor_rate"] = float(blind_no_actor / max(fire_ticks, 1))
+    summary["obs_blind_fire_offcone_rate"] = float(blind_offcone / max(fire_ticks, 1))
+    summary["obs_fire_aim_cos_mean"] = float(fire_cos_sum / max(fire_cos_n, 1))
+    summary["obs_fire_cone_deg"] = _FIRE_CONE_DEG
+    summary["obs_fire_angle_hist"] = {
+        lab: float(c / _hist_tot) for lab, c in zip(_FIRE_ANGLE_LABELS, fire_angle_hist)
+    }
+    # engine-side fire x LOS-alignment correlation (ground-truth tracking_cos)
+    summary["engine_los_ticks"] = int(los_n)
+    summary["engine_fire_tracking_cos_mean"] = float(los_cosfire_sum / max(los_fire, 1))
+    summary["engine_nofire_tracking_cos_mean"] = float(
+        (los_cos_sum - los_cosfire_sum) / max(los_n - los_fire, 1)
+    )
+    # point-biserial corr between fire (0/1) and tracking_cos
+    if los_n > 1:
+        _num = los_n * los_cosfire_sum - los_fire * los_cos_sum
+        _den_f = los_n * los_fire - los_fire * los_fire           # = n*Σf - (Σf)^2
+        _den_c = los_n * los_cos2_sum - los_cos_sum * los_cos_sum
+        _den = (_den_f * _den_c) ** 0.5
+        summary["engine_fire_tracking_cos_corr"] = float(_num / _den) if _den > 1e-12 else 0.0
+    else:
+        summary["engine_fire_tracking_cos_corr"] = 0.0
+    # P(fire | LOS-aim-angle bucket): live analog of the offline aim table
+    summary["engine_fire_by_los_angle"] = {
+        lab: {
+            "n_ticks": int(t),
+            "p_fire": float(f / t) if t else 0.0,
+        }
+        for lab, t, f in zip(_FIRE_ANGLE_LABELS, los_tick_bucket, los_fire_bucket)
+    }
     summary["episode_metric_means"] = episode_metric_means
     summary.update(build_eval_summary_aliases(episode_metric_means))
     summary["scenario_metric_means"] = {
@@ -644,7 +774,14 @@ def main() -> None:
     parser.add_argument("--num-episodes", type=int, default=None, help="Override eval_num_episodes from config")
     parser.add_argument("--num-envs", type=int, default=None, help="Override eval_num_envs from config")
     parser.add_argument("--device", default="cpu", help="Torch device (default: cpu)")
+    parser.add_argument("--model-diag-log", default=None,
+                        help="dump per-tick model internals (weapon desired/held/conf, "
+                             "look pred, move logits/probs) to this JSONL — debug only")
     args = parser.parse_args()
+
+    if args.model_diag_log:
+        global _MODEL_DIAG_LOG
+        _MODEL_DIAG_LOG = args.model_diag_log
 
     run_cfg = load_run_config(args.run_dir.resolve())
     machine = _require_mapping(run_cfg, "machine", "run config")

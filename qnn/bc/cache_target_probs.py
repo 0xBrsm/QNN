@@ -59,7 +59,7 @@ def _populate_one_shard(args: tuple) -> tuple[int, str, int]:
         key: np.load(split_dir / fname, mmap_mode="r")
         for key, fname in shard["obs"].items()
     }
-    # u16/u32 → i32 (matches _process_shard_work for chunked compat).
+    # u16/u32 → i32 to match the chunked training gather path.
     obs_arrays = {
         key: (np.asarray(arr).astype(np.int32, copy=False)
               if arr.dtype in (np.uint16, np.uint32)

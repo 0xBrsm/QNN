@@ -36,7 +36,7 @@
  *  widths follow src/qnn/engine_norm.py exactly; the model-side
  *  dequantizers (qnn.model.dequant) divide by the scale factors below.
  *
- *  SELF BLOCK (21 B):
+ *  SELF BLOCK (27 B):
  *     0   1   health             u8
  *     1   1   effective_armor    u8   (= round(raw_armor × type_factor))
  *     2   1   ammo_shells        u8
@@ -50,6 +50,8 @@
  *    16   4   self_items         u32        raw cl.items bitfield
  *    20   1   view_pitch         i8         pitch_deg / 90, range ~[-1, 1]
  *                                            (Quake pitch engine-clamped ±70°)
+ *    21   6   look_delta[3]      f16 × 3    look[t-1]-look[t-2] (realized
+ *                                            look-vec change; ~0 steady turn)
  *
  *  SPATIAL BLOCK (135 B = field-major across 9 sectors):
  *    Layout: for each field, all 9 sectors' values laid out
@@ -67,7 +69,7 @@
  *   117     9  slime_frac[9]      u8  × 9
  *   126     9  lava_frac[9]       u8  × 9
  *
- *  ENTITY STREAM (variable-length, starts at offset 155):
+ *  ENTITY STREAM (variable-length, starts at offset 162):
  *     0   1   n_tokens           u8
  *     Per token (variable):
  *       1 type_tag (u8)         QNN_TOKEN_* (0=PROJ, 1=ACTOR, 2=ITEM, 3=MOVER)
@@ -115,7 +117,7 @@
  *   recomputes |rel| / DIST_SCALE.
  */
 
-#define QNN_OBS_SELF_BLOCK_BYTES         21
+#define QNN_OBS_SELF_BLOCK_BYTES         27
 #define QNN_OBS_SPATIAL_PER_SECTOR_BYTES 15
 #define QNN_OBS_SPATIAL_BLOCK_BYTES (QNN_OBS_SPATIAL_COUNT * QNN_OBS_SPATIAL_PER_SECTOR_BYTES)
 
@@ -135,6 +137,7 @@
 #define QNN_OBS_OFF_SELF_MOVEMENT_ID     15
 #define QNN_OBS_OFF_SELF_ITEMS           16
 #define QNN_OBS_OFF_SELF_VIEW_PITCH      20
+#define QNN_OBS_OFF_SELF_LOOK_DELTA      21   /* f16 × 3 = 6 B (21..26) */
 
 /* QNN_OBS_BUFFER_SIZE (4096) is defined in qnn.h (shared with tick-emit
  * state). The new layout occupies far less than 4096 B even with
@@ -324,6 +327,8 @@ typedef struct
 	int      movement_id;        /* 0=ground/1=air/2..4=water */
 	int32_t  items;              /* raw cl.items bitfield (Quake's `int items`) */
 	float    view_pitch;         /* pitch normalized to ~[-1, 1] (deg / 90) */
+	float    look_delta[3];      /* look[t-1]-look[t-2] (realized look-vec change);
+	                              * ~0 under steady turn. See QNN_ComputeLookDelta. */
 } qnn_self_token_t;
 
 typedef struct

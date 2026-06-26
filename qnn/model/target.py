@@ -59,6 +59,8 @@ class TargetPointer(nn.Module):
         super().__init__()
         self.d_model = int(d_model)
         self.d_target = int(d_target)
+        # out_dim — width of target_feat (the pointer-blended entity vector).
+        self.out_dim = self.d_model
         self.score = nn.Sequential(
             nn.Linear(self.d_model, self.d_target),
             nn.GELU(),

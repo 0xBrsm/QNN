@@ -50,10 +50,12 @@ from qnn.model.bench.inputs.preattn_encoder import PreAttnEncoder
 from qnn.model.bench.inputs.weapon_head_obs_embedding import (
     AttackFinishedOnlyObsEmbedding, TargetOnlyObsEmbedding, WeaponHeadObsEmbedding,
 )
-from qnn.model.bench.look_head_prev import PrevLookHead
-from qnn.model.bench.look_head_prev_aim_vec import PrevLookAimVecHead
+from qnn.model.bench.look_head_move_token import MoveTokenLookHead
+from qnn.model.bench.look_head_gain import GainLookHead
+from qnn.model.bench.inputs.obs_network import BenchObsNetwork
+from qnn.model.bench.inputs.move_aim_network import MoveAimNetwork
 from qnn.model.look_head import LookHead
-from qnn.model.network import Network, Off, compute_slot_dims
+from qnn.model.network import Network, Off, slot_dims
 from qnn.model.transformer import ObsEmbedding
 
 from qnn.model.bench.weapon_aim.look_head import WeaponAimLookHead
@@ -68,12 +70,16 @@ _FEATURE_TOKENS = (
     "weapon_cooldown",        # weapon_static + attack_finished (no ammo)
     "target_only",            # zero self/weapon half — only target_feat carries signal
     "attack_finished_only",   # Linear(1, d_model)(attack_finished) — no weapon static / ID
-    "prev_look",              # look-only ablation: PrevLookHead reads prev_look from
-                              #   actions[look_prev] context. Self/weapon half zeroed
-                              #   (TargetOnlyObsEmbedding); attack head Off.
-    "prev_look_aim_vec",      # look-only ablation: aim_vec prior (lead-corrected) +
-                              #   PrevLookAimVecHead consuming (target_feat, prev_look).
-                              #   Uses WeaponAimNetwork wrapper; attack head Off.
+    "move_token",             # look-only: MLP(cat(target_feat, attack_bundle move_token)),
+                              #   no prior. BenchObsNetwork wrapper; attack head Off.
+    "aimvec_move_token",      # look-only: aim_vec prior + MLP(cat(target_feat, move_token)).
+                              #   MoveAimNetwork wrapper (both contexts); attack head Off.
+    "gain",                   # look-only: GainLookHead — g·logmap(target_prior) + residual
+                              #   in tangent space. Explicit scalar gain on the bearing (vs
+                              #   canonical's full-snap unit prior). Bare Network; attack Off.
+    "canonical_look",         # look-only: plain LookHead (normalize(unit_prior + delta)) on
+                              #   target_feat only — the A/B baseline for "gain". Bare Network;
+                              #   attack Off. Falls through to the LookHead else-branch.
 )
 
 
@@ -108,7 +114,6 @@ def _build_weapon_aim(probe: Mapping[str, Any]) -> HeadBuildResult:
     variant         = str(_required(probe, "variant"))
     alignment_scale = float(probe.get("alignment_scale", 5.0))
     feature_token   = str(probe.get("feature_token", "self"))
-    num_prev_frames = int(probe.get("num_prev_frames", 1))
     # OFAT knob for the attack-head prior. "look_style" = canonical
     # LookStyleAttackHead (geometric prior only). "engaged_look_style" =
     # same prior + engagement_ema concatenated to the residual MLP input.
@@ -134,26 +139,59 @@ def _build_weapon_aim(probe: Mapping[str, Any]) -> HeadBuildResult:
     model_config = neutral_model_config(
         d_model=d_model, self_weapon_embed_in_self=self_weapon,
     )
-    dims = compute_slot_dims(
-        model_config, has_temporal=False, has_weapon_head=False,
+    dims = slot_dims(
+        d_model=model_config.d_model, d_gru=model_config.d_gru,
+        has_temporal=False, has_target_pointer=True, has_weapon_head=False,
+        weapon_sources=model_config.weapon_sources,
     )
     motor_in = dims["motor_in"]   # 2 * d_model (no GRU, no weapon head)
 
     def factory(obs_dim: int, model_cfg) -> Network:
-        # The bench wrapper exists to install the WeaponAimContext for
-        # forward() — only needed when at least one bench head reads it.
-        # Canonical variant uses bare Network and pays no overhead.
-        # The aim_vec head (prev_look_aim_vec) requires the wrapper too.
-        needs_weapon_aim_ctx = (variant == "weapon_aim") or (feature_token == "prev_look_aim_vec")
-        net_cls = WeaponAimNetwork if needs_weapon_aim_ctx else Network
-        if feature_token == "prev_look":
-            look_head = PrevLookHead(
-                d_model=d_model, d_hidden=d_hidden, activation=activation,
-                num_prev_frames=num_prev_frames,
+        # Build obs_embedding FIRST so heads that tie embeds (move_token) can
+        # reference its entity_embed / movement_embed.
+        if feature_token == "self":
+            obs_embedding = ObsEmbedding(
+                d_model=d_model, self_weapon_embed_in_self=self_weapon, include_spatial=False,
             )
-        elif feature_token == "prev_look_aim_vec":
-            look_head = PrevLookAimVecHead(
+        elif feature_token in ("target_only", "move_token", "aimvec_move_token",
+                               "gain", "canonical_look"):
+            obs_embedding = TargetOnlyObsEmbedding(
+                d_model=d_model, self_weapon_embed_in_self=self_weapon, include_spatial=False,
+            )
+        elif feature_token == "attack_finished_only":
+            obs_embedding = AttackFinishedOnlyObsEmbedding(
+                d_model=d_model, self_weapon_embed_in_self=self_weapon, include_spatial=False,
+            )
+        else:
+            # weapon / weapon_ammo / weapon_cooldown — attack_finished is now
+            # unconditional on the weapon token (no flag); only ammo still toggles.
+            obs_embedding = WeaponHeadObsEmbedding(
+                d_model=d_model, self_weapon_embed_in_self=self_weapon, include_spatial=False,
+                include_ammo=(feature_token in ("weapon", "weapon_ammo")),
+            )
+
+        # Network wrapper installs the forward-scoped context(s) heads read.
+        # move_token needs the ObsAccessor scope; aimvec_move_token needs both
+        # that and WeaponAimContext; aim_vec/weapon_aim heads need WeaponAim.
+        if feature_token == "aimvec_move_token":
+            net_cls = MoveAimNetwork
+        elif feature_token == "move_token":
+            net_cls = BenchObsNetwork
+        elif variant == "weapon_aim":
+            net_cls = WeaponAimNetwork
+        else:
+            net_cls = Network
+
+        if feature_token in ("move_token", "aimvec_move_token"):
+            look_head = MoveTokenLookHead(
                 d_model=d_model, d_hidden=d_hidden, activation=activation,
+                prior=("aim_vec" if feature_token == "aimvec_move_token" else "none"),
+                entity_embed=obs_embedding.entity_embed,
+                movement_embed=obs_embedding.movement_embed,
+            )
+        elif feature_token == "gain":
+            look_head = GainLookHead(
+                in_dim=motor_in, d_hidden=d_hidden, activation=activation,
             )
         elif variant == "weapon_aim":
             look_head = WeaponAimLookHead(
@@ -164,7 +202,8 @@ def _build_weapon_aim(probe: Mapping[str, Any]) -> HeadBuildResult:
                 in_dim=motor_in, d_hidden=d_hidden, activation=activation,
             )
         # Look-only ablations skip the attack head entirely.
-        if feature_token in ("prev_look", "prev_look_aim_vec"):
+        if feature_token in ("move_token", "aimvec_move_token", "gain",
+                             "canonical_look"):
             attack_head = Off
         elif attack_head_kind == "engaged_look_style":
             attack_head = EngagedLookStyleAttackHead(
@@ -211,26 +250,6 @@ def _build_weapon_aim(probe: Mapping[str, Any]) -> HeadBuildResult:
                 scale_init=alignment_scale,
             )
 
-        if feature_token == "self":
-            obs_embedding = ObsEmbedding(
-                d_model=d_model, self_weapon_embed_in_self=self_weapon, include_spatial=False,
-            )
-        elif feature_token in ("target_only", "prev_look", "prev_look_aim_vec"):
-            obs_embedding = TargetOnlyObsEmbedding(
-                d_model=d_model, self_weapon_embed_in_self=self_weapon, include_spatial=False,
-            )
-        elif feature_token == "attack_finished_only":
-            obs_embedding = AttackFinishedOnlyObsEmbedding(
-                d_model=d_model, self_weapon_embed_in_self=self_weapon, include_spatial=False,
-            )
-        else:
-            # weapon / weapon_ammo / weapon_cooldown — toggle which dynamic
-            # gate scalars get concatenated into the weapon-token projection.
-            obs_embedding = WeaponHeadObsEmbedding(
-                d_model=d_model, self_weapon_embed_in_self=self_weapon, include_spatial=False,
-                include_attack_finished=(feature_token in ("weapon", "weapon_cooldown")),
-                include_ammo=(feature_token in ("weapon", "weapon_ammo")),
-            )
         return net_cls(
             obs_dim=obs_dim,
             model=model_cfg,
@@ -254,7 +273,7 @@ def _build_weapon_aim(probe: Mapping[str, Any]) -> HeadBuildResult:
 # QNNPolicy._compute_head_losses_and_metrics. The HeadSpec.loss field
 # here is a placeholder — the runner won't invoke it for this
 # multi-head probe. We pick "look" as the nominal label_key and
-# "cos_sim_look" as the selection metric since look is the primary
+# "look_r2" as the selection metric since look is the primary
 # downstream consumer of aim_vec.
 
 
@@ -273,7 +292,7 @@ WEAPON_AIM = HeadSpec(
         metrics_fn=_stub_metrics,
         label_key="look",
         output_dim=3,
-        selection_metric="cos_sim_look",
+        selection_metric="look_skill",
         selection_lower_is_better=False,
     ),
     build=_build_weapon_aim,

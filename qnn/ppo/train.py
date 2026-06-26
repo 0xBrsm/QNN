@@ -533,7 +533,7 @@ def _prepare_lenient_qnn_ckpt(ckpt: str, dest_dir: Path) -> str:
         ``attack_prior_mode``, ``attack_alignment_scale``)
       * missing fields that the current ModelConfig requires
         (post-v23 additions like ``d_target``,
-        ``weapon_use_self_readout``, ``self_weapon_embed_in_self``)
+        ``weapon_sources``, ``self_weapon_embed_in_self``)
       * renamed fields (``fire`` → ``attack`` in legacy
         ``head_bottleneck_dims``; the dict was later split into four
         per-action-head scalars ``d_move`` /
@@ -639,7 +639,13 @@ def _warm_start_policy(
     #     {"model", "optimizer", "train_step", ...}. Raw-copy, with optional
     #     v17→v20 entity-vocab + self-scalar migrations if the seed predates
     #     the v21 wire-format split.
-    from qnn.utils.checkpoint_converter import QNNPolicy, save_sf_format, migrate_entity_embed, migrate_self_scalars
+    from qnn.utils.checkpoint_converter import (
+        QNNPolicy,
+        migrate_entity_embed,
+        migrate_obs_embedding_self_token_builder,
+        migrate_self_scalars,
+        save_sf_format,
+    )
     from qnn.utils.io import trusted_torch_load
 
     dest = policy_dir / "checkpoint_000000000_0.pth"
@@ -657,6 +663,7 @@ def _warm_start_policy(
     elif is_sf_format:
         migrated = bool(migrate_entity_embed(payload["model"], optimizer=payload.get("optimizer")))
         migrated = bool(migrate_self_scalars(payload["model"], optimizer=payload.get("optimizer"))) or migrated
+        migrated = bool(migrate_obs_embedding_self_token_builder(payload["model"])) or migrated
         if migrated:
             print(f"[quake_ppo] Migrated warm-start checkpoint tensors in {ckpt}")
             _scrub_numpy(payload)

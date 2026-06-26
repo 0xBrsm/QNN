@@ -165,8 +165,8 @@ TARGET_SELF_QUERY = HeadSpec(
         metrics_fn=target_metrics,
         label_key="target_probs",
         output_dim=16,
-        selection_metric="target_kl",
-        selection_lower_is_better=True,
+        selection_metric="target_skill",
+        selection_lower_is_better=False,
     ),
     build=_build_target_self_query,
 )
@@ -179,8 +179,8 @@ TARGET_SELF_QUERY_ENEMY = HeadSpec(
         metrics_fn=target_metrics,
         label_key="target_probs",
         output_dim=16,
-        selection_metric="target_kl",
-        selection_lower_is_better=True,
+        selection_metric="target_skill",
+        selection_lower_is_better=False,
     ),
     build=_build_target_self_query_enemy,
 )

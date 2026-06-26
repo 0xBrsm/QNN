@@ -38,7 +38,7 @@ from qnn.model.bench.spec import (
     neutral_model_config,
 )
 from qnn.model.attack_head import AttackHead
-from qnn.model.network import Network, Off, compute_slot_dims
+from qnn.model.network import Network, Off, slot_dims
 
 
 _GEOM_SCALE_MODES = {
@@ -88,8 +88,8 @@ def _build_attack_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
 
       prior_mode (str): one of {"none", "geometric_fixed",
         "geometric_learnable_scalar", "geometric_learnable_perweapon",
-        "hit_test"}. Default "none". Geometric modes need ``base_look``
-        so ``LookHead`` stays in the slot for those (its ``base_look``
+        "hit_test"}. Default "none". Geometric modes need ``look_prior``
+        so ``LookHead`` stays in the slot for those (its ``look_prior``
         is a pure function of target_logits + entity_rel with no
         learnable params).
       alignment_scale (float): seed value for the geometric scale
@@ -105,8 +105,10 @@ def _build_attack_preattn(probe: Mapping[str, Any]) -> HeadBuildResult:
     model_config = neutral_model_config(
         d_model=d_model, self_weapon_embed_in_self=self_weapon,
     )
-    dims = compute_slot_dims(
-        model_config, has_temporal=False, has_weapon_head=False,
+    dims = slot_dims(
+        d_model=model_config.d_model, d_gru=model_config.d_gru,
+        has_temporal=False, has_target_pointer=True, has_weapon_head=False,
+        weapon_sources=model_config.weapon_sources,
     )
 
     needs_look_head = prior_mode in _GEOM_SCALE_MODES
@@ -151,7 +153,7 @@ ATTACK_PREATTN = HeadSpec(
         metrics_fn=attack_metrics,
         label_key="attack",
         output_dim=1,
-        selection_metric="f1_attack",
+        selection_metric="attack_skill",
         selection_lower_is_better=False,
     ),
     build=_build_attack_preattn,

@@ -28,13 +28,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from qnn.bc.weapon_physics import QNN_DIST_SCALE, QNN_VEL_SCALE, WEAPON_PHYSICS
+from qnn.bc.weapon_physics import (
+    ACTOR_REL_OFFSET, ACTOR_VEL_OFFSET, QNN_DIST_SCALE, QNN_VEL_SCALE, WEAPON_PHYSICS,
+)
 from qnn.model._mlp import make_head_mlp
 from qnn.model.attack_head import OUT_DIM, AttackHeadInput, AttackHeadOutput
 from qnn.vocab import self_weapon_id_to_impulse
 
-_ESC_REL_BEGIN, _ESC_REL_END = 3, 6   # entity_scalars_raw ACTOR layout
-_ESC_VEL_BEGIN, _ESC_VEL_END = 7, 10
+# entity_scalars_raw ACTOR layout — offsets owned by qnn.bc.weapon_physics.
+_ESC_REL_BEGIN, _ESC_REL_END = ACTOR_REL_OFFSET, ACTOR_REL_OFFSET + 3
+_ESC_VEL_BEGIN, _ESC_VEL_END = ACTOR_VEL_OFFSET, ACTOR_VEL_OFFSET + 3
 _MAX_WEAPON_ID = 9
 
 

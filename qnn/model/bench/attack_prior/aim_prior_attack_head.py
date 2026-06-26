@@ -1,6 +1,6 @@
 """AttackHead variant with aim-alignment prior + residual MLP.
 
-  prior_logit = scale * base_look[..., 0]   # alignment cosine in [-1, +1]
+  prior_logit = scale * look_prior[..., 0]   # alignment cosine in [-1, +1]
   attack_logit = prior_logit + delta_attack(features)
 
 Three scale parameterizations selected at construction:
@@ -12,7 +12,7 @@ The residual MLP's final Linear is zero-initialized so training starts
 at attack_logit == prior_logit exactly; the MLP learns only deviations.
 
 Slots into Network via ``attack_head=AimPriorAttackHead(...)``.
-Requires ``inp.base_look`` (and ``inp.weapon_id`` for the perweapon
+Requires ``inp.look_prior`` (and ``inp.weapon_id`` for the perweapon
 variant) — both populated by Network.forward in canonical configs.
 """
 
@@ -61,8 +61,8 @@ class AimPriorAttackHead(nn.Module):
             nn.init.zeros_(final.bias)
 
     def forward(self, inp: AttackHeadInput) -> AttackHeadOutput:
-        assert inp.base_look is not None, "AimPriorAttackHead requires base_look"
-        alignment = inp.base_look[..., 0:1].to(inp.features.dtype)          # (B*, 1)
+        assert inp.look_prior is not None, "AimPriorAttackHead requires look_prior"
+        alignment = inp.look_prior[..., 0:1].to(inp.features.dtype)          # (B*, 1)
         if self.scale_mode == "fixed":
             prior_logit = self.scale_init * alignment
         elif self.scale_mode == "scalar":

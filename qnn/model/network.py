@@ -67,11 +67,19 @@ class ModelConfig:
     use_weapon_head: bool
     weapon_switch_confidence: float
     weapon_switch_margin: float
-    weapon_use_gru: bool
+    # Weapon-selector input composition as an ordered edge list, not bools.
+    # Each member names a source the selector cat is built from, in order:
+    #   "gru"          — temporal hidden (contributes only when a temporal
+    #                     slot is active; silently dropped otherwise).
+    #   "self_readout" — encoder self/CLS readout.
+    #   "target_feat"  — pointer-blended target feature (zeros when the
+    #                     target slot is off, but still occupies its width).
+    # Canonical is ("gru", "self_readout", "target_feat"). At least one of
+    # {"gru", "self_readout"} must be present — target_feat alone is too thin.
+    weapon_sources: tuple[str, ...]
     weapon_context_from_obs: bool
     look_bypass_gru: bool
     d_target: int
-    weapon_use_self_readout: bool
     self_weapon_embed_in_self: bool
     d_move: int
     d_look: int
@@ -90,13 +98,42 @@ class ModelConfig:
         """
         data = dict(raw)
         data.pop("encoder_hidden", None)
-        if "weapon_use_cls_readout" in data:
-            data.setdefault("weapon_use_self_readout", data.pop("weapon_use_cls_readout"))
+        data["weapon_sources"] = cls._resolve_weapon_sources(data)
         if data.get("head_activation") not in ("none", "gelu", "relu"):
             raise ValueError(
                 f"head_activation must be 'none', 'gelu', or 'relu', got {data.get('head_activation')!r}"
             )
         return cls(**data)
+
+    @staticmethod
+    def _resolve_weapon_sources(data: "dict[str, Any]") -> "tuple[str, ...]":
+        """Pop weapon-source keys from ``data`` and return the source tuple.
+
+        New configs carry ``weapon_sources`` directly. Pre-rename configs
+        (the 396 serialized run model.json) carry the old
+        ``weapon_use_gru`` / ``weapon_use_self_readout`` bools (with the
+        even-older ``weapon_use_cls_readout`` alias of the latter) — those
+        are migrated to the ordered edge list here so existing checkpoints
+        keep loading. Legacy keys are always stripped so they never reach
+        the dataclass constructor.
+        """
+        legacy_gru = data.pop("weapon_use_gru", None)
+        legacy_self = data.pop("weapon_use_self_readout", None)
+        legacy_cls = data.pop("weapon_use_cls_readout", None)
+        if "weapon_sources" in data:
+            return tuple(data["weapon_sources"])
+        # Migrate from bools. Historical defaults were both True (canonical
+        # [gru, self_readout, target_feat]); only an explicit False drops a source.
+        use_gru = True if legacy_gru is None else bool(legacy_gru)
+        self_val = legacy_self if legacy_self is not None else legacy_cls
+        use_self = True if self_val is None else bool(self_val)
+        sources = []
+        if use_gru:
+            sources.append("gru")
+        if use_self:
+            sources.append("self_readout")
+        sources.append("target_feat")
+        return tuple(sources)
 
     @classmethod
     def from_flat_dict(cls, raw: "Mapping[str, Any]") -> "ModelConfig":
@@ -104,7 +141,10 @@ class ModelConfig:
         flat config dict (e.g. a PPO config that merges train + model
         keys). Missing required model fields still raise TypeError.
         """
-        keys = {f.name for f in fields(cls)} | {"encoder_hidden"}
+        keys = {f.name for f in fields(cls)} | {
+            "encoder_hidden",
+            "weapon_use_gru", "weapon_use_self_readout", "weapon_use_cls_readout",
+        }
         subset = {k: v for k, v in raw.items() if k in keys}
         return cls.from_dict(subset)
 
@@ -205,39 +245,62 @@ def _restore_outputs(
     return features, logits, values, target_logits
 
 
-def compute_slot_dims(
-    model: ModelConfig,
-    *,
-    has_temporal: bool | None = None,
-    has_weapon_head: bool | None = None,
-) -> dict[str, int]:
-    """Return the dim contract Network's slots are built with.
+def _weapon_source_dim(
+    source: str, *, d_model: int, d_gru: int, has_temporal: bool,
+) -> int:
+    """Width one weapon-selector source contributes to the selector cat.
 
-    Defaults to the canonical layout implied by ``ModelConfig`` (use_gru,
-    use_weapon_head). Pass ``has_temporal=False`` / ``has_weapon_head=False``
-    when authoring overrides that disable a slot — the motor / weapon dims
-    shrink accordingly.
+    ``gru`` contributes ``d_gru`` only when a temporal slot is active (and 0
+    otherwise — it's silently dropped from the cat); ``self_readout`` and
+    ``target_feat`` are each ``d_model`` wide.
+    """
+    if source == "gru":
+        return int(d_gru) if has_temporal else 0
+    if source in ("self_readout", "target_feat"):
+        return int(d_model)
+    raise ValueError(f"unknown weapon source {source!r}")
+
+
+def slot_dims(
+    *,
+    d_model: int,
+    d_gru: int,
+    has_temporal: bool,
+    has_target_pointer: bool,
+    has_weapon_head: bool,
+    weapon_sources: "tuple[str, ...]",
+) -> dict[str, int]:
+    """Single authority for the dim contract Network's slots are built with.
+
+    Pure function over *resolved node widths*, not a ModelConfig — ``d_model``
+    is the encoder/obs-embedding ``out_dim``, ``d_gru`` is the temporal slot's
+    ``out_dim`` (pass 0 when the slot is off). ``Network.__init__`` calls this
+    with its built nodes' ``out_dim`` so nodes — not config scalars — are the
+    dim source of truth; bench builders that must size an override head before
+    constructing Network call it with their config-derived widths.
+
+    ``has_target_pointer`` controls whether the motor feature vector carries the
+    pointer's ``target_feat`` (``d_model`` wide). When the pointer slot is Off
+    there is no target — the block is dropped entirely rather than fed as a
+    ``d_model``-wide zeros pad the heads have to learn to ignore (and which, with
+    a weapon head present, sits *between* the readout and weapon_context where no
+    prefix slice can drop it). "If target is off, it's off."
 
     Keys:
-      d_model           — token width / target_feat width / weapon_context width.
-      d_gru        — Temporal hidden width (0 when temporal slot is off).
       base_features_dim — input to motor heads excluding weapon_context.
       motor_in          — input to MoveHead / LookHead / AttackHead.
       weapon_in         — input to WeaponHead's classifier.
     """
-    if has_temporal is None:
-        has_temporal = bool(model.use_gru and model.d_gru > 0)
-    if has_weapon_head is None:
-        has_weapon_head = bool(model.use_weapon_head)
-    d_gru = int(model.d_gru) if has_temporal else 0
-    d_model = int(model.d_model)
+    d_gru = int(d_gru) if has_temporal else 0
+    d_model = int(d_model)
     weapon_ctx_dim = d_model if has_weapon_head else 0
-    base_features_dim = (d_gru + d_model) if has_temporal else (2 * d_model)
+    readout_dim = d_gru if has_temporal else d_model
+    target_dim = d_model if has_target_pointer else 0
+    base_features_dim = readout_dim + target_dim
     motor_in = base_features_dim + weapon_ctx_dim
-    weapon_in = (
-        (d_gru if (model.weapon_use_gru and has_temporal) else 0)
-        + (d_model if model.weapon_use_self_readout else 0)
-        + d_model
+    weapon_in = sum(
+        _weapon_source_dim(src, d_model=d_model, d_gru=d_gru, has_temporal=has_temporal)
+        for src in weapon_sources
     )
     return {
         "d_model": d_model,
@@ -263,7 +326,8 @@ class Network(nn.Module):
         ``ModelConfig`` (respecting the existing ``use_gru`` / ``use_weapon_head``
         flags for backward compatibility).
       * An ``nn.Module`` instance — Network uses it as-is. Use
-        ``compute_slot_dims(model)`` to size the override correctly.
+        ``slot_dims(...)`` (passing the override's ``out_dim``) to size the
+        override correctly.
       * ``Off`` (sentinel defined below) — slot disabled. ``Network.forward``
         substitutes zero tensors where the slot's output would have fed
         downstream, and (for head slots) omits the slot's logits-dict entry.
@@ -300,7 +364,6 @@ class Network(nn.Module):
             raise ValueError("encoder slot cannot be disabled (Off)")
         self.obs_dim = int(obs_dim)
         self.config = model
-        self.d_model = int(model.d_model)
         self.obs_embedding = obs_embedding if obs_embedding is not None else ObsEmbedding(
             d_model=int(model.d_model),
             self_weapon_embed_in_self=bool(model.self_weapon_embed_in_self),
@@ -312,25 +375,35 @@ class Network(nn.Module):
             d_ffn=int(model.d_ffn),
             dropout=float(model.attn_dropout),
         )
+        # Token width is the encoder's declared out_dim — the resolved node,
+        # not the config scalar, is the dim source of truth (an override
+        # encoder may carry a different width). A passthrough encoder
+        # (PreAttnEncoder) emits the obs-embedding's tokens unchanged and
+        # declares no out_dim, so fall back to the obs-embedding's width.
+        self.d_model = int(getattr(self.encoder, "out_dim", None) or self.obs_embedding.out_dim)
         self.use_gru = bool(model.use_gru and model.d_gru > 0)
-        self.d_gru = int(model.d_gru) if self.use_gru else 0
         self.use_weapon_head = bool(model.use_weapon_head)
         # look_bypass_gru is a v17-fidelity load-time flag.  v20+ always sets
         # this False — when True (only via QNNPolicy.load on a v17 checkpoint)
         # the look head is fed cat(self_readout, target_feat) instead of
         # cat(gru_flat, target_feat), matching the features it was trained on.
         self.look_bypass_gru = bool(model.look_bypass_gru and self.use_gru)
-        self.weapon_use_gru = bool(model.weapon_use_gru and self.use_gru)
-        # Weapon head selector composition is per-flag: at least one of
-        # {gru_flat, self_readout} must be present (target_feat is always
-        # included). Default (true, true) preserves the historical
-        # [gru_flat, self_readout, target_feat] layout.
-        self.weapon_use_self_readout = bool(model.weapon_use_self_readout)
-        if not (self.weapon_use_gru or self.weapon_use_self_readout):
+        # Weapon-selector composition is an ordered edge list (see
+        # ModelConfig.weapon_sources). The "gru" source contributes only when
+        # a temporal slot is active; the others always contribute their width.
+        self.weapon_sources = tuple(model.weapon_sources)
+        _valid_sources = {"gru", "self_readout", "target_feat"}
+        _bad = [s for s in self.weapon_sources if s not in _valid_sources]
+        if _bad:
             raise ValueError(
-                "weapon head needs at least one of weapon_use_gru or "
-                "weapon_use_self_readout — got both False (target_feat "
-                "alone is too thin)"
+                f"weapon_sources contains unknown source(s) {_bad}; "
+                f"valid sources are {sorted(_valid_sources)}"
+            )
+        if not ({"gru", "self_readout"} & set(self.weapon_sources)):
+            raise ValueError(
+                "weapon head needs at least one of 'gru' / 'self_readout' in "
+                "weapon_sources — got "
+                f"{self.weapon_sources!r} (target_feat alone is too thin)"
             )
         self.weapon_context_from_obs = bool(model.weapon_context_from_obs)
         self.d_target = int(model.d_target)
@@ -351,25 +424,19 @@ class Network(nn.Module):
         self._has_look_head = look_head is not Off
         self._has_attack_head = attack_head is not Off
 
-        # Effective dim contract — what flat features each slot consumes.
-        # base_features_dim swaps gru_flat → self_readout when temporal is off;
-        # the weapon_ctx contribution to motor_in disappears when weapon head is off.
-        weapon_ctx_dim = self.d_model if self._has_weapon_head else 0
-        base_features_dim = (self.d_gru + self.d_model) if self._has_temporal else (2 * self.d_model)
-        motor_in = base_features_dim + weapon_ctx_dim
-        weapon_in = (
-            (self.d_gru if (self.weapon_use_gru and self._has_temporal) else 0)
-            + (self.d_model if self.weapon_use_self_readout else 0)
-            + self.d_model  # target_feat is always present (zero when target_pointer is off)
-        )
-
-        # Build / accept overrides for each slot. Defaults use the effective dims above.
-
+        # Build the upstream slots (temporal, target pointer) FIRST so the
+        # downstream dim contract reads their declared out_dim rather than a
+        # config scalar — nodes are the dim source of truth. The canonical
+        # GRU is still *sized* from config d_gru; self.d_gru is then read back
+        # from whatever node landed in the slot (canonical or override).
         if self._has_temporal:
             self.temporal = (
-                Temporal(d_model=self.d_model, hidden_dim=self.d_gru)
+                Temporal(d_model=self.d_model, hidden_dim=int(model.d_gru))
                 if temporal is None else temporal
             )
+            self.d_gru = int(self.temporal.out_dim)
+        else:
+            self.d_gru = 0
 
         if self._has_target_pointer:
             if target_pointer is None:
@@ -379,6 +446,19 @@ class Network(nn.Module):
                 )
             else:
                 self.target_pointer = target_pointer
+
+        # Effective dim contract — single authority in slot_dims, fed the
+        # resolved node widths (d_model from encoder, d_gru from temporal slot).
+        dims = slot_dims(
+            d_model=self.d_model,
+            d_gru=self.d_gru,
+            has_temporal=self._has_temporal,
+            has_target_pointer=self._has_target_pointer,
+            has_weapon_head=self._has_weapon_head,
+            weapon_sources=self.weapon_sources,
+        )
+        motor_in = dims["motor_in"]
+        weapon_in = dims["weapon_in"]
 
         if self._has_weapon_head:
             if weapon_head is None:
@@ -477,29 +557,40 @@ class Network(nn.Module):
             target_logits = tp_out.target_logits
             target_feat = tp_out.target_feat
         else:
+            # No pointer slot → no target. target_logits stays a shape-preserving
+            # zeros (entity-anchored priors / weapon target_feat source still read
+            # it), but target_feat is NOT fabricated into the motor feature cat —
+            # see slot_dims(has_target_pointer=...). "If target is off, it's off."
             n_entities = int(enc_out.entity_outs.shape[1])
             zero_kw = {"dtype": self_readout.dtype, "device": self_readout.device}
             target_logits = torch.zeros((batch_flat, n_entities), **zero_kw)
             target_feat = torch.zeros((batch_flat, self.d_model), **zero_kw)
 
-        if self._has_temporal:
-            features_base_flat = torch.cat([gru_flat, target_feat], dim=-1)
-            _ws_parts: list[torch.Tensor] = []
-            if self.weapon_use_gru:
-                _ws_parts.append(gru_flat)
-            if self.weapon_use_self_readout:
-                _ws_parts.append(self_readout)
-            _ws_parts.append(target_feat)
-            weapon_selector_flat = torch.cat(_ws_parts, dim=-1)
+        # Motor feature base = readout (+ target_feat only when a pointer exists).
+        readout_flat = gru_flat if self._has_temporal else self_readout
+        if self._has_target_pointer:
+            features_base_flat = torch.cat([readout_flat, target_feat], dim=-1)
         else:
-            features_base_flat = torch.cat([self_readout, target_feat], dim=-1)
-            weapon_selector_flat = features_base_flat
+            features_base_flat = readout_flat
 
         entity_scalars_flat = flat_obs["entity_scalars_raw"]
         entity_rel_flat = entity_scalars_flat[..., _ACTOR_REL_OFFSET:_ACTOR_REL_OFFSET + 3]
 
         weapon_out = None
         if self._has_weapon_head:
+            # Selector cat — assembled by iterating weapon_sources in declared
+            # order. The "gru" source only exists when temporal is on; it's
+            # dropped from the cat otherwise (matching its 0-width dim).
+            _ws_available: dict[str, torch.Tensor] = {
+                "self_readout": self_readout,
+                "target_feat": target_feat,
+            }
+            if self._has_temporal:
+                _ws_available["gru"] = gru_flat
+            weapon_selector_flat = torch.cat(
+                [_ws_available[src] for src in self.weapon_sources if src in _ws_available],
+                dim=-1,
+            )
             weapon_out = self.weapon_head(WeaponHeadInput(
                 selector=weapon_selector_flat,
                 obs_weapon_id=flat_obs["self_weapon_id"] if self.weapon_context_from_obs else None,
@@ -513,9 +604,11 @@ class Network(nn.Module):
         # set look_bypass_gru=True so the look head sees the same features
         # it was trained on (cat(self_readout, target_feat)).
         if self._has_temporal and self.look_bypass_gru:
-            look_features_flat = self._with_weapon_context(
-                torch.cat([self_readout, target_feat], dim=-1), weapon_context,
+            bypass_base = (
+                torch.cat([self_readout, target_feat], dim=-1)
+                if self._has_target_pointer else self_readout
             )
+            look_features_flat = self._with_weapon_context(bypass_base, weapon_context)
         else:
             look_features_flat = self._with_weapon_context(features_base_flat, weapon_context)
         if self._has_look_head:
@@ -527,10 +620,10 @@ class Network(nn.Module):
             ))
         else:
             look_out = None
-        # base_look is consumed by bench AimPrior variants; canonical
+        # look_prior is consumed by bench AimPrior variants; canonical
         # AttackHead ignores it. Substitute zeros when look is off.
-        base_look_for_attack = (
-            look_out.base_look if look_out is not None
+        look_prior_for_attack = (
+            look_out.look_prior if look_out is not None
             else torch.zeros((batch_flat, 3), dtype=self_readout.dtype, device=self_readout.device)
         )
 
@@ -538,7 +631,7 @@ class Network(nn.Module):
         if self._has_attack_head:
             attack_out = self.attack_head(AttackHeadInput(
                 features=attack_features_flat,
-                base_look=base_look_for_attack,
+                look_prior=look_prior_for_attack,
                 weapon_id=flat_obs["self_weapon_id"],
                 target_logits=target_logits,
                 entity_scalars=entity_scalars_flat,
@@ -552,16 +645,28 @@ class Network(nn.Module):
         if move_out is not None:
             logits_flat[MOVE_HEAD] = move_out.logits
         if look_out is not None:
-            logits_flat[LOOK_HEAD] = look_out.pred_look
+            logits_flat[LOOK_HEAD] = look_out.look_predict
             # Underscored keys are loss-only; not used for inference / sampling.
-            logits_flat["_look_base"] = look_out.base_look
-            logits_flat["_look_delta"] = look_out.delta_look
+            logits_flat["_look_prior"] = look_out.look_prior
+            logits_flat["_look_delta"] = look_out.look_delta
+            # Distributional head outputs (binned / polar / vMF) forwarded
+            # generically so a new look head's LOSS can live entirely in bench:
+            # QNNPolicy dispatches to look_head.look_loss, which reads these.
+            for _f in ("look_bins", "look_mag_logits", "look_dir_logits",
+                       "look_vmf_mix", "look_vmf_mu", "look_vmf_kappa"):
+                _v = getattr(look_out, _f, None)
+                if _v is not None:
+                    logits_flat["_" + _f] = _v
         if attack_out is not None:
             logits_flat["_attack_prior"] = attack_out.prior_logit
             logits_flat["_attack_delta"] = attack_out.delta_attack
             logits_flat[ATTACK_HEAD] = attack_out.attack_logit
         if weapon_out is not None:
             logits_flat[WEAPON_HEAD] = weapon_out.logits
+            # Loss-only underscored key (not used for inference/sampling) so a
+            # bench weapon head's LOSS can live entirely in bench — mirrors look.
+            if getattr(weapon_out, "when_logit", None) is not None:
+                logits_flat["_weapon_switch_when"] = weapon_out.when_logit
 
         features_flat = move_features_flat  # downstream consumers ignore the weapon-ctx dim
         values_flat = torch.zeros((batch_flat,), dtype=sample.dtype, device=sample.device)

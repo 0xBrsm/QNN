@@ -1,11 +1,11 @@
 """Look head: target-anchored prior + learned residual.
 
-  base_look  = normalize(Σ_n softmax(target_logits)[n] * entity_rel[n])
-  delta_look = mlp(features)
-  pred_look  = normalize(base_look + delta_look)
+  look_prior  = normalize(Σ_n softmax(target_logits)[n] * entity_rel[n])
+  look_delta = mlp(features)
+  look_predict  = normalize(look_prior + look_delta)
 
-base_look is zero (and pred_look defaults to delta_look's normalized
-output) when no actor entity is present. base_look[..., 0] is the cosine
+look_prior is zero (and look_predict defaults to look_delta's normalized
+output) when no actor entity is present. look_prior[..., 0] is the cosine
 of the current aim against the soft target direction in view frame —
 AttackHead consumes it as the alignment prior.
 """
@@ -33,9 +33,33 @@ class LookHeadInput:
 
 @dataclass(frozen=True, slots=True)
 class LookHeadOutput:
-    pred_look: torch.Tensor   # (B*, 3) unit-normalized
-    base_look: torch.Tensor   # (B*, 3) unit-normalized prior
-    delta_look: torch.Tensor  # (B*, 3) raw residual
+    look_predict: torch.Tensor   # (B*, 3) unit-normalized
+    look_prior: torch.Tensor   # (B*, 3) unit-normalized prior
+    look_delta: torch.Tensor  # (B*, 3) raw residual
+    # Binned (classification) look heads emit per-axis tangent bin logits
+    # (B*, 2, N_BINS); the canonical look loss then uses cross-entropy instead
+    # of smooth_l1. None for regression heads. See qnn.model.look_bins.
+    look_bins: torch.Tensor | None = None
+    # Polar (magnitude × direction) look heads emit a categorical over
+    # {hold} ∪ magnitude bins (B*, N_MAG+1) and over direction bins (B*, N_DIR).
+    # The hold mode is a single bin and a flick's yaw/pitch share one direction.
+    # None for non-polar heads. See qnn.model.look_bins.
+    look_mag_logits: torch.Tensor | None = None
+    look_dir_logits: torch.Tensor | None = None
+    # Mixture-of-vMF look heads emit a directional mixture over S²: weights
+    # (B*, K), unit mean directions (B*, K, 3), concentrations (B*, K). Continuous
+    # + multimodal (no quantization). None for non-vMF heads. See qnn.model.vmf.
+    look_vmf_mix: torch.Tensor | None = None
+    look_vmf_mu: torch.Tensor | None = None
+    look_vmf_kappa: torch.Tensor | None = None
+    # Polar+offset (discretized mixture) look heads emit, in addition to the
+    # mag/dir categoricals above, a continuous 2D Gaussian over the tangent
+    # residual within the chosen (mag,dir) cell: mean (B*, 2) + log-std (B*, 2).
+    # The Gaussian replaces polar's −log(cell_area) term with a true within-cell
+    # density (continuous resolution while keeping the multimodal polar structure).
+    # None for non-offset heads. See qnn.model.bench.look_head_polar_offset.
+    look_off_mean: torch.Tensor | None = None
+    look_off_logstd: torch.Tensor | None = None
 
 
 class LookHead(nn.Module):
@@ -53,10 +77,10 @@ class LookHead(nn.Module):
         soft_target_rel = soft_target_rel * has_actor
 
         soft_norm = torch.linalg.vector_norm(soft_target_rel, dim=-1, keepdim=True).clamp(min=1e-6)
-        base_look = soft_target_rel / soft_norm
+        look_prior = soft_target_rel / soft_norm
 
-        delta_look = self.mlp(inp.features)                                     # (B*, 3)
-        unnormalized = base_look + delta_look
+        look_delta = self.mlp(inp.features)                                     # (B*, 3)
+        unnormalized = look_prior + look_delta
         out_norm = torch.linalg.vector_norm(unnormalized, dim=-1, keepdim=True).clamp(min=1e-6)
-        pred_look = unnormalized / out_norm
-        return LookHeadOutput(pred_look=pred_look, base_look=base_look, delta_look=delta_look)
+        look_predict = unnormalized / out_norm
+        return LookHeadOutput(look_predict=look_predict, look_prior=look_prior, look_delta=look_delta)
