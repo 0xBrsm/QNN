@@ -35,12 +35,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from qnn.actions import MOVE_CLASS_NONE
+from qnn.actions import (
+    MOVE_CLASS_NEG,
+    MOVE_CLASS_NONE,
+    MOVE_CLASS_POS,
+    decode_move_pressbyte,
+)
+from .data import (
+    _EpisodeView,
+    _load_split,
+    op_input_keep_mask,
+)
 from .model import (
     CORE_FEAT_DIM,
     FeatureSpec,
     MoveLabeler,
     N_CLASSES,
+    VELOCITY_SCALE,
     build_features,
     decode_move_fb_lr,
     decode_move_fb_lr_ud,
@@ -111,121 +122,62 @@ class TrainConfig:
     smooth_target: int = 0              # majority-vote window over move target (0/1 = off)
     predict_ud:   bool = False          # add a third head for ud (jump press)
     # When set, per-tick targets are CE-masked using the operative-input
-    # bitmask sidecar (`obs/op_input`) emitted by the C worker.  Bit i of
-    # the mask corresponds to axis i in {fb, lr, ud, fire, weapon_switch};
+    # bitmask (`act/op_input`) emitted by the C worker.  Bit i of
+    # the mask corresponds to axis i in {fb, lr, ud, fire, impulse};
     # a 0 bit means the player's input on that axis at that tick had no
     # observable engine effect (e.g., jump-while-airborne, fire-in-
     # cooldown) and the target is replaced with ignore_index=-100 so CE
     # skips it.  Silently no-op for shards that don't carry the sidecar
     # (older formats — falls through unmodified).
     sanitize_targets: bool = False
+    # Cap training to at most this many frames (0 = all).  Episodes are shuffled
+    # by `seed` and accumulated until the cap (cap-first, so smaller caps nest in
+    # larger ones) — for data-scaling / learning-curve sweeps.
+    max_train_frames: int = 0
 
 
-# ── episode loading (mmap-backed, lazy) ───────────────────────────────────────
-
-@dataclass
-class _EpisodeView:
-    """mmap-backed slices into shard arrays for one episode."""
-    self_velocity:    np.ndarray
-    self_movement_id: np.ndarray
-    look:             np.ndarray
-    move:             np.ndarray
-    c_rule_fire:      np.ndarray | None
-    c_rule_jump:      np.ndarray | None
-    weapon_id:        np.ndarray | None
-    gbt_probs:        np.ndarray | None
-    # Per-tick operative-input bitmask emitted by the C worker (bit0=fb,
-    # bit1=lr, bit2=ud, bit3=fire, bit4=weapon_switch).  1 = engine acted
-    # on this axis's input this tick (keep in loss); 0 = no-op (drop).
-    # Optional; older shards won't carry the sidecar and the trainer
-    # falls back to no masking even with --sanitize-targets.
-    op_input: np.ndarray | None
-    n_frames:         int
-
-
-def _load_split(split_dir: Path) -> list[_EpisodeView]:
-    manifest_path = split_dir / "manifest.json"
-    if not manifest_path.exists():
-        return []
-    manifest = json.loads(manifest_path.read_text())
-    episodes: list[_EpisodeView] = []
-
-    for shard in manifest["shards"]:
-        obs = shard["obs"]
-        acts = shard["actions"]
-
-        vel  = np.load(split_dir / obs["self_velocity"],    mmap_mode="r")
-        mid  = np.load(split_dir / obs["self_movement_id"], mmap_mode="r")
-        look = np.load(split_dir / obs["look"],             mmap_mode="r")
-        move = np.load(split_dir / acts["move"])  # uint8, small — load fully
-        fire = (np.load(split_dir / obs["c_rule_fire"], mmap_mode="r")
-                if "c_rule_fire" in obs else None)
-        jump = (np.load(split_dir / obs["c_rule_jump"], mmap_mode="r")
-                if "c_rule_jump" in obs else None)
-        wid  = (np.load(split_dir / obs["weapon_id"], mmap_mode="r")
-                if "weapon_id" in obs else None)
-        opi  = (np.load(split_dir / obs["op_input"], mmap_mode="r")
-                if "op_input" in obs else None)
-        # GBT stacking probs are an optional sidecar written by
-        # scripts/gbt_oof_stack.py.  Path convention: same prefix as the
-        # other obs arrays, suffix `_obs_gbt_probs.npy`.
-        gbt_rel = obs.get("gbt_probs")
-        if gbt_rel is None:
-            # Backward-compat: derive from shard arrays' prefix.
-            vel_rel = obs["self_velocity"]
-            guess = vel_rel.replace("_obs_self_velocity", "_obs_gbt_probs")
-            if (split_dir / guess).exists():
-                gbt_rel = guess
-        gbt  = (np.load(split_dir / gbt_rel, mmap_mode="r")
-                if gbt_rel is not None else None)
-
-        start = 0
-        for length in shard["episode_lengths"]:
-            stop = start + int(length)
-            episodes.append(_EpisodeView(
-                self_velocity   =vel[start:stop],
-                self_movement_id=mid[start:stop],
-                look            =look[start:stop],
-                move            =move[start:stop],
-                c_rule_fire     =fire[start:stop] if fire is not None else None,
-                c_rule_jump     =jump[start:stop] if jump is not None else None,
-                weapon_id       =wid[start:stop]  if wid  is not None else None,
-                gbt_probs       =gbt[start:stop]  if gbt  is not None else None,
-                op_input        =opi[start:stop] if opi  is not None else None,
-                n_frames        =stop - start,
-            ))
-            start = stop
-    return episodes
+# Episode loading (_EpisodeView, _load_split) lives in qnn.labeler.data and is
+# imported above — shared with the GBT path's materialize_split.
 
 
 # ── chunked dataset ───────────────────────────────────────────────────────────
 
 def _smooth_move_target(move_packed: np.ndarray, window: int) -> np.ndarray:
-    """Per-axis majority-vote smoothing of the packed move target.
+    """Per-axis majority-vote smoothing of the packed press-byte move target.
 
     For each tick t, replace the per-axis class with the mode over
     [t - window//2 .. t + window//2], clamped to episode bounds.  Window
     sizes of 0 or 1 are a no-op (no smoothing).  Reduces frame-boundary
     transition noise (e.g., button-just-released ticks) at the cost of
     blurring labels near genuine press boundaries.
+
+    Decodes/re-encodes in the press-byte layout so the result round-trips
+    cleanly back through ``decode_move_pressbyte`` (the smoothed byte carries
+    only the fb/lr/ud direction bits; attack/jump-button bits, which the
+    labeler never reads from the target, are dropped).
     """
     if window <= 1:
         return move_packed
     half = window // 2
     arr = np.asarray(move_packed, dtype=np.uint8).reshape(-1)
     n = arr.shape[0]
-    fb = (arr & 0x3).astype(np.int32)
-    lr = ((arr >> 2) & 0x3).astype(np.int32)
-    ud = ((arr >> 4) & 0x3).astype(np.int32)
-    out = arr.copy()
+    axes = decode_move_pressbyte(arr)          # (n, 3) {0=neg, 1=none, 2=pos}
+    fb = axes[:, 0].astype(np.int32)
+    lr = axes[:, 1].astype(np.int32)
+    ud = axes[:, 2].astype(np.int32)
+    # Press-byte bit positions for the negative/positive class of each axis.
+    neg_bit = (1, 3, 5)
+    pos_bit = (2, 4, 6)
+    out = np.zeros(n, dtype=np.uint8)
     for t in range(n):
         lo = max(0, t - half)
         hi = min(n, t + half + 1)
-        # Mode via bincount per axis.
-        new_fb = int(np.bincount(fb[lo:hi], minlength=3).argmax())
-        new_lr = int(np.bincount(lr[lo:hi], minlength=3).argmax())
-        new_ud = int(np.bincount(ud[lo:hi], minlength=3).argmax())
-        out[t] = (new_fb & 0x3) | ((new_lr & 0x3) << 2) | ((new_ud & 0x3) << 4)
+        for axis, col in enumerate((fb, lr, ud)):
+            cls = int(np.bincount(col[lo:hi], minlength=3).argmax())
+            if cls == MOVE_CLASS_NEG:
+                out[t] |= np.uint8(1 << neg_bit[axis])
+            elif cls == MOVE_CLASS_POS:
+                out[t] |= np.uint8(1 << pos_bit[axis])
     return out
 
 
@@ -242,14 +194,47 @@ class ChunkedDataset(Dataset):
         self.smooth_target = int(smooth_target)
         self.with_ud = bool(with_ud)
         self.sanitize_targets = bool(sanitize_targets)
-        # Pre-smooth per-episode targets so __getitem__ stays cheap.
-        if self.smooth_target > 1:
-            self._smoothed_moves = [
-                _smooth_move_target(np.asarray(ep.move), self.smooth_target)
-                for ep in episodes
-            ]
-        else:
-            self._smoothed_moves = None
+
+        # Precompute per-episode features + decoded/sanitized targets ONCE.
+        # Previously build_features + decode + op_input sanitize ran inside
+        # every __getitem__, i.e. re-featurizing the whole corpus on every
+        # epoch across only num_workers processes — the GPU-starving
+        # bottleneck.  Paying it a single time here makes __getitem__ a pure
+        # slice+pad.  feats stored fp16 (~1.8 GB for 100M frames, cast back
+        # to fp32 on copy), targets int8 (-100 ignore_index fits).  Built in
+        # the main process before the loader forks; workers share via COW.
+        t_pre = time.time()
+        self._feats: list[np.ndarray] = []   # (T, F) fp16
+        self._fb:    list[np.ndarray] = []   # (T,)   int8, -100 = ignore
+        self._lr:    list[np.ndarray] = []
+        self._ud:    list[np.ndarray] = []   # filled only if with_ud
+        for ep in episodes:
+            feats = build_features(
+                ep.self_velocity, ep.self_movement_id, ep.look,
+                weapon_id=ep.weapon_id if ep.weapon_id is not None else None,
+                gbt_probs=ep.gbt_probs if ep.gbt_probs is not None else None,
+                spec=spec,
+            ).astype(np.float16, copy=False)
+            move_src = (_smooth_move_target(np.asarray(ep.move), self.smooth_target)
+                        if self.smooth_target > 1 else np.asarray(ep.move))
+            decoded = (decode_move_fb_lr_ud(move_src) if self.with_ud
+                       else decode_move_fb_lr(move_src))      # (T, 2|3)
+            fb = decoded[:, 0].astype(np.int8)
+            lr = decoded[:, 1].astype(np.int8)
+            ud = decoded[:, 2].astype(np.int8) if self.with_ud else None
+            if self.sanitize_targets and ep.op_input is not None:
+                keep = op_input_keep_mask(decoded, np.asarray(ep.op_input),
+                                          with_ud=self.with_ud)   # (T, n_axes)
+                fb = np.where(keep[:, 0], fb, np.int8(-100)).astype(np.int8)
+                lr = np.where(keep[:, 1], lr, np.int8(-100)).astype(np.int8)
+                if self.with_ud:
+                    ud = np.where(keep[:, 2], ud, np.int8(-100)).astype(np.int8)
+            self._feats.append(feats)
+            self._fb.append(fb)
+            self._lr.append(lr)
+            if self.with_ud:
+                self._ud.append(ud)
+
         self.index: list[tuple[int, int, int]] = []   # (ep_idx, start, valid_len)
         for ep_idx, ep in enumerate(episodes):
             T = ep.n_frames
@@ -261,75 +246,35 @@ class ChunkedDataset(Dataset):
             tail = T - n_full * chunk_len
             if tail > 0:
                 self.index.append((ep_idx, n_full * chunk_len, tail))
+        print(f"  precomputed features for {len(episodes)} eps in "
+              f"{time.time() - t_pre:.1f}s", flush=True)
 
     def __len__(self) -> int:
         return len(self.index)
 
     def __getitem__(self, idx: int):
         ep_idx, start, valid_len = self.index[idx]
-        ep = self.episodes[ep_idx]
         end = start + valid_len
         L = self.chunk_len
         F_dim = self.spec.dim
 
-        feats_np = build_features(
-            ep.self_velocity[start:end],
-            ep.self_movement_id[start:end],
-            ep.look[start:end],
-            c_rule_fire=ep.c_rule_fire[start:end] if ep.c_rule_fire is not None else None,
-            c_rule_jump=ep.c_rule_jump[start:end] if ep.c_rule_jump is not None else None,
-            weapon_id  =ep.weapon_id[start:end]   if ep.weapon_id  is not None else None,
-            gbt_probs  =ep.gbt_probs[start:end]   if ep.gbt_probs   is not None else None,
-            spec=self.spec,
-        )
-        move_src = (self._smoothed_moves[ep_idx] if self._smoothed_moves is not None
-                    else np.asarray(ep.move))
-        if self.with_ud:
-            decoded = decode_move_fb_lr_ud(move_src[start:end])
-        else:
-            decoded = decode_move_fb_lr(move_src[start:end])
-
+        # Pure slice + pad off the precomputed per-episode arrays.  Assigning
+        # the fp16 feats / int8 targets into the fp32 / long destination
+        # tensors casts on copy.
         feats = torch.zeros(L, F_dim, dtype=torch.float32)
         fb    = torch.full((L,), -100, dtype=torch.long)
         lr    = torch.full((L,), -100, dtype=torch.long)
-        feats[:valid_len] = torch.from_numpy(feats_np)
-        fb[:valid_len]    = torch.from_numpy(decoded[:, 0])
-        lr[:valid_len]    = torch.from_numpy(decoded[:, 1])
+        feats[:valid_len] = torch.from_numpy(self._feats[ep_idx][start:end])
+        fb[:valid_len]    = torch.from_numpy(self._fb[ep_idx][start:end])
+        lr[:valid_len]    = torch.from_numpy(self._lr[ep_idx][start:end])
         if self.with_ud:
             ud = torch.full((L,), -100, dtype=torch.long)
-            ud[:valid_len] = torch.from_numpy(decoded[:, 2])
+            ud[:valid_len] = torch.from_numpy(self._ud[ep_idx][start:end])
         else:
             ud = None
 
-        # Strict op_input + press-detection sanitize.  op_input now reports
-        # only "press AND engine acted on it" per axis, so no-press frames
-        # have bit 0 — but those are legitimate training data (the "none"
-        # class).  Keep per axis: (no press) OR (op_input bit set).  Press
-        # detection comes from the already-decoded move classes (1 = none,
-        # 0/2 = press).
-        if self.sanitize_targets and ep.op_input is not None:
-            mask = np.asarray(ep.op_input[start:end], dtype=np.uint8)
-            fb_cls = decoded[:, 0]
-            lr_cls = decoded[:, 1]
-            fb_no_press = (fb_cls == MOVE_CLASS_NONE)
-            lr_no_press = (lr_cls == MOVE_CLASS_NONE)
-            fb_keep = fb_no_press | ((mask & 0x01) != 0)
-            lr_keep = lr_no_press | ((mask & 0x02) != 0)
-            fb_ok = torch.from_numpy(fb_keep.astype(np.bool_))
-            lr_ok = torch.from_numpy(lr_keep.astype(np.bool_))
-            fb[:valid_len] = torch.where(fb_ok, fb[:valid_len],
-                                         torch.full_like(fb[:valid_len], -100))
-            lr[:valid_len] = torch.where(lr_ok, lr[:valid_len],
-                                         torch.full_like(lr[:valid_len], -100))
-            if self.with_ud:
-                ud_cls = decoded[:, 2]
-                ud_no_press = (ud_cls == MOVE_CLASS_NONE)
-                ud_keep = ud_no_press | ((mask & 0x04) != 0)
-                ud_ok = torch.from_numpy(ud_keep.astype(np.bool_))
-                ud[:valid_len] = torch.where(ud_ok, ud[:valid_len],
-                                             torch.full_like(ud[:valid_len], -100))
-
         if self.spec.use_baseline_skip:
+            ep = self.episodes[ep_idx]
             # Baseline one-hot (fb, lr) computed from velocity, fed as a
             # separate input that bypasses the encoder.
             from .model import _baseline_classes_from_vel, BASELINE_EPS, BASELINE_DIM
@@ -371,10 +316,12 @@ def _class_weights(
         eye = torch.ones(N_CLASSES, dtype=torch.float32)
         return eye, eye, eye
 
-    all_moves = np.concatenate([np.asarray(ep.move) for ep in episodes])
-    fb = all_moves & 0x3
-    lr = (all_moves >> 2) & 0x3
-    ud = (all_moves >> 4) & 0x3
+    all_moves = np.concatenate([np.asarray(ep.move) for ep in episodes]).astype(np.uint8)
+    # move is the BC press-byte — decode to 3-class {0=neg,1=none,2=pos} per axis
+    # (NOT the retired field3 2-bit fields, which read the wrong bits here and
+    # yield a 4-class histogram → a 4-long weight tensor cross_entropy rejects).
+    axes = decode_move_pressbyte(all_moves)   # (N, 3)
+    fb, lr, ud = axes[:, 0], axes[:, 1], axes[:, 2]
 
     def _w(counts: np.ndarray) -> torch.Tensor:
         total = counts.sum()
@@ -411,6 +358,18 @@ def train(cfg: TrainConfig) -> None:
     val_eps   = _load_split(cfg.data_dir / "precomputed_val")
     if not train_eps:
         raise SystemExit(f"no training episodes under {cfg.data_dir}/precomputed_train")
+    if cfg.max_train_frames > 0:
+        # Cap-first episode subsample for data-scaling sweeps (shuffle by seed,
+        # take whole episodes until the frame cap; nested across cap sizes).
+        order = np.random.default_rng(cfg.seed).permutation(len(train_eps))
+        kept, n = [], 0
+        for i in order:
+            kept.append(train_eps[i]); n += train_eps[i].n_frames
+            if n >= cfg.max_train_frames:
+                break
+        train_eps = kept
+        print(f"  [max_train_frames={cfg.max_train_frames:,}] capped to "
+              f"{len(train_eps)} eps / {n:,} frames")
     train_frames = sum(ep.n_frames for ep in train_eps)
     val_frames   = sum(ep.n_frames for ep in val_eps)
     print(f"  train: {len(train_eps)} eps  {train_frames:,} frames")
@@ -518,7 +477,7 @@ def train(cfg: TrainConfig) -> None:
         saved_spec = ckpt.get("feat_spec")
         if saved_spec is not None:
             cur_spec = asdict(cfg.feat_spec)
-            for k in ("is_firing", "is_jumping", "use_weapon_id",
+            for k in ("use_weapon_id",
                       "use_baseline", "use_baseline_skip", "use_gbt_stack",
                       "clip_velocity", "baseline_skip_axes"):
                 if saved_spec.get(k) != cur_spec.get(k):
@@ -527,7 +486,10 @@ def train(cfg: TrainConfig) -> None:
                         f"saved={saved_spec.get(k)} vs current={cur_spec.get(k)}"
                     )
         start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_avg = float(ckpt.get("best_avg", ckpt.get("val_avg", 0.0)))
+        # best.pt is selected on macro-F1 (`if avg_f1 > best_avg` below), so seed
+        # best_avg from the saved F1 keys — NOT val_avg (accuracy 0..100, which
+        # would exceed any F1 and freeze best.pt for the whole resumed run).
+        best_avg = float(ckpt.get("best_avg_f1", ckpt.get("val_avg_f1", 0.0)))
         if start_epoch > cfg.epochs:
             raise ValueError(
                 f"resume target already trained: saved epoch={start_epoch-1} >= "
@@ -535,11 +497,15 @@ def train(cfg: TrainConfig) -> None:
         print(f"  resumed from {cfg.resume}: epoch {start_epoch-1}, "
               f"best_avg={best_avg:.2f}%, continuing through epoch {cfg.epochs}",
               flush=True)
+    n_batches = len(train_loader)
+    log_every = max(1, n_batches // 50)         # ~50 step lines per epoch
     for epoch in range(start_epoch, cfg.epochs + 1):
         model.train()
         t0 = time.time()
-        loss_sum = chunks = 0
-        for batch in train_loader:
+        win_t, win_i = t0, 0
+        loss_accum = torch.zeros((), device=device)   # on-GPU; no per-batch sync
+        chunks = 0
+        for i, batch in enumerate(train_loader, 1):
             feats, fb, lr, ud, baseline = _unpack(batch)
 
             with torch.autocast(device_type=device.type, dtype=autocast_dt,
@@ -566,9 +532,21 @@ def train(cfg: TrainConfig) -> None:
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
-            loss_sum += float(loss.item())
+            loss_accum += loss.detach()
             chunks   += 1
 
+            if i % log_every == 0 or i == n_batches:
+                now = time.time()
+                it_s = (i - win_i) / max(now - win_t, 1e-9)
+                fr_s = it_s * cfg.batch_size * cfg.chunk_len
+                eta  = (n_batches - i) / max(it_s, 1e-9)
+                avg  = (loss_accum / max(1, chunks)).item()   # sole sync point
+                print(f"  e{epoch:2d} step {i:>5d}/{n_batches}  loss={avg:.4f}  "
+                      f"{it_s:5.1f} it/s  {fr_s/1e3:6.0f}k fr/s  eta {eta:4.0f}s",
+                      flush=True)
+                win_t, win_i = now, i
+
+        loss_sum = float(loss_accum.item())
         sched.step()
 
         # Validate.  Track per-axis 3x3 confusion matrices so we can
@@ -685,8 +663,9 @@ def main() -> None:
                          "smooths frame-boundary press-transition noise.")
     ap.add_argument("--predict-ud", action="store_true",
                     help="Add a third head for the jump-press axis (ud).  "
-                         "ud truth = (move_packed >> 4) & 0x3.  Loss for ud "
-                         "is included whenever train-axis is 'both' or 'ud'.")
+                         "ud truth = decode_move_pressbyte(move)[...,2] (press-byte "
+                         "ud bits + jump).  Loss for ud is included whenever "
+                         "train-axis is 'both' or 'ud'.")
     ap.add_argument("--use-baseline", action="store_true",
                     help="Feed the per-frame sign(velocity) baseline as an "
                          "additional input feature so the model starts from "
@@ -712,10 +691,6 @@ def main() -> None:
                          "applies when --use-baseline-skip is on).  'fb_lr' "
                          "(default): both axes.  'lr': lr only (fb head is "
                          "encoder-only).  'fb': fb only.")
-    ap.add_argument("--use-fire",   action="store_true",
-                    help="Include c_rule_fire as input feature (requires it in collect output)")
-    ap.add_argument("--use-jump",   action="store_true",
-                    help="Include c_rule_jump as input feature (requires it in collect output)")
     ap.add_argument("--use-weapon-id", action="store_true",
                     help="One-hot the server-held weapon_id (9 dims: 0=none, "
                          "1..8 = axe..LG) and append to the encoder input.")
@@ -724,14 +699,16 @@ def main() -> None:
                          "ticks where the player's input on that axis was "
                          "a no-op (engine-rejected jump-while-airborne, "
                          "fire-in-cooldown, etc.).  Uses the per-axis "
-                         "`obs/op_input` bitmask emitted by the C worker "
-                         "(LOBS bit0=fb, bit1=lr, bit2=ud; 1=keep, 0=drop). "
+                         "`act/op_input` bitmask emitted by the C worker "
+                         "(bit0=fb, bit1=lr, bit2=ud; 1=keep, 0=drop). "
                          "No-op for shards that don't carry the sidecar.")
+    ap.add_argument("--max-train-frames", type=int, default=0,
+                    help="Cap training to at most N frames (whole episodes, "
+                         "shuffled by --seed, cap-first). 0 = all. For "
+                         "data-scaling / learning-curve sweeps.")
     args = ap.parse_args()
 
     spec = FeatureSpec(
-        is_firing=args.use_fire,
-        is_jumping=args.use_jump,
         use_weapon_id=args.use_weapon_id,
         use_baseline=args.use_baseline,
         use_baseline_skip=args.use_baseline_skip,
@@ -761,6 +738,7 @@ def main() -> None:
         smooth_target=args.smooth_target,
         predict_ud =args.predict_ud,
         sanitize_targets=args.sanitize_targets,
+        max_train_frames=args.max_train_frames,
     )
     train(cfg)
 

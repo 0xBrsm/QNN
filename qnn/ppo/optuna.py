@@ -197,7 +197,6 @@ def _evaluate_trial(trial_ctx: RunnerContext, checkpoint_path: Path, output_root
             procgen=None,
             scenario_config_path="",
             reward_json_path=str(trial_ctx.run_cfg["config_paths"]["reward"]),
-            record_demos=False,
             parallel_policy_modes=False,
             device="cpu",
         )

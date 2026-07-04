@@ -12,7 +12,7 @@
  *      the NQ corpus manifest.
  *
  * Pattern is the standard X-macro: caller defines an X() macro,
- * invokes QNN_FIRE_SOUND_LIST(X) or QNN_JUMP_SOUND_LIST(X), then
+ * invokes QNN_ATTACK_SOUND_LIST(X) or QNN_JUMP_SOUND_LIST(X), then
  * #undefs X.  Each consumer expands the entries differently.
  *
  * Names extracted from vendor/quakec/qc/{weapons,client}.qc top-level
@@ -25,7 +25,7 @@
 
 /* (path, subject) — subject is one of QNN_SUBJECT_<WEAPON> from qnn.h.
  * The classifier discards the subject; the engine table uses it. */
-#define QNN_FIRE_SOUND_LIST(X) \
+#define QNN_ATTACK_SOUND_LIST(X) \
 	X("weapons/ax1.wav",      QNN_SUBJECT_AXE) \
 	X("weapons/guncock.wav",  QNN_SUBJECT_SHOTGUN) \
 	X("weapons/shotgn2.wav",  QNN_SUBJECT_SUPER_SHOTGUN) \

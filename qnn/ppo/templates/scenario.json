@@ -14,7 +14,6 @@
     "fraglimit": 0,
     "timelimit": 0,
     "samelevel": 1,
-    "arena_mode": 1,
     "pre_map_commands": "cl_forwardspeed 320\ncl_backspeed 320\ncl_sidespeed 320",
     "post_map_commands": "impulse 100\nimpulse 100\nimpulse 100\nimpulse 100\nimpulse 100"
   },
@@ -58,10 +57,11 @@
     {
       "scenario_id": "arena-1v1-box",
       "map_id": "arena_box",
-      "skill_note": "Tiny box arena - 1v1, model spawns with 200 RA + RL + LG + full ammo.",
+      "skill_note": "Tiny box arena - 1v1, ARENA MODE: both model and opponent bot spawn fully kitted (200 RA + all weapons + full ammo). train=arena is the definition of this scenario, applied in eval AND PPO.",
       "options": {
         "maxplayers": 3,
         "post_map_commands": "impulse 100",
+        "train": "arena",
         "inventory": {
           "weapons": ["rocket_launcher", "lightning"],
           "rockets": 100,

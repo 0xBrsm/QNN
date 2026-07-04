@@ -831,6 +831,10 @@ def register_quake_components() -> None:
 
 def add_quake_cli_args(parser: Any) -> None:
     """Add Quake-specific CLI arguments to an SF argument parser."""
+    # Run identity (qnn.utils.artifacts) — provenance for archived
+    # checkpoints; empty for ad-hoc launches outside a run dir.
+    parser.add_argument("--qnn_run_id", type=str, default="",
+                        help="Run id from run.json (best checkpoint naming/provenance)")
     # Environment
     parser.add_argument("--quake_executable", type=str, default=None,
                         help="Path to the Quake worker binary")
@@ -985,6 +989,7 @@ def build_ppo_cfg(
     head_loss_weights: str = "",
     initial_stddev: float = 0.2,
     model_graph_json: str = "",
+    run_id: str = "",
     extra_argv: Optional[List[str]] = None,
 ) -> Any:
     """Build a PPO cfg namespace without command-line parsing.
@@ -1030,6 +1035,7 @@ def build_ppo_cfg(
         "--save_milestones_sec=600",
         f"--with_wandb={'True' if with_wandb else 'False'}",
         f"--experiment={experiment}",
+        f"--qnn_run_id={run_id}",
         f"--train_dir={output_dir}",
         f"--device={'gpu' if device in ('gpu', 'cuda') else 'cpu'}",
         f"--train_for_env_steps={total_env_steps}",

@@ -4,12 +4,12 @@
  * Used when no usercmd_t is available (real MVD demos OR `force_mvd_emit`
  * on QWD).  Three discrete-cmd inference paths plus one move path:
  *
- *   FIRE   sound (weapon-fire PHS multicast) → walkback by full ping
- *          → fire=1 → co-temporal dedup → cooldown-gated chain-fill
- *          → forward log-normal hold tail (qnn_hold_samplers.c)
+ *   ATTACK sound (weapon-fire PHS multicast) → walkback by full ping
+ *          → attack=1 → co-temporal dedup. One operative press per event;
+ *          no hold tail.
  *   JUMP   sound (player/plyrjmp8.wav) → walkback by full ping →
- *          move[2]=jump_speed → grounded-count chain gate → forward
- *          log-normal hold tail (qnn_hold_samplers.c)
+ *          move[2]=jump_speed → grounded-count chain gate.
+ *          One operative press per event; no hold tail.
  *   SWITCH per-emit action.weapon from snapshot; on weapon_id
  *          transitions, rewrite trailing K slots back to the press
  *          frame (pickup gate at call site suppresses server-forced
@@ -17,15 +17,9 @@
  *   MOVE   per-emit fb/lr from view-relative position-delta sign;
  *          back-shifted into the ring by QNN_MvdBackShiftWriteMoveXY
  *
- * All MVD-private state (back-shift ring, fire/jump hold counters,
- * per-weapon dedup tables) lives as module-private static inside
- * qnn_mvd_collect.c.  Callers reset it at demo start via
- * QNN_MvdCollectReset().
- *
- * Not used by the labeler training pipeline.  The labeler collects
- * sparse one-tick-per-event signals via the QWD path
- * (qnn_qwd_collect.c) — these hold/chain-fill mechanisms only run
- * when MVD inference emits BC training labels.
+ * All MVD-private state (back-shift ring, per-weapon dedup tables)
+ * lives as module-private static inside qnn_mvd_collect.c.  Callers
+ * reset it at demo start via QNN_MvdCollectReset().
  */
 
 #ifndef QNN_MVD_COLLECT_H
@@ -36,17 +30,16 @@
 
 /* ── Module reset (per demo) ──────────────────────────────────────── */
 
-/* Reset back-shift ring, per-weapon fire/jump dedup tables, and the
- * log-normal hold counters/RNG seeds.  Caller supplies a seed derived
- * from the demo path so different demos use distinct PRNG streams. */
+/* Reset the back-shift ring and per-weapon attack/jump dedup tables.
+ * The demo_path_seed argument is retained for call-site compatibility
+ * but is no longer used (the hold-sim RNG it seeded was removed). */
 void QNN_MvdCollectReset(uintptr_t demo_path_seed);
 
 /* ── Action inference ─────────────────────────────────────────────── */
 
-/* Per-native-frame fire detection — emits fire=1 only on the native frame
- * where a shot event is detected (weapon-fire sound OR ammo decrement).
- * Updates the module's native_fire_this_window latch (mirrored in
- * qnn_runtime for NQ compatibility). */
+/* Per-native-frame attack detection — emits attack=1 only on the native frame
+ * where a self weapon-fire sound is detected.  Updates the module's
+ * native_attack_this_window latch (mirrored in qnn_runtime for NQ compatibility). */
 void QNN_MvdInferNativeAction(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
 
@@ -61,37 +54,15 @@ void QNN_MvdInferEmitAction(qnn_action_t *action,
 void QNN_MvdInferEmitMove(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot, float emit_dt);
 
-/* ── Back-shift ring API ──────────────────────────────────────────── */
+/* ── MVD sound/move back-shift writers ────────────────────────────────
+ *
+ * The generic back-shift ring (push/flush/slot-at/rewrite/accessors) now
+ * lives in qnn_collect_helpers.h.  These remain MVD-specific: they walk
+ * weapon-fire / jump sound events back to the press frame and stamp the
+ * resolved slot via the shared ring. */
 
-/* Accessor: returns true if the ring saw a previous weapon id (i.e.,
- * at least one push has happened).  Sets *prev_weapon out param. */
-qboolean QNN_MvdBackShiftPrevWeapon(int *prev_weapon_out);
-
-/* Accessor: returns true if the ring tracked stat_items on the previous
- * push.  Sets *prev_items_out.  Used by the pickup gate to detect
- * IT_ bit 0→1 flips on the same frame as a weapon transition. */
-qboolean QNN_MvdBackShiftPrevStatItems(int *prev_items_out);
-
-/* Number of slots currently held in the ring (0..QNN_BACKSHIFT_K). */
-int QNN_MvdBackShiftCount(void);
-
-/* Push the current emit tick's (pre-packed obs + action + metadata)
- * into the ring.  See qnn_collect_helpers.h's QNN_BackShiftPush for
- * the full contract — this is a thin wrapper that exposes the module-
- * private ring pointer. */
-void QNN_MvdBackShiftPush(qnn_tick_emit_state_t *emit, FILE *out,
-	const uint8_t *obs_bytes, const qnn_action_t *action,
-	qboolean done, int tick, int steps, int tick_hz,
-	qboolean reset_flag, qboolean grounded,
-	int weapon_id, int stat_items);
-
-/* Rewrite the trailing `shift_frames` slots so they carry the new
- * weapon — anchoring intent at the press frame. */
-void QNN_MvdBackShiftOnWeaponChange(int new_weapon_id,
-	int prev_weapon_id, int shift_frames);
-
-/* Per-event fire/jump back-shift driven by sound native_time. */
-void QNN_MvdBackShiftWriteFireEvents(const qnn_snapshot_t *snapshot,
+/* Per-event attack/jump back-shift driven by sound native_time. */
+void QNN_MvdBackShiftWriteAttackEvents(const qnn_snapshot_t *snapshot,
 	float ping_sec, float emit_start_native_time);
 void QNN_MvdBackShiftWriteJumpEvents(const qnn_snapshot_t *snapshot,
 	float ping_sec, float emit_start_native_time);
@@ -99,13 +70,71 @@ void QNN_MvdBackShiftWriteJumpEvents(const qnn_snapshot_t *snapshot,
 /* Copy the current emit's move XY to the back-shifted slot. */
 void QNN_MvdBackShiftWriteMoveXY(uint8_t move, int shift_frames);
 
-/* Drain every remaining slot through `emit`.  Called at demo end. */
-void QNN_MvdBackShiftFlushAll(qnn_tick_emit_state_t *emit);
+/* Reset the per-weapon attack dedup state for `weapon_id` (1..8).  Called
+ * when the held weapon changes so a later same-weapon shot isn't
+ * false-linked through a different-weapon interval. */
+void QNN_MvdResetAttackChain(int weapon_id);
 
-/* Reset the per-weapon fire chain-fill state for `weapon_id` (1..10)
- * and clear any pending hold spillover.  Called when the held weapon
- * changes so a later same-weapon shot isn't false-linked through a
- * different-weapon interval. */
-void QNN_MvdResetFireChain(int weapon_id);
+/* ── De-scripted intent label (MVD parity, weapon-head.md §12) ─────────
+ *
+ * MVD mirror of QNN_QwdIntentWeaponLabel: act.weapon = the player's
+ * deliberate weapon carried forward, reconstructed from held-weapon
+ * transitions + attack sounds instead of usercmd select edges (which .mvd
+ * demos lack).  Per-transition classification:
+ *
+ *   deliberate  any transition not classified below → adopt the new
+ *               held weapon; caller back-shift-rewrites the trailing
+ *               ring slots (press-frame anticipation, same shift source
+ *               as the old held rewrite).
+ *   dump        attack-scripted demo + transition INTO the demo's release
+ *               target + dump evidence: a recent attack of the outgoing
+ *               weapon (the deferred release-half equip) or a recent
+ *               respawn (the respawn press's release half dumps with no
+ *               shot) → config churn, label frozen.  Without either the
+ *               equip is a deliberate choice — the axe-release
+ *               population genuinely fights with its release weapon,
+ *               and axe swings are inaudible to the attack path, so
+ *               over-suppression cannot be corrected back.
+ *   forced      pickup auto-equip (IT_ bit 0→1, detected here from the
+ *               ring's prev stat_items) or intent no longer QC-
+ *               selectable (ammo-out auto-switch) → adopt held at the
+ *               observed frame, no press lead.
+ *   death       label 0 (masked) while dead; the first alive frame
+ *               adopts the spawn weapon (respawning takes a button
+ *               press, and QWD adopts held on that shot-less attack
+ *               press — waiting for an attack sound would mask the whole
+ *               post-spawn re-arm).  An attack sound also re-reveals at
+ *               its back-shifted press slot for any other masked span.
+ *
+ * The attack path stamps slot->action.weapon only when the sound's weapon
+ * AGREES with intent (pure timing fix) or when intent is unrevealed
+ * (adopt).  A disagreeing sound leaves the label alone — QWD truth rides
+ * revealed intent through unrealizable presses, so overriding from
+ * sound would diverge from the labels this path is validated against. */
+
+typedef enum
+{
+	QNN_MVD_WTRANS_NONE = 0,	/* no transition this emit */
+	QNN_MVD_WTRANS_DELIBERATE,
+	QNN_MVD_WTRANS_DUMP,
+	QNN_MVD_WTRANS_FORCED,
+} qnn_mvd_wtrans_t;
+
+/* QC-feasibility callback: return nonzero iff `weapon` (raw 1..8) is
+ * selectable for the snapshot's stats given `current` held.  Supplied by
+ * the QW call site (QNN_ProgsEvalWeaponImpulse) so this common module
+ * stays progs-free. */
+typedef int (*qnn_mvd_select_feasible_fn)(const qnn_snapshot_t *snapshot,
+	int current, int weapon);
+
+/* Advance the intent state for this emit tick and return the act.weapon
+ * label (raw 1..8, 0 = unrevealed/masked).  Call once per emit, after
+ * the ring pushed last tick's slot and before this tick's push.
+ * `out_trans`/`out_prev_intent` (either may be NULL) report the
+ * transition class and the pre-transition intent so the caller can
+ * back-shift-rewrite deliberate adoptions. */
+int QNN_MvdIntentWeaponStep(const qnn_snapshot_t *snapshot,
+	qnn_mvd_select_feasible_fn feasible,
+	qnn_mvd_wtrans_t *out_trans, int *out_prev_intent);
 
 #endif /* QNN_MVD_COLLECT_H */

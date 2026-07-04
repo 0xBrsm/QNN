@@ -8,7 +8,7 @@
  * The QC builtin table in pr_cmds.c references many server-side
  * functions for things like reliable client writes, multicast, world
  * collision tracing, frag logs.  None of the QC functions we invoke
- * (W_ChangeWeapon, W_Attack's pre-fire path, W_WeaponFrame's cooldown
+ * (W_ChangeWeapon, W_Attack's pre-attack path, W_WeaponFrame's cooldown
  * check) actually call those builtins, but the linker still wants
  * resolutions.  This file provides safe no-op stubs.
  *

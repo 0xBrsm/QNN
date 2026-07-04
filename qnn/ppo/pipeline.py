@@ -200,6 +200,7 @@ def run_training_job(
         total_env_steps=total_env_steps,
         output_dir=output_dir,
         experiment="",
+        run_id=str(ppo_cfg.get("run_id", "")),
         executable=str(worker_path),
         basedir=str(resolved_asset_root),
         native_workdir=require_cfg_string(ppo_cfg, "native_workdir", "PPO config"),

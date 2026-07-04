@@ -13,6 +13,8 @@
 
 extern player_state_t qnn_mvd_latest_playerstate[MAX_CLIENTS];
 
+long qnn_dbg_actor_n = 0, qnn_dbg_actor_wirezero = 0;
+
 /* ── Team detection (QW): explicit userinfo "team" string ──────────────
  *   QW players set their team via the "team" userinfo key.  When the
  *   server's "teamplay" serverinfo is nonzero, identical team strings
@@ -133,6 +135,12 @@ int QNN_AppendPlayerEntityUpdates(const qnn_snapshot_t *snapshot,
 		eu->subject_id = QNN_SUBJECT_PLAYER;
 		VectorCopy(anchor_origin, eu->origin);
 		VectorCopy(state->velocity, eu->velocity);
+		{
+			extern long qnn_dbg_actor_n, qnn_dbg_actor_wirezero;
+			qnn_dbg_actor_n++;
+			if (state->velocity[0]==0 && state->velocity[1]==0 && state->velocity[2]==0)
+				qnn_dbg_actor_wirezero++;
+		}
 		eu->angles[0] = -state->viewangles[0] / 3.0f;
 		eu->angles[1] = state->viewangles[1];
 		eu->angles[2] = 0.0f;

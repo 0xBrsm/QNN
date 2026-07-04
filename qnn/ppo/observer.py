@@ -1,9 +1,13 @@
-"""AlgoObserver that archives every best checkpoint to the run checkpoint directory.
+"""AlgoObserver that maintains the run's single best checkpoint.
 
 SF's ``Learner.save_best`` keeps only the single most recent best checkpoint
-(``keep=1``).  This observer connects to each learner's ``saved_model`` signal
-and archives new best checkpoints into ``{train_dir}/best/`` (hard-link or
-copy) and to the NAS share over SMB.
+(``keep=1``) under the SF experiment dir.  This observer connects to each
+learner's ``saved_model`` signal and mirrors the newest best into
+``{train_dir}/best/best_<run_id>.pth`` (overwritten in place — one best per
+run, matching BC's ``best_<run_id>.pth``) and to the NAS share over SMB.
+
+NAS connection details come from the ``QNN_NAS_*`` env vars (same contract
+as corpus/nas.py; defaults nas.local/QNN/guest).
 
 Usage::
 
@@ -25,65 +29,51 @@ if TYPE_CHECKING:
 from sample_factory.algo.runners.runner import AlgoObserver
 from signal_slot.signal_slot import EventLoopObject
 
-log = logging.getLogger(__name__)
+from qnn.utils.artifacts import best_name, new_run_id
 
-_NAS_SHARE = r"\\pi.local\nqcorpus"
-_NAS_BEST = _NAS_SHARE + r"\best"
+log = logging.getLogger(__name__)
 
 
 class BestCheckpointArchiver(AlgoObserver, EventLoopObject):
-    """Archive best checkpoints whenever a model is saved."""
+    """Mirror the newest best checkpoint to a run-id-named archive file."""
 
     def __init__(self, runner: "Runner") -> None:
         EventLoopObject.__init__(self, runner.event_loop, "BestCheckpointArchiver")
-        self._seen: set[str] = set()
+        self._last_source: str = ""
         self._archive_dir: Path | None = None
         self._exp_dir: Path | None = None
+        self._run_id = ""
         self._smb_available = False
+        self._nas_dir = ""
 
     def on_start(self, runner: "Runner") -> None:
         cfg = runner.cfg
         train_dir = Path(str(getattr(cfg, "train_dir", ".")))
         experiment = str(getattr(cfg, "experiment", "quake_combat"))
+        self._run_id = str(getattr(cfg, "qnn_run_id", "") or "") or new_run_id()
         self._archive_dir = train_dir / "best"
         self._archive_dir.mkdir(parents=True, exist_ok=True)
         self._exp_dir = train_dir / experiment
 
-        # Locate the demos directory so we can archive best.dem alongside
-        # the best checkpoint.  Demos live in <basedir>/<game>/demos/.
-        basedir = Path(str(getattr(cfg, "quake_basedir", "assets")))
-        native_args = str(getattr(cfg, "quake_native_args_json", "") or "")
-        game_subdir = "id1"
-        if "-game" in native_args:
-            import json
-            try:
-                args = json.loads(native_args)
-                idx = args.index("-game")
-                if idx + 1 < len(args):
-                    game_subdir = args[idx + 1]
-            except (json.JSONDecodeError, ValueError):
-                pass
-        self._demos_dir = basedir / game_subdir / "demos"
-
-        # Seed _seen with any files already in the archive so we don't
-        # re-copy them on resume.
-        for f in self._archive_dir.glob("best_*.pth"):
-            self._seen.add(f.name)
-
         # Try to register the SMB share for direct writes (no mount needed).
         try:
             import smbclient
-            smbclient.ClientConfig(username="guest", password="", require_secure_negotiate=False)
+            server = os.environ.get("QNN_NAS_SERVER", "nas.local")
+            share = os.environ.get("QNN_NAS_SHARE", "QNN")
+            user = os.environ.get("QNN_NAS_USER", "guest")
+            password = os.environ.get("QNN_NAS_PASS", "guest")
+            smbclient.ClientConfig(require_secure_negotiate=False)
             smbclient.register_session(
-                "pi.local", username="guest", password="",
-                auth_protocol="ntlm", require_signing=False,
+                server, username=user, password=password,
+                encrypt=False, require_signing=False, auth_protocol="ntlm",
             )
-            smbclient.makedirs(_NAS_BEST, exist_ok=True)
+            self._nas_dir = rf"\\{server}\{share}\best"
+            smbclient.makedirs(self._nas_dir, exist_ok=True)
             self._smb_available = True
-            log.info("SMB share %s available for best checkpoint sync", _NAS_SHARE)
+            log.info("SMB %s available for best checkpoint sync", self._nas_dir)
         except Exception:
             self._smb_available = False
-            log.info("SMB share %s not available — skipping NAS sync", _NAS_SHARE)
+            log.info("NAS not available — skipping best checkpoint sync")
 
     def on_connect_components(self, runner: "Runner") -> None:
         for learner_worker in runner.learners.values():
@@ -95,75 +85,28 @@ class BestCheckpointArchiver(AlgoObserver, EventLoopObject):
         ckpt_dir = self._exp_dir / f"checkpoint_p{policy_id}"
         if not ckpt_dir.is_dir():
             return
-        for best_file in ckpt_dir.glob("best_0*.pth"):
-            if best_file.name in self._seen:
-                continue
-            self._seen.add(best_file.name)
-            dest = self._archive_dir / best_file.name
-            if dest.exists():
-                continue
-            try:
-                os.link(best_file, dest)
-            except OSError:
-                shutil.copy2(best_file, dest)
-            log.info("Archived best checkpoint: %s", best_file.name)
-            self._archive_best_demo(best_file.name, policy_id)
-            if self._smb_available:
-                self._smb_copy(best_file)
-
-    def _archive_best_demo(self, checkpoint_name: str, policy_id: int = 0) -> None:
-        """Copy the most recent worker demo for *policy_id*, named to match the checkpoint.
-
-        Layout:
-            best/*.pth
-            best/demos/*.dem
-            best/demos/maps/*.bsp   (original map name, e.g. gen_1234567.bsp)
-        """
-        if not self._demos_dir or not self._demos_dir.is_dir():
+        best_files = sorted(ckpt_dir.glob("best_0*.pth"))
+        if not best_files:
             return
-        # Find the most recently completed demo for this policy.
-        # Envs save a copy of the finished episode as *_last.dem before reset
-        # overwrites the active demo file.
-        worker_demos = list(self._demos_dir.glob(f"train_p{policy_id}_w*_last.dem"))
-        if not worker_demos:
-            worker_demos = list(self._demos_dir.glob(f"train_p{policy_id}_w*.dem"))
-            worker_demos = [d for d in worker_demos if "_last" not in d.name]
-        if not worker_demos:
+        newest = best_files[-1]
+        if newest.name == self._last_source:
             return
-        newest = max(worker_demos, key=lambda p: p.stat().st_mtime)
-        # Name demo to match checkpoint: best_000002890_12231680_reward_-23.041.dem
-        demo_stem = Path(checkpoint_name).stem  # strip .pth
-        demos_dir = self._archive_dir / "demos"
-        demos_dir.mkdir(exist_ok=True)
-        dest_dem = demos_dir / f"{demo_stem}.dem"
-        shutil.copy2(newest, dest_dem)
-        # Copy the matching procgen BSP if it exists (read map name from demo).
-        # Keep the original map name so it can be loaded for replay.
-        try:
-            import re
-            raw = newest.read_bytes()
-            m = re.search(rb"(gen_\d+)", raw[:4096])
-            if m:
-                map_id = m.group(1).decode()
-                # Maps live under <game_dir>/maps/, same parent as demos dir.
-                bsp_src = self._demos_dir.parent / "maps" / f"{map_id}.bsp"
-                if bsp_src.exists():
-                    maps_dir = demos_dir / "maps"
-                    maps_dir.mkdir(exist_ok=True)
-                    dest_bsp = maps_dir / f"{map_id}.bsp"
-                    if not dest_bsp.exists():
-                        shutil.copy2(bsp_src, dest_bsp)
-        except Exception:
-            pass
-        log.info("Archived best demo: %s", dest_dem.name)
+        self._last_source = newest.name
+        dest = self._archive_dir / best_name(self._run_id)
+        tmp = dest.with_name(dest.name + ".tmp")
+        shutil.copy2(newest, tmp)
+        os.replace(tmp, dest)
+        log.info("Archived best checkpoint %s -> %s", newest.name, dest.name)
+        if self._smb_available:
+            self._smb_copy(dest, source_name=newest.name)
 
-    def _smb_copy(self, src: Path) -> None:
+    def _smb_copy(self, src: Path, *, source_name: str) -> None:
         try:
             import smbclient
-            nas_dest = _NAS_BEST + "\\" + src.name
+            nas_dest = self._nas_dir + "\\" + src.name
             with open(src, "rb") as local_f:
                 with smbclient.open_file(nas_dest, mode="wb") as remote_f:
                     shutil.copyfileobj(local_f, remote_f)
-            log.info("Copied %s to NAS", src.name)
+            log.info("Copied %s (%s) to NAS", src.name, source_name)
         except Exception as exc:
             log.warning("Failed to copy %s to NAS: %s", src.name, exc)

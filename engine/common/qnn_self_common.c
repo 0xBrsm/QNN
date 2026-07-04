@@ -12,7 +12,7 @@
  */
 
 #include "qnn_io.h"               /* QNN_TIME_SCALE — canonical time normalization */
-#include "qnn.h"                  /* QNN_ProgsGetAttackCdRemaining */
+#include "qnn.h"                  /* QNN_ProgsGetAttackCdRemainingSec */
 #include "qnn_collect_helpers.h"  /* qnn_runtime */
 
 #include <string.h>
@@ -85,16 +85,13 @@ void QNN_SelfEmitToken(qnn_self_token_t *out, const qnn_snapshot_t *snapshot)
 	}
 
 	{
-		/* attack_finished cooldown — read native-frame remainder from
-		 * the QC VM evaluator, convert to seconds.  The model
-		 * dequantizer divides by QNN_TIME_SCALE (60s) like every other
-		 * time scalar in the obs.  NQ build's stub returns 0 (no QC
-		 * VM emulation), so this is a no-op on NQ paths and live for QW. */
-		int af_frames = QNN_ProgsGetAttackCdRemaining(
-			qnn_runtime.tick, qnn_runtime.fixed_tick_hz);
-		float af_sec = (qnn_runtime.fixed_tick_hz > 0)
-			? (float)af_frames / (float)qnn_runtime.fixed_tick_hz
-			: 0.0f;
+		/* attack_finished cooldown — seconds remaining, straight from
+		 * the QC VM evaluator.  The model dequantizer divides by
+		 * QNN_TIME_SCALE (60s) like every other time scalar in the obs.
+		 * NQ build's stub returns 0 (no QC VM emulation), so this is a
+		 * no-op on NQ paths and live for QW. */
+		float af_sec = QNN_ProgsGetAttackCdRemainingSec(
+			QNN_RuntimeNowSeconds());
 		if (af_sec < 0.0f) af_sec = 0.0f;
 		out->attack_finished = af_sec;
 	}

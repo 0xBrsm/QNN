@@ -7,33 +7,40 @@
  * single back-shift ring that lets server-observed sound/state events
  * write labels back at the press frame instead of the broadcast frame.
  *
- *   FIRE   sound (weapon-fire PHS multicast) → walkback by full ping
- *          → OR the attack bit into slot.action.move → co-temporal dedup
- *          → chain-fill across short cooldown gaps → forward log-normal
- *          hold tail.
+ *   ATTACK sound (weapon-fire PHS multicast) → walkback by full ping →
+ *          OR the attack bit into slot.action.move AND stamp
+ *          slot.action.weapon from the SOUND's own class (byte truth) →
+ *          co-temporal dedup.  Attack + weapon are phase-locked onto the
+ *          same slot by construction, so a switch can't land on a
+ *          different frame than the attack it precedes (mvd-attack-audit.md
+ *          §Round 5).  One operative press per event; no hold tail (held
+ *          frames are masked in training).
  *
  *   JUMP   sound (player/plyrjmp8.wav) → walkback by full ping → OR
  *          the jump bit (bit 7) into slot.action.move → grounded-
- *          count chain gate → forward log-normal hold tail.  Bit 6
- *          (ud-pos) is reserved for actual swim-up / jumppad upmove
- *          and is NOT set from jump-sound inference.
+ *          count chain gate.  One operative press per event; no hold
+ *          tail.  Bit 6 (ud-pos) is reserved for actual swim-up /
+ *          jumppad upmove and is NOT set from jump-sound inference.
  *
- *   SWITCH per-emit `action.weapon = snapshot.weapon_id`.  On
- *          weapon_id transitions, rewrite the trailing K slots back to
- *          the press frame.  Pickup gate (IT_ bit 0→1) suppresses the
- *          rewrite when the transition was a server-forced touch
- *          (impulse handlers can't fire on a bit that wasn't set).
+ *   SWITCH act.weapon = de-scripted DELIBERATE intent carried forward
+ *          (QNN_MvdIntentWeaponStep — the MVD mirror of the QWD §12
+ *          label; semantics in qnn_mvd_collect.h).  Held transitions
+ *          classify as deliberate (adopt + trailing-slot rewrite to
+ *          the press frame), script dump (fingerprinted release
+ *          target, label frozen), or forced (pickup IT_-bit gate /
+ *          intent no longer selectable — adopt at the observed
+ *          frame).  Death masks to 0 until the respawn press; the
+ *          ATTACK path re-reveals or adopts on sound evidence.
  *
  *   MOVE   per-emit fb/lr from view-relative position-delta sign
  *          (`QNN_MvdInferEmitMove`).  fb/lr back-shifted into the ring
  *          by `QNN_MvdBackShiftWriteMoveXY`; ud is set via the JUMP
  *          path above (water gets ud from snap-time position delta).
  *
- * Hold-tail samplers live in qnn_hold_samplers.c — the per-weapon and
- * jump CDFs are fit on QWD truth, and only run when MVD inference
- * emits BC training labels (NOT when the labeler is collecting its
- * sparse one-tick-per-event training signal — that uses the QWD path
- * in qnn_qwd_collect.c).
+ * Attack/jump labels are sparse: one operative press per sound event, no
+ * forward hold tail.  Under input_mask=true training the held-button
+ * frames are non-operative and masked from every target, so they are
+ * not synthesized (the former log-normal hold samplers were removed).
  *
  * Module-private state lives in the file-scope `mvd_state` struct.
  * `QNN_MvdCollectReset` is the per-demo reset entry point invoked by
@@ -41,15 +48,14 @@
  *
  * Cross-module touch points:
  *   - `qnn_runtime.tick` / `fixed_tick_hz` (timing scale) — read-only.
- *   - `qnn_runtime.native_fire_this_window` — mirrored for NQ's MVD path
- *     which shares the field (NQ has its own native-fire emit logic in
+ *   - `qnn_runtime.native_attack_this_window` — mirrored for NQ's MVD path
+ *     which shares the field (NQ has its own native-attack emit logic in
  *     nq/qnn_collect_main.c).
  *   - `qnn_runtime.emit_*` / `prev_*` / mover refs — read-only state from
  *     the main loop's emit anchor + per-tick capture.
  */
 
 #include "qnn_mvd_collect.h"
-#include "qnn_hold_samplers.h"
 #include "qnn_io.h"
 #include "qnn_store.h"
 
@@ -62,68 +68,125 @@
  *                       MODULE-PRIVATE STATE
  * ══════════════════════════════════════════════════════════════════════ */
 
+/* Continuous-weapon trigger-pull collapse window.  A held nailgun/lightning
+ * think-chain emits one projectile sound every ~0.1s, but the operative label
+ * is the W_Attack TRIGGER PULL (~0.2s cadence), not each nail.  Same-weapon
+ * attack sounds closer than this collapse into one operative press — matching
+ * BOTH the QWD op-attack bit (QNN_ProgsEvalAttack's attack_finished cooldown
+ * gate) and the validator reference (qnn.bc.demo_truth.trigger_events), so the
+ * MVD and QWD paths share one trigger-pull cadence after the press is
+ * identified.  MUST stay equal to qnn.bc.demo_truth.MERGE_GAP. */
+#define QNN_ATTACK_TRIGGER_MERGE_SEC 0.15f
+
+/* Lightning-gun (Thunderbolt) op-attack reconstruction.  UNLIKE every other
+ * weapon, LG emits NO per-shot sound: W_FireLightning plays `lhit` throttled to
+ * a fixed 0.6s HEARTBEAT (self.t_width = time + 0.6) plus `lstart` once per
+ * discharge onset — while LG actually re-fires every 0.2s while held (the
+ * player_light think-chain; QNN_WEAPON_LIGHTNING cd = 0.2f, == nailguns).  So
+ * the 0.2s op-attacks BETWEEN heartbeats are real operative bolts with no sound,
+ * and the sound-driven emitter lands only ~0.5x the true LG op-attack count
+ * (the QWD path gets it right via the progs op-attack bit).  Reconstruct them:
+ * when two LG attack sounds fall within one burst gap (=> firing was continuous,
+ * since the heartbeat only plays WHILE firing), fill op-attacks at the 0.2s
+ * op-cadence across the held-LG slots between them.  These are OPERATIVE (not
+ * masked no-op holds), so the fill sets input_mask bit 0 too.  Mirrors
+ * qnn.bc.demo_truth.lg_op_attack_count (LG_OP_CADENCE 0.2, burst_gap 0.7) —
+ * KEEP THESE EQUAL.  Validate MVD/QWD LG -> ~1.0 (NOT the throttled sound-ref). */
+#define QNN_LG_OP_CADENCE_SEC 0.2f
+#define QNN_LG_BURST_GAP_SEC  0.7f
+
 typedef struct
 {
-	qnn_backshift_ring_t backshift;
-	/* MVD-path fire hold extension.  When a tap-weapon shot is back-
-	 * shifted into a ring slot, a hold duration is sampled from a
-	 * truncated log-normal fit and fire=1 is written forward into
-	 * subsequent emit slots.  Slots that haven't been pushed yet are
-	 * covered by fire_hold_remaining: each push decrements the counter
-	 * and sets fire=1 on the new slot until it reaches zero. */
-	int      fire_hold_remaining;
-	uint32_t fire_hold_rng;       /* xorshift32; seeded per demo */
-	/* MVD-path jump hold extension — direct analog of fire. */
-	int      jump_hold_remaining;
-	uint32_t jump_hold_rng;
-	/* Per-weapon fire chain-fill state.  Index = QNN subject weapon id
-	 * (3..10); slot 0 unused.  See qnn_collect_helpers.h's comment for
-	 * the dedup semantics. */
-	int      last_fire_shot_tick[11];
-	int      last_fire_source_tick[11];
+	/* Per-weapon attack dedup state.  Index = action weapon id 1..8;
+	 * slot 0 unused. */
+	int      last_attack_shot_tick[11];
+	int      last_attack_source_tick[11];
+	/* Per-weapon native_time (demo seconds) of the last KEPT attack trigger,
+	 * for the QNN_ATTACK_TRIGGER_MERGE_SEC think-chain collapse.
+	 * -1 = none kept yet this demo. */
+	float    last_attack_kept_native[11];
 	/* Jump chain-fill / dedup state — single global counter. */
 	int      last_jump_shot_tick;
 	int      last_jump_source_tick;
+
+	/* ── De-scripted intent label state (QNN_MvdIntentWeaponStep) ──
+	 * MVD mirror of qwd_state.intent_* in qnn_qwd_collect.c; semantics
+	 * in the header comment.  All zeroed by the per-demo reset. */
+	int      intent_weapon;		/* raw 1..8, 0 = unrevealed/masked */
+	int      intent_prev_held;	/* last VALID held id (1..8) seen */
+	int      intent_prev_items;	/* items_owned at the previous step */
+	int      intent_prev_items_valid;
+	int      intent_was_dead;	/* respawn-baseline guard: the first
+					 * alive frame's held change is the
+					 * server spawn equip, not a player
+					 * transition — skip classification */
+	float    intent_respawn_native;	/* demo time of the last respawn-
+					 * adopt; the respawn press's release
+					 * half dumps with no shot fired, so
+					 * the dump gate accepts a release-
+					 * target equip shortly after respawn
+					 * as well as after an attack */
+	/* Feasibility callback captured from the last intent step (the step
+	 * runs before this tick's sounds drain), for the attack path's
+	 * mismatch-adopt rule.  Zeroed with the rest at demo reset. */
+	qnn_mvd_select_feasible_fn intent_feasible_fn;
 } qnn_mvd_state_t;
 
 static qnn_mvd_state_t mvd_state;
 
-
-/* ══════════════════════════════════════════════════════════════════════
- *                  SHARED BACK-SHIFT RING (used by all paths)
- * ══════════════════════════════════════════════════════════════════════ */
-
-static int QNN_BackShiftLatestIndex(const qnn_backshift_ring_t *ring)
+/* Env-gated (QNN_WEAPON_INTENT_DEBUG=<path>) intent-label trace, the MVD
+ * twin of the QWD "WI ..." lines — used by the parity validation to diff
+ * the two machines' decisions on the same demo. */
+static void QNN_MvdIntentTrace(const char *what, int held, int arg)
 {
-	return (ring->head + QNN_BACKSHIFT_K - 1) % QNN_BACKSHIFT_K;
+	const char *dbg = getenv("QNN_WEAPON_INTENT_DEBUG");
+	FILE *df;
+
+	if (!dbg)
+		return;
+	df = fopen(dbg, "a");
+	if (!df)
+		return;
+	fprintf(df, "WIM %d %s held=%d intent=%d arg=%d\n",
+		qnn_runtime.tick, what, held, mvd_state.intent_weapon, arg);
+	fclose(df);
 }
 
-static qboolean QNN_BackShiftSlotAt(qnn_backshift_ring_t *ring,
-	int shift_frames, qnn_backshift_slot_t **slot_out)
-{
-	int idx;
 
-	if (ring->count == 0 || shift_frames < 0)
-		return false;
-	if (shift_frames >= ring->count)
-		shift_frames = ring->count - 1;
-	idx = (QNN_BackShiftLatestIndex(ring) + QNN_BACKSHIFT_K
-		- shift_frames) % QNN_BACKSHIFT_K;
-	*slot_out = &ring->slots[idx];
-	return true;
+/* ══════════════════════════════════════════════════════════════════════
+ *          MVD SOUND/MOVE BACK-SHIFT WRITERS (drive the shared ring)
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ * The generic ring (instance, push/flush/slot-at/rewrite/accessors) lives
+ * in qnn_collect_helpers.c.  This module reaches it via QNN_BackShiftRing()
+ * and the public QNN_BackShiftSlotAt, and adds the MVD-specific sound
+ * walk-back: a server-observed weapon-fire / jump sound is mapped to its
+ * press frame by full-ping offset and stamps the resolved ring slot. */
+
+static float QNN_BackShiftSlotSeconds(void)
+{
+	if (qnn_runtime.fixed_tick_hz > 0)
+		return 1.0f / (float)qnn_runtime.fixed_tick_hz;
+	if (qnn_runtime.fixed_dt > 0.0001f)
+		return qnn_runtime.fixed_dt;
+	return 1.0f / 77.0f;
 }
 
 /* Convert a press-time offset (seconds, negative = past) to a ring-
  * slot index back from the latest push.  Returns -1 if the press
- * lands beyond the ring's history.  Resolution is 50ms (one slot per
- * 20Hz emit). */
-static int QNN_BackShiftOffsetFromPress(float press_offset_sec, int count)
+ * lands beyond the ring's history.  Slot width follows the active emit
+ * cadence: fixed-rate collects use 1/tick_hz; native-rate collects use
+ * the current demo frame dt. */
+static int QNN_BackShiftOffsetFromPress(float press_offset_sec, int count,
+	float slot_seconds)
 {
 	int offset;
 
 	if (press_offset_sec >= 0.0f)
 		return 0;
-	offset = (int)ceilf(-press_offset_sec / 0.05f);
+	if (slot_seconds <= 0.0001f)
+		slot_seconds = 1.0f / 77.0f;
+	offset = (int)ceilf(-press_offset_sec / slot_seconds);
 	if (offset >= count)
 		return -1;
 	return offset;
@@ -135,7 +198,8 @@ static qnn_backshift_slot_t *QNN_BackShiftSlotForPress(
 	int offset;
 	qnn_backshift_slot_t *slot;
 
-	offset = QNN_BackShiftOffsetFromPress(press_offset_sec, ring->count);
+	offset = QNN_BackShiftOffsetFromPress(press_offset_sec, ring->count,
+		QNN_BackShiftSlotSeconds());
 	if (offset < 0 || !QNN_BackShiftSlotAt(ring, offset, &slot))
 		return NULL;
 	if (offset_out != NULL)
@@ -159,64 +223,33 @@ static qnn_backshift_slot_t *QNN_BackShiftSlotForSound(
 	return QNN_BackShiftSlotForPress(ring, press_offset, offset_out);
 }
 
-static int QNN_PingSecToEmitFrames(float ping_sec)
-{
-	if (qnn_runtime.fixed_tick_hz <= 0)
-		return 0;
-	return (int)(ping_sec * (float)qnn_runtime.fixed_tick_hz + 0.5f);
-}
 
-
-/* ── Generic press-event pipeline (dedup + chain-fill + hold tail) ── */
+/* ── Generic press-event pipeline (dedup only) ── */
 /*
- * Shared between the FIRE and JUMP paths.  Each path supplies callbacks
- * for the action mutation, chain-gate decision, chain-fill (across slots
- * between the previous and current event), and hold-tail sampler.
+ * Shared between the ATTACK and JUMP paths.  Each path supplies the action
+ * mutation and its own dedup-tick state.
  *
- * For a sparse-only training signal (one tick per event, no hold,
- * no chain-fill), callers can supply no-op chain_fill and a hold
- * sampler that returns 0.  Today both fire and jump pass real
- * generators because BC labels want the human-feel hold semantics.
+ * The label is sparse: exactly one operative press per sound event.  No
+ * forward hold tail and no gap-bridging chain-fill are synthesized —
+ * both only ever write the attack/jump bit onto within-cooldown frames,
+ * which are non-operative and masked from every training target under
+ * input_mask=true.  (The self player is always in its own PHS, so its
+ * own attack/jump sounds are never dropped; there is nothing to recover.)
  */
 
 typedef void (*qnn_press_set_action_fn)(qnn_action_t *action);
-
-typedef qboolean (*qnn_press_chain_gate_fn)(
-	qnn_backshift_ring_t *ring,
-	int prev_tick, int cur_tick,
-	float ping_sec, void *ctx);
-
-typedef void (*qnn_press_chain_fill_fn)(
-	qnn_backshift_ring_t *ring,
-	int prev_tick, int cur_tick);
-
-typedef int (*qnn_press_hold_sample_fn)(void *ctx);
 
 typedef struct
 {
 	qnn_press_set_action_fn   set_action;
 	int                      *last_dest_tick;
 	int                      *last_source_tick;
-	qnn_press_chain_gate_fn   chain_gate;
-	qnn_press_chain_fill_fn   chain_fill;
-	void                     *chain_gate_ctx;
-	qnn_press_hold_sample_fn  hold_sample;
-	void                     *hold_sample_ctx;
-	int                      *hold_remaining;
 } qnn_press_event_cfg_t;
 
 static qboolean QNN_BackShiftApplyPressEvent(
-	qnn_backshift_ring_t *ring,
 	qnn_backshift_slot_t *slot,
-	int offset,
-	float ping_sec,
 	const qnn_press_event_cfg_t *cfg)
 {
-	int cur_tick;
-	int prev_tick;
-	int ext;
-	int i;
-
 	/* Dedup co-temporal duplicate sounds for the same event.  Two
 	 * distinct presses can't land in the same source emit tick
 	 * (qnn_runtime.tick), but a single press may emit multiple sounds
@@ -229,36 +262,14 @@ static qboolean QNN_BackShiftApplyPressEvent(
 
 	cfg->set_action(&slot->action);
 
-	cur_tick = slot->tick;
-	prev_tick = *cfg->last_dest_tick;
-	if (prev_tick > 0 && cur_tick > prev_tick
-		&& cfg->chain_gate(ring, prev_tick, cur_tick,
-			ping_sec, cfg->chain_gate_ctx))
-	{
-		cfg->chain_fill(ring, prev_tick, cur_tick);
-	}
-
-	*cfg->last_dest_tick = cur_tick;
+	*cfg->last_dest_tick = slot->tick;
 	*cfg->last_source_tick = qnn_runtime.tick;
-
-	/* Forward tail.  Sampled after dedup so the RNG stream advances
-	 * once per emitted event, not per incoming sound. */
-	ext = cfg->hold_sample(cfg->hold_sample_ctx);
-	for (i = 1; i < ext && i <= offset; i++)
-	{
-		qnn_backshift_slot_t *s;
-		if (QNN_BackShiftSlotAt(ring, offset - i, &s))
-			cfg->set_action(&s->action);
-	}
-	if (ext > 1 && cfg->hold_remaining != NULL)
-		*cfg->hold_remaining =
-			(ext - 1 > offset) ? (ext - 1 - offset) : 0;
 
 	return true;
 }
 
 
-/* ── Sound-event iterator (shared by FIRE and JUMP path apply fns) ── */
+/* ── Sound-event iterator (shared by ATTACK and JUMP path apply fns) ── */
 
 typedef qboolean (*qnn_backshift_sound_predicate_t)(
 	const qnn_sound_event_t *snd);
@@ -293,62 +304,34 @@ static void QNN_BackShiftForSoundEvents(qnn_backshift_ring_t *ring,
 
 
 /* ══════════════════════════════════════════════════════════════════════
- *                          FIRE PATH
+ *                          ATTACK PATH
  * ══════════════════════════════════════════════════════════════════════ */
 /*
  * Sound (weapon-fire PHS multicast) → back-shift by full ping →
- * fire=1 in target ring slot → dedup against co-temporal duplicates
- * (LG lstart+lhit) → chain-fill across slots from prev fire event if
- * within cooldown + slack → log-normal forward hold tail.
+ * attack=1 in target ring slot → dedup against co-temporal duplicates
+ * (LG lstart+lhit).  One operative press per event; no chain-fill,
+ * no hold tail (both only ever wrote masked within-cooldown frames).
  */
 
-static void QNN_BackShiftFillBetween(qnn_backshift_ring_t *ring,
-	int from_tick, int to_tick)
+static void qnn_press_set_attack(qnn_action_t *a)
 {
-	int i;
-
-	if (from_tick >= to_tick - 1)
-		return;
-	for (i = 0; i < ring->count; ++i)
-	{
-		qnn_backshift_slot_t *s;
-		if (!QNN_BackShiftSlotAt(ring, i, &s))
-			break;
-		if (s->tick > from_tick && s->tick < to_tick)
-			s->action.move |= 0x01; /* bit 0 = attack press */
-	}
+	a->move |= 0x01;       /* bit 0 = attack press */
+	/* Assert attack FEASIBILITY on the same slot, from sound truth.  The
+	 * press is back-shifted by ping onto a slot whose input_mask was packed
+	 * `ping` frames out of phase with the cooldown clock, so its
+	 * attack-feasibility bit (input_mask bit 0) is often 0 exactly where
+	 * genuine presses land — zeroing the operative label (move&1 &
+	 * input_mask&1) for ~1/4-1/3 of shots (the -30% operative-attack gap;
+	 * realigning the cooldown stamp via e597bca2 couldn't fix it — the slot's
+	 * mask was already frozen at push).  A self weapon-attack sound proves the
+	 * weapon was off-cooldown at the true press frame, so feasibility is 1
+	 * there by construction.  Phase-locked with the attack bit, mirroring the
+	 * sound-truth weapon stamp (mvd-attack-audit.md §Round 5). */
+	a->input_mask |= 0x01; /* bit 0 = attack feasible */
 }
 
-static void qnn_press_set_fire(qnn_action_t *a)
-{
-	a->move |= 0x01; /* bit 0 = attack press */
-}
 
-static qboolean qnn_press_chain_gate_fire(qnn_backshift_ring_t *ring,
-	int prev_tick, int cur_tick,
-	float ping_sec, void *ctx)
-{
-	int weapon_id = (int)(intptr_t)ctx;
-	int cd_emit;
-	int slack;
-
-	(void)ring;
-	if (weapon_id < 3 || weapon_id > 10)
-		return false;
-	cd_emit = QNN_FireCooldownEmit(weapon_id);
-	if (cd_emit <= 0)
-		return false;
-	slack = 2 + QNN_PingSecToEmitFrames(ping_sec);
-	return (cur_tick - prev_tick) <= cd_emit + slack;
-}
-
-static int qnn_press_hold_sample_fire(void *ctx)
-{
-	int weapon_id = (int)(intptr_t)ctx;
-	return QNN_FireHoldFrames(weapon_id, &mvd_state.fire_hold_rng);
-}
-
-static void QNN_BackShiftWriteFireAtTime(qnn_backshift_ring_t *ring,
+static void QNN_BackShiftWriteAttackAtTime(qnn_backshift_ring_t *ring,
 	const qnn_snapshot_t *snapshot, int sound_index,
 	const qnn_sound_event_t *snd, float ping_sec,
 	float emit_start_native_time)
@@ -363,27 +346,150 @@ static void QNN_BackShiftWriteFireAtTime(qnn_backshift_ring_t *ring,
 	if (slot == NULL)
 		return;
 
-	weapon_id = snapshot->weapon_id;
-	if (weapon_id < 0 || weapon_id > 10)
+	/* Universal-shift attribution: the firing weapon comes from the
+	 * SOUND's own class (the demo's byte truth, 100% correct), NOT from
+	 * the held-weapon snapshot at this emit frame.  The attack bit and
+	 * the weapon label are then stamped together onto the SAME slot the
+	 * sound back-shifts to, so a weapon switch can never land on a
+	 * different frame than the attack it precedes.  This replaces the old
+	 * independent two-offset scheme (attack bit phase-shifted here, weapon
+	 * flat-shifted by QNN_BackShiftRewriteWeapon) that skewed the two
+	 * apart and mis-tagged RL/GL shots as SG (see mvd-attack-audit.md §R3).
+	 *
+	 * Fall back to the held-weapon snapshot only if the sound somehow
+	 * doesn't classify (should not happen: the predicate already gated on
+	 * QNN_IsSelfWeaponAttackSound). */
+	weapon_id = QNN_WeaponIdFromAttackSound(snd);
+	if (!QNN_WeaponIsValid(weapon_id))
+		weapon_id = snapshot->weapon_id;
+	if (!QNN_WeaponIsValid(weapon_id))
 		return;
 
-	cfg.set_action      = qnn_press_set_fire;
-	cfg.last_dest_tick  = &mvd_state.last_fire_shot_tick[weapon_id];
-	cfg.last_source_tick = &mvd_state.last_fire_source_tick[weapon_id];
-	cfg.chain_gate      = qnn_press_chain_gate_fire;
-	cfg.chain_fill      = QNN_BackShiftFillBetween;
-	cfg.chain_gate_ctx  = (void *)(intptr_t)weapon_id;
-	cfg.hold_sample     = qnn_press_hold_sample_fire;
-	cfg.hold_sample_ctx = (void *)(intptr_t)weapon_id;
-	cfg.hold_remaining  = &mvd_state.fire_hold_remaining;
-
-	if (!QNN_BackShiftApplyPressEvent(ring, slot, offset, ping_sec, &cfg))
+	/* Continuous-weapon trigger-pull collapse (DRY with the validator
+	 * reference trigger_events and the QWD cooldown gate): a same-weapon attack
+	 * sound within QNN_ATTACK_TRIGGER_MERGE_SEC of the last KEPT trigger is a
+	 * think-chain continuation (NG/SNG fire every ~0.1s while held), not a
+	 * distinct operative press — drop it so the nailguns match the QWD ~0.2s
+	 * trigger cadence instead of one press per nail.  Single-shot weapons
+	 * fire >=0.5s apart, so this never collapses them.  Keyed on the sound's
+	 * native_time — the same demo-second timeline trigger_events collapses —
+	 * independent of where the press back-shifts. */
+	if (mvd_state.last_attack_kept_native[weapon_id] >= 0.0f
+		&& snd->native_time - mvd_state.last_attack_kept_native[weapon_id]
+			< QNN_ATTACK_TRIGGER_MERGE_SEC)
 		return;
 
-	if (slot->fire_route_count < QNN_MAX_FIRE_ROUTE_EVENTS)
+	cfg.set_action      = qnn_press_set_attack;
+	cfg.last_dest_tick  = &mvd_state.last_attack_shot_tick[weapon_id];
+	cfg.last_source_tick = &mvd_state.last_attack_source_tick[weapon_id];
+
+	if (!QNN_BackShiftApplyPressEvent(slot, &cfg))
+		return;
+
+	/* Lightning-gun op-attack reconstruction (see QNN_LG_OP_CADENCE_SEC).  The
+	 * lhit heartbeat + lstart are ~0.5x LG's true 0.2s op-attack rate; recover the
+	 * silent between-heartbeat bolts.  A gap within QNN_LG_BURST_GAP_SEC of the
+	 * previous LG attack means firing was continuous (the heartbeat only plays
+	 * while firing), so fill op-attacks at the 0.2s op-cadence across the
+	 * held-LG slots between the two sounds.  Walk from the current press slot
+	 * (`offset` frames back) toward older slots; stop at the ring edge or the
+	 * first non-LG slot (beam ended / weapon switched) so a non-firing LG hold
+	 * or a prior beam is never back-filled. */
+	if (weapon_id == QNN_WEAPON_LIGHTNING
+		&& mvd_state.last_attack_kept_native[weapon_id] >= 0.0f)
 	{
-		qnn_fire_route_event_t *ev =
-			&slot->fire_routes[slot->fire_route_count++];
+		float gap = snd->native_time
+			- mvd_state.last_attack_kept_native[weapon_id];
+		if (gap > QNN_ATTACK_TRIGGER_MERGE_SEC && gap <= QNN_LG_BURST_GAP_SEC)
+		{
+			int hz = (slot->tick_hz > 0) ? slot->tick_hz : 20;
+			int step = (int)(QNN_LG_OP_CADENCE_SEC * hz + 0.5f);
+			int nfill = (int)(gap / QNN_LG_OP_CADENCE_SEC + 0.5f) - 1;
+			int k;
+			if (step < 1)
+				step = 1;
+			for (k = 1; k <= nfill; ++k)
+			{
+				qnn_backshift_slot_t *fill_slot;
+				int back = offset + step * k;
+				if (back >= ring->count)
+					break;
+				if (!QNN_BackShiftSlotAt(ring, back, &fill_slot))
+					break;
+				if (fill_slot->action.weapon
+					!= (uint8_t)QNN_WEAPON_LIGHTNING)
+					break;
+				qnn_press_set_attack(&fill_slot->action);
+			}
+		}
+	}
+
+	/* Only KEPT triggers advance the collapse window — matches
+	 * trigger_events' "gap from last counted event". */
+	mvd_state.last_attack_kept_native[weapon_id] = snd->native_time;
+
+	/* Intent interaction (weapon-head.md §12 parity; header comment in
+	 * qnn_mvd_collect.h).  The intent label owns act.weapon, so the
+	 * sound-truth stamp is applied only where it cannot fight it:
+	 *
+	 *   unrevealed  intent==0 (post-death/demo-start): engaging IS the
+	 *               reveal — adopt the fired weapon (the MVD proxy for
+	 *               QWD's attack-press-adopts-held rule) and rewrite
+	 *               the still-masked slots from the press slot to now,
+	 *               since QWD reveals at the press tick.
+	 *   agreement   sound weapon == intent: stamp the press slot —
+	 *               pure timing fix, keeping attack+weapon phase-locked
+	 *               (mvd-attack-audit.md §Round 5).
+	 *   mismatch    firing a weapon that is NOT the intent while the
+	 *               intent is still selectable = the player CHOSE this
+	 *               weapon (QWD's press-coincident select of the dump
+	 *               target — "fight with SG" — classifies deliberate):
+	 *               adopt the fired weapon from the press slot forward.
+	 *               If the intent is NOT selectable this is the dry-
+	 *               press case (RL press with no rockets fires SG) —
+	 *               QWD keeps the revealed intent, so keep it too. */
+	if (mvd_state.intent_weapon == 0)
+	{
+		int i;
+
+		mvd_state.intent_weapon = weapon_id;
+		for (i = 0; i <= offset; i++)
+		{
+			qnn_backshift_slot_t *reveal;
+			if (!QNN_BackShiftSlotAt(ring, i, &reveal))
+				break;
+			if (reveal->action.weapon == 0)
+				reveal->action.weapon = (uint8_t)weapon_id;
+		}
+		QNN_MvdIntentTrace("reveal", weapon_id, offset);
+	}
+	else if (weapon_id == mvd_state.intent_weapon)
+		slot->action.weapon = (uint8_t)weapon_id;
+	else if (mvd_state.intent_feasible_fn
+		&& mvd_state.intent_feasible_fn(snapshot,
+			snapshot->weapon_id, mvd_state.intent_weapon))
+	{
+		int old_intent = mvd_state.intent_weapon;
+		int i;
+
+		mvd_state.intent_weapon = weapon_id;
+		for (i = 0; i <= offset; i++)
+		{
+			qnn_backshift_slot_t *adopt;
+			if (!QNN_BackShiftSlotAt(ring, i, &adopt))
+				break;
+			if (adopt->action.weapon == old_intent)
+				adopt->action.weapon = (uint8_t)weapon_id;
+		}
+		QNN_MvdIntentTrace("attack-adopt", weapon_id, old_intent);
+	}
+	else
+		QNN_MvdIntentTrace("attack-mismatch", weapon_id, slot->action.weapon);
+
+	if (slot->attack_route_count < QNN_MAX_ATTACK_ROUTE_EVENTS)
+	{
+		qnn_attack_route_event_t *ev =
+			&slot->attack_routes[slot->attack_route_count++];
 		float phase = snd->native_time - emit_start_native_time;
 		ev->source_tick = qnn_runtime.tick;
 		ev->dest_tick = slot->tick;
@@ -399,17 +505,17 @@ static void QNN_BackShiftWriteFireAtTime(qnn_backshift_ring_t *ring,
 	}
 }
 
-static qboolean QNN_BackShiftMatchFireSound(const qnn_sound_event_t *snd)
+static qboolean QNN_BackShiftMatchAttackSound(const qnn_sound_event_t *snd)
 {
-	return QNN_IsSelfWeaponFireSound(snd);
+	return QNN_IsSelfWeaponAttackSound(snd);
 }
 
-static void QNN_BackShiftApplyFireSound(qnn_backshift_ring_t *ring,
+static void QNN_BackShiftApplyAttackSound(qnn_backshift_ring_t *ring,
 	const qnn_snapshot_t *snapshot,
 	const qnn_sound_event_t *snd, int sound_index,
 	float ping_sec, float emit_start_native_time)
 {
-	QNN_BackShiftWriteFireAtTime(ring, snapshot, sound_index,
+	QNN_BackShiftWriteAttackAtTime(ring, snapshot, sound_index,
 		snd, ping_sec, emit_start_native_time);
 }
 
@@ -419,72 +525,20 @@ static void QNN_BackShiftApplyFireSound(qnn_backshift_ring_t *ring,
  * ══════════════════════════════════════════════════════════════════════ */
 /*
  * Sound (player/plyrjmp8.wav) → back-shift by full ping →
- * move[2]=jump_speed in target ring slot → grounded-count chain gate
- * (allow chain-fill only when intervening slots are mostly grounded —
- * a bhop chain) → log-normal forward hold tail.
+ * move[2]=jump_speed in target ring slot → dedup.  One operative press
+ * per event; no chain-fill (bhop is discrete short presses separated by
+ * released gaps — bridging merged them into single long runs).
  */
-
-static void QNN_BackShiftFillJumpBetween(qnn_backshift_ring_t *ring,
-	int from_tick, int to_tick)
-{
-	int i;
-
-	if (from_tick >= to_tick - 1)
-		return;
-	for (i = 0; i < ring->count; ++i)
-	{
-		qnn_backshift_slot_t *s;
-		if (!QNN_BackShiftSlotAt(ring, i, &s))
-			break;
-		if (s->tick > from_tick && s->tick < to_tick)
-			s->action.move |= 0x80; /* jump bit only — sound implies
-			                          * button press, not raw upmove */
-	}
-}
-
-static int QNN_BackShiftJumpGroundedCount(qnn_backshift_ring_t *ring,
-	int from_tick, int to_tick)
-{
-	int i;
-	int count = 0;
-
-	if (from_tick >= to_tick)
-		return 0;
-	for (i = 0; i < ring->count; ++i)
-	{
-		qnn_backshift_slot_t *s;
-		if (!QNN_BackShiftSlotAt(ring, i, &s))
-			break;
-		if (s->tick > from_tick && s->tick < to_tick && s->grounded)
-			count++;
-	}
-	return count;
-}
 
 static void qnn_press_set_jump(qnn_action_t *a)
 {
-	a->move |= 0x80; /* jump bit only — sound implies button press,
-	                  * not raw upmove */
-}
-
-static qboolean qnn_press_chain_gate_jump(qnn_backshift_ring_t *ring,
-	int prev_tick, int cur_tick,
-	float ping_sec, void *ctx)
-{
-	int slack;
-	int grounded_count;
-
-	(void)ctx;
-	slack = 2 + QNN_PingSecToEmitFrames(ping_sec);
-	grounded_count = QNN_BackShiftJumpGroundedCount(ring,
-		prev_tick, cur_tick);
-	return grounded_count <= slack;
-}
-
-static int qnn_press_hold_sample_jump(void *ctx)
-{
-	(void)ctx;
-	return QNN_JumpHoldFrames(&mvd_state.jump_hold_rng);
+	a->move |= 0x80;       /* jump bit only — sound implies button press,
+	                        * not raw upmove */
+	/* Assert jump FEASIBILITY (input_mask bit 7) on the same slot, from
+	 * sound truth — same back-shift phase-skew as attack above, which dropped
+	 * the operative jump label even harder (-49%).  A jump sound proves the
+	 * jump was feasible (grounded/alive) at the true press frame. */
+	a->input_mask |= 0x80; /* bit 7 = jump feasible */
 }
 
 static qboolean QNN_BackShiftMatchJumpSound(const qnn_sound_event_t *snd)
@@ -511,14 +565,8 @@ static void QNN_BackShiftApplyJumpSound(qnn_backshift_ring_t *ring,
 	cfg.set_action      = qnn_press_set_jump;
 	cfg.last_dest_tick  = &mvd_state.last_jump_shot_tick;
 	cfg.last_source_tick = &mvd_state.last_jump_source_tick;
-	cfg.chain_gate      = qnn_press_chain_gate_jump;
-	cfg.chain_fill      = QNN_BackShiftFillJumpBetween;
-	cfg.chain_gate_ctx  = NULL;
-	cfg.hold_sample     = qnn_press_hold_sample_jump;
-	cfg.hold_sample_ctx = NULL;
-	cfg.hold_remaining  = &mvd_state.jump_hold_remaining;
 
-	(void)QNN_BackShiftApplyPressEvent(ring, slot, offset, ping_sec, &cfg);
+	(void)QNN_BackShiftApplyPressEvent(slot, &cfg);
 }
 
 
@@ -539,33 +587,138 @@ static void QNN_BackShiftApplyJumpSound(qnn_backshift_ring_t *ring,
  * ≥1 frame later — leave that label at the server-observed frame.
  */
 
-void QNN_MvdBackShiftOnWeaponChange(int new_weapon_id,
-	int prev_weapon_id, int shift_frames)
+/* The rewrite itself is the generic QNN_BackShiftRewriteWeapon in
+ * qnn_collect_helpers.c (shared with the QWD path). */
+
+/* ── De-scripted intent label (weapon-head.md §12 parity) ─────────────
+ * Semantics in qnn_mvd_collect.h; QWD reference machine is
+ * QNN_QwdIntentWeaponLabel in qnn_qwd_collect.c. */
+
+int QNN_MvdIntentWeaponStep(const qnn_snapshot_t *snapshot,
+	qnn_mvd_select_feasible_fn feasible,
+	qnn_mvd_wtrans_t *out_trans, int *out_prev_intent)
 {
-	qnn_backshift_ring_t *ring = &mvd_state.backshift;
-	int n;
-	int i;
+	/* Held: vanilla ids only, mod held ids (>8) are no-weapon — same
+	 * handling as the QWD label and the obs token. */
+	int held = QNN_WeaponIsValid(snapshot->weapon_id)
+		? snapshot->weapon_id : 0;
+	int items = snapshot->items_owned;
+	int prev_held = mvd_state.intent_prev_held;
+	int prev_items = mvd_state.intent_prev_items;
+	int prev_items_valid = mvd_state.intent_prev_items_valid;
+	int transition;
+	qnn_mvd_wtrans_t trans = QNN_MVD_WTRANS_NONE;
 
-	if (ring->count == 0 || shift_frames <= 0)
-		return;
+	if (out_trans)
+		*out_trans = QNN_MVD_WTRANS_NONE;
+	if (out_prev_intent)
+		*out_prev_intent = mvd_state.intent_weapon;
+	mvd_state.intent_feasible_fn = feasible;
 
-	/* Call site is BEFORE the current push of the post-transition
-	 * frame.  `latest` is therefore the previous push's slot.  Rewrite
-	 * the trailing `shift_frames` slots so they carry the new weapon.
-	 * Only rewrite slots whose label still equals `prev_weapon_id`
-	 * so a later transition can't clobber an earlier one when both
-	 * land inside the same window. */
-	n = shift_frames;
-	if (n > ring->count)
-		n = ring->count;
-	for (i = 0; i < n; i++)
+	if (held)
+		mvd_state.intent_prev_held = held;
+	mvd_state.intent_prev_items = items;
+	mvd_state.intent_prev_items_valid = 1;
+
+	if (snapshot->health <= 0)
 	{
-		qnn_backshift_slot_t *slot;
-		if (!QNN_BackShiftSlotAt(ring, i, &slot))
-			break;
-		if (slot->action.weapon == prev_weapon_id)
-			slot->action.weapon = new_weapon_id;
+		/* Dead: intent resets; the label stays 0 (masked) until the
+		 * player re-reveals it — an attack sound (adopt in the attack
+		 * path) or a deliberate transition below. */
+		mvd_state.intent_weapon = 0;
+		mvd_state.intent_was_dead = 1;
+		return 0;
 	}
+
+	if (mvd_state.intent_was_dead)
+	{
+		/* First alive frame: adopt the spawn weapon.  Respawning
+		 * takes a button press, and QWD adopts held on that attack
+		 * press (which fires no shot, so the attack-sound reveal
+		 * would lag by seconds and mask the whole post-spawn
+		 * re-arm — swallowing its pickup/select onsets).  The held
+		 * change from the pre-death weapon is the server's spawn
+		 * equip, not a transition — re-baseline without
+		 * classifying. */
+		mvd_state.intent_was_dead = 0;
+		if (held)
+			mvd_state.intent_weapon = held;
+		mvd_state.intent_respawn_native = qnn_runtime.emit_start_native;
+		QNN_MvdIntentTrace("respawn-adopt", held, 0);
+		return mvd_state.intent_weapon;
+	}
+
+	transition = held && prev_held && held != prev_held;
+	if (transition)
+	{
+		int it_bit = QNN_ItemFlagFromImpulse(held);
+		int gained = prev_items_valid && it_bit
+			&& (items & it_bit) && !(prev_items & it_bit);
+		/* Dump evidence: the release-half equip either trails an attack
+		 * of the outgoing weapon (deferred through its cooldown, max
+		 * 0.8s RL, plus slack) or trails the respawn press (whose
+		 * release half dumps with no shot fired).  A release-target
+		 * equip with NEITHER is a deliberate choice — the axe-release
+		 * population genuinely fights with the release weapon, and
+		 * axe swings are inaudible to the attack path, so an
+		 * unconditional dump gate can never be corrected back. */
+		int attack_recent = QNN_WeaponIsValid(prev_held)
+			&& mvd_state.last_attack_kept_native[prev_held] >= 0.0f
+			&& qnn_runtime.emit_start_native
+				- mvd_state.last_attack_kept_native[prev_held]
+				<= 1.5f;
+		int respawn_recent = qnn_runtime.emit_start_native
+			- mvd_state.intent_respawn_native <= 2.0f;
+
+		if (qnn_runtime.weapon_script
+			&& held == qnn_runtime.weapon_release
+			&& mvd_state.intent_weapon
+			&& (attack_recent || respawn_recent))
+		{
+			/* Attack-script release dump: label frozen.  Checked FIRST,
+			 * before pickup/feasibility — QWD's dump-suppression
+			 * branch wins over the forced re-baseline, so an
+			 * ammo-dry dump keeps the revealed intent exactly like
+			 * the reference machine. */
+			trans = QNN_MVD_WTRANS_DUMP;
+			QNN_MvdIntentTrace("dump", held, prev_held);
+		}
+		else if (gained)
+		{
+			/* Pickup auto-equip (weapon_touch: items|=new and
+			 * self.weapon=new in one QC call) — forced.  Adopt held
+			 * at the observed frame, but only over a revealed
+			 * intent (QWD parity: re-baseline requires intent!=0). */
+			if (mvd_state.intent_weapon)
+				mvd_state.intent_weapon = held;
+			trans = QNN_MVD_WTRANS_FORCED;
+			QNN_MvdIntentTrace("pickup", held, prev_held);
+		}
+		else if (mvd_state.intent_weapon && !(feasible
+			&& feasible(snapshot, held, mvd_state.intent_weapon)))
+		{
+			/* Held changed while the intent weapon is no longer
+			 * QC-selectable: ammo-out auto-switch.  Adopt held at
+			 * the observed frame, no press lead. */
+			mvd_state.intent_weapon = held;
+			trans = QNN_MVD_WTRANS_FORCED;
+			QNN_MvdIntentTrace("forced", held, prev_held);
+		}
+		else
+		{
+			/* Deliberate select (the default: MVD sees no select
+			 * edges, so any unexplained held change is the player's
+			 * choice realized).  Caller back-shift-rewrites the
+			 * trailing slots for press-frame anticipation. */
+			mvd_state.intent_weapon = held;
+			trans = QNN_MVD_WTRANS_DELIBERATE;
+			QNN_MvdIntentTrace("delib", held, prev_held);
+		}
+	}
+
+	if (out_trans)
+		*out_trans = trans;
+	return mvd_state.intent_weapon;
 }
 
 
@@ -583,7 +736,7 @@ void QNN_MvdBackShiftOnWeaponChange(int new_weapon_id,
 
 void QNN_MvdBackShiftWriteMoveXY(uint8_t move, int shift_frames)
 {
-	qnn_backshift_ring_t *ring = &mvd_state.backshift;
+	qnn_backshift_ring_t *ring = QNN_BackShiftRing();
 	qnn_backshift_slot_t *slot;
 	qnn_backshift_slot_t *latest;
 	const uint8_t fb_lr_mask = 0x1E; /* bits 1-4: fb_neg, fb_pos, lr_neg, lr_pos */
@@ -595,29 +748,10 @@ void QNN_MvdBackShiftWriteMoveXY(uint8_t move, int shift_frames)
 		|| slot == latest)
 		return;
 	/* Only back-shift fb/lr bits — these come from view-relative velocity
-	 * sign, which lags the keyboard press by ping+tick like fire and
+	 * sign, which lags the keyboard press by ping+tick like attack and
 	 * switch.  ud bits are back-shifted per-event by the jump writer. */
 	slot->action.move = (uint8_t)((slot->action.move & ~fb_lr_mask)
 		| (move & fb_lr_mask));
-}
-
-
-/* ══════════════════════════════════════════════════════════════════════
- *                  RING DRAIN (back to the emit pipeline)
- * ══════════════════════════════════════════════════════════════════════ */
-
-static void QNN_BackShiftEmitSlot(qnn_backshift_slot_t *slot,
-	qnn_tick_emit_state_t *emit)
-{
-	if (!slot->valid)
-		return;
-	QNN_WriteObsTickPrepackedWithFireRoutes(emit, slot->out,
-		slot->obs, &slot->action,
-		slot->done, slot->tick, slot->steps, slot->tick_hz,
-		slot->reset_flag, slot->fire_routes,
-		slot->fire_route_count);
-	slot->valid = false;
-	slot->fire_route_count = 0;
 }
 
 
@@ -627,128 +761,42 @@ static void QNN_BackShiftEmitSlot(qnn_backshift_slot_t *slot,
 
 void QNN_MvdCollectReset(uintptr_t demo_path_seed)
 {
+	int w;
+	(void)demo_path_seed;  /* hold-sim RNG removed; reset is now pure zero */
+	QNN_BackShiftReset();  /* the ring instance lives in qnn_collect_helpers.c */
 	memset(&mvd_state, 0, sizeof(mvd_state));
-	mvd_state.fire_hold_rng = 0x12345678u ^ (uint32_t)demo_path_seed;
-	mvd_state.jump_hold_rng = 0x9e3779b9u ^ (uint32_t)demo_path_seed;
+	/* native_time 0 is a valid demo time; sentinel -1 = no kept trigger yet. */
+	for (w = 0; w < 11; ++w)
+		mvd_state.last_attack_kept_native[w] = -1.0f;
+	/* Far past so demo start doesn't read as "just respawned". */
+	mvd_state.intent_respawn_native = -1.0e6f;
 }
 
-qboolean QNN_MvdBackShiftPrevWeapon(int *prev_weapon_out)
-{
-	if (!mvd_state.backshift.has_prev_weapon_id)
-		return false;
-	if (prev_weapon_out != NULL)
-		*prev_weapon_out = mvd_state.backshift.prev_weapon_id;
-	return true;
-}
-
-qboolean QNN_MvdBackShiftPrevStatItems(int *prev_items_out)
-{
-	if (!mvd_state.backshift.has_prev_stat_items)
-		return false;
-	if (prev_items_out != NULL)
-		*prev_items_out = mvd_state.backshift.prev_stat_items;
-	return true;
-}
-
-int QNN_MvdBackShiftCount(void)
-{
-	return mvd_state.backshift.count;
-}
-
-void QNN_MvdBackShiftPush(qnn_tick_emit_state_t *emit, FILE *out,
-	const uint8_t *obs_bytes, const qnn_action_t *action,
-	qboolean done, int tick, int steps, int tick_hz,
-	qboolean reset_flag, qboolean grounded,
-	int weapon_id, int stat_items)
-{
-	qnn_backshift_ring_t *ring = &mvd_state.backshift;
-	qnn_backshift_slot_t *slot;
-
-	/* When full, the slot at `head` is the oldest — drain it first. */
-	if (ring->count == QNN_BACKSHIFT_K)
-		QNN_BackShiftEmitSlot(&ring->slots[ring->head], emit);
-	else
-		ring->count++;
-
-	slot = &ring->slots[ring->head];
-	memcpy(slot->obs, obs_bytes, QNN_OBS_BUFFER_SIZE);
-	slot->action = *action;
-	slot->done = done;
-	slot->tick = tick;
-	slot->steps = steps;
-	slot->tick_hz = tick_hz;
-	slot->reset_flag = reset_flag;
-	slot->grounded = grounded;
-	slot->out = out;
-	slot->valid = true;
-	slot->fire_route_count = 0;
-
-	/* Apply any hold extension that spilled past the previous head. */
-	if (mvd_state.fire_hold_remaining > 0)
-	{
-		slot->action.move |= 0x01; /* bit 0 = attack press */
-		mvd_state.fire_hold_remaining--;
-	}
-	if (mvd_state.jump_hold_remaining > 0)
-	{
-		slot->action.move |= 0x80; /* jump bit only — sound implies
-		                            * button press, not raw upmove */
-		mvd_state.jump_hold_remaining--;
-	}
-
-	ring->head = (ring->head + 1) % QNN_BACKSHIFT_K;
-	ring->prev_weapon_id = weapon_id;
-	ring->has_prev_weapon_id = true;
-	ring->prev_stat_items = stat_items;
-	ring->has_prev_stat_items = true;
-}
-
-void QNN_MvdBackShiftWriteFireEvents(const qnn_snapshot_t *snapshot,
+void QNN_MvdBackShiftWriteAttackEvents(const qnn_snapshot_t *snapshot,
 	float ping_sec, float emit_start_native_time)
 {
-	QNN_BackShiftForSoundEvents(&mvd_state.backshift, snapshot,
+	QNN_BackShiftForSoundEvents(QNN_BackShiftRing(), snapshot,
 		ping_sec, emit_start_native_time,
-		QNN_BackShiftMatchFireSound,
-		QNN_BackShiftApplyFireSound);
+		QNN_BackShiftMatchAttackSound,
+		QNN_BackShiftApplyAttackSound);
 }
 
 void QNN_MvdBackShiftWriteJumpEvents(const qnn_snapshot_t *snapshot,
 	float ping_sec, float emit_start_native_time)
 {
-	QNN_BackShiftForSoundEvents(&mvd_state.backshift, snapshot,
+	QNN_BackShiftForSoundEvents(QNN_BackShiftRing(), snapshot,
 		ping_sec, emit_start_native_time,
 		QNN_BackShiftMatchJumpSound,
 		QNN_BackShiftApplyJumpSound);
 }
 
-void QNN_MvdBackShiftFlushAll(qnn_tick_emit_state_t *emit)
+void QNN_MvdResetAttackChain(int weapon_id)
 {
-	qnn_backshift_ring_t *ring = &mvd_state.backshift;
-	int i;
-	int idx;
-
-	/* Drain oldest-to-newest: oldest is at `head` when full, or at
-	 * (head - count + K) % K otherwise. */
-	idx = (ring->head + QNN_BACKSHIFT_K - ring->count) % QNN_BACKSHIFT_K;
-	for (i = 0; i < ring->count; i++)
+	if (QNN_WeaponIsValid(weapon_id))
 	{
-		QNN_BackShiftEmitSlot(&ring->slots[idx], emit);
-		idx = (idx + 1) % QNN_BACKSHIFT_K;
+		mvd_state.last_attack_shot_tick[weapon_id] = 0;
+		mvd_state.last_attack_source_tick[weapon_id] = 0;
 	}
-	ring->count = 0;
-	ring->head = 0;
-	ring->has_prev_weapon_id = false;
-	ring->prev_weapon_id = 0;
-}
-
-void QNN_MvdResetFireChain(int weapon_id)
-{
-	if (weapon_id >= 0 && weapon_id <= 10)
-	{
-		mvd_state.last_fire_shot_tick[weapon_id] = 0;
-		mvd_state.last_fire_source_tick[weapon_id] = 0;
-	}
-	mvd_state.fire_hold_remaining = 0;
 }
 
 
@@ -766,10 +814,10 @@ void QNN_MvdInferNativeAction(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot)
 {
 	QNN_ClearAction(action);
-	if (QNN_DetectFireEvent(snapshot))
+	if (QNN_SnapshotHasSelfWeaponAttackSound(snapshot))
 	{
 		action->move |= 0x01; /* bit 0 = attack press */
-		qnn_runtime.native_fire_this_window = true;
+		qnn_runtime.native_attack_this_window = true;
 	}
 	/* Jump is handled by QNN_MvdBackShiftWriteJumpEvents at emit time. */
 }

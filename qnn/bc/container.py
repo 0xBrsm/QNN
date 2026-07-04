@@ -122,6 +122,17 @@ def _required_actions_for_config(
     return frozenset(required_actions_set)
 
 
+def _needs_move_hazard(config: Any, head_loss_weights: Mapping[str, float] | None = None) -> bool:
+    """a25: does this run train the move-hazard head? Derived from the run's
+    head_loss_weights so it is correct even when the caller (e.g. the ablation
+    daemon's source-bundle build) passes only ``config`` — config.head_loss_weights
+    is a raw JSON string, so parse it via effective_head_loss_weights."""
+    weights = head_loss_weights if head_loss_weights is not None else effective_head_loss_weights(
+        config.head_loss_weights
+    )
+    return bool(float((weights or {}).get("move_hazard", 0.0)) > 0.0)
+
+
 def _source_compatibility_key(
     config: Any,
     *,
@@ -141,6 +152,9 @@ def _source_compatibility_key(
         _json_key(config.token_mask),
         tuple(sorted(required_actions)),
         float(config.engagement_ema_alpha),
+        # a25: hazard runs carry extra derived obs/act columns, so they must not
+        # share a cached source bundle with hazard-less runs (and vice versa).
+        _needs_move_hazard(config),
     )
 
 
@@ -213,6 +227,11 @@ def build_behavior_cloning_sources(
     _t0 = _time.monotonic()
     eng_alpha = float(config.engagement_ema_alpha)
     device = resolve_torch_device(str(config.device)).device
+    # a25: derive the move-hazard columns on the fly only when the run trains
+    # that head. Derived from config so it is correct even when called WITHOUT
+    # head_loss_weights (the ablation daemon's source-bundle build passes only
+    # config) — that gap is exactly what KeyError'd 'move_held_class' before.
+    needs_move_hazard = _needs_move_hazard(config, head_loss_weights)
     if bool(config.streaming):
         print(f"  [bc] streaming=true: lazy mmap reads from {train_cache}")
         train_source = make_streaming_source(
@@ -220,6 +239,7 @@ def build_behavior_cloning_sources(
             segment_mask=config.segment_mask, token_mask=config.token_mask,
             prefetch_depth=max(2, int(config.prefetch)),
             engagement_ema_alpha=eng_alpha,
+            needs_move_hazard=needs_move_hazard,
         )
         val_source = (
             make_streaming_source(
@@ -227,6 +247,7 @@ def build_behavior_cloning_sources(
                 segment_mask=config.segment_mask, token_mask=config.token_mask,
                 prefetch_depth=max(2, int(config.prefetch)),
                 engagement_ema_alpha=eng_alpha,
+                needs_move_hazard=needs_move_hazard,
             ) if val_cache.exists()
             else make_resident_source([], device, engagement_ema_alpha=eng_alpha)
         )
@@ -241,6 +262,7 @@ def build_behavior_cloning_sources(
             chunk_rows=int(os.environ.get("QNN_BC_RESIDENT_PRELOAD_CHUNK_ROWS", "65536")),
             engagement_ema_alpha=eng_alpha,
             compact_dequantized=True,
+            needs_move_hazard=needs_move_hazard,
         )
         _gc.collect()
         if torch.cuda.is_available():
@@ -254,6 +276,7 @@ def build_behavior_cloning_sources(
                 chunk_rows=int(os.environ.get("QNN_BC_RESIDENT_PRELOAD_CHUNK_ROWS", "65536")),
                 engagement_ema_alpha=eng_alpha,
                 compact_dequantized=True,
+                needs_move_hazard=needs_move_hazard,
             )
         else:
             val_source = make_resident_source([], device, engagement_ema_alpha=eng_alpha)

@@ -1,6 +1,22 @@
 # Changelog
 
-## 0.25.0
+## 0.26.0
+
+### Added
+
+- De-scripted `act.weapon` labeling in the collector: per-demo fire-script fingerprinting suppresses press/release select churn; deliberate-intent carry-forward with forced re-baseline on held-changes-without-select, death masking, and min-dwell debounce
+- MVD inference path for weapon labels: `act.weapon` reconstruction from spectated `.mvd` streams at parity with the QWD path; synthetic-label collect for the MVD scale-up program
+- Label-gate validation (`bc.validate_labels`, `bc.demo_truth`): collect output checked against raw-demo ground truth before a corpus is trainable
+- `bc.attack_vocab`: attack-stream vocabulary/derivation helpers shared by collect and training
+- Move-labeler package (`qnn.labeler`): GBT relabeler pipeline with MVD-domain training data
+
+### Changed
+
+- BC training pipeline: GPU-resident preload (one-time dequantize to device), per-encounter GRU segment training via `segment_mask`, precomputed temporal labels, engagement-EMA and attack-shift loss options
+- Resident BC ablation daemon: mid-epoch snapshot/resume, per-job source-bundle swap, hardened submit/poll flow
+- Collector engine worker consolidated (v4): event/entity/hold samplers, demo-sound stamps, weapon-lead instrumentation; corpus fingerprints recomputed
+
+
 
 ### Added
 

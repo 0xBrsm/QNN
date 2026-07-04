@@ -30,7 +30,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "qnn_demo_sounds.h"  /* canonical fire/jump sound name lists */
+#include "qnn_demo_sounds.h"  /* canonical attack/jump sound name lists */
 
 /* ── DEM_* record types (low 3 bits of QWD type byte) ──────────────── */
 
@@ -250,7 +250,7 @@ static void active_input_commit(active_input_t *out, active_input_accum_t *a)
 /* Per-frame counters for inventory/state deltas — what the player
  * RECEIVED/LOST this frame.  Distinct from active_input (recorder's
  * intent): an ammo_down without an attack signal indicates a spectator
- * triggering attack-bind without firing; a fire-only frame with no
+ * triggering attack-bind without firing; an attack-only frame with no
  * ammo_down is impossible for real play.
  *
  * weapon_up counts new bits set in IT_AXE..IT_LIGHTNING (items bits 0-8).
@@ -333,11 +333,11 @@ static int g_emit_ping_history = 0;
  * weapon-timing analysis.  Toggled by QNN_EMIT_WEAPON_TIMING env. */
 static int g_emit_weapon_timing = 0;
 
-/* Debug: emit attack-button rising edges (`FT ... press`), fire sound
+/* Debug: emit attack-button rising edges (`FT ... press`), attack sound
  * events (`FT ... sound`), ammo decrements (`FT ... ammo`) and per-ping
- * updates (`FT ... ping`) to stderr for fire-timing analysis.  Toggled
- * by QNN_EMIT_FIRE_TIMING env. */
-static int g_emit_fire_timing = 0;
+ * updates (`FT ... ping`) to stderr for attack-timing analysis.  Toggled
+ * by QNN_EMIT_ATTACK_TIMING env. */
+static int g_emit_attack_timing = 0;
 
 /* ── Per-label interval tracking ─────────────────────────────────────
  *
@@ -429,7 +429,7 @@ static void labels_close_all(labels_t *L, int final_frame)
 /* NQ inference adapter: per-state we need to derive active_input bits from
  * server-observed signals (vendor doesn't expose the player's usercmd in NQ
  * demos).  Sound-based attack/jump detection requires matching sound_num
- * against a small bitset of precached fire/jump sound indices, captured at
+ * against a small bitset of precached attack/jump sound indices, captured at
  * signon (SVC_SERVERINFO precache list). */
 #define NQ_MAX_PRECACHED_SOUNDS 512
 
@@ -481,7 +481,7 @@ typedef struct {
 	 * so origin reaches us even when svc_clientdata omits velocity bits. */
 	float nq_prev_origin[3];
 	int nq_have_prev_origin;
-	/* Per-sound-num classification: 1 = weapon fire, 2 = jump.
+	/* Per-sound-num classification: 1 = weapon attack, 2 = jump.
 	 * Other bytes left zero.  Indexed by sound_num as emitted in
 	 * SVC_SOUND.  Populated during SVC_SERVERINFO precache walk. */
 	uint8_t nq_sound_kind[NQ_MAX_PRECACHED_SOUNDS];
@@ -780,9 +780,9 @@ static void walk_qwd(const uint8_t *data, size_t n,
 				if (buttons & 0x01) acc.attack = 1;
 				if (buttons & 0x02) acc.jump   = 1;
 				if (buttons & 0x04) acc.use    = 1;
-				/* Attack rising edge for fire-timing analysis. */
+				/* Attack rising edge for attack-timing analysis. */
 				int attack_now = (buttons & 0x01) ? 1 : 0;
-				if (g_emit_fire_timing && !prev_attack && attack_now)
+				if (g_emit_attack_timing && !prev_attack && attack_now)
 					fprintf(stderr, "FT %.3f press frame %d\n",
 						ls.current_demotime, frame);
 				prev_attack = attack_now;
@@ -1148,7 +1148,7 @@ static void skip_temp_entity(reader_t *r)
 /* SVC_CLIENTDATA: walks the variable-length payload, returning fields the
  * label/inference code uses.  Velocity / currentammo / onground are also
  * in the wire format but unused — origin-delta is the movement signal
- * (see nq_track_entity_update) and per-pool ammo decrement the fire
+ * (see nq_track_entity_update) and per-pool ammo decrement the attack
  * fallback.  `armor_out` is -1 when SU_ARMOR bit is unset (caller carries
  * forward prior value); `items_out` is always read (vendor cl_parse.c:541). */
 static int read_clientdata(reader_t *r, int *health, int *armor_out,
@@ -1177,14 +1177,14 @@ static int read_clientdata(reader_t *r, int *health, int *armor_out,
 	return r->overflowed ? 0 : 1;
 }
 
-/* Classify a precached NQ sound path as weapon-fire (1), jump (2), or
+/* Classify a precached NQ sound path as weapon-attack (1), jump (2), or
  * neither (0).  Canonical lists live in qnn_demo_sounds.h, shared with
  * the engine's qnn_event.c sound-rule tables — single source of truth. */
 static uint8_t nq_classify_sound_name(const char *s, size_t len)
 {
 #define X(path, subject) \
 	if (len == sizeof(path) - 1 && memcmp(s, path, len) == 0) return 1;
-	QNN_FIRE_SOUND_LIST(X)
+	QNN_ATTACK_SOUND_LIST(X)
 #undef X
 #define X(path) \
 	if (len == sizeof(path) - 1 && memcmp(s, path, len) == 0) return 2;
@@ -1778,7 +1778,7 @@ static void qw_parse_sound(reader_t *r, label_state_t *ls, int frame)
 	if (channel & SND_ATTENUATION) rd_byte(r);
 	uint8_t sound_num = rd_byte(r);
 	rd_coord(r); rd_coord(r); rd_coord(r);      /* position */
-	if (g_emit_fire_timing
+	if (g_emit_attack_timing
 		&& sound_num < NQ_MAX_PRECACHED_SOUNDS
 		&& ls->nq_sound_kind[sound_num] == 1)
 	{
@@ -1987,7 +1987,7 @@ static int dispatch_qw_message(reader_t *r, label_state_t *ls,
 						ls->ph_n++;
 					}
 				}
-				if (g_emit_fire_timing
+				if (g_emit_attack_timing
 					&& ls->self_slot >= 0 && (int)slot == ls->self_slot
 					&& ping_ms > 0 && ping_ms < 999)
 					fprintf(stderr, "FT %.3f ping ms=%d frame %d\n",
@@ -2080,7 +2080,7 @@ static int dispatch_nq_message(reader_t *r, label_state_t *ls,
 		if (cmd == SVC_SOUND)
 		{
 			/* Parse svc_sound (vendor cl_parse.c:101) and fold per-self
-			 * fire/jump events into the active_input accumulator. */
+			 * attack/jump events into the active_input accumulator. */
 			uint8_t mask = rd_byte(r);
 			if (mask & 1) rd_byte(r);   /* volume */
 			if (mask & 2) rd_byte(r);   /* attenuation */
@@ -2575,9 +2575,9 @@ int main(int argc, char **argv)
 	const char *wt_env = getenv("QNN_EMIT_WEAPON_TIMING");
 	if (wt_env != NULL && wt_env[0] != '\0' && wt_env[0] != '0')
 		g_emit_weapon_timing = 1;
-	const char *ft_env = getenv("QNN_EMIT_FIRE_TIMING");
+	const char *ft_env = getenv("QNN_EMIT_ATTACK_TIMING");
 	if (ft_env != NULL && ft_env[0] != '\0' && ft_env[0] != '0')
-		g_emit_fire_timing = 1;
+		g_emit_attack_timing = 1;
 
 	char buf[4096];
 	setvbuf(stdout, NULL, _IOLBF, 0);

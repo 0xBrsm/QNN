@@ -74,8 +74,8 @@ static const qnn_sound_rule_t qnn_player_sound_rules[] = {
 /* Weapon-fire sound rules: paths + subject metadata sourced from
  * qnn_demo_sounds.h (shared with src/demo/qw_classifier.c). */
 static const qnn_sound_rule_t qnn_weapon_sound_rules[] = {
-#define X(path, subject) {path, QNN_ACTION_FIRE, subject, 0},
-	QNN_FIRE_SOUND_LIST(X)
+#define X(path, subject) {path, QNN_ACTION_ATTACK, subject, 0},
+	QNN_ATTACK_SOUND_LIST(X)
 #undef X
 	{NULL, 0, 0, 0},
 };
@@ -188,21 +188,41 @@ static qboolean QNN_SnapshotHasSelfActionSound(const qnn_snapshot_t *snapshot,
 	return false;
 }
 
-qboolean QNN_SnapshotHasSelfWeaponFireSound(const qnn_snapshot_t *snapshot)
+qboolean QNN_SnapshotHasSelfWeaponAttackSound(const qnn_snapshot_t *snapshot)
 {
-	return QNN_SnapshotHasSelfActionSound(snapshot, qnn_weapon_sound_rules, QNN_ACTION_FIRE);
+	return QNN_SnapshotHasSelfActionSound(snapshot, qnn_weapon_sound_rules, QNN_ACTION_ATTACK);
 }
 
 /* Per-sound check: true iff `sound` is a weapon-fire multicast for
- * the self entity.  Same rule set as QNN_SnapshotHasSelfWeaponFireSound
+ * the self entity.  Same rule set as QNN_SnapshotHasSelfWeaponAttackSound
  * but evaluated one sound at a time so the caller can use the sound's
  * native_time for per-event back-shift decisions. */
-qboolean QNN_IsSelfWeaponFireSound(const qnn_sound_event_t *sound)
+qboolean QNN_IsSelfWeaponAttackSound(const qnn_sound_event_t *sound)
 {
 	if (sound->entity_num != cl.viewentity)
 		return false;
 	return QNN_SoundMatchesAction(qnn_weapon_sound_rules,
-		sound->name, QNN_ACTION_FIRE);
+		sound->name, QNN_ACTION_ATTACK);
+}
+
+/* Raw weapon id (1..8) for a self weapon-fire sound, else
+ * QNN_WEAPON_NONE.  The fire rule table carries each sound's subject
+ * (qnn_demo_sounds.h); map it to the raw weapon id so the MVD fire
+ * back-shift can attribute the shot's weapon from the SOUND itself —
+ * the demo's own byte truth — rather than the held-weapon snapshot at a
+ * separately-shifted frame. */
+int QNN_WeaponIdFromAttackSound(const qnn_sound_event_t *sound)
+{
+	const qnn_sound_rule_t *rule;
+
+	if (sound->entity_num != cl.viewentity)
+		return QNN_WEAPON_NONE;
+	rule = QNN_FindSoundRule(qnn_weapon_sound_rules, sound->name);
+	if (rule == NULL || rule->action_id != QNN_ACTION_ATTACK)
+		return QNN_WEAPON_NONE;
+	/* The fire rules store the weapon SUBJECT in the source_id column
+	 * (X-macro: {path, QNN_ACTION_ATTACK, subject, 0}). */
+	return QNN_RawWeaponIdFromSubject(rule->source_id);
 }
 
 qboolean QNN_SnapshotHasSelfJumpSound(const qnn_snapshot_t *snapshot)

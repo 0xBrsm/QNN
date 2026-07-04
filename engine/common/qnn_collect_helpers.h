@@ -59,8 +59,8 @@ typedef struct
 	qboolean	reset_flag;
 	FILE		*out;
 	qboolean	valid;
-	qnn_fire_route_event_t fire_routes[QNN_MAX_FIRE_ROUTE_EVENTS];
-	int		fire_route_count;
+	qnn_attack_route_event_t attack_routes[QNN_MAX_ATTACK_ROUTE_EVENTS];
+	int		attack_route_count;
 } qnn_backshift_slot_t;
 
 typedef struct
@@ -70,13 +70,50 @@ typedef struct
 	int			count;
 	int			prev_weapon_id;
 	qboolean		has_prev_weapon_id;
-	/* STAT_ITEMS at the previous push.  Used by the MVD pickup gate
-	 * to suppress the back-shift when the new weapon's IT_ bit
-	 * flipped 0→1 on the same frame as the transition (deterministic
-	 * server-driven switch via weapon_touch — not player intent). */
-	int			prev_stat_items;
-	qboolean		has_prev_stat_items;
 } qnn_backshift_ring_t;
+
+/* ── Shared back-shift ring API (engine-agnostic) ─────────────────────
+ *
+ * The ring instance lives file-static in qnn_collect_helpers.c.  The MVD
+ * sound/move/infer paths in qnn_mvd_collect.c obtain it via
+ * QNN_BackShiftRing(); the QWD path reuses the same primitives directly.
+ * The MVD-specific sound back-shift writers (fire/jump native_time walk-
+ * back) stay in qnn_mvd_collect.c. */
+
+/* Accessor for the shared ring instance. */
+qnn_backshift_ring_t *QNN_BackShiftRing(void);
+
+/* Reset (zero) the shared ring.  Called from each module's per-demo reset. */
+void QNN_BackShiftReset(void);
+
+/* Resolve the slot `shift_frames` back from the latest push.  Clamps to
+ * the oldest slot held; returns false if the ring is empty or
+ * shift_frames < 0. */
+qboolean QNN_BackShiftSlotAt(qnn_backshift_ring_t *ring,
+	int shift_frames, qnn_backshift_slot_t **slot_out);
+
+/* Accessor: returns true if the ring saw a previous weapon id (i.e.,
+ * at least one push has happened).  Sets *prev_weapon_out. */
+qboolean QNN_BackShiftPrevWeapon(int *prev_weapon_out);
+
+/* Number of slots currently held in the ring (0..QNN_BACKSHIFT_K). */
+int QNN_BackShiftCount(void);
+
+/* Push the current emit tick's (pre-packed obs + action + metadata) into
+ * the ring.  When full, the oldest slot is drained through `emit` first. */
+void QNN_BackShiftPush(qnn_tick_emit_state_t *emit, FILE *out,
+	const uint8_t *obs_bytes, const qnn_action_t *action,
+	qboolean done, int tick, int steps, int tick_hz,
+	qboolean reset_flag, qboolean grounded,
+	int weapon_id);
+
+/* Rewrite the trailing `shift_frames` slots so they carry the new
+ * weapon — anchoring intent at the press frame. */
+void QNN_BackShiftRewriteWeapon(int new_weapon_id,
+	int prev_weapon_id, int shift_frames);
+
+/* Drain every remaining slot through `emit`.  Called at demo end. */
+void QNN_BackShiftFlushAll(qnn_tick_emit_state_t *emit);
 
 /* ── Collect runtime state ───────────────────────────────────────── */
 
@@ -155,6 +192,14 @@ typedef struct
 	int		push_model_indices[QNN_MAX_PUSH_TRIGGERS];
 	vec3_t		push_velocities[QNN_MAX_PUSH_TRIGGERS];
 	int		push_count;
+	/* The cl.worldmodel the mover/player/push refs above were built
+	 * against (void * to avoid a model_t dependency in this header).
+	 * A mid-demo svc_serverdata repoints cl.worldmodel and reuses the
+	 * model_precache[] indices for the new map's models — so the old
+	 * refs would point pmove physents at hull-less .mdl precache slots
+	 * (PM_RecursiveHullCheck fault).  The QW main loop rebuilds the refs
+	 * when cl.worldmodel diverges from this. */
+	void		*refs_worldmodel;
 	/* Previous candidate direction for continuity bias. */
 	int		prev_fwd_sign;
 	int		prev_strafe_sign;
@@ -172,7 +217,7 @@ typedef struct
 	 * at native-tick resolution within the current emit window.  Read by
 	 * QNN_InferEmitAction* for the fire label and cleared by
 	 * QNN_SaveEmitAnchor after each emission. */
-	qboolean	native_fire_this_window;
+	qboolean	native_attack_this_window;
 	/* Actual reported velocity from the previous native tick.  Unlike
 	 * prev_velocity (origin-delta estimate), this is snapshot->player_velocity
 	 * stored directly so QNN_InferNativeAction_MVD can detect the +270 u/s
@@ -183,25 +228,68 @@ typedef struct
 	 * QWD demos where usercmd_t is available.  Used to validate label
 	 * drift against ground-truth recorded inputs. */
 	qboolean	force_mvd_emit;
-	/* QW-only: labeler-mode collect.  When true, the worker writes a
-	 * slim LOBS stream (qnn_collect_helpers.c QNN_EmitLabelerTick)
-	 * instead of the full QOBS frame; the snapshot path is also held
-	 * to MVD-faithful semantics (cl_nopred=1, zero player_velocity)
-	 * so the labeler sees the same obs distribution at training time
-	 * as it would on a real MVD apply path.  When the host demo is
-	 * a QWD with usercmd_t available, the move target is extracted
-	 * from the recorded usercmd so the labeler trains against truth;
-	 * the inference path is unused. */
-	qboolean	labeler_mode;
+	/* QW-only: under force_mvd_emit, take the `move` action from the
+	 * usercmd-TRUTH QWD decoder (QNN_QwdBuildActionLabel) instead of the
+	 * MVD physics inference (QNN_MvdInferEmitMove), while obs features stay
+	 * MVD-domain.  This decouples "MVD features" from "MVD-inferred move":
+	 * QWD demos still carry usercmd_t, so move is recoverable as truth even
+	 * when the obs distribution is MVD-ified for apply-time parity.  Set =1
+	 * by the force_mvd LOBS labeler collect (qnn.labeler.collect); =0
+	 * everywhere else so normal force_mvd parity collects keep the physics
+	 * move (byte-identical to before).  Ignored on real .mvd playback
+	 * (cls.mvdplayback): there is no usercmd to read. */
+	qboolean	usercmd_move;
+	/* Compute-gate flags (set per-collect from the op JSON `select`
+	 * block).  When an expensive variable-length subsystem is NOT
+	 * selected, the worker SKIPS its compute entirely and the obs
+	 * buffer carries the fixed layout with that block zeroed (spatial
+	 * = zeros, entity stream n_tokens=0).  Default (both false = skip
+	 * nothing, zero-init) = the pre-existing full BC collect, byte-
+	 * identical.  Skip-semantics so the zero-initialized runtime struct
+	 * (NQ never sets these) emits both blocks.  The Python field
+	 * projection drops the zeroed blocks before they hit disk. */
+	qboolean	skip_spatial;	/* true → skip QNN_SpatialEmitTokens */
+	qboolean	skip_entities;	/* true → skip QNN_OracleEmitTokens */
+	/* Matched-emit mode (set per-collect from the op JSON `matched_emit`
+	 * flag).  When true, the worker runs at native dt and emits TWO framed
+	 * streams interleaved on one stdout pipe:
+	 *   - a slim "MLOB" record every native frame (per-native-frame
+	 *     derivatives + usercmd-truth move/look/op_input + native index),
+	 *     for training a native-rate move labeler; and
+	 *   - the full "QOBS" record at each 20 Hz cl.mtime demo-time boundary
+	 *     (the model corpus), with interval-correct derivatives and the
+	 *     current native index stamped into the QOBS header `steps` field.
+	 * The Python orchestration demuxes the two streams by magic.  Default
+	 * false = the pre-existing single-stream collect, unchanged. */
+	qboolean	matched_emit;
+	/* Per-demo fire-script fingerprint (set per-collect from the op JSON;
+	 * weapon-head.md §10-11).  weapon_script=1 marks a demo whose player
+	 * uses press/release `+weapon` aliases (select on attack press, dump
+	 * to a fallback on release, every shot); weapon_release is that
+	 * alias's release target (raw 1..8).  Drives the de-scripted
+	 * act.weapon intent label in qnn_qwd_collect.c: a select to
+	 * weapon_release on a cmd with the attack button UP is config churn,
+	 * not intent, and must not update the label.  Defaults 0/0 = no
+	 * dump suppression (unscripted demo).  QWD-only. */
+	int		weapon_script;
+	int		weapon_release;
 	char		demo_path[MAX_OSPATH];
-	/* MVD-path back-shift ring / fire/jump chain-fill state lives in
-	 * the module-private struct in qnn_mvd_collect.c.  Labeler-mode
-	 * cooldown counter lives in qnn_labeler_collect.c.  Both modules
-	 * expose Reset entry points called from the QW main loop's per-
-	 * demo init.  See qnn_mvd_collect.h / qnn_labeler_collect.h. */
+	/* The shared back-shift ring instance lives file-static in
+	 * qnn_collect_helpers.c (see QNN_BackShiftRing).  MVD-path fire/jump
+	 * dedup state lives in the module-private struct in qnn_mvd_collect.c.
+	 * Each module exposes a Reset entry point called from the QW main
+	 * loop's per-demo init.  See qnn_mvd_collect.h. */
 } qnn_runtime_t;
 
 extern qnn_runtime_t qnn_runtime;
+
+/* Engine real-seconds clock for the QC time-gated predicates (attack
+ * cooldown, jump anti-pogo).  At a fixed emit rate this is the synthetic
+ * tick grid (tick / fixed_tick_hz); at native rate (fixed_tick_hz == 0)
+ * it's the demo playback clock captured per emit (emit_start_native).
+ * Tick-rate-independent — the op-feasibility test must run every native
+ * frame regardless of the requested emit Hz. */
+float QNN_RuntimeNowSeconds(void);
 
 /* ── Shared collect helpers ──────────────────────────────────────── */
 
@@ -216,7 +304,7 @@ void QNN_SavePrev(const qnn_snapshot_t *snapshot, float dt);
  * The weapon-id guard on the ammo check prevents weapon-switch
  * cascades (snapshot->ammo jumps between weapons' ammo pools and
  * would otherwise read as a "decrement"). */
-qboolean QNN_DetectFireEvent(const qnn_snapshot_t *snapshot);
+qboolean QNN_DetectAttackEvent(const qnn_snapshot_t *snapshot);
 
 /* Emission-rate filter: returns stdout to emit, NULL to drop.  May
  * mutate snapshot->action_label (dead-frame fire injection). */
@@ -233,23 +321,22 @@ void QNN_FillLookAndSwitch(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
 
 /* Pack the per-axis op_input mask given press bits + per-axis op
- * predicate results.  Single source of truth used by both the BC
- * QwdBuildActionLabel path (action->op_input on the QOBS wire) and the
- * labeler LOBS emit (LOBS payload op_input byte).
+ * predicate results.  Single source of truth for the QWD action
+ * label's op_input byte (action->op_input on the QOBS wire).
  *
  *   bit0 = fb       : fb_press
  *   bit1 = lr       : lr_press
  *   bit2 = ud       : (jump_press AND op_jump) OR (swim_press AND in_water)
- *   bit3 = fire     : fire_press AND op_fire
+ *   bit3 = fire     : attack_press AND op_attack
  *   bit4 = impulse  : has_impulse AND op_impulse
  *
  * Dead frames (alive=0) return 0x00.  Bits 5..7 reserved. */
 uint8_t QNN_PackOpInput(
 	int alive,
 	int fb_press, int lr_press,
-	int jump_press, int swim_press, int fire_press,
+	int jump_press, int swim_press, int attack_press,
 	int in_water,
-	int op_jump, int op_fire, int op_impulse,
+	int op_jump, int op_attack, int op_impulse,
 	int has_impulse);
 
 /* Pack the 8-bit per-axis input-mask byte (input_mask field on
@@ -285,5 +372,20 @@ uint8_t QNN_PackInputMask(
 	int up_act_neg,  int up_act_pos,
 	int jump_act,
 	int attack_act);
+
+/* Shared attack-feasibility probe used by BOTH the QWD and force-MVD
+ * input-mask packers (was duplicated in each). Answers "would a press fire
+ * if button0=1 right now?" by temporarily swapping in the start-of-tick
+ * attack_finished baseline, running the QC W_Attack predicate, and restoring
+ * the live cooldown. Returns 1 if feasible, 0 otherwise (incl. invalid weapon).
+ * Caller-supplied baseline keeps it path-agnostic (QWD: pre-loop AF; MVD: the
+ * shot-stamped AF). */
+int QNN_EvalAttackFeasible(const qnn_snapshot_t *snapshot,
+	float start_of_tick_attack_finished);
+
+/* NOTE: the QWD act_weapon action-label helper (held + pending-impulse
+ * lead) lives in qnn_qwd_collect.c, not here — it depends on the QW-only QC
+ * predicate (QNN_ProgsEvalWeaponImpulse) and must not be linked into the NQ
+ * worker via this shared module. */
 
 #endif /* QNN_COLLECT_HELPERS_H */

@@ -35,6 +35,7 @@ from qnn.bc.container import (
     validate_cache_for_training,
     validate_source_bundle_compatible,
 )
+from qnn.utils import artifacts as _artifacts
 from qnn.utils.io import write_json
 from qnn.utils.repro import set_global_seed, write_experiment_manifest
 
@@ -182,6 +183,12 @@ class BCConfig:
     autostop_min_improve: float = 0.001
     autostop_drift_frac: float = 0.5
     autostop_min_epoch: int = 6
+    # Run identity (qnn.utils.artifacts) — stamped into checkpoint names
+    # (ckpt_e<epoch>_<run_id>.pt / best_<run_id>.pth), checkpoint meta, and
+    # bc_summary/bc_manifest for provenance. Injected from run.json by
+    # build_run_bc_config; defaulted so ad-hoc construction from pre-rename
+    # config blobs keeps working (a fresh id is minted at train start).
+    run_id: str = ""
     # Catastrophic hard-stop: if val_selection regresses > this margin ABOVE the
     # running best, stop immediately regardless of drift/patience/min_epoch (catches
     # divergence the reorganizing-veto would otherwise mask). 0 disables; always on
@@ -205,7 +212,7 @@ def _selection_score(metrics: Mapping[str, float]) -> float:
     common ruler (``<head>_dll / H_marg``, a proper scoring rule normalised to
     [.,1)); summing the normalised terms weights all five heads equally, unlike
     raw nats/KL/BCE whose scales differ ~20×. argmax F1/acc are diagnostics and
-    are NOT used here. The single source of truth is src/docs/head-metrics.md.
+    are NOT used here. The single source of truth is research/head-metrics.md.
 
     Heads absent from a run contribute a neutral 0 (skill defaults to 1). The
     fallbacks below only fire on the train-proxy path, where the distributional
@@ -380,23 +387,13 @@ def _unpack_move_axes(packed: np.ndarray) -> np.ndarray:
     Attack and jump are extracted separately by ``_unpack_attack_bit`` and
     ``_unpack_jump_bit``. Materializes a fresh array (no longer mmap-backed)
     — fine because action labels are tiny relative to obs.
+
+    The decode itself lives in :func:`qnn.actions.decode_move_pressbyte`
+    (the single home for the press-byte packing, alongside the labeler's
+    FIELD3 packing); this is a thin alias kept for the existing call sites.
     """
-    arr = np.asarray(packed, dtype=np.uint8)
-    if arr.ndim != 1:
-        raise ValueError(f"expected (T,) packed move, got shape {arr.shape}")
-    one = np.uint8(1)
-    fb_neg = (arr >> 1) & one
-    fb_pos = (arr >> 2) & one
-    lr_neg = (arr >> 3) & one
-    lr_pos = (arr >> 4) & one
-    ud_neg = (arr >> 5) & one
-    # ud_pos folds in jump (bit 7) so both swim/jumppad upmove and the
-    # explicit jump button supervise the same "press +Z" class.
-    ud_pos = ((arr >> 6) & one) | ((arr >> 7) & one)
-    fb = (one + fb_pos - fb_neg).astype(np.uint8)
-    lr = (one + lr_pos - lr_neg).astype(np.uint8)
-    ud = (one + ud_pos - ud_neg).astype(np.uint8)
-    return np.ascontiguousarray(np.stack([fb, lr, ud], axis=-1))
+    from qnn.actions import decode_move_pressbyte
+    return decode_move_pressbyte(packed)
 
 
 def _unpack_attack_bit(packed: np.ndarray) -> np.ndarray:
@@ -1021,6 +1018,53 @@ def _push_metrics_to_prometheus(
             _warned[0] = True
 
 
+def _nas_archive_bc_run(
+    output: Path,
+    run_id: str,
+    best_model_path: Path,
+    _log: Callable[[str], None],
+) -> None:
+    """Push the run's result to the NAS, best-effort.
+
+    Best-only policy: the NAS archives the run's RESULT (best weights +
+    meta + summary), never the rolling resume checkpoint — its optimizer
+    state only serves extending a finished run, which config+seed retrain
+    covers. Destination: ``bc_checkpoints/<run_id>/`` on the share
+    configured by the ``QNN_NAS_SERVER`` / ``QNN_NAS_SHARE`` /
+    ``QNN_NAS_USER`` / ``QNN_NAS_PASS`` env vars (same contract as
+    corpus/nas.py; defaults nas.local/QNN).
+    """
+    sources = [
+        best_model_path,
+        best_model_path.with_suffix(".json"),
+        output / "bc_summary.json",
+    ]
+    sources = [p for p in sources if p is not None and p.exists()]
+    if not sources:
+        return
+    try:
+        import shutil as _shutil
+        import smbclient as _smb
+        server = os.environ.get("QNN_NAS_SERVER", "nas.local")
+        share = os.environ.get("QNN_NAS_SHARE", "QNN")
+        user = os.environ.get("QNN_NAS_USER", "guest")
+        password = os.environ.get("QNN_NAS_PASS", "guest")
+        _smb.ClientConfig(require_secure_negotiate=False)
+        _smb.register_session(
+            server, username=user, password=password,
+            encrypt=False, require_signing=False, auth_protocol="ntlm",
+        )
+        dest_dir = rf"\\{server}\{share}\bc_checkpoints\{run_id}"
+        _smb.makedirs(dest_dir, exist_ok=True)
+        for src in sources:
+            with open(src, "rb") as local_f:
+                with _smb.open_file(dest_dir + "\\" + src.name, mode="wb") as remote_f:
+                    _shutil.copyfileobj(local_f, remote_f)
+        _log(f"NAS archive: {len(sources)} files -> {dest_dir}")
+    except Exception as exc:
+        _log(f"NAS archive unavailable — skipping offsite backup ({exc})")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point.
 # ---------------------------------------------------------------------------
@@ -1162,7 +1206,7 @@ def run_behavior_cloning(
         hlw = dict(head_loss_weights)
 
     # Best _selection_score seen so far — composite Σ_head (1 − head_skill).
-    # NOT a loss; selection error, lower is better. See src/docs/head-metrics.md.
+    # NOT a loss; selection error, lower is better. See research/head-metrics.md.
     best_selection_score = float("inf")
     best_epoch = -1
     history: list[Dict[str, float]] = []
@@ -1183,32 +1227,25 @@ def run_behavior_cloning(
     _autostop_stall = 0
     _autostop_drift_ref: "float | None" = None
 
-    # NAS archive: save every epoch checkpoint to SMB share for offsite backup.
-    _NAS_CHECKPOINTS = r"\\pi.local\nqcorpus\bc_checkpoints"
-    _smb_available = False
-    try:
-        import smbclient
-        smbclient.ClientConfig(username="guest", password="", require_secure_negotiate=False)
-        smbclient.register_session(
-            "pi.local", username="guest", password="",
-            auth_protocol="ntlm", require_signing=False,
-        )
-        _variant_name = output.parent.name or output.name
-        _variant_dir = _NAS_CHECKPOINTS + "\\" + _variant_name
-        smbclient.makedirs(_variant_dir, exist_ok=True)
-        _smb_available = True
-        _log(f"NAS archive available: {_variant_dir}")
-    except Exception:
-        _smb_available = False
-        _log("NAS archive not available — skipping offsite backup")
+    # Run identity for checkpoint names + artifact provenance. Run-dir
+    # launches inject this from run.json; ad-hoc constructions mint one.
+    run_id = config.run_id or _artifacts.new_run_id()
+    if not config.run_id:
+        _log(f"No run_id in config — minted {run_id}")
 
     # Mid-epoch state: rolling file for deterministic resume within an epoch.
     mid_epoch_path = output / "snapshot.pt"
     _MID_EPOCH_SAVE_INTERVAL = config.snapshot_interval
 
-    # Resume from checkpoint if available.
-    checkpoint_path = output / "bc_training_checkpoint.pt"
-    if checkpoint_path.exists():
+    # Resume from checkpoint if available (ckpt_e<epoch>_<run_id>.pt, or the
+    # legacy fixed name for pre-rename run dirs).
+    checkpoint_path = _artifacts.find_resume_checkpoint(output)
+    if checkpoint_path is not None:
+        # Continue the on-disk identity: the file's run_id wins over a
+        # (possibly freshly minted) config value so one run keeps one id.
+        _parsed = _artifacts.parse_ckpt_name(checkpoint_path.name)
+        if _parsed is not None:
+            run_id = _parsed[1]
         import torch as _torch_resume
         from qnn.utils.checkpoint_converter import (
             migrate_entity_embed,
@@ -1251,6 +1288,8 @@ def run_behavior_cloning(
         _log(f"Resuming from epoch {start_epoch} (best_selection={best_selection_score:.4f} at epoch {best_epoch})")
     else:
         _resume_optimizer_state = None
+
+    best_model_path = output / _artifacts.best_name(run_id)
 
     # Mid-epoch resume: if we have a mid-epoch state file, use it to
     # resume within the current epoch instead of restarting it.
@@ -1396,9 +1435,20 @@ def run_behavior_cloning(
             save_state_callback=_save_mid_epoch,
             snapshot_interval=_MID_EPOCH_SAVE_INTERVAL,
             resume_state=_mid_epoch_resume,
+            cancel_event=cancel_event,
         )
         _mid_epoch_resume = None
         _t_train_end = _time.monotonic()
+
+        # Immediate (mid-epoch) cancel: train_on_batches broke out and the
+        # mid-epoch snapshot was force-saved, so stop now WITHOUT running val,
+        # writing this epoch's checkpoint, or clearing snapshot.pt — resume
+        # continues from within this epoch. (The epoch-boundary cancel check
+        # further below still handles a cancel that lands during val.)
+        if cancel_event is not None and cancel_event.is_set():
+            _log(f"Cancellation requested — stopping mid-epoch {epoch + 1} "
+                 f"(mid-epoch state kept for resume)")
+            break
         if _resume_optimizer_state is not None:
             bc_opt = model._optimizers.get("bc")
             if bc_opt is not None:
@@ -1467,7 +1517,7 @@ def run_behavior_cloning(
         # fraction of that head's marginal entropy it captures (0 = base rate,
         # →1 = fully determined). Comparable across heads and the terms of the
         # selection composite. All raw metrics (dll/kl/nll/loss/f1/per-class)
-        # stay in bc_history.json for analysis. See src/docs/head-metrics.md.
+        # stay in bc_history.json for analysis. See research/head-metrics.md.
         _headline_keys = (
             "move_skill", "look_skill", "target_skill", "attack_skill", "weapon_skill",
         )
@@ -1588,7 +1638,7 @@ def run_behavior_cloning(
         if selection_metric < best_selection_score:
             best_selection_score = selection_metric
             best_epoch = epoch
-            model.save(output / "bc_best_model.pth")
+            model.save(best_model_path, extra_meta={"run_id": run_id})
 
         if move_reg > config.regression_threshold or look_reg > config.regression_threshold:
             _reg_violations += 1
@@ -1626,6 +1676,7 @@ def run_behavior_cloning(
         # Save resumable checkpoint every epoch (latest + epoch-stamped).
         bc_opt = model._optimizers.get("bc")
         ckpt_data = {
+            "run_id": run_id,
             "epoch": epoch,
             "model_state_dict": {
                 k.replace("_orig_mod.", ""): v
@@ -1644,27 +1695,17 @@ def run_behavior_cloning(
             "_autostop_drift_ref": _autostop_drift_ref,
             "rng_state": rng.bit_generator.state,
         }
-        torch.save(ckpt_data, checkpoint_path)
+        # Single rolling resume checkpoint: durable atomic write of this
+        # epoch's file, then drop the superseded one. No epoch-stamp archive
+        # — the atomic write guarantees one intact checkpoint survives any
+        # crash, and nothing ever consumed the historical series.
+        prev_checkpoint_path = checkpoint_path
+        checkpoint_path = output / _artifacts.ckpt_name(epoch, run_id)
+        _artifacts.atomic_torch_save(ckpt_data, checkpoint_path)
+        if prev_checkpoint_path is not None and prev_checkpoint_path != checkpoint_path:
+            prev_checkpoint_path.unlink(missing_ok=True)
         # Epoch completed cleanly — remove the rolling mid-epoch state.
         mid_epoch_path.unlink(missing_ok=True)
-        # Epoch-stamped copy so we can resume from any epoch.
-        epoch_ckpt_dir = output / "checkpoints"
-        epoch_ckpt_dir.mkdir(exist_ok=True)
-        torch.save(ckpt_data, epoch_ckpt_dir / f"bc_checkpoint_epoch{epoch:03d}.pt")
-
-        # Archive checkpoint and best model to NAS.
-        if _smb_available:
-            try:
-                import smbclient as _smb
-                import shutil as _shutil
-                for src in [checkpoint_path, output / "bc_best_model.pth"]:
-                    if src.exists():
-                        nas_dest = _variant_dir + "\\" + src.name
-                        with open(src, "rb") as local_f:
-                            with _smb.open_file(nas_dest, mode="wb") as remote_f:
-                                _shutil.copyfileobj(local_f, remote_f)
-            except Exception as exc:
-                _log(f"NAS archive failed: {exc}")
 
         if cancel_event is not None and cancel_event.is_set():
             _log(f"Cancellation requested — stopping after epoch {epoch + 1}")
@@ -1682,7 +1723,7 @@ def run_behavior_cloning(
             break
 
     if best_epoch < 0:
-        model.save(output / "bc_best_model.pth")
+        model.save(best_model_path, extra_meta={"run_id": run_id})
 
     # Free the training model + optimizer state before loading the best
     # checkpoint for the final val pass. In normal single-run mode we also
@@ -1697,8 +1738,11 @@ def run_behavior_cloning(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # A resumed pre-rename run whose best never improved post-rename still
+    # has its best under the legacy name — discover rather than assume.
+    final_best_path = best_model_path if best_model_path.exists() else _artifacts.find_best_model(output)
     final_model = QNNPolicy.load(
-        output / "bc_best_model.pth", device=config.device, model_factory=model_factory,
+        final_best_path, device=config.device, model_factory=model_factory,
     )
     # QNNPolicy.load builds a fresh policy without the side-channel provider, so
     # re-attach it — otherwise side-channel-dependent heads (GTTargetPointer,
@@ -1730,6 +1774,7 @@ def run_behavior_cloning(
         val_source.release_device_tensors()
 
     summary: Dict[str, Any] = {
+        "run_id": run_id,
         "best_epoch": best_epoch,
         "best_selection_score": best_selection_score,
         "final_val_loss": float(final_val_metrics["loss"]),
@@ -1759,6 +1804,14 @@ def run_behavior_cloning(
     write_json(output / "bc_history.json", {"history": history})
     write_json(output / "bc_summary.json", summary)
     write_experiment_manifest(output / "bc_manifest.json", asdict(config), summary)
+
+    # End-of-run offsite backup: best model + summary to the NAS, keyed by
+    # run_id (best-only — no resume checkpoint). One push per run (not per
+    # epoch) — the per-epoch stream only insured against mid-run host loss,
+    # which a cheap run re-creates faster than the uploads cost. Connection
+    # details come from the QNN_NAS_* env vars (see corpus/nas.py); failure
+    # is non-fatal.
+    _nas_archive_bc_run(output, run_id, best_model_path, _log)
 
     return {k: float(v) for k, v in summary.items() if isinstance(v, (int, float))}
 
@@ -1807,9 +1860,9 @@ def run(ctx: "RunnerContext") -> dict[str, object]:
 
 def _eval_only(run_dir: Path, data_dir: Path | None, device: str, batch_size: int) -> None:
     import json as _json
-    checkpoint = run_dir / "checkpoints" / "bc_best_model.pth"
-    if not checkpoint.exists():
-        raise FileNotFoundError(f"No best-model checkpoint at {checkpoint}")
+    checkpoint = _artifacts.find_best_model(run_dir / "checkpoints")
+    if checkpoint is None:
+        raise FileNotFoundError(f"No best-model checkpoint under {run_dir / 'checkpoints'}")
 
     if data_dir is None:
         machine_cfg = _json.loads((run_dir / "config" / "machine.json").read_text())

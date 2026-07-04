@@ -30,7 +30,7 @@ void QNN_QwdCollectReset(void);
  * state.  Returns the resolved impulse_target weapon (1..8) or 0 if no
  * weapon-select impulse appeared in the window.
  *
- *   fire / jump (move[2] set to QNN_SV_JUMP_SPEED/QNN_SV_MAXSPEED):
+ *   attack / jump (move[2] set to QNN_SV_JUMP_SPEED/QNN_SV_MAXSPEED):
  *     OR across all cmds in the window (any press counts).
  *   forward / side move:
  *     Averaged across the window — each cmd is integrated over
@@ -39,18 +39,29 @@ void QNN_QwdCollectReset(void);
  *   upmove (swim down):
  *     Most-negative value across the window.
  *
- * action->weapon is left untouched by this function; the held-weapon
- * state machine lives in QNN_QwdBuildActionLabel.
+ * action->weapon is left untouched by this function, but the per-cmd loop
+ * advances the QC weapon-select predicate (once per emit tick); the label
+ * is then read from QNN_ProgsGetSelfWeapon in QNN_QwdBuildActionLabel.
  */
-int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot);
+void QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot);
 
-/* Emit-time QWD action: usercmd extraction + held-weapon state machine
- * (impulse / engine-forced / carry, using snapshot->weapon_id) +
- * look/switch fill. */
+/* Emit-time QWD action: usercmd extraction + canonical action.weapon label
+ * (held weapon + ping-gated pending-impulse lead) + look/switch fill. */
 void QNN_QwdBuildActionLabel(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
 
-/* Per-cmd fire-predicate eval + cmd-block aggregation across the
+/* Ping-gated weapon-lead clear.  Call once per emit tick on the genuine QWD
+ * usercmd path, AFTER QwdBuildActionLabel and BEFORE the back-shift ring push:
+ * clears a lead the engine never confirms within its realization window
+ * (ping×2 + the remaining attack cooldown the switch must wait out) — a
+ * stale-impulse phantom — by walking the shared ring back over the lead window
+ * and resetting those slots + this frame to held.  ping_frames =
+ * QNN_PressBackShiftFrames(player, emit_hz); emit_hz converts cooldown to
+ * frames. */
+void QNN_QwdWeaponLeadStep(qnn_action_t *action,
+	const qnn_snapshot_t *snapshot, int tick, int ping_frames, int emit_hz);
+
+/* Per-cmd attack-predicate eval + cmd-block aggregation across the
  * current QWD cmd window.  Calls QNN_ProgsEvalAttack once per cmd
  * (advancing the QC attack_finished state at cmd granularity) and
  * aggregates raw usercmd bytes: fmove/smove as mean, umove as
@@ -60,7 +71,7 @@ void QNN_QwdBuildActionLabel(qnn_action_t *action,
  * (pmove-driven, no QC predicate involvement). */
 void QNN_QwdEvalOperativePerCmd(
 	const qnn_snapshot_t *snapshot,
-	int *out_op_fire,
+	int *out_op_attack,
 	int *out_fmove,
 	int *out_smove,
 	int *out_umove,
@@ -85,7 +96,7 @@ int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot, int synth_button2);
 /* Fill action->input_mask from press bits (read off action->move,
  * already filled by QwdExtractAction) + per-axis op predicate results.
  * Must run exactly once per tick — invoked from QwdBuildActionLabel
- * right after FillLookAndSwitch.  Reads qwd_state.last_op_fire /
+ * right after FillLookAndSwitch.  Reads qwd_state.last_op_attack /
  * last_jump_press_any / last_upmove_pos_any stashed by the same-tick
  * QwdExtractAction call.  See QNN_PackInputMask in qnn_collect_helpers.h
  * for the bit layout. */

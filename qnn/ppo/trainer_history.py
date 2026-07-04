@@ -51,6 +51,16 @@ def load_ledger(path: Path | None = None) -> list[dict[str, Any]]:
     return entries
 
 
+def _run_id_from_root(run_root: str) -> str:
+    """run_id from the run dir's run.json; '' when absent. Lets ledger
+    entries carry stable identity without callers threading it through."""
+    try:
+        manifest = read_json(Path(run_root) / "run.json")
+        return str(manifest.get("run_id", ""))
+    except Exception:
+        return ""
+
+
 def record_launch(
     *,
     trainer_config: dict[str, Any],
@@ -63,6 +73,7 @@ def record_launch(
     entry = {
         "timestamp": _utc_now(),
         "event": "launch",
+        "run_id": _run_id_from_root(run_root),
         "trainer_config_hash": trainer_config_hash(trainer_config),
         "trainer_config": trainer_config,
         "run_root": run_root,
@@ -88,6 +99,7 @@ def record_outcome(
     entry = {
         "timestamp": _utc_now(),
         "event": "outcome",
+        "run_id": _run_id_from_root(run_root),
         "trainer_config_hash": trainer_config_hash_value,
         "run_root": run_root,
         "status": status,

@@ -18,7 +18,7 @@ from typing import Any, Dict
 
 import numpy as np
 
-from qnn.actions import ACTION_HEADS, CONTINUOUS_ACTION_HEADS
+from qnn.actions import decode_move_pressbyte
 
 
 def _load_episodes(cache_dir: Path) -> list[dict[str, np.ndarray]]:
@@ -65,12 +65,19 @@ def copy_previous_baseline(episodes: Sequence[dict[str, np.ndarray]]) -> Dict[st
     _LOOK_BINS = [("0_1", 0.0, 1.0), ("1_5", 1.0, 5.0), ("5_15", 5.0, 15.0), ("15p", 15.0, 180.0)]
 
     total_frames = 0
-    # Continuous heads: collect angular errors for look, component L1 for move
+    # Continuous floors: angular error for look, per-axis class L1 for move.
     look_errors: list[np.ndarray] = []
     look_label_raw_deg: list[np.ndarray] = []
     move_l1: list[np.ndarray] = []
-    # Discrete heads: count tp/fp/fn
-    discrete_counts: Dict[str, list[int]] = {h: [0, 0, 0] for h in ACTION_HEADS if h not in CONTINUOUS_ACTION_HEADS}
+    move_fwd_l1: list[np.ndarray] = []
+    move_str_l1: list[np.ndarray] = []
+    move_up_l1: list[np.ndarray] = []
+    # Discrete copy-previous floors. The cache stores NO standalone `attack`
+    # array — the demonstrator fire press is bit 0 of the packed move byte
+    # (mirrors qnn.bc.train._unpack_attack_bit / the resident-source preload).
+    # The move axes are the unpacked (T,3) classes scored via the L1 path, NOT a
+    # discrete fire-style head, so move is excluded from this confusion-matrix.
+    discrete_counts: Dict[str, list[int]] = {"attack": [0, 0, 0], "weapon": [0, 0, 0]}
 
     for ep in episodes:
         n = len(next(iter(ep.values())))
@@ -78,26 +85,35 @@ def copy_previous_baseline(episodes: Sequence[dict[str, np.ndarray]]) -> Dict[st
             continue
         total_frames += n - 1  # skip frame 0 (no previous)
 
-        # Look: copy previous
-        look = ep["look"]
-        look_predict = look[:-1]  # frame T-1 as prediction for frame T
-        tgt_look = look[1:]
-        look_errors.append(_angular_error_deg(look_predict, tgt_look))
-        look_label_raw_deg.append(_target_turn_deg(tgt_look))
+        # Look: copy previous (cache is f16 — cast to f32 for the angular math).
+        look = np.asarray(ep["look"], dtype=np.float32)
+        look_errors.append(_angular_error_deg(look[:-1], look[1:]))
+        look_label_raw_deg.append(_target_turn_deg(look[1:]))
 
-        # Move: copy previous, L1 error
-        move = ep["move"]
-        pred_move = move[:-1]
-        tgt_move = move[1:]
-        move_l1.append(np.abs(pred_move - tgt_move).sum(axis=1))
+        # Move: expand the packed byte to (T,3) class indices {0=neg,1=none,2=pos}
+        # (canonical qnn.actions.decode_move_pressbyte) then copy-previous class L1.
+        move_raw = np.asarray(ep["move"], dtype=np.uint8).reshape(-1)
+        move_cls = decode_move_pressbyte(move_raw)            # (T, 3)
+        diff = np.abs(move_cls[:-1].astype(np.int64) - move_cls[1:].astype(np.int64))
+        move_l1.append(diff.sum(axis=1))
+        move_fwd_l1.append(diff[:, 0]); move_str_l1.append(diff[:, 1]); move_up_l1.append(diff[:, 2])
 
-        # Discrete heads: copy previous, count matches
-        for head in discrete_counts:
-            if head not in ep:
-                continue
-            vals = ep[head].flatten()
-            pred = vals[:-1]
-            tgt = vals[1:]
+        # Discrete heads: attack = move byte bit 0 (raw demo press), weapon = class.
+        streams = {"attack": (move_raw & 0x1), "weapon": np.asarray(ep["weapon"]).reshape(-1)}
+        for head, vals in streams.items():
+            pred, tgt = vals[:-1], vals[1:]
+            # OPERATIVE-FRAME FILTER (see src/docs/attack-head.md): the copy-previous
+            # floor MUST be scored on the SAME frame population the trained head's
+            # metric uses. attack: operative = input_mask bit 0 (engine honours fire;
+            # raw attack over-counts held-trigger cooldown frames). weapon: weapon-
+            # present frames (training ignores no-weapon target=-100). The mask aligns
+            # to the TARGET frame T (tgt = vals[1:]).
+            if head == "attack" and "input_mask" in ep:
+                op = (np.asarray(ep["input_mask"]).reshape(-1).astype(np.uint8) & 0x1) != 0
+                keep = op[1:]
+            else:  # weapon
+                keep = tgt != 0
+            pred, tgt = pred[keep], tgt[keep]
             pos_pred = pred != 0
             pos_tgt = tgt != 0
             match = pred == tgt
@@ -128,19 +144,7 @@ def copy_previous_baseline(episodes: Sequence[dict[str, np.ndarray]]) -> Dict[st
         if cnt > 0:
             result["look"][f"mae_{tag}_deg"] = float(all_look_err[mask].mean())
 
-    # Move per-component
-    # Recompute per-component for reporting
-    move_fwd_l1: list[np.ndarray] = []
-    move_str_l1: list[np.ndarray] = []
-    move_up_l1: list[np.ndarray] = []
-    for ep in episodes:
-        move = ep["move"]
-        if move.shape[0] < 2:
-            continue
-        diff = np.abs(move[:-1] - move[1:])
-        move_fwd_l1.append(diff[:, 0])
-        move_str_l1.append(diff[:, 1])
-        move_up_l1.append(diff[:, 2])
+    # Move per-component (collected inline above; class-space L1 in {0,1,2}).
     result["move"]["mae_forward"] = float(np.concatenate(move_fwd_l1).mean())
     result["move"]["mae_strafe"] = float(np.concatenate(move_str_l1).mean())
     result["move"]["mae_up"] = float(np.concatenate(move_up_l1).mean())

@@ -29,8 +29,6 @@
   "eval_holdout_seed_offset": 1000,
   "eval_sample_seed_offset": 2000,
   "eval_map_features_path": "",
-  "eval_record_demos": false,
   "eval_parallel_policy_modes": false,
-  "demo_policy_mode": "greedy",
   "head_loss_weights": ""
 }

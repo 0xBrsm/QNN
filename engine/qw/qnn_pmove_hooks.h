@@ -16,7 +16,7 @@
  * player physically left the ground at the cmd just integrated.  The
  * QWD labeler's per-cmd driver clears this before each PlayerMove()
  * call and OR's the post-call value across the cmd window. */
-extern int qnn_pmove_jump_fired;
+extern int qnn_pmove_jump_attacked;
 
 /* Snapshot of pmove globals our per-cmd driver mutates.  Saved before
  * we seed pmove from the labeler snapshot and restored after the cmd

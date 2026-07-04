@@ -122,9 +122,9 @@ _RAW_SUM_METRIC_PREFIXES = (
     "looksum_",  # tangent-space look-metric sufficient stats (see qnn.bc.look_metrics)
     "lookdist_",  # binned-head distributional (human-likeness) sufficient stats
     "movedist_",  # move-head distributional (human-likeness) sufficient stats
-    "weapondist_",  # weapon_skill sufficient stats (see src/docs/head-metrics.md)
-    "attackdist_",  # attack_skill sufficient stats (see src/docs/head-metrics.md)
-    "targetdist_",  # target_skill sufficient stats (see src/docs/head-metrics.md)
+    "weapondist_",  # weapon_skill sufficient stats (see research/head-metrics.md)
+    "attackdist_",  # attack_skill sufficient stats (see research/head-metrics.md)
+    "targetdist_",  # target_skill sufficient stats (see research/head-metrics.md)
 )
 _AVERAGED_METRIC_PREFIXES = (
     "acc_", "mae_", "f1_", "precision_", "recall_",
@@ -531,7 +531,7 @@ def _skill_from_nll(result: Dict[str, float], head: str, nll: float, h_marg: flo
     """Common ``<head>_dll`` / ``<head>_skill`` from a clean NLL + marginal
     entropy. dll = H_marg − NLL (gain over the base-rate predictor, nats);
     skill = dll / H_marg (fraction of the marginal entropy eliminated, the
-    common ruler the selection composite sums). See src/docs/head-metrics.md.
+    common ruler the selection composite sums). See research/head-metrics.md.
     """
     dll = h_marg - nll
     result[f"{head}_dll"] = dll
@@ -1094,10 +1094,15 @@ class StreamingSource:
         prefetch_depth: int = 4,
         n_workers: int = 1,
         engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
+        needs_move_hazard: bool = False,
     ) -> None:
         self._ll = ll
         self.device = device
         self._engagement_ema_alpha = float(engagement_ema_alpha)
+        # a25 move-hazard (WHEN-law) opt-in. When False (every run that doesn't
+        # train the hazard head) the derivation + injection are skipped entirely
+        # — byte-identical to before.
+        self._needs_move_hazard = bool(needs_move_hazard)
         self.episodes: list[Any] = list(ll.episodes)
         self.prefetch_depth = int(prefetch_depth)
         self.n_workers = int(n_workers)
@@ -1136,8 +1141,16 @@ class StreamingSource:
         self._look_delta: torch.Tensor | None = None
         self._engagement_ema: torch.Tensor | None = None
         self._attack_shifted: torch.Tensor | None = None
+        # a25 hazard columns (held_class/dwell_age → obs, release/valid → act),
+        # per-frame and indexed by the same global order as self._jump_dist.
+        self._hz_held: torch.Tensor | None = None
+        self._hz_dwell: torch.Tensor | None = None
+        self._hz_release: torch.Tensor | None = None
+        self._hz_valid: torch.Tensor | None = None
         if self.episodes:
             self._precompute_distances()
+            if self._needs_move_hazard:
+                self._precompute_move_hazard()
 
     def _open_shard(self, shard_idx: int):
         """``open_shard`` wrapper that lazily unpacks the packed ``move`` byte.
@@ -1227,6 +1240,34 @@ class StreamingSource:
             self._engagement_ema = torch.from_numpy(np.concatenate(eng_parts, axis=0)).to(self.device)
         if any_attack_shifted:
             self._attack_shifted = torch.from_numpy(np.concatenate(att_shift_parts, axis=0)).to(self.device)
+
+    def _precompute_move_hazard(self) -> None:
+        """a25: derive the per-frame move-hazard columns from act_move, episode
+        by episode (no recollect, no disk cache). Held on device and injected in
+        ``_make_batch`` exactly like ``_jump_dist``. Gated by needs_move_hazard.
+
+        held_class/dwell_age describe the semi-Markov decode state entering each
+        frame; release is the binary switch-next-tick target; valid masks the
+        episode start (no prior frame). See
+        qnn.model.bench.a25.hazard_labels.derive_hazard_labels.
+        """
+        from qnn.model.bench.a25.hazard_labels import derive_hazard_labels
+        held_parts: list[np.ndarray] = []
+        dwell_parts: list[np.ndarray] = []
+        release_parts: list[np.ndarray] = []
+        valid_parts: list[np.ndarray] = []
+        for ep in self.episodes:
+            view = self._open_shard(int(ep.shard_idx))
+            move = np.asarray(view.actions["move"][int(ep.row_start):int(ep.row_end)])
+            cols = derive_hazard_labels(move.reshape(move.shape[0], -1))
+            held_parts.append(cols["held_class"])
+            dwell_parts.append(cols["dwell_age"])
+            release_parts.append(cols["release"])
+            valid_parts.append(cols["valid"])
+        self._hz_held = torch.from_numpy(np.concatenate(held_parts, axis=0)).to(self.device)
+        self._hz_dwell = torch.from_numpy(np.concatenate(dwell_parts, axis=0)).to(self.device)
+        self._hz_release = torch.from_numpy(np.concatenate(release_parts, axis=0)).to(self.device)
+        self._hz_valid = torch.from_numpy(np.concatenate(valid_parts, axis=0)).to(self.device)
 
     def _ensure_dequant(self) -> None:
         if not self._needs_dequant or self._dequant_chain:
@@ -1368,6 +1409,13 @@ class StreamingSource:
             act_t["engagement_ema"] = self._engagement_ema.index_select(0, indices)
         if self._attack_shifted is not None:
             act_t["attack_shifted"] = self._attack_shifted.index_select(0, indices)
+        if self._hz_held is not None:
+            # a25 hazard: held_class/dwell_age feed the head (obs); release/valid
+            # are its loss labels (act). Same global indexing as _jump_dist.
+            obs_t["move_held_class"] = self._hz_held.index_select(0, indices)
+            obs_t["move_dwell_age"] = self._hz_dwell.index_select(0, indices)
+            act_t["move_hazard_release"] = self._hz_release.index_select(0, indices)
+            act_t["move_hazard_valid"] = self._hz_valid.index_select(0, indices)
         return obs_t, act_t
 
     def _to_device(self, v: np.ndarray) -> torch.Tensor:
@@ -1460,6 +1508,7 @@ def make_streaming_source(
     prefetch_depth: int = 4,
     n_workers: int = 1,
     engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
+    needs_move_hazard: bool = False,
 ) -> StreamingSource:
     """Build a :class:`StreamingSource` from a sharded BC cache directory."""
     from qnn.bc.streaming_source import StreamingSource as _LowLevel
@@ -1469,6 +1518,7 @@ def make_streaming_source(
         prefetch_depth=prefetch_depth,
         n_workers=n_workers,
         engagement_ema_alpha=engagement_ema_alpha,
+        needs_move_hazard=needs_move_hazard,
     )
 
 
@@ -1482,12 +1532,15 @@ def make_resident_source_from_cache(
     engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
     compact_dequantized: bool = True,
     progress_interval_seconds: float = 5.0,
+    needs_move_hazard: bool = False,
 ) -> ResidentSource:
     """Materialize a device-resident source directly from sharded cache files.
 
-    This is the streaming=false low-RAM preload path. It reuses the streaming
-    mmap gatherer as an ingestion engine, copying fixed-size chunks into final
-    resident tensors on ``device``.
+    This is the streaming=false low-RAM preload path (the DEFAULT). It reuses the
+    streaming mmap gatherer as an ingestion engine, copying fixed-size chunks
+    into final resident tensors on ``device`` — so ``gather``'s derived columns
+    (incl. the a25 hazard columns when ``needs_move_hazard``) are materialized
+    into the resident tensors and need no separate resident-side derivation.
     """
     import time as _time
 
@@ -1499,6 +1552,7 @@ def make_resident_source_from_cache(
         prefetch_depth=0,
         n_workers=0,
         engagement_ema_alpha=engagement_ema_alpha,
+        needs_move_hazard=needs_move_hazard,
     )
     n_rows = streaming.n_total_rows
     if n_rows <= 0:
@@ -1633,6 +1687,7 @@ def train_on_batches(
     head_loss_weights: Mapping[str, float] | None = None,
     accum_target: float = 1.0,
     initial: Mapping[str, Any] | None = None,
+    cancel_event: Any = None,
 ) -> Dict[str, float]:
     """Train or eval over an iterable of :class:`Batch` objects.
 
@@ -1662,6 +1717,7 @@ def train_on_batches(
     grad_norm_sum_t: torch.Tensor | None = None
     grad_norm_max_t: torch.Tensor | None = None
     grad_norm_n = 0
+    cancelled = False
 
     for b in batches:
         if training:
@@ -1730,8 +1786,16 @@ def train_on_batches(
                 total_loss=total_loss_t,
             )
 
+        # Immediate cancel: the on_step above force-saved a fresh mid-epoch
+        # snapshot (when a save callback is wired), so stopping here lets resume
+        # continue from within this epoch. Break before flushing the partial
+        # accumulation so opt_steps matches the saved snapshot.
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            break
+
     # Final partial-accumulation flush.
-    if training and accum_count > 0:
+    if training and accum_count > 0 and not cancelled:
         if max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_grad_norm)
         model.bc_step()
@@ -1756,6 +1820,7 @@ def train_on_batches(
         "accuracy": 0.0,
         "n_rows": float(total_rows),
         "opt_steps": float(opt_steps),
+        "cancelled": 1.0 if cancelled else 0.0,
     }
     for key in raw_sum_totals:
         result[key] = synced[key]
@@ -1887,6 +1952,7 @@ def lane_packed_batches(
     report_every: int = 0,
     report_interval_seconds: float = 0.0,
     resume_state: "MidEpochState | None" = None,
+    cancel_event: Any = None,
 ) -> tuple[Iterable[Batch], "Mapping[str, Any] | None", float, int]:
     """Yield lane-packed sequence batches with per-batch hidden propagation.
 
@@ -2002,7 +2068,11 @@ def lane_packed_batches(
                 return
             if save_state_callback and snapshot_interval > 0:
                 now = _time.monotonic()
-                if now - _last_save_time >= snapshot_interval:
+                # Force a fresh mid-epoch snapshot the moment a cancel lands so
+                # resume continues from within this epoch (not the interval-stale
+                # state); the consumer loop breaks right after this step.
+                _cancelling = cancel_event is not None and cancel_event.is_set()
+                if _cancelling or now - _last_save_time >= snapshot_interval:
                     _last_save_time = now
                     active_hiddens = [
                         (lane_idx, 0, lane_hidden[lane_idx].clone())
@@ -2104,6 +2174,7 @@ def run_epoch(
     report_every: int = 0,
     report_interval_seconds: float = 0.0,
     resume_state: "MidEpochState | None" = None,
+    cancel_event: Any = None,
 ) -> Dict[str, float]:
     """Single supervised-epoch entry point.
 
@@ -2137,6 +2208,7 @@ def run_epoch(
             report_every=report_every,
             report_interval_seconds=report_interval_seconds,
             resume_state=resume_state,
+            cancel_event=cancel_event,
         )
     else:
         batches = frame_shuffled_batches(
@@ -2160,4 +2232,5 @@ def run_epoch(
         head_loss_weights=head_loss_weights,
         accum_target=accum_target,
         initial=initial,
+        cancel_event=cancel_event,
     )

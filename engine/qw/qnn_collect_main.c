@@ -9,7 +9,7 @@
  *   MVD (server-side): No usercmd_t.  All player state is visible.
  *     Actions are inferred from position/angle/state deltas using the
  *     same approach as the NQ worker: 9-candidate BSP physics for
- *     movement (via QW pmove), sound/state cues for fire/jump.
+ *     movement (via QW pmove), sound/state cues for attack/jump.
  *
  * Client state sync via QNN_SyncEngineCompat() each frame.
  * Output format is identical to the NQ worker (QOBS framed binary)
@@ -18,9 +18,9 @@
 
 #include "qnn.h"
 #include "qnn_collect_helpers.h"
+#include "qnn_weapon.h"
 #include "qnn_mvd_collect.h"
 #include "qnn_qwd_collect.h"
-#include "qnn_labeler_collect.h"
 #include "qnn_fault.h"
 #include "qnn_io.h"
 #include "qnn_store.h"
@@ -28,6 +28,7 @@
 #include "qnn_watchdog.h"
 #include "qnn_tick.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -144,7 +145,7 @@ static void QNN_SaveEmitAnchor(const qnn_snapshot_t *snapshot)
 	qnn_runtime.emit_waterlevel = snapshot->waterlevel;
 	qnn_runtime.emit_weapon_id = snapshot->weapon_id;
 	qnn_runtime.native_frame_count = 0;
-	qnn_runtime.native_fire_this_window = false;
+	qnn_runtime.native_attack_this_window = false;
 	/* Snapshot mover positions at emission anchor. */
 	for (m = 0; m < qnn_runtime.mover_count; m++)
 	{
@@ -152,6 +153,55 @@ static void QNN_SaveEmitAnchor(const qnn_snapshot_t *snapshot)
 		VectorCopy(me->origin, qnn_runtime.mover_emit_origins[m]);
 	}
 	qnn_runtime.has_emit_anchor = true;
+}
+
+/* Pack action->input_mask on MVD-path collects — same pure-feasibility
+ * semantics as QNN_QwdPackInputMask, built only from MVD-observable
+ * state: alive, BSP-derived grounded/waterlevel, stats ammo, held
+ * weapon, and the QC VM's attack_finished (cmd-driven under
+ * force_mvd_emit; shot-driven on real .mvd playback — see the
+ * cooldown driver in the emit loop).  Without this, MVD collects
+ * carried input_mask = 0 on every frame, and under input_mask=true
+ * training the feasibility-AND-press label rewrite would zero every
+ * head's labels — the corpus would train toward "never act".
+ *
+ * `start_of_tick_attack_finished` mirrors the QWD pre-loop semantics:
+ * bit 0 means "could press attack at the START of this tick", so AND
+ * with the press recovers the engine-attacked-this-tick label. */
+static void QNN_MvdPackInputMask(qnn_action_t *action,
+	const qnn_snapshot_t *snapshot, float start_of_tick_attack_finished)
+{
+	int in_water;
+	int op_attack;
+	int op_jump;
+
+	if (snapshot->health <= 0)
+	{
+		action->input_mask = 0;
+		return;
+	}
+	in_water = (snapshot->waterlevel >= 2);
+
+	/* Shared feasibility probe (same core as the QWD path). Baseline is the
+	 * shot-stamped start-of-tick attack_finished. */
+	op_attack = QNN_EvalAttackFeasible(snapshot, start_of_tick_attack_finished);
+
+	/* No cmd stream maintains the JUMPRELEASED carry on this path —
+	 * assert released-since-last-tick so the predicate evaluates the
+	 * grounded/water/alive gates (see QNN_ProgsSetJumpReleased). */
+	QNN_ProgsSetJumpReleased(true);
+	op_jump = QNN_ProgsEvalJump(
+		QNN_RuntimeNowSeconds(),
+		snapshot->health, snapshot->grounded ? 1 : 0,
+		snapshot->waterlevel, /*button2=*/1);
+
+	action->input_mask = QNN_PackInputMask(
+		1,
+		/*fb_act_neg=*/1, /*fb_act_pos=*/1,
+		/*lr_act_neg=*/1, /*lr_act_pos=*/1,
+		/*up_act_neg=*/in_water ? 1 : 0,
+		/*up_act_pos=*/in_water ? 1 : 0,
+		op_jump, op_attack);
 }
 
 static void QNN_RuntimeReset(void)
@@ -171,6 +221,15 @@ static void QNN_RuntimeReset(void)
 			fprintf(stderr, "[qw-demo] store dump: %s\n", dump_path);
 		else
 			fprintf(stderr, "[qw-demo] store dump: failed to open %s\n", dump_path);
+	}
+
+	{
+		/* Per-sound capture dump (entity + native_time + name) for
+		 * attack-label auditing. Opened once across demos. */
+		extern FILE *qnn_sound_dump;
+		const char *snd_dump = getenv("QNN_SOUND_DUMP");
+		if (snd_dump != NULL && snd_dump[0] != '\0' && qnn_sound_dump == NULL)
+			qnn_sound_dump = fopen(snd_dump, "w");
 	}
 }
 
@@ -267,7 +326,7 @@ static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, qboolean reset_fl
 	 * recorder's own velocity), which is QWD-specific signal the MVD
 	 * inference path must not see.  Zero it so the rest of the
 	 * pipeline operates on MVD-recoverable signals only. */
-	if ((qnn_runtime.force_mvd_emit || qnn_runtime.labeler_mode) && !cls.mvdplayback)
+	if (qnn_runtime.force_mvd_emit && !cls.mvdplayback)
 	{
 		snapshot->player_velocity[0] = 0.0f;
 		snapshot->player_velocity[1] = 0.0f;
@@ -295,7 +354,6 @@ static qboolean QNN_ResetWorldLocal(const char *demo_path, char *error, size_t e
 	qnn_sound_count = 0;
 	QNN_TickEmitReset(&qnn_runtime.tick_emit);
 	QNN_MvdCollectReset((uintptr_t)qnn_runtime.demo_path);
-	QNN_LabelerCollectReset();
 	QNN_QwdCollectReset();
 	QNN_ResetPingEstimator();
 	cls.demonum = -1;
@@ -503,6 +561,338 @@ static int QNN_HandleHello(const char *line)
 	return 0;
 }
 
+/* MVD carries no attack_finished (the QC VM never sees usercmds, so
+ * W_Attack never stamps it).  On a detected attack, stamp
+ * attack_finished = now + the weapon's QC cooldown so the obs scalar and
+ * the input-mask attack-feasibility bit reflect the engine lockout.
+ * Cooldown is owned by qnn_weapon.c (raw weapon id 1..8). */
+/* QC-feasibility callback for the MVD intent label (weapon-head.md §12
+ * parity): same predicate the QWD machine uses (QNN_QwdEvalSelect →
+ * QNN_ProgsEvalWeaponImpulse), answering "would W_ChangeWeapon accept a
+ * direct select of `weapon` given the snapshot's items/ammo".  Returns 0
+ * when the progs VM is unavailable (bare real-.mvd playback) — every
+ * held change then re-baselines, degrading toward held-tracking rather
+ * than inventing intent. */
+static int QNN_MvdSelectFeasible(const qnn_snapshot_t *snapshot,
+	int current, int weapon)
+{
+	int cand = QNN_ImpulseFromItemFlag(QNN_ProgsEvalWeaponImpulse(
+		snapshot->health, snapshot->items_owned,
+		snapshot->ammo_shells, snapshot->ammo_nails,
+		snapshot->ammo_rockets, snapshot->ammo_cells,
+		current, weapon));
+	return cand == weapon;
+}
+
+static void QNN_MvdStampAttackFinished(int weapon_id, float now_seconds)
+{
+	float done_sec;
+
+	if (!QNN_WeaponIsValid(weapon_id))
+		return;
+	done_sec = now_seconds + QNN_WeaponCooldownSec(weapon_id);
+	if (done_sec > QNN_ProgsGetAttackFinished())
+		QNN_ProgsSetAttackFinished(done_sec);
+}
+
+/* enumerate_players — signon-only pass over an MVD; reports the valid
+ * non-spectator player slots so the controller can dispatch one collect
+ * per slot (approach A, single-POV per pass).  Output is a single JSON
+ * line: {"players":[{"slot":N,"name":"..."},...]}.  Ungated demux so
+ * every slot is observed. */
+static int QNN_HandleEnumeratePlayers(const char *line)
+{
+	char demo_path[MAX_OSPATH];
+	char error[256];
+	int p, first;
+
+	memset(demo_path, 0, sizeof(demo_path));
+	memset(error, 0, sizeof(error));
+	if (!QNN_JsonExtractString(line, "\"demo_path\"", demo_path, sizeof(demo_path)))
+	{
+		QNN_WriteError("enumerate_players requires demo_path");
+		return 0;
+	}
+	Q_strncpy(qnn_runtime.demo_path, demo_path, sizeof(qnn_runtime.demo_path) - 1);
+	qnn_runtime.demo_path[sizeof(qnn_runtime.demo_path) - 1] = '\0';
+	QNN_FaultSetContext(demo_path);
+
+	/* Ungated: observe every player's signon so we see all slots. */
+	qnn_mvd_anchor_player = -1;
+	if (!QNN_ResetWorldLocal(demo_path, error, sizeof(error)))
+	{
+		QNN_WriteError(error);
+		QNN_FaultSetContext(NULL);
+		return 0;
+	}
+
+	/* Emit slots only — QW player names use the Quake charset (high-bit
+	 * bytes) and aren't valid UTF-8, which the JSON reader can't decode.
+	 * The controller only needs the slots; names are logged to stderr
+	 * during the per-slot collect for humans. */
+	fprintf(stdout, "{\"slots\":[");
+	first = 1;
+	for (p = 0; p < MAX_CLIENTS; ++p)
+	{
+		if (cl.players[p].name[0] == '\0' || cl.players[p].spectator)
+			continue;
+		fprintf(stdout, "%s%d", first ? "" : ",", p);
+		first = 0;
+	}
+	fprintf(stdout, "]}\n");
+	fflush(stdout);
+	QNN_FaultSetContext(NULL);
+	return 0;
+}
+
+/* ── Matched-emit native-rate pass ───────────────────────────────────
+ *
+ * One native-dt replay that emits TWO interleaved framed streams:
+ *
+ *   MLOB (every native frame): the slim move-labeler record — view-frame
+ *     per-native-frame velocity, self_movement_id / self_weapon_id, and
+ *     usercmd-TRUTH move/look/op_input (always the QWD decoder, even when
+ *     the run sets force_mvd_emit — the labeler trains on MVD-domain obs
+ *     with truth labels).  native_index = qnn_runtime.tick.
+ *
+ *   QOBS (each 20 Hz cl.mtime boundary): the full model corpus frame, with
+ *     derivatives computed over the 20 Hz interval (anchored at the
+ *     previous boundary): vel = (origin_now − origin_prev_boundary) /
+ *     interval_dt, look / look_delta relative to the previous boundary's
+ *     view (via QNN_SaveEmitAnchor's emit_view_angles + the IOEmit
+ *     look_delta carry).  The current native index is stamped into the
+ *     QOBS header `steps` field so labeler predictions can be resampled to
+ *     20 Hz by exact index lookup.
+ *
+ * No back-shift ring / no jitter filter on this path: the slim stream is
+ * raw per-native-frame truth (the labeler owns any smoothing), and the
+ * QOBS frames are emitted directly (QNN_EmitTick) at the boundary so the
+ * native_index stamp is exact.  force_mvd_emit affects only obs velocity
+ * sourcing (handled the same way as the single-stream loop). */
+static void QNN_RunMatchedEmit(qnn_snapshot_t *snapshot,
+	qnn_snapshot_t *label_snapshot, int play_start, int play_end)
+{
+	const qboolean mvd_path =
+		(cls.mvdplayback || qnn_runtime.force_mvd_emit);
+	const float NATIVE_PROBE_DT = 0.001f;
+	const int NATIVE_PUMPS_PER_FRAME_MAX = 4096;
+	qboolean emitting = false;
+	/* 20 Hz demo-time boundary tracking. */
+	int last_boundary = -1;
+	qboolean have_boundary_anchor = false;
+	vec3_t boundary_origin = {0, 0, 0};
+	double boundary_mtime = 0.0;
+
+	QNN_WatchdogBegin(10);
+	while (!qnn_runtime.done)
+	{
+		float tick_start_attack_finished;
+		int prev_seq;
+		int pumps;
+		float actual_dt;
+		int cur_boundary;
+
+		qnn_runtime.cmd_seq_window_start = cls.netchan.outgoing_sequence;
+		qnn_runtime.emit_start_native = (float)cl.time;
+		QNN_CaptureSnapshotLocal(snapshot, false);
+		tick_start_attack_finished = QNN_ProgsGetAttackFinished();
+
+		/* Native step: pump 1 ms frames until one server frame is consumed. */
+		prev_seq = cls.netchan.incoming_sequence;
+		pumps = 0;
+		while (cls.netchan.incoming_sequence == prev_seq
+			&& cls.demoplayback
+			&& cls.state != ca_disconnected
+			&& pumps < NATIVE_PUMPS_PER_FRAME_MAX)
+		{
+			Host_Frame(NATIVE_PROBE_DT);
+			pumps++;
+		}
+		actual_dt = (float)cl.time - qnn_runtime.emit_start_native;
+		if (actual_dt > 0.0001f)
+			qnn_runtime.fixed_dt = actual_dt;
+
+		QNN_WatchdogTick();
+		qnn_runtime.tick += 1;
+		qnn_runtime.steps += 1;
+
+		/* Mid-demo map change: rebuild physics refs (same as the
+		 * single-stream loop). */
+		if ((void *)cl.worldmodel != qnn_runtime.refs_worldmodel
+			&& QNN_ClientReady())
+		{
+			QNN_SyncEngineCompat();
+			QNN_SyncBaselines();
+			QNN_BuildAllRefs();
+			QNN_PhysInit();
+			qnn_runtime.refs_worldmodel = (void *)cl.worldmodel;
+		}
+
+		if (!cls.demoplayback || cls.state == ca_disconnected)
+			qnn_runtime.done = true;
+		if (!qnn_runtime.done)
+			QNN_CaptureSnapshotLocal(label_snapshot, false);
+		else
+		{
+			*label_snapshot = *snapshot;
+			snapshot->done = true;
+			label_snapshot->done = true;
+		}
+
+		if (qnn_runtime.tick > play_end)
+		{
+			snapshot->done = true;
+			label_snapshot->done = true;
+			qnn_runtime.done = true;
+		}
+
+		if (!emitting && qnn_runtime.tick >= play_start)
+		{
+			emitting = true;
+			QNN_IOUpdate(snapshot, qnn_runtime.fixed_dt, true);
+			QNN_SaveEmitAnchor(snapshot);
+		}
+		if (!emitting && !qnn_runtime.done)
+		{
+			QNN_SavePrev(label_snapshot, qnn_runtime.fixed_dt);
+			continue;
+		}
+		if (!emitting)
+			continue;
+
+		/* MVD-recoverable obs velocity (matches the single-stream loop:
+		 * the MVD parser delivers no playerstate velocity, so feed the
+		 * origin-delta estimate into the obs snapshot). */
+		if (mvd_path)
+			VectorCopy(qnn_runtime.prev_velocity, snapshot->player_velocity);
+
+		if (qnn_runtime.tick > play_start)
+			QNN_IOUpdate(snapshot, qnn_runtime.fixed_dt, false);
+
+		/* ── Slim MLOB record: usercmd-TRUTH labels, every native frame ──
+		 * Feature fields (vel / movement_id / weapon_id) are sourced from
+		 * the PRE-frame `snapshot` so they frame identically to the QOBS at
+		 * the same native_index (the QOBS obs is also packed from the
+		 * pre-frame snapshot — decision-time input).  The action label is
+		 * the usercmd-truth move/look/op_input decoded over the cmd window
+		 * consumed this Host_Frame, built on the label snapshot regardless
+		 * of force_mvd_emit so the labeler trains on truth labels. */
+		if (!snapshot->done)
+		{
+			qnn_mlob_record_t rec;
+			vec3_t vel_view;
+
+			memset(&rec, 0, sizeof(rec));
+			QNN_QwdBuildActionLabel(&label_snapshot->action_label, label_snapshot);
+			QNN_FillLookAndSwitch(&label_snapshot->action_label, label_snapshot);
+
+			rec.native_index = (uint32_t)qnn_runtime.tick;
+			rec.flags = 0;
+			/* Per-native-frame velocity, view-frame (same transform
+			 * QNN_SelfEmitToken applies to the obs vel).  Uses the pre-frame
+			 * snapshot's velocity so it matches the obs vel field framing;
+			 * on the MVD path snapshot->player_velocity was set to the
+			 * origin-delta estimate above. */
+			QNN_RelativeFrame(snapshot->player_view_angles,
+				snapshot->player_velocity, vel_view);
+			rec.vel[0] = QNN_QuantizeI16Clamped(vel_view[0], QNN_VELOCITY_SCALE);
+			rec.vel[1] = QNN_QuantizeI16Clamped(vel_view[1], QNN_VELOCITY_SCALE);
+			rec.vel[2] = QNN_QuantizeI16Clamped(vel_view[2], QNN_VELOCITY_SCALE);
+			switch (snapshot->waterlevel)
+			{
+			case 1: rec.self_movement_id = 2; break;
+			case 2: rec.self_movement_id = 3; break;
+			case 3: rec.self_movement_id = 4; break;
+			default: rec.self_movement_id =
+				snapshot->grounded ? 0 : 1; break;
+			}
+			rec.self_weapon_id =
+				(uint8_t)qnn_weapon_subject_from_id(snapshot->weapon_id);
+			rec.action = label_snapshot->action_label;
+			QNN_EmitMlob(stdout, &rec);
+		}
+
+		/* ── 20 Hz QOBS boundary emission ───────────────────────────────
+		 * Demo-time boundary = floor(cl.mtime[0] * 20).  Emit one QOBS
+		 * each time the boundary index advances, with interval-correct
+		 * derivatives anchored at the previous boundary. */
+		cur_boundary = (int)floor((double)cl.mtime[0] * 20.0);
+		if (!snapshot->done && cur_boundary != last_boundary)
+		{
+			uint8_t obs_bytes[QNN_OBS_BUFFER_SIZE];
+			qnn_snapshot_t obs_snap = *snapshot;
+			float interval_dt;
+
+			/* Interval velocity over the previous 20 Hz boundary → now.
+			 * QNN_SelfEmitToken rotates player_velocity into the view
+			 * frame, so write the world-frame interval velocity here. */
+			if (have_boundary_anchor
+				&& (interval_dt = (float)(cl.mtime[0] - boundary_mtime)) > 0.0001f)
+			{
+				vec3_t ivel;
+				int k;
+				for (k = 0; k < 3; k++)
+					ivel[k] = (obs_snap.player_origin[k]
+						- boundary_origin[k]) / interval_dt;
+				VectorCopy(ivel, obs_snap.player_velocity);
+			}
+			/* else: first boundary — leave snapshot velocity as-is. */
+
+			/* look / look_delta anchor at the previous boundary view: the
+			 * emit anchor (emit_view_angles) was last saved at the prior
+			 * boundary, and the IOEmit look_delta carry advances only on
+			 * QOBS emits (QNN_IOUpdate ran above with reset only at
+			 * play_start). */
+			{
+				float saved_af = QNN_ProgsGetAttackFinished();
+				QNN_ProgsSetAttackFinished(tick_start_attack_finished);
+				QNN_PackSnapshotObs(&obs_snap, obs_bytes);
+				QNN_ProgsSetAttackFinished(saved_af);
+			}
+
+			/* Build the QOBS action label.  On the genuine QWD path this is
+			 * the usercmd decoder; under force_mvd_emit the single-stream
+			 * loop runs MVD inference, but the matched corpus QOBS keeps the
+			 * usercmd-truth label here too (the labeler-resample rewrite is
+			 * what later supplies MVD-domain move; co-emitting truth keeps
+			 * the QOBS self-consistent and avoids the back-shift machinery). */
+			QNN_QwdBuildActionLabel(&obs_snap.action_label, &obs_snap);
+			QNN_FillLookAndSwitch(&obs_snap.action_label, &obs_snap);
+
+			/* steps field carries the native index this QOBS was sampled
+			 * at (reused — downstream QOBS parser ignores steps). */
+			QNN_EmitTick(stdout, obs_bytes, &obs_snap.action_label,
+				qnn_runtime.tick, /*steps=*/qnn_runtime.tick,
+				/*tick_hz=*/20, /*flags=*/0);
+
+			/* Advance the boundary anchor for the next interval. */
+			QNN_SaveEmitAnchor(snapshot);
+			VectorCopy(snapshot->player_origin, boundary_origin);
+			boundary_mtime = cl.mtime[0];
+			have_boundary_anchor = true;
+			last_boundary = cur_boundary;
+		}
+
+		QNN_SavePrev(label_snapshot, qnn_runtime.fixed_dt);
+	}
+	QNN_WatchdogEnd();
+
+	/* Terminate both streams with a done frame so the Python demux unblocks.
+	 * A zero-token done QOBS carries FLAG_DONE; the MLOB stream's done is
+	 * signalled by the same flag on a trailing MLOB. */
+	{
+		qnn_mlob_record_t done_rec;
+		memset(&done_rec, 0, sizeof(done_rec));
+		done_rec.native_index = (uint32_t)qnn_runtime.tick;
+		done_rec.flags = QNN_FLAG_DONE;
+		QNN_EmitMlob(stdout, &done_rec);
+
+		snapshot->done = true;
+		QNN_WriteObsTick(&qnn_runtime.tick_emit, stdout, snapshot,
+			qnn_runtime.tick, qnn_runtime.tick, 20, true);
+	}
+}
+
 static int QNN_HandleCollect(const char *line)
 {
 	qnn_action_t native_action;
@@ -520,7 +910,27 @@ static int QNN_HandleCollect(const char *line)
 	play_start = QNN_JsonExtractInt(line, "\"play_start\"", 0);
 	play_end = QNN_JsonExtractInt(line, "\"play_end\"", 999999999);
 	qnn_runtime.force_mvd_emit = QNN_JsonExtractInt(line, "\"force_mvd_emit\"", 0) != 0;
-	qnn_runtime.labeler_mode   = QNN_JsonExtractInt(line, "\"labeler_mode\"",   0) != 0;
+	/* usercmd_move (default 0): under force_mvd_emit on a QWD demo, take the
+	 * `move` action from the usercmd-truth decoder instead of MVD physics
+	 * inference, leaving obs features MVD-domain.  The force_mvd LOBS labeler
+	 * collect sends =1; everywhere else =0 keeps the physics move unchanged. */
+	qnn_runtime.usercmd_move   = QNN_JsonExtractInt(line, "\"usercmd_move\"", 0) != 0;
+	/* Compute-gate selection (default OFF skip → full BC collect
+	 * unchanged).  A slim subset collect passes skip_spatial=1 /
+	 * skip_entities=1 to skip the spatial raycast + entity oracle/
+	 * pathfinding entirely; the obs buffer then carries those blocks
+	 * zeroed and the Python projection drops them before disk. */
+	qnn_runtime.skip_spatial   = QNN_JsonExtractInt(line, "\"skip_spatial\"",  0) != 0;
+	qnn_runtime.skip_entities  = QNN_JsonExtractInt(line, "\"skip_entities\"", 0) != 0;
+	/* Matched-emit mode: one native-rate pass emits a slim MLOB record per
+	 * native frame plus a full QOBS at every 20 Hz demo-time boundary (see
+	 * qnn_runtime_t.matched_emit).  Requires native-rate playback
+	 * (requested_tick_hz==0); the controller pairs it with tick_hz:0 hello. */
+	qnn_runtime.matched_emit   = QNN_JsonExtractInt(line, "\"matched_emit\"", 0) != 0;
+	/* Attack-script fingerprint for the de-scripted weapon intent label
+	 * (weapon-head.md §10-11); 0/0 default = unscripted demo. */
+	qnn_runtime.weapon_script  = QNN_JsonExtractInt(line, "\"weapon_script\"", 0) != 0;
+	qnn_runtime.weapon_release = QNN_JsonExtractInt(line, "\"weapon_release\"", 0);
 	if (!QNN_JsonExtractString(line, "\"demo_path\"", demo_path, sizeof(demo_path)))
 	{
 		QNN_WriteError("reset options must include demo_path");
@@ -529,6 +939,10 @@ static int QNN_HandleCollect(const char *line)
 	Q_strncpy(qnn_runtime.demo_path, demo_path, sizeof(qnn_runtime.demo_path) - 1);
 	qnn_runtime.demo_path[sizeof(qnn_runtime.demo_path) - 1] = '\0';
 	QNN_FaultSetContext(demo_path);
+	/* Leave the demux ungated through signon (serverdata/modellist/
+	 * userinfo may arrive on per-recipient blocks the anchor isn't in).
+	 * We lock the anchor below, once the tracked slot is chosen. */
+	qnn_mvd_anchor_player = -1;
 	if (!QNN_ResetWorldLocal(demo_path, error, sizeof(error)))
 	{
 		QNN_WriteError(error);
@@ -542,7 +956,7 @@ static int QNN_HandleCollect(const char *line)
 	 * pr_strings/etc.  Initializing here puts the QC bytecode at the
 	 * top of the hunk where it stays valid for the duration of demo
 	 * playback.  QC VM is the canonical source of truth for the labeler's
-	 * op_input (fire / jump operativeness) — if it fails to load,
+	 * op_input (attack / jump operativeness) — if it fails to load,
 	 * the worker has no principled sanitization, so we hard-fail. */
 	if (!QNN_ProgsInit())
 	{
@@ -562,7 +976,7 @@ static int QNN_HandleCollect(const char *line)
 	 * (100% ground) and breaks the labeler's movement_id feature.
 	 *
 	 * QWD leakage from pmove is suppressed at the source: under
-	 * force_mvd_emit / labeler_mode, qnn_self.c QNN_CaptureBaseSnapshot
+	 * force_mvd_emit, qnn_self.c QNN_CaptureBaseSnapshot
 	 * routes origin/velocity through the server playerstate
 	 * (ps->origin / ps->velocity) instead of the pmove-driven
 	 * cl.simorg / cl.simvel, and QNN_CaptureSnapshotLocal then zeros
@@ -575,38 +989,45 @@ static int QNN_HandleCollect(const char *line)
 	 * QNN_DetectNativeTickHz (~77 Hz on MVDSV, varies elsewhere). */
 	if (cls.mvdplayback)
 	{
-		int p;
-
-		/* Select player: use requested player_num or auto-select */
-		if (mvd_player_num >= 0 && mvd_player_num < MAX_CLIENTS
-			&& cl.players[mvd_player_num].name[0] != '\0')
+		/* Require an explicit, valid tracked player.  The controller
+		 * enumerates slots (op "enumerate_players") and dispatches one
+		 * collect per slot, so player_num is always supplied.  No
+		 * auto-select: a single-POV stream needs an unambiguous anchor,
+		 * and silently picking the first slot would mislabel which
+		 * player's trajectory this collect represents. */
+		if (mvd_player_num < 0 || mvd_player_num >= MAX_CLIENTS
+			|| cl.players[mvd_player_num].name[0] == '\0'
+			|| cl.players[mvd_player_num].spectator)
 		{
-			cl.playernum = mvd_player_num;
+			snprintf(error, sizeof(error),
+				"mvd collect requires a valid non-spectator player_num "
+				"(got %d) — call enumerate_players first", mvd_player_num);
+			QNN_WriteError(error);
+			QNN_FaultSetContext(NULL);
+			return 0;
 		}
-		else
-		{
-			for (p = 0; p < MAX_CLIENTS; p++)
-			{
-				if (cl.players[p].name[0] != '\0'
-					&& !cl.players[p].spectator)
-				{
-					cl.playernum = p;
-					break;
-				}
-			}
-		}
+		cl.playernum = mvd_player_num;
 		fprintf(stderr, "[qw-demo] MVD tracking player %d: %s\n",
 			cl.playernum, cl.players[cl.playernum].name);
+
+		/* Lock the per-recipient demux to the tracked slot: from here on
+		 * CL_GetMVDMessage skips dem_single/dem_multiple blocks not
+		 * addressed to this player, so events/sounds match exactly what
+		 * the tracked player received (its own weapon-attack sound always
+		 * included; attacks it never heard excluded — no cross-player
+		 * pollution of the sound-derived labels). */
+		qnn_mvd_anchor_player = cl.playernum;
 	}
 
 	/* Initialize BSP-clipped physics for any path that will call into
 	 * PlayerMove() during this demo: MVD movement inference, QWD MVD-
-	 * inference (force_mvd_emit), and the QWD labeler's per-cmd pmove
-	 * jump driver.  Without this, pmove.physents[0].model points at the
-	 * previous demo's freed worldmodel (or NULL on the first demo) and
-	 * the next trace SEGVs. */
-	if (cls.mvdplayback || qnn_runtime.force_mvd_emit
-		|| qnn_runtime.labeler_mode)
+	 * inference (force_mvd_emit).  The genuine QWD path's per-cmd pmove
+	 * jump driver (QNN_QwdEvalPmoveJump) self-seeds physents[0] from
+	 * cl.worldmodel each call, so it does not require this global init.
+	 * Without this, pmove.physents[0].model points at the previous
+	 * demo's freed worldmodel (or NULL on the first demo) and the next
+	 * trace SEGVs. */
+	if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
 		QNN_PhysInit();
 
 	/* Engine tick = emit tick.  fixed_dt was set from hello.tick_hz and
@@ -637,14 +1058,39 @@ static int QNN_HandleCollect(const char *line)
 			play_start, play_end);
 	}
 
+	/* Matched-emit mode is a distinct native-rate pass: it interleaves a
+	 * slim MLOB stream (per native frame) with the 20 Hz QOBS corpus on
+	 * one pipe.  Handled in its own loop to keep the single-stream emit
+	 * path below unchanged; shares all the signon / QC VM / physics /
+	 * play-gate setup done above. */
+	if (qnn_runtime.matched_emit)
+	{
+		QNN_RunMatchedEmit(&snapshot, &label_snapshot, play_start, play_end);
+		fflush(stdout);
+		if (qnn_runtime.store_dump != NULL)
+		{
+			fflush(qnn_runtime.store_dump);
+			fclose(qnn_runtime.store_dump);
+			qnn_runtime.store_dump = NULL;
+		}
+		QNN_FaultSetContext(NULL);
+		return 0;
+	}
+
 	{
 		int emit_hz = qnn_runtime.fixed_tick_hz;
+		/* MVD inference path: a real MVD, or a QWD replayed under
+		 * force_mvd_emit for parity validation.  Computed once here;
+		 * every emit-loop branch below keys off this single predicate. */
+		const qboolean mvd_path =
+			(cls.mvdplayback || qnn_runtime.force_mvd_emit);
 
 		QNN_CaptureSnapshotLocal(&snapshot, true);
 		QNN_SavePrev(&snapshot, 0.0f);
 		QNN_SaveEmitAnchor(&snapshot);
 		QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
 		QNN_BuildAllRefs();
+		qnn_runtime.refs_worldmodel = (void *)cl.worldmodel;
 
 		{
 			qboolean emitting = false;
@@ -670,16 +1116,13 @@ static int QNN_HandleCollect(const char *line)
 
 			qnn_runtime.cmd_seq_window_start = cls.netchan.outgoing_sequence;
 			qnn_runtime.emit_start_native = (float)cl.time;
-			if (!qnn_runtime.labeler_mode)
-			{
-				QNN_CaptureSnapshotLocal(&snapshot, false);
-				/* Snapshot the QC VM's attack_finished BEFORE Host_Frame
-				 * consumes this tick's demo cmd and before any action label
-				 * code advances the cooldown by this tick's fire. The obs
-				 * must record decision-time AF, not post-action AF. */
-				tick_start_attack_finished =
-					QNN_ProgsGetAttackFinished();
-			}
+			QNN_CaptureSnapshotLocal(&snapshot, false);
+			/* Snapshot the QC VM's attack_finished BEFORE Host_Frame
+			 * consumes this tick's demo cmd and before any action label
+			 * code advances the cooldown by this tick's attack. The obs
+			 * must record decision-time AF, not post-action AF. */
+			tick_start_attack_finished =
+				QNN_ProgsGetAttackFinished();
 			if (native_emit_mode)
 			{
 				int prev_seq = cls.netchan.incoming_sequence;
@@ -707,11 +1150,31 @@ static int QNN_HandleCollect(const char *line)
 			qnn_runtime.tick += 1;
 			qnn_runtime.steps += 1;
 
+			/* Mid-demo map change: a fresh svc_serverdata repointed
+			 * cl.worldmodel and reset per-map state.  Rebuild the
+			 * mover/player/push refs (and re-seed pmove) against the new
+			 * map once it's fully active — the old refs carry stale
+			 * model_precache indices that now resolve to the new map's
+			 * non-bmodel (.mdl) slots, faulting PM_RecursiveHullCheck.
+			 * Until this fires, QNN_QwdEvalPmoveJump skips on the same
+			 * refs_worldmodel mismatch so no trace runs cross-map.  The QC
+			 * VM is reloaded independently via the CL_ParseServerData hook. */
+			if ((void *)cl.worldmodel != qnn_runtime.refs_worldmodel
+				&& QNN_ClientReady())
+			{
+				QNN_SyncEngineCompat();
+				QNN_SyncBaselines();
+				QNN_BuildAllRefs();
+				QNN_PhysInit();
+				qnn_runtime.refs_worldmodel = (void *)cl.worldmodel;
+				fprintf(stderr,
+					"[qw-demo] map change: rebuilt physics refs for %s at tick %d\n",
+					cl.worldmodel->name, qnn_runtime.tick);
+			}
+
 			if (!cls.demoplayback || cls.state == ca_disconnected)
 				qnn_runtime.done = true;
 			if (!qnn_runtime.done)
-				QNN_CaptureSnapshotLocal(&label_snapshot, false);
-			else if (qnn_runtime.labeler_mode)
 				QNN_CaptureSnapshotLocal(&label_snapshot, false);
 			else
 			{
@@ -719,8 +1182,6 @@ static int QNN_HandleCollect(const char *line)
 				snapshot.done = true;
 				label_snapshot.done = true;
 			}
-			if (qnn_runtime.labeler_mode)
-				snapshot = label_snapshot;
 
 			/* Frame-gated emission: play_start..play_end from the
 			 * offline analyzer.  Everything outside is skipped. */
@@ -738,11 +1199,6 @@ static int QNN_HandleCollect(const char *line)
 				QNN_SaveEmitAnchor(&snapshot);
 				fprintf(stderr, "[qw-demo] emitting from tick %d (play_start=%d play_end=%d)\n",
 					qnn_runtime.tick, play_start, play_end);
-				if (qnn_runtime.labeler_mode)
-				{
-					QNN_SavePrev(&snapshot, qnn_runtime.fixed_dt);
-					continue;
-				}
 			}
 
 			if (!emitting && !qnn_runtime.done)
@@ -752,6 +1208,23 @@ static int QNN_HandleCollect(const char *line)
 			}
 			if (!emitting)
 				continue;
+
+			/* MVD-recoverable velocity for the obs stream.  The MVD
+			 * parser never delivers playerstate velocity (and the
+			 * QWD-only simvel is scrubbed under force_mvd_emit), so
+			 * obs vel on MVD-path collects would otherwise be all
+			 * zero — an obs-distribution gap against QWD training
+			 * data and a dead input for the offline move relabeler.
+			 * prev_velocity at this point is the origin delta over
+			 * the previous emit tick: SavePrev ran on the post-frame
+			 * label snapshots of t-1/t-2, and post[t-1] == pre[t],
+			 * so it equals (pre[t] - pre[t-1]) / dt — the trailing
+			 * estimate a real MVD can recover.  Written to the obs
+			 * snapshot only; label inference reads emit_velocity /
+			 * prev_snap_velocity and is unchanged. */
+			if (mvd_path)
+				VectorCopy(qnn_runtime.prev_velocity,
+					snapshot.player_velocity);
 
 			if (emitting && qnn_runtime.tick > play_start)
 				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
@@ -765,7 +1238,7 @@ static int QNN_HandleCollect(const char *line)
 			/* Buffer per-native-frame mover and other-player positions
 			 * so the emission-time physics inference can set up the
 			 * correct BSP collision state for the 9 candidates. */
-			if ((cls.mvdplayback || qnn_runtime.force_mvd_emit) && !snapshot.done)
+			if (mvd_path && !snapshot.done)
 			{
 				int nf = qnn_runtime.native_frame_count;
 				if (nf < QNN_MAX_NATIVE_FRAMES)
@@ -790,8 +1263,8 @@ static int QNN_HandleCollect(const char *line)
 			 *
 			 * MVD branch carries a real side effect:
 			 * QNN_MvdInferNativeAction sets
-			 * qnn_runtime.native_fire_this_window for the back-shift
-			 * fire emit downstream.
+			 * qnn_runtime.native_attack_this_window for the back-shift
+			 * attack emit downstream.
 			 *
 			 * QWD branch was a dead call: native_action is
 			 * write-only across this function, so the only effect of
@@ -801,14 +1274,14 @@ static int QNN_HandleCollect(const char *line)
 			 * QwdExtractAction once per tick already, and the per-cmd
 			 * loop's QNN_ProgsEvalAttack on the second call saw the
 			 * just-set future attack_finished and rejected every
-			 * fire, leaving qwd_state.last_op_fire = 0 in the stash
+			 * attack, leaving qwd_state.last_op_attack = 0 in the stash
 			 * QwdPackInputMask reads. Result: input_mask bit 0
 			 * (attack) never set across the BC QWD corpus. Same
 			 * failure mode commit 4c7c9b4d fixed for the labeler
 			 * path. */
 			if (!snapshot.done)
 			{
-				if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
+				if (mvd_path)
 					QNN_MvdInferNativeAction(&native_action,
 						&label_snapshot);
 			}
@@ -818,7 +1291,7 @@ static int QNN_HandleCollect(const char *line)
 			 * QNN_QwdBuildActionLabel); MVD path runs inference. */
 			if (!snapshot.done)
 			{
-				if (cls.mvdplayback || qnn_runtime.force_mvd_emit)
+				if (mvd_path)
 				{
 					float phys_dt;
 					QNN_MvdInferEmitAction(
@@ -837,47 +1310,62 @@ static int QNN_HandleCollect(const char *line)
 					{
 						label_snapshot.action_label.move = qnn_runtime.prev_move;
 					}
+					QNN_MvdPackInputMask(
+						&label_snapshot.action_label,
+						&label_snapshot,
+						tick_start_attack_finished);
+					/* usercmd_move decouple: features stay MVD-domain
+					 * (obs velocity scrubbed/origin-delta above), but the
+					 * `move` action is taken from the usercmd-TRUTH QWD
+					 * decoder instead of the 9-candidate physics inference.
+					 * QWD demos still carry usercmd_t, so QwdBuildActionLabel
+					 * recovers the recorded press byte.  Only the move byte is
+					 * overridden — the MVD-inferred attack/weapon and
+					 * back-shift machinery below are left intact.  Skipped on
+					 * real .mvd playback (no usercmd to read) and when
+					 * usercmd_move is unset (physics move preserved, byte-
+					 * identical to the prior force_mvd path).  Mirrors the
+					 * matched-emit MLOB co-emission (QNN_RunMatchedEmit). */
+					if (qnn_runtime.usercmd_move && !cls.mvdplayback)
+					{
+						qnn_action_t usercmd_label;
+						QNN_QwdBuildActionLabel(&usercmd_label,
+							&label_snapshot);
+						label_snapshot.action_label.move =
+							usercmd_label.move;
+						/* op_input is the per-axis operativeness mask
+						 * the labeler trains/sanitizes on, and it is a
+						 * function of the usercmd press (QwdPackOpInput
+						 * reads action->move).  The MVD inference path
+						 * never packs it, so without this copy it stays 0
+						 * for the whole corpus — which silently turns
+						 * --sanitize-targets into "keep only no-press
+						 * frames", collapsing every target to the 'none'
+						 * class (degenerate 100% acc).  Take it from the
+						 * same usercmd decoder as move (matches the
+						 * documented usercmd-TRUTH move/look/op_input). */
+						label_snapshot.action_label.op_input =
+							usercmd_label.op_input;
+						qnn_runtime.prev_move =
+							label_snapshot.action_label.move;
+					}
 					snapshot.action_label = label_snapshot.action_label;
 				}
 				else
 				{
-					if (qnn_runtime.labeler_mode)
-					{
-						QNN_QwdBuildActionLabel(
-							&snapshot.action_label,
-							&snapshot);
-					}
-					else
-					{
-						QNN_QwdBuildActionLabel(
-							&snapshot.action_label,
-							&snapshot);
-						QNN_FillLookAndSwitch(&snapshot.action_label,
-							&label_snapshot);
-					}
+					QNN_QwdBuildActionLabel(
+						&snapshot.action_label,
+						&snapshot);
+					QNN_FillLookAndSwitch(&snapshot.action_label,
+						&label_snapshot);
 				}
 			}
 			else
 				QNN_ClearAction(&snapshot.action_label);
 
-			/* Labeler-mode LOBS emit: bypass the QOBS pipeline entirely
-			 * (no jitter filter, no back-shift ring, no fire-hold).
-			 * One LOBS frame per native tick.  Target move comes from
-			 * the action label which is filled above — usercmd truth on
-			 * QWD demos (the labeler's training distribution); MVD-rule
-			 * inference if applied to a real MVD (no truth available). */
-			if (qnn_runtime.labeler_mode)
-			{
-				QNN_LabelerHandleTick(&snapshot, stdout);
-				if (snapshot.done)
-					qnn_runtime.done = true;
-				continue;
-			}
 			{
 				FILE *emit_out;
 				qnn_snapshot_t filter_snapshot;
-				qboolean mvd_path =
-					(cls.mvdplayback || qnn_runtime.force_mvd_emit);
 				uint8_t obs_bytes[QNN_OBS_BUFFER_SIZE];
 				int cur_weapon = mvd_path
 					? label_snapshot.weapon_id
@@ -902,12 +1390,12 @@ static int QNN_HandleCollect(const char *line)
 				/* QWD path is a pure cmd-byte decoder — action.weapon
 				 * is already the canonical label, no rewriting needed.
 				 * Only the MVD path runs back-shift inference (weapon
-				 * via ping-shift + pickup gate, fire/jump per-event).
+				 * via ping-shift + pickup gate, attack/jump per-event).
 				 *
 				 * AF restore: pack obs with the start-of-tick
 				 * attack_finished (captured before any action label
 				 * advanced cooldown). Without this, obs[t] would
-				 * contain the post-fire stamp from action[t], leaking
+				 * contain the post-attack stamp from action[t], leaking
 				 * the BC label being predicted into the input. The
 				 * agent's live decision-time input is post-prev-action
 				 * == start-of-this-tick state; collect must match. */
@@ -928,49 +1416,64 @@ static int QNN_HandleCollect(const char *line)
 				{
 					int prev_weapon = 0;
 					qboolean has_prev_weapon =
-						QNN_MvdBackShiftPrevWeapon(&prev_weapon);
+						QNN_BackShiftPrevWeapon(&prev_weapon);
+					qnn_mvd_wtrans_t wtrans = QNN_MVD_WTRANS_NONE;
+					int prev_intent = 0;
+
+					/* De-scripted intent label (weapon-head.md §12
+					 * parity): the intent machine owns act.weapon
+					 * OUTRIGHT — including 0 = unrevealed/masked —
+					 * overwriting the held fallback that
+					 * QNN_FillLookAndSwitch wrote.  Transition
+					 * classification (deliberate / script dump /
+					 * forced pickup+ammo-out / death) lives in
+					 * qnn_mvd_collect.c; the pickup gate that used
+					 * to sit here is the FORCED branch there. */
+					snapshot.action_label.weapon =
+						(uint8_t)QNN_MvdIntentWeaponStep(
+							&label_snapshot,
+							QNN_MvdSelectFeasible,
+							&wtrans, &prev_intent);
+
+					/* Deliberate adoptions anticipate the press:
+					 * rewrite the trailing ring slots from the old
+					 * intent, same shift source as the old held
+					 * rewrite.  prev_intent==0 slots stay masked —
+					 * they may reach into dead frames, which QWD
+					 * keeps at 0. */
+					if (wtrans == QNN_MVD_WTRANS_DELIBERATE
+						&& prev_intent > 0)
+						QNN_BackShiftRewriteWeapon(
+							snapshot.action_label.weapon,
+							prev_intent,
+							QNN_PressBackShiftFrames(
+								cl.playernum, emit_hz));
+
+					/* Break attack carryover across HELD transitions
+					 * (dedup state is held-stream domain, independent
+					 * of the intent label): clear the old weapon's
+					 * chain state so a later same-weapon shot isn't
+					 * false-linked through a different-weapon
+					 * interval. */
 					if (has_prev_weapon
 						&& prev_weapon != cur_weapon
 						&& cur_weapon > 0)
-					{
-						int shift;
-						/* Pickup gate: if the new weapon's IT_ bit
-						 * flipped 0→1 this frame, the transition is the
-						 * server's weapon_touch auto-switch (items|=new
-						 * and self.weapon=new in one QC call).  Impulse
-						 * handlers can't fire on a bit that wasn't
-						 * already on, so a player-intent switch can
-						 * only land ≥1 frame later.  Leave the label
-						 * at the server-observed frame. */
-						int it_bit = QNN_ItemFlagFromImpulse(cur_weapon);
-						int items_now = cl.stats[STAT_ITEMS];
-						int prev_items = 0;
-						qboolean has_prev_items =
-							QNN_MvdBackShiftPrevStatItems(&prev_items);
-						qboolean is_pickup =
-							has_prev_items
-							&& it_bit
-							&& (items_now & it_bit)
-							&& !(prev_items & it_bit);
-						if (is_pickup)
-							shift = 0;
-						else
-							shift = QNN_PressBackShiftFrames(
-								cl.playernum, emit_hz);
-						QNN_MvdBackShiftOnWeaponChange(
-							cur_weapon, prev_weapon, shift);
-
-						/* Break fire carryover across weapon transitions.
-						 * Clear the old weapon's chain state so a later
-						 * same-weapon shot isn't false-linked through a
-						 * different-weapon interval, and clear pending
-						 * hold spillover so post-switch fire=1 frames are
-						 * not inherited from the pre-switch weapon. */
-						QNN_MvdResetFireChain(prev_weapon);
-					}
+						QNN_MvdResetAttackChain(prev_weapon);
+				}
+				else
+				{
+					/* Genuine QWD usercmd path: clear a pending weapon lead
+					 * the engine never confirms within ~ping×2 frames (a
+					 * stale-impulse phantom) by walking the shared ring back
+					 * over the lead window — keeps QWD logic out of the MVD
+					 * module, reusing QNN_BackShiftRewriteWeapon. */
+					QNN_QwdWeaponLeadStep(&snapshot.action_label, &snapshot,
+						qnn_runtime.tick,
+						QNN_PressBackShiftFrames(cl.playernum, emit_hz),
+						emit_hz);
 				}
 
-				QNN_MvdBackShiftPush(
+				QNN_BackShiftPush(
 					&qnn_runtime.tick_emit, emit_out,
 					obs_bytes, &snapshot.action_label,
 					snapshot.done,
@@ -978,12 +1481,11 @@ static int QNN_HandleCollect(const char *line)
 					emit_hz, false,
 					mvd_path ? label_snapshot.grounded
 						: snapshot.grounded,
-					cur_weapon,
-					cl.stats[STAT_ITEMS]);
+					cur_weapon);
 
 				if (mvd_path)
 				{
-					/* Fire + jump: per-event back-shift via native_time.
+					/* Attack + jump: per-event back-shift via native_time.
 					 * Both use the same ping-RTT correction: sound
 					 * arrives at the recording client one full RTT
 					 * after the button press.
@@ -999,20 +1501,49 @@ static int QNN_HandleCollect(const char *line)
 					 * recall drops (76.58 % → 59.06 %).  Reach the
 					 * remaining ~6 pp gap to ceiling via per-press
 					 * ping (QNN_LatencySeconds on QWD, no alternative
-					 * available on MVD playback) instead. */
-					if (snapshot.health > 0)
+					 * available on MVD playback) instead.
+					 *
+					 * Must read label_snapshot, not the pre-frame obs
+					 * snapshot: QNN_DrainSounds consumes the global
+					 * sound ring, and the post-Host_Frame capture
+					 * (label_snapshot) is the one that drains this
+					 * tick's events.  The pre-frame snapshot's sound
+					 * list is always empty — passing it here silenced
+					 * every attack/jump event since the pre-frame obs
+					 * capture landed. */
+					if (label_snapshot.health > 0)
 					{
 						/* Single ping authority — same source
 						 * (median-fallback, outlier-rejected) as
 						 * the weapon/move bulk shift via
 						 * QNN_PressBackShiftFrames. */
 						float ping_sec = QNN_PressPingSec(cl.playernum);
-						QNN_MvdBackShiftWriteFireEvents(&snapshot,
+						QNN_MvdBackShiftWriteAttackEvents(&label_snapshot,
 							ping_sec,
 							qnn_runtime.emit_start_native);
-						QNN_MvdBackShiftWriteJumpEvents(&snapshot,
+						QNN_MvdBackShiftWriteJumpEvents(&label_snapshot,
 							ping_sec,
 							qnn_runtime.emit_start_native);
+
+						/* Real MVD: the QC VM never sees cmds, so
+						 * W_Attack never stamps attack_finished.
+						 * Drive it from detected shots so the obs
+						 * attack_finished scalar and the mask's
+						 * attack-feasibility bit carry the engine
+						 * cooldown. */
+						if (cls.mvdplayback
+							&& qnn_runtime.native_attack_this_window)
+							/* Anchor the cooldown at the back-shifted press
+							 * time (now - ping), in lock-step with the attack
+							 * bit / weapon / move which are all back-shifted by
+							 * ping on this path. Correctness/consistency: the
+							 * attack_finished timeline must sit on the same
+							 * frame axis as the labels it describes. (Does not
+							 * by itself move the operative-attack gap — that's a
+							 * separate, still-open issue.) */
+							QNN_MvdStampAttackFinished(
+								label_snapshot.weapon_id,
+								QNN_RuntimeNowSeconds() - ping_sec);
 					}
 
 					/* Move: continuous label.  Today's velocity-sign
@@ -1034,7 +1565,7 @@ static int QNN_HandleCollect(const char *line)
 		}
 		QNN_WatchdogEnd();
 
-		QNN_MvdBackShiftFlushAll(&qnn_runtime.tick_emit);
+		QNN_BackShiftFlushAll(&qnn_runtime.tick_emit);
 		QNN_FlushTickEmit(&qnn_runtime.tick_emit);
 
 		if (!qnn_runtime.tick_emit.has_prev_emitted)
@@ -1052,6 +1583,15 @@ static int QNN_HandleCollect(const char *line)
 		}
 	}
 	fflush(stdout);
+	{
+		extern long qnn_dbg_actor_n, qnn_dbg_actor_wirezero;
+		FILE *df = fopen("/tmp/qnn_actor_dbg.log", "a");
+		if (df) {
+			fprintf(df, "actor n=%ld wirezero=%ld\n",
+				qnn_dbg_actor_n, qnn_dbg_actor_wirezero);
+			fclose(df);
+		}
+	}
 	if (qnn_runtime.store_dump != NULL)
 	{
 		fflush(qnn_runtime.store_dump);
@@ -1113,6 +1653,11 @@ int main(int argc, char **argv)
 		if (QNN_OpIs(line, "nav_query"))
 		{
 			QNN_HandleNavQuery(line);
+			continue;
+		}
+		if (QNN_OpIs(line, "enumerate_players"))
+		{
+			QNN_HandleEnumeratePlayers(line);
 			continue;
 		}
 		if (QNN_OpIs(line, "collect"))

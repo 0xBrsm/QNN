@@ -9,23 +9,23 @@
  * only the latest one would lose sub-50ms button events.  This is the
  * dem_cmd analogue of kbutton_t's impulse-flag aggregation in the
  * live-play CL_BaseMove path:
- *   - fire/jump: OR across cmds (any press in the window counts)
+ *   - attack/jump: OR across cmds (any press in the window counts)
  *   - forward/side move: average (each cmd is integrated over native_dt;
  *     averaging N approximates a single 50ms-integrated cmd)
  *   - upmove (swim down): min across cmds (most-negative captures any
  *     swim-down press regardless of when in the window it occurred)
- *   - weapon switch: per-frame "held weapon" state, not event.
- *     QWD is ground truth — the player's intent is observable in
- *     the usercmd impulse byte every frame.  Direct labelling:
- *       impulse 1-8 → that weapon (gated on inventory ownership)
- *       impulse 10  → QNN_NextWeaponId(forward) — deterministic
- *                     simulation of server CycleWeaponCommand
- *       impulse 12  → QNN_NextWeaponId(reverse)
- *       no impulse  → carry prior intent, or accept a non-impulse
- *                     server-state change (pickup/respawn/auto-switch)
- *     No ping math — this is INTENT TRACKING from observable usercmds,
- *     not inference.  MVD-side inference (back-shift from server
- *     state changes) lives in qnn_mvd_collect.c.
+ *   - weapon: the canonical action.weapon label snaps to the HELD weapon
+ *     (snapshot->weapon_id), leading to a QC-accepted weapon-select target
+ *     while a switch is pending (QNN_QwdWeaponLabel); a lead the engine never
+ *     confirms within ~ping×2 frames is cleared retroactively from the
+ *     back-shift ring (QNN_QwdWeaponLeadStep).  With no pending impulse the
+ *     label equals held, so it tracks engine state including engine-forced
+ *     switches (pickup auto-select, ammo-out W_BestWeapon, respawn).  Each
+ *     cmd's impulse + attack button is still fed to QNN_ProgsStepWeaponFrame
+ *     (real W_WeaponFrame), but only to drive the attack (W_Attack) cooldown
+ *     gate — it no longer produces the
+ *     label.  MVD-side inference (back-shift from server state changes) lives
+ *     in qnn_mvd_collect.c.
  *
  * On slow demos (native < emit) the window may be empty for some
  * Host_Frames; we fall back to the latest cmd in cl.frames[] (which
@@ -64,15 +64,68 @@ extern void PlayerMove(void);
 extern int onground;
 extern int waterlevel;
 
-/* Module-private state: tracks the canonical held-weapon label across
- * ticks (carry-forward on non-press ticks, engine-forced override on
- * stat transitions) plus pmove.oldbuttons for the pmove jump driver's
- * cross-tick anti-pogo state. */
+/* ── act_weapon action label: de-scripted DELIBERATE intent ────────────
+ *
+ * QW-only (depends on the QC predicate QNN_ProgsEvalWeaponImpulse, so it
+ * cannot live in the NQ-shared helper).  act.weapon = the weapon the
+ * player has DELIBERATELY selected as of this tick, carried forward
+ * between deliberate selects (weapon-head.md §10-11).  All ids RAW 1..8.
+ *
+ *   - A deliberate weapon-select edge (any select on an unscripted demo;
+ *     on an attack-scripted demo, any select EXCEPT the release-half dump —
+ *     see QNN_QwdExtractAction's per-cmd classification) updates the
+ *     intent immediately, QC-validated for ownership/ammo.  The label
+ *     therefore leads the engine's equip through the switch cooldown,
+ *     as the old lead machinery did — but only for deliberate presses.
+ *   - Attack-script release dumps do NOT update the label: the held weapon
+ *     flaps to the script's release target every attack cycle, the label
+ *     stays on the weapon the player means to fight with.
+ *   - Engine-forced changes RE-BASELINE the label to held: ammo-out
+ *     auto-switch (the intent weapon is no longer QC-feasible) and
+ *     pickup auto-equip (held's item bit was just acquired).  The
+ *     transition itself is a non-decision (the engine performs it for
+ *     free live), but riding the engine's choice afterwards is
+ *     legitimate revealed preference.
+ *   - Death resets the label to 0 (= no-weapon, masked from weapon-head
+ *     supervision by the existing label!=0 filter) until the player
+ *     re-reveals intent: a deliberate select, or an attack press
+ *     (which adopts the currently held weapon — engaging with the
+ *     spawn shotgun is choosing it).
+ *
+ * The old held+ping-gated-lead label (and its phantom back-shift
+ * machinery, QNN_QwdWeaponLeadStep) is superseded: on attack-scripted
+ * demos (67% of the corpus) it faithfully tracked config churn — ~84%
+ * of raw weapon-select edges — into the BC target. */
+/* QC-validate a weapon-select impulse against ownership/ammo.  Fed held
+ * as the current weapon so cycle impulses (10/12) resolve right.
+ * Returns the accepted RAW weapon id, or 0 if QC keeps the current
+ * weapon (not owned / no ammo / invalid). */
+static int QNN_QwdEvalSelect(const qnn_snapshot_t *snapshot, int current,
+	int impulse)
+{
+	int cand = QNN_ImpulseFromItemFlag(QNN_ProgsEvalWeaponImpulse(
+		snapshot->health, snapshot->items_owned,
+		snapshot->ammo_shells, snapshot->ammo_nails,
+		snapshot->ammo_rockets, snapshot->ammo_cells,
+		current, impulse));
+	return QNN_WeaponIsValid(cand) ? cand : 0;
+}
+
+/* Module-private state.  The act_weapon label is derived per tick by
+ * QNN_QwdIntentWeaponLabel (de-scripted deliberate intent, below the
+ * struct).  The per-cmd QC weapon predicate (qnn_progs.c) is still
+ * advanced, but only so W_Attack advances the currently-selected weapon's
+ * cooldown; weapon_advanced_tick guards it against double-advance.  Plus
+ * pmove.oldbuttons for the pmove jump driver's cross-tick anti-pogo
+ * state. */
 static struct
 {
-	int		held_weapon;       /* canonical action.weapon value */
-	int		prev_stat_weapon;  /* prior tick's snapshot->weapon_id */
-	qboolean	initialized;
+	int		weapon_advanced_tick;	/* qnn_runtime.tick the QC weapon
+						 * predicate last advanced for; guards
+						 * the >1 QwdBuildActionLabel calls per
+						 * tick on the force_mvd_emit path so the
+						 * stateful predicate replays the cmd
+						 * window exactly once per emit tick. */
 	int		pmove_oldbuttons;        /* pmove.oldbuttons carried across pmove-jump driver calls */
 	qboolean	pmove_oldbuttons_inited;
 	/* Pre-tick origin/velocity snapshot for the pmove jump driver.
@@ -87,19 +140,22 @@ static struct
 	vec3_t		pmove_prev_simorg;
 	vec3_t		pmove_prev_simvel;
 	qboolean	pmove_prev_sim_inited;
-	/* op_fire captured from the per-cmd predicate call inside
+	/* op_attack captured from the per-cmd predicate call inside
 	 * QNN_QwdExtractAction's cmd-window loop. Read by
 	 * QwdPackInputMask to set input_mask bit 0 (attack) without
 	 * re-advancing the QC VM. Only valid when set by the same-tick
 	 * QwdExtractAction call; QwdBuildActionLabel inherits the value
 	 * implicitly via the QwdExtractAction call that happens inside
 	 * it. */
-	int		last_op_fire;
-	/* Last nonzero impulse byte seen anywhere in the cmd window. The
-	 * BC QWD path doesn't pack impulse-feasibility into input_mask
-	 * (impulse is the weapon-switch byte, not an axis); kept here
-	 * because the labeler path's separate LOBS bit uses it. */
-	int		last_impulse_any;
+	int		last_op_attack;
+	/* op_impulse captured from the same per-cmd QC weapon advance:
+	 * 1 iff an edge-triggered weapon-select flipped self.weapon this
+	 * tick.  Read by QwdPackOpInput for the op_input impulse bit (no
+	 * second stateful predicate). */
+	int		last_op_impulse;
+	/* This tick's weapon-select impulse (1-8 direct, 10/12 cycle, 0 =
+	 * none), stashed for the QwdBuildActionLabel weapon-label call. */
+	int		last_weapon_impulse;
 	/* Per-tick aggregated press signals captured from the cmd window
 	 * so QwdPackInputMask can read them without re-iterating. Jump
 	 * and upmove are kept distinct here (vs collapsed into the
@@ -107,23 +163,103 @@ static struct
 	int		last_jump_press_any;	/* any cmd had buttons & BUTTON_JUMP */
 	int		last_upmove_pos_any;	/* any cmd had upmove > 0 (swim up) */
 	/* QC predicate state at the START of QwdExtractAction's per-cmd
-	 * loop — i.e. BEFORE this tick's fire (if any) advances cooldown.
+	 * loop — i.e. BEFORE this tick's attack (if any) advances cooldown.
 	 * QwdPackInputMask reads this so its synthetic feasibility check
-	 * answers "could a press fire AT THE BEGINNING of this tick" not
-	 * "could a press fire NEXT tick after this tick's fire already
+	 * answers "could a press attack AT THE BEGINNING of this tick" not
+	 * "could a press attack NEXT tick after this tick's attack already
 	 * advanced the cooldown" (the previous off-by-one — input_mask
 	 * was capturing post-loop state, anti-correlated with demo press
-	 * on engine-fired ticks). */
+	 * on engine-attacked ticks). */
 	float		pre_loop_attack_finished;
+	/* Previous cmd's raw impulse byte, for edge-triggering the weapon
+	 * select.  The replayed usercmd impulse is NOT cleared between cmds
+	 * (real QW clears self.impulse after the server consumes it once),
+	 * so a held value re-triggers W_ChangeWeapon every cmd — a stale
+	 * impulse 1 (select-axe, left over from axe-running) drags
+	 * self.weapon back to axe every frame and overrides the
+	 * server-correct snapshot->weapon_id.  We feed the impulse to the QC
+	 * advance only on its rising edge (when it changes). -1 = unseen. */
+	int		prev_cmd_impulse;
+	/* Edge-detect for the env-gated attack-edge dump (diagnostic only). */
+	int		prev_emit_op_attack;
+	/* ── De-scripted intent label state (weapon-head.md §10-11) ──
+	 * act.weapon = the player's current DELIBERATE weapon, carried
+	 * forward between deliberate selects.  Attack-script release dumps
+	 * (select to qnn_runtime.weapon_release with the attack button up,
+	 * scripted demos only) do NOT update it; engine-forced changes
+	 * (ammo-out, pickup auto-equip) re-baseline it to held; death
+	 * resets it to 0 (masked) until the player re-reveals intent via
+	 * a select or an attack press. */
+	int		intent_weapon;		/* raw 1..8, 0 = unknown/masked */
+	int		intent_dump_pending;	/* release-half select seen; the
+						 * next held move to weapon_release
+						 * is the script equip, not intent */
+	int		last_deliberate_sel;	/* this tick's deliberate select
+						 * impulse (1-8/10/12, 0 = none) */
+	int		last_dump_sel;		/* this tick saw a release dump */
+	int		last_attack_press;	/* any cmd in this tick's window
+						 * had a button0 rising edge */
+	int		prev_cmd_attack;	/* button0 of the previous cmd,
+						 * for the rising-edge track */
+	int		prev_items_owned;	/* previous tick's items_owned for
+						 * the pickup re-baseline check */
+	int		prev_items_valid;
+	int		prev_label_held;	/* previous tick's valid held id, for
+						 * the held-changed re-baseline gate */
 } qwd_state;
+
+/* Diagnostic: env-gated (QNN_QWD_ATTACK_EDGE_DUMP=<path>) JSONL dump of every
+ * operative attack rising edge, capturing native_time (same clock as demo
+ * svc_sound), the act_weapon label, the lagged obs weapon, and the QC-advanced
+ * weapon.  Read-only — no effect on emitted labels.  Used to measure the gap
+ * between the op-attack edge and the attack sound that names the true weapon. */
+static void QNN_QwdDumpAttackEdge(const qnn_action_t *action,
+	const qnn_snapshot_t *snapshot)
+{
+	const char *path;
+	FILE *out;
+	int pressed, feasible;
+
+	if (action == NULL || snapshot == NULL)
+		return;
+	if (snapshot->health <= 0)        /* alive frames only — no attack while dead */
+		return;
+	path = getenv("QNN_QWD_ATTACK_EDGE_DUMP");
+	if (path == NULL || path[0] == '\0')
+		return;
+	/* Per-alive-frame attack state, for aligning attack sounds against the
+	 * emitted op-attack: `pressed` = demo button0 this tick (act_move bit 0),
+	 * `feasible` = input_mask bit 0 (QNN_EvalAttackFeasible). op_attack edge =
+	 * rising edge of (pressed & feasible). An attack sound near a (pressed=1,
+	 * feasible=0) frame is a feasibility false-negative; near no pressed frame
+	 * is a press-detection miss; near a pressed&feasible frame already 1 is an
+	 * edge-merge. */
+	pressed  = (action->move & 0x01) ? 1 : 0;
+	feasible = (action->input_mask & 0x01) ? 1 : 0;
+	out = fopen(path, "a");
+	if (out == NULL)
+		return;
+	fprintf(out, "{\"demo_path\":");
+	QNN_WriteJsonString(out, qnn_runtime.demo_path);
+	fprintf(out,
+		",\"t\":%.6f,\"pressed\":%d,\"feasible\":%d,\"qc_weapon\":%d}\n",
+		QNN_RuntimeNowSeconds(), pressed, feasible, QNN_ProgsGetSelfWeapon());
+	fclose(out);
+}
 
 void QNN_QwdCollectReset(void)
 {
 	memset(&qwd_state, 0, sizeof(qwd_state));
+	/* -1 so the guard fires on the first emit tick even if its
+	 * qnn_runtime.tick is 0 (memset would otherwise alias tick 0). */
+	qwd_state.weapon_advanced_tick = -1;
+	qwd_state.prev_cmd_impulse = -1;   /* force the first impulse to edge-trigger */
+	/* intent_weapon / dump_pending / prev_items_* zeroed by memset:
+	 * the label starts masked (0) until the first select or attack. */
 }
 
 /* Iterate the QWD cmd window and evaluate the per-cmd operative
- * predicates (QC W_WeaponFrame for fire, PlayerJump for jump) while
+ * predicates (QC W_WeaponFrame for attack, PlayerJump for jump) while
  * also aggregating the raw usercmd bytes into the per-tick cmd block
  * (mean for fmove/smove/umove, OR for buttons, last-non-zero for
  * impulse).  Single pass.
@@ -147,7 +283,7 @@ void QNN_QwdCollectReset(void)
  *                    overwritten — engine processes the last) */
 void QNN_QwdEvalOperativePerCmd(
 	const qnn_snapshot_t *snapshot,
-	int *out_op_fire,
+	int *out_op_attack,
 	int *out_fmove,
 	int *out_smove,
 	int *out_umove,
@@ -158,7 +294,7 @@ void QNN_QwdEvalOperativePerCmd(
 	int window_end;
 	int n;
 	int i;
-	int op_fire = 0;
+	int op_attack = 0;
 	int held_weapon = snapshot->weapon_id;
 	long forward_sum = 0;
 	long side_sum = 0;
@@ -167,7 +303,7 @@ void QNN_QwdEvalOperativePerCmd(
 	int last_nonzero_impulse = 0;
 	int jump_any = 0;
 
-	*out_op_fire = 0;
+	*out_op_attack = 0;
 	*out_fmove = 0;
 	*out_smove = 0;
 	*out_umove = 0;
@@ -207,22 +343,21 @@ void QNN_QwdEvalOperativePerCmd(
 		if (imp != 0)
 			last_nonzero_impulse = imp;
 
-		/* Fire predicate (only meaningful if a weapon is held). */
-		if (held_weapon >= 1 && held_weapon <= 8)
+		/* Attack predicate (only meaningful if a weapon is held). */
+		if (QNN_WeaponIsValid(held_weapon))
 		{
-			int fire_op = QNN_ProgsEvalAttack(
-				qnn_runtime.tick,
-				qnn_runtime.fixed_tick_hz,
+			int attack_op = QNN_ProgsEvalAttack(
+				QNN_RuntimeNowSeconds(),
 				snapshot->health, snapshot->items_owned,
 				snapshot->ammo_shells, snapshot->ammo_nails,
 				snapshot->ammo_rockets, snapshot->ammo_cells,
 				held_weapon, button0);
-			if (fire_op)
-				op_fire = 1;
+			if (attack_op)
+				op_attack = 1;
 		}
 	}
 
-	*out_op_fire = op_fire;
+	*out_op_attack = op_attack;
 	*out_fmove   = (int)(forward_sum / n);
 	*out_smove   = (int)(side_sum / n);
 	*out_umove   = jump_any ? QNN_SV_JUMP_SPEED : last_umove_neg;
@@ -279,6 +414,16 @@ int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot, int synth_button2)
 	 * cl.worldmodel happens to be NULL or got freed (e.g., between
 	 * demos), PM_PointContents would null-deref inside PlayerMove. */
 	if (!cl.worldmodel)
+		return 0;
+	/* Mid-demo map-change transition guard.  After a fresh svc_serverdata
+	 * repoints cl.worldmodel, the mover/player refs (built once at demo
+	 * start) still hold the previous map's model_precache indices, which
+	 * on the new map resolve to non-bmodel (.mdl) slots — tracing against
+	 * a hull-less model faults inside PM_RecursiveHullCheck.  Skip until
+	 * the main loop rebuilds the refs (QNN_BuildAllRefs) for the new
+	 * worldmodel and updates refs_worldmodel.  op_jump feasibility just
+	 * defaults to 0 for the few transition frames, which are noise. */
+	if ((void *)cl.worldmodel != qnn_runtime.refs_worldmodel)
 		return 0;
 	/* Need previous-tick state to seed pmove correctly — snapshot is
 	 * post-tick (server already ran pmove over this window's cmds), so
@@ -394,9 +539,9 @@ int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot, int synth_button2)
 			 * we press now, so feasibility=0 in that frame. */
 			pmove.cmd.buttons |= 2;
 		}
-		qnn_pmove_jump_fired = 0;
+		qnn_pmove_jump_attacked = 0;
 		PlayerMove();
-		if (qnn_pmove_jump_fired)
+		if (qnn_pmove_jump_attacked)
 			op_jump = 1;
 	}
 
@@ -429,13 +574,13 @@ int QNN_QwdEvalPmoveJump(const qnn_snapshot_t *snapshot, int synth_button2)
 }
 
 
-int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
+void QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 {
 	int window_start;
 	int window_end;
 	int n;
 	int i;
-	int fire_any;
+	int attack_any;
 	int jump_press_any;	/* buttons & BUTTON_JUMP set in any cmd */
 	int upmove_pos_any;	/* upmove > 0 in any cmd (swim up) */
 	int jump_any;		/* jump_press_any OR upmove_pos_any — drives
@@ -444,28 +589,28 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 	long side_sum;
 	int last_upmove;
 	int last_nonzero_impulse;
-	int impulse_any;
-	int op_fire_any;
-	int impulse_target;
-	int held_weapon = snapshot ? snapshot->weapon_id : 0;
-	int grounded_effective = snapshot ? (snapshot->grounded ? 1 : 0) : 0;
+	int op_attack_any;
+	int op_impulse_any;	/* any cmd's weapon-select impulse flipped self.weapon */
+	int advance_weapon;
+	int deliberate_sel;	/* last deliberate weapon-select edge in the window */
+	int dump_sel;		/* window saw an attack-script release dump */
+	int attack_press_any;	/* window saw a button0 rising edge */
 
 	QNN_ClearAction(action);
 	/* Stash slots read by QNN_QwdPackInputMask run from QwdBuildActionLabel. */
-	qwd_state.last_op_fire = 0;
-	qwd_state.last_impulse_any = 0;
+	qwd_state.last_op_attack = 0;
 	/* Snapshot cooldown state BEFORE the per-cmd loop runs (and possibly
-	 * advances it by firing this tick). QwdPackInputMask uses this so
-	 * its bit-0 feasibility check answers "could press fire AT START of
+	 * advances it by attacking this tick). QwdPackInputMask uses this so
+	 * its bit-0 feasibility check answers "could press attack AT START of
 	 * this tick" — which AND'd with the demo press gives the correct
-	 * engine-fired-this-tick label. Without this snapshot, PackInputMask
+	 * engine-attacked-this-tick label. Without this snapshot, PackInputMask
 	 * saw post-loop state and bit 0 ended up anti-correlated with the
-	 * demo press on the very ticks the engine actually fired. */
+	 * demo press on the very ticks the engine actually attacked. */
 	qwd_state.pre_loop_attack_finished = QNN_ProgsGetAttackFinished();
 
 	window_end = cls.netchan.outgoing_sequence;
 	if (window_end <= 0)
-		return 0;
+		return;
 
 	window_start = qnn_runtime.cmd_seq_window_start;
 	n = window_end - window_start;
@@ -478,7 +623,7 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 	if (n > UPDATE_BACKUP)
 		n = UPDATE_BACKUP;
 
-	fire_any = 0;
+	attack_any = 0;
 	jump_press_any = 0;
 	upmove_pos_any = 0;
 	jump_any = 0;
@@ -486,8 +631,19 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 	side_sum = 0;
 	last_upmove = 0;
 	last_nonzero_impulse = 0;
-	impulse_any = 0;
-	op_fire_any = 0;
+	op_attack_any = 0;
+	op_impulse_any = 0;
+	deliberate_sel = 0;
+	dump_sel = 0;
+	attack_press_any = 0;
+	/* Advance the QC weapon-select predicate exactly once per emit tick.
+	 * QwdBuildActionLabel may call QwdExtractAction more than once for the
+	 * same tick (force_mvd_emit path), and the predicate is stateful, so a
+	 * second window replay would corrupt its self.weapon / sticky-impulse
+	 * tracking — gate on qnn_runtime.tick. */
+	advance_weapon = (qnn_runtime.tick != qwd_state.weapon_advanced_tick);
+	if (advance_weapon)
+		qwd_state.weapon_advanced_tick = qnn_runtime.tick;
 	for (i = 0; i < n; ++i)
 	{
 		int seq = (window_start + i) & UPDATE_MASK;
@@ -497,7 +653,7 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 		int button2 = ((cmd->buttons & 2) || cmd->upmove > 0) ? 1 : 0;
 
 		if (cmd->buttons & 1)
-			fire_any = 1;
+			attack_any = 1;
 		/* Split jump button from upmove > 0 so input_mask can record
 		 * them on distinct bits. jump_any (used to derive the unified
 		 * ud-pos press bit) stays as OR of the two. */
@@ -521,57 +677,103 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 		imp = (int)cmd->impulse;
 		if ((imp >= 1 && imp <= 8) || imp == 10 || imp == 12)
 			last_nonzero_impulse = imp;
-		/* Track any nonzero impulse byte for op_input bit 4 (matches the
-		 * labeler-mode aggregation in QwdEvalOperativePerCmd). */
-		if (imp != 0)
-			impulse_any = imp;
 
-		/* Advance the QC predicate VM per-cmd in NON-labeler mode only.
-		 * In non-labeler mode this side-effect drives the BC self_token
-		 * attack_finished scalar via QNN_ProgsGetAttackCdRemaining in
-		 * QNN_SelfEmitToken, AND captures op_fire_any so QwdPackInputMask
-		 * can populate action->input_mask bit 0 without re-advancing.
-		 * In LABELER mode the same per-cmd loop runs a SECOND time
-		 * inside QNN_QwdEvalOperativePerCmd — running it here too would
-		 * double-advance qnn_progs_attack_finished and pre-reject every
-		 * fire (regression caught during the impulse/fire F1 audit). */
-		if (!qnn_runtime.labeler_mode
-			&& snapshot && held_weapon >= 1 && held_weapon <= 8)
+		/* Per-cmd QC think advance: ONE W_WeaponFrame advances self.weapon +
+		 * attack_finished on shared persistent state so W_Attack advances the
+		 * currently-selected weapon through the engine cooldown gate (a select
+		 * pressed during attack cooldown is realized only when the engine would
+		 * — no early-process stuck divergence).  This feeds ONLY the attack
+		 * op-bit (op_attack_any → input_mask bit 0); the act_weapon label is
+		 * QNN_QwdWeaponLabel(held, impulse) in QwdBuildActionLabel.
+		 *
+		 * Tick-guarded (the force_mvd_emit path may call QwdExtractAction
+		 * twice per tick) — a double-advance would corrupt
+		 * attack_finished. */
+		if (advance_weapon && snapshot)
 		{
-			int fire_op = QNN_ProgsEvalAttack(
-				qnn_runtime.tick,
-				qnn_runtime.fixed_tick_hz,
+			int attack_op = 0;
+			/* Edge-trigger the weapon select.  The replayed cmd impulse
+			 * byte is held across cmds (not cleared like the live server
+			 * clears self.impulse), so feeding it raw re-runs
+			 * W_ChangeWeapon every frame — a stale impulse 1 keeps
+			 * re-selecting axe over the (correct) snapshot weapon.  Pass
+			 * the impulse to the QC advance only when it CHANGES; 0 while
+			 * held.  Matches the live "consume self.impulse once" rule.
+			 * Attack (button0) is unaffected — only the select is gated. */
+			int imp_edge = (imp != qwd_state.prev_cmd_impulse) ? imp : 0;
+			int weapon_op = 0;
+			qwd_state.prev_cmd_impulse = imp;
+			/* Attack rising edge (per cmd, tracked across windows) for
+			 * the intent label's post-respawn acceptance rule. */
+			if (button0 && !qwd_state.prev_cmd_attack)
+				attack_press_any = 1;
+			qwd_state.prev_cmd_attack = button0;
+			/* Classify this weapon-select edge for the intent label
+			 * (weapon-head.md §10-11).  On an attack-scripted demo, a
+			 * select to the script's release target on a cmd with the
+			 * attack button UP is the `-weapon` alias half — config
+			 * churn, not intent.  Everything else (including a
+			 * press-coincident select of the release target, which is
+			 * a genuine "fight with SG" choice) is deliberate. */
+			if (imp_edge && ((imp_edge >= 1 && imp_edge <= 8)
+				|| imp_edge == 10 || imp_edge == 12))
+			{
+				if (qnn_runtime.weapon_script && !button0
+					&& imp_edge == qnn_runtime.weapon_release)
+					dump_sel = 1;
+				else
+					deliberate_sel = imp_edge;
+				{
+					const char *dbg = getenv("QNN_WEAPON_INTENT_DEBUG");
+					if (dbg)
+					{
+						FILE *df = fopen(dbg, "a");
+						if (df)
+						{
+							fprintf(df, "WI %d sel imp=%d b0=%d cls=%s\n",
+								qnn_runtime.tick, imp_edge, button0,
+								(qnn_runtime.weapon_script && !button0
+								 && imp_edge == qnn_runtime.weapon_release)
+									? "dump" : "delib");
+							fclose(df);
+						}
+					}
+				}
+			}
+			QNN_ProgsStepWeaponFrame(
+				QNN_RuntimeNowSeconds(),
 				snapshot->health, snapshot->items_owned,
 				snapshot->ammo_shells, snapshot->ammo_nails,
 				snapshot->ammo_rockets, snapshot->ammo_cells,
-				held_weapon, button0);
-			if (fire_op)
-				op_fire_any = 1;
+				snapshot->weapon_id, imp_edge, button0,
+				/*out_weapon=*/NULL, &weapon_op, &attack_op);
+			if (attack_op)
+				op_attack_any = 1;
+			/* op_impulse: this cmd's edge-triggered select flipped
+			 * self.weapon — the operative weapon-switch this tick.
+			 * Captured from the same shared QC advance the attack op
+			 * uses, so no second stateful predicate runs. */
+			if (weapon_op)
+				op_impulse_any = 1;
 		}
 	}
 	/* Stash for QNN_QwdPackInputMask (called once per tick from
 	 * QwdBuildActionLabel). The stash is overwritten by each
 	 * QwdExtractAction call; the value seen by QwdPackInputMask is
 	 * the one set by the QwdBuildActionLabel-internal call. */
-	qwd_state.last_op_fire = op_fire_any;
-	qwd_state.last_impulse_any = impulse_any;
+	qwd_state.last_op_attack = op_attack_any;
+	qwd_state.last_op_impulse = op_impulse_any;
+	qwd_state.last_weapon_impulse = last_nonzero_impulse;
 	qwd_state.last_jump_press_any = jump_press_any;
 	qwd_state.last_upmove_pos_any = upmove_pos_any;
-
-	/* Resolve the impulse byte to a concrete 1..8 weapon id, gated
-	 * on ownership for direct selects.  Server-side cmd dispatch
-	 * applies the same ownership gate, so resolved values are
-	 * exactly the transitions the server actually produces. */
-	impulse_target = 0;
-	if (last_nonzero_impulse == 10 || last_nonzero_impulse == 12)
+	/* Intent-label inputs are edge-derived, so they are only valid on the
+	 * pass that advanced the per-cmd edge state; a second same-tick call
+	 * (force_mvd_emit path) must not clobber them with empty values. */
+	if (advance_weapon)
 	{
-		impulse_target = QNN_NextWeaponId(last_nonzero_impulse == 12);
-	}
-	else if (last_nonzero_impulse >= 1 && last_nonzero_impulse <= 8)
-	{
-		int item = QNN_ItemFlagFromImpulse(last_nonzero_impulse);
-		if (snapshot && (snapshot->items_owned & item))
-			impulse_target = last_nonzero_impulse;
+		qwd_state.last_deliberate_sel = deliberate_sel;
+		qwd_state.last_dump_sel = dump_sel;
+		qwd_state.last_attack_press = attack_press_any;
 	}
 
 	/* Average move across the window, threshold at the Python compaction
@@ -600,79 +802,176 @@ int QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot)
 			lr_neg, lr_pos,
 			up_neg, up_pos,
 			/*jump_act=*/jump_press_any,
-			/*attack_act=*/fire_any);
+			/*attack_act=*/attack_any);
 	}
 
-	/* action->weapon is filled by QNN_QwdBuildActionLabel using the
-	 * snapshot's weapon_id (server-state at the same point in the tick
-	 * the obs sees) plus the impulse_target returned here.  Keeping
-	 * extraction pure (no qwd_state, no snapshot dependency) ensures
-	 * cur_stat and snapshot->weapon_id stay coherent. */
-	return impulse_target;
+	/* action->weapon is set in QwdBuildActionLabel via QNN_QwdWeaponLabel
+	 * (held + pending impulse), not from this loop's QC self.weapon advance. */
+}
+
+/* De-scripted intent label for this tick (header comment at the top of
+ * this file).  Reads the per-window select/press classification stashed
+ * by QNN_QwdExtractAction; mutates qwd_state.intent_* tracking. */
+static int QNN_QwdIntentWeaponLabel(const qnn_snapshot_t *snapshot)
+{
+	/* Held: only vanilla weapon ids 1..8 are a real label.  Mod servers
+	 * (CTF grapple, TF, KombatTeam) report held ids >8 in the playerstate
+	 * stat; those are not weapons we model, so treat them as no-weapon —
+	 * same handling the obs token gets via qnn_weapon_subject_from_id.
+	 * Without this, a mod held id leaks into the act_weapon label and
+	 * trips the 0..8 wire guard, losing the whole demo. */
+	int held = QNN_WeaponIsValid(snapshot->weapon_id)
+		? snapshot->weapon_id : 0;
+	int prev_items = qwd_state.prev_items_owned;
+	int items_valid = qwd_state.prev_items_valid;
+	/* held_changed: the engine equipped a different weapon since the
+	 * last label tick.  The forced re-baseline below keys on this —
+	 * NOT on mere held!=intent divergence, which is the normal state
+	 * while a deliberate select leads the equip through cooldown (and
+	 * which stale reliable-channel obs would otherwise erode). */
+	int held_changed = held && qwd_state.prev_label_held
+		&& held != qwd_state.prev_label_held;
+
+	qwd_state.prev_items_owned = snapshot->items_owned;
+	qwd_state.prev_items_valid = 1;
+	if (held)
+		qwd_state.prev_label_held = held;
+
+	if (snapshot->health <= 0)
+	{
+		/* Dead: intent resets.  The label stays 0 (masked) after
+		 * respawn until the player re-reveals it. */
+		qwd_state.intent_weapon = 0;
+		qwd_state.intent_dump_pending = 0;
+		return 0;
+	}
+
+	if (qwd_state.last_deliberate_sel)
+	{
+		int sel = qwd_state.last_deliberate_sel;
+		/* A direct select (1-8) IS the intent, unvalidated — the press
+		 * reveals the desire even when the reliable-channel obs lag
+		 * says no ammo (common right after respawn).  Realization is
+		 * settled by the engine: if it equips, held catches up; if it
+		 * genuinely refuses (real ammo-out), the forced re-baseline
+		 * corrects on the engine's own auto-switch.  Cycle impulses
+		 * (10/12) need the QC predicate to resolve the destination. */
+		int target = (sel >= 1 && sel <= 8) ? sel
+			: QNN_QwdEvalSelect(snapshot,
+				held ? held : qwd_state.intent_weapon, sel);
+		if (QNN_WeaponIsValid(target))
+		{
+			qwd_state.intent_weapon = target;
+			qwd_state.intent_dump_pending = 0;
+		}
+	}
+	else if (qwd_state.last_dump_sel)
+	{
+		/* Release-half dump: arm the suppression.  It stays armed
+		 * until the next deliberate select (or death) — the engine
+		 * defers the dump equip through the outgoing weapon's attack
+		 * cooldown, and the sticky impulse byte can re-equip the
+		 * release target much later with no fresh edge at all. */
+		qwd_state.intent_dump_pending = 1;
+	}
+
+	/* Post-respawn (or demo-start) acceptance: engaging with the held
+	 * weapon adopts it as intent. */
+	if (qwd_state.intent_weapon == 0 && held
+		&& (qwd_state.last_attack_press || qwd_state.last_op_attack))
+		qwd_state.intent_weapon = held;
+
+	if (held_changed && !qwd_state.last_deliberate_sel
+		&& qwd_state.intent_weapon && held != qwd_state.intent_weapon)
+	{
+		if (qwd_state.intent_dump_pending
+			&& held == qnn_runtime.weapon_release)
+		{
+			/* Script dump equip at cooldown expiry — not intent. */
+		}
+		else
+		{
+			/* The engine equipped a different weapon with no select
+			 * this tick: forced re-baseline if the intent weapon is
+			 * no longer selectable (ammo-out auto-switch) or held was
+			 * just picked up (auto-equip).  Otherwise keep intent —
+			 * e.g. a stale sticky impulse re-equipped an old weapon. */
+			int feasible = QNN_QwdEvalSelect(snapshot, held,
+				qwd_state.intent_weapon) == qwd_state.intent_weapon;
+			int gained = items_valid
+				&& (snapshot->items_owned
+					& QNN_ItemFlagFromImpulse(held))
+				&& !(prev_items & QNN_ItemFlagFromImpulse(held));
+			if (!feasible || gained)
+				qwd_state.intent_weapon = held;
+		}
+	}
+	{
+		const char *dbg = getenv("QNN_WEAPON_INTENT_DEBUG");
+		if (dbg)
+		{
+			FILE *df = fopen(dbg, "a");
+			if (df)
+			{
+				fprintf(df, "WI %d lab held=%d intent=%d dsel=%d dump=%d pend=%d\n",
+					qnn_runtime.tick, held, qwd_state.intent_weapon,
+					qwd_state.last_deliberate_sel, qwd_state.last_dump_sel,
+					qwd_state.intent_dump_pending);
+				fclose(df);
+			}
+		}
+	}
+	return qwd_state.intent_weapon;
 }
 
 void QNN_QwdBuildActionLabel(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot)
 {
-	int impulse_target = QNN_QwdExtractAction(action, snapshot);
-	int cur_stat = snapshot->weapon_id;
+	/* Side effects we depend on: QwdExtractAction packs action->move,
+	 * stashes the input-mask inputs, and (per-cmd, once per emit tick)
+	 * advances the QC weapon-select predicate. */
+	QNN_QwdExtractAction(action, snapshot);
 
-	/* Canonical action.weapon label.  Three paths:
-	 *   (1) impulse press: player chose explicitly.
-	 *   (2) engine-forced: server changed the held weapon without an
-	 *       impulse (pickup auto-switch via weapon_touch, respawn
-	 *       default, ammo-out down-switch in some mods).  Detected as
-	 *       a snapshot->weapon_id transition to a value the player
-	 *       didn't ask for.
-	 *   (3) carry: keep last value (covers cmd-pipeline lag and steady
-	 *       state).
-	 * No back-shift, no ring rewriting — the label at this tick is
-	 * the truth label.  snapshot->weapon_id is used (not QNN_WeaponId)
-	 * so cur_stat and the obs byte stay coherent. */
-	if (!qwd_state.initialized && cur_stat > 0)
-	{
-		qwd_state.held_weapon      = cur_stat;
-		qwd_state.prev_stat_weapon = cur_stat;
-		qwd_state.initialized      = true;
-	}
-	if (impulse_target != 0)
-	{
-		qwd_state.held_weapon = impulse_target;
-		if (!qwd_state.initialized)
-		{
-			/* Impulse-first init: seed prev_stat so the next tick's
-			 * engine-forced check sees a consistent baseline. */
-			qwd_state.prev_stat_weapon = cur_stat;
-			qwd_state.initialized      = true;
-		}
-	}
-	else if (qwd_state.initialized
-		&& cur_stat != qwd_state.prev_stat_weapon
-		&& cur_stat != qwd_state.held_weapon
-		&& cur_stat > 0)
-	{
-		qwd_state.held_weapon = cur_stat;
-	}
-	qwd_state.prev_stat_weapon = cur_stat;
-	if (qwd_state.initialized)
-		action->weapon = qwd_state.held_weapon;
-	/* else: leave action->weapon at 0; QNN_FillLookAndSwitch fills it
-	 * from snapshot->weapon_id for pre-signon frames. */
-
+	/* Look label first: QNN_FillLookAndSwitch's held-weapon fallback is
+	 * for the usercmd-less MVD path; on this path the intent label owns
+	 * act.weapon OUTRIGHT — including 0 = masked (post-respawn, intent
+	 * not yet revealed) — so it is assigned after, overwriting the
+	 * fallback. */
 	QNN_FillLookAndSwitch(action, snapshot);
+
+	/* Canonical action.weapon label = de-scripted deliberate intent
+	 * (header comment at the top of this file).  The per-cmd QC weapon
+	 * advance above is kept only to drive the attack cooldown. */
+	action->weapon = QNN_QwdIntentWeaponLabel(snapshot);
 	QNN_QwdPackInputMask(action, snapshot);
+
+	QNN_QwdDumpAttackEdge(action, snapshot);
+}
+
+/* SUPERSEDED (weapon-head.md §10-11): the ping-gated phantom-lead clear
+ * belonged to the old held+lead label.  The de-scripted intent label
+ * (QNN_QwdIntentWeaponLabel) only leads on QC-validated DELIBERATE
+ * selects, so the stale-sticky-impulse phantom this machinery existed to
+ * rewrite cannot arise (a select edge updates intent exactly once, and a
+ * press the engine never realizes is still the player's revealed intent).
+ * Kept as a no-op so the emit-loop call site stays wire-compatible. */
+void QNN_QwdWeaponLeadStep(qnn_action_t *action,
+	const qnn_snapshot_t *snapshot, int tick, int ping_frames, int emit_hz)
+{
+	(void)action; (void)snapshot; (void)tick;
+	(void)ping_frames; (void)emit_hz;
 }
 
 /* Pack action->input_mask — pure-feasibility per-axis mask the trainer
  * consumes when input_mask=true. "Would the engine accept this axis if
  * the player pressed AT THE START of this tick?" — no AND with the demo's
- * actual press. State is captured PRE-loop (before this tick's fire
+ * actual press. State is captured PRE-loop (before this tick's attack
  * advances cooldown) via qwd_state.pre_loop_attack_finished, so bit 0
- * AND demo_press cleanly recovers the engine-fired-this-tick label.
+ * AND demo_press cleanly recovers the engine-attacked-this-tick label.
  *
  * Layout (see QNN_PackInputMask):
  *
- *   bit 0    = attack feasibility : would QC W_Attack fire if button0=1
+ *   bit 0    = attack feasibility : would QC W_Attack trigger if button0=1
  *                                   at START of this tick? (cooldown
  *                                   expired AND held weapon has ammo)
  *   bits 1-2 = forward feasibility: both bits set whenever alive —
@@ -681,7 +980,7 @@ void QNN_QwdBuildActionLabel(qnn_action_t *action,
  *   bits 3-4 = side    feasibility: same — always 11 when alive.
  *   bits 5-6 = up      feasibility: 11 when in water (swim up & down
  *                                   both feasible), 00 otherwise.
- *   bit 7    = jump    feasibility: would pmove ground-jump fire if
+ *   bit 7    = jump    feasibility: would pmove ground-jump trigger if
  *                                   button2=1 each cmd? (depends on
  *                                   onground + anti-pogo + dead state)
  *
@@ -711,55 +1010,76 @@ void QNN_QwdPackInputMask(qnn_action_t *action,
 	int op_jump_feasible;
 	int op_attack_feasible;
 	int in_water;
-	int held_weapon;
-	float saved_attack_finished;
 
 	if (action == NULL || snapshot == NULL)
 		return;
 	if (snapshot->health <= 0)
 	{
 		action->input_mask = 0;
+		action->op_input = 0;
 		return;
 	}
 
 	in_water = (snapshot->waterlevel >= 2);
-	held_weapon = snapshot->weapon_id;
 
 	/* Attack feasibility via the existing QC predicate.
 	 *
 	 * Two state-management requirements:
 	 *  (a) The synthetic call here must use PRE-loop cooldown as its
-	 *      baseline so bit 0 means "could press fire at START of this
+	 *      baseline so bit 0 means "could press attack at START of this
 	 *      tick" — which AND'd with the demo press recovers the
-	 *      engine-fired-this-tick label. Without this, the per-cmd
+	 *      engine-attacked-this-tick label. Without this, the per-cmd
 	 *      loop in QwdExtractAction has already advanced cooldown by
-	 *      this tick's fire, and bit 0 collapses to "could press fire
+	 *      this tick's attack, and bit 0 collapses to "could press attack
 	 *      NEXT tick" — anti-correlated with demo press on exactly
-	 *      the ticks the engine actually fired.
+	 *      the ticks the engine actually attacked.
 	 *  (b) After the synthetic call we must restore the POST-loop value
 	 *      so downstream code (next tick's per-cmd loop, BC self_token
 	 *      attack_finished readout) sees the real engine state.
 	 *
 	 * We snapshot the post-loop value, switch to the pre-loop value
 	 * for the eval, restore the post-loop value when done. */
-	saved_attack_finished = QNN_ProgsGetAttackFinished();
-	QNN_ProgsSetAttackFinished(qwd_state.pre_loop_attack_finished);
-	op_attack_feasible = 0;
-	if (held_weapon >= 1 && held_weapon <= 8)
-	{
-		op_attack_feasible = QNN_ProgsEvalAttack(
-			qnn_runtime.tick,
-			qnn_runtime.fixed_tick_hz,
-			snapshot->health, snapshot->items_owned,
-			snapshot->ammo_shells, snapshot->ammo_nails,
-			snapshot->ammo_rockets, snapshot->ammo_cells,
-			held_weapon, /*button0=*/1);
-	}
-	QNN_ProgsSetAttackFinished(saved_attack_finished);
+	/* Synthetic "would a press attack at the START of this tick?" feasibility
+	 * (shared helper, baseline = pre-loop cooldown). */
+	op_attack_feasible = QNN_EvalAttackFeasible(snapshot,
+		qwd_state.pre_loop_attack_finished);
 
 	/* Jump feasibility via pmove with synthetic button2=1; the helper
-	 * internally save/restores its persistent carry state. */
+	 * internally save/restores its persistent carry state.  Computed
+	 * here (before op_input) because op_input's ud op-bit reuses it —
+	 * see below.  This call leaves pmove carry state untouched, so it
+	 * does NOT perturb the genuine QWD path's per-tick jump state
+	 * (byte-identical input_mask). */
 	op_jump_feasible = QNN_QwdEvalPmoveJump(snapshot, /*synth_button2=*/1);
+
+	/* op_input (strict per-axis operativeness — DISTINCT from the
+	 * pure-feasibility input_mask): bit i set iff the player pressed
+	 * axis i AND the engine acted on it this tick.  Computed entirely
+	 * from signals already produced on this BC QWD path, with NO new
+	 * stateful predicate (so input_mask stays byte-identical):
+	 *   fb/lr   : press read off action->move (set by QwdExtractAction)
+	 *   ud      : (jump press AND the engine would jump = op_jump_feasible),
+	 *             OR swim-up in water — operativeness = "pressed AND it
+	 *             took effect".  The feasibility eval honours onground +
+	 *             anti-pogo, so feasible-while-pressing == jumped.
+	 *   attack  : last_op_attack (per-cmd QC W_Attack advance)
+	 *   impulse : last_op_impulse (per-cmd QC weapon-select advance) */
+	{
+		int fb_press = QNN_ActionAxisSign(action->move, 0) != 0;
+		int lr_press = QNN_ActionAxisSign(action->move, 1) != 0;
+		int attack_press = QNN_ActionAttack(action->move);
+		action->op_input = QNN_PackOpInput(
+			/*alive=*/1,
+			fb_press, lr_press,
+			/*jump_press=*/qwd_state.last_jump_press_any,
+			/*swim_press=*/qwd_state.last_upmove_pos_any,
+			attack_press,
+			in_water,
+			/*op_jump=*/op_jump_feasible,
+			qwd_state.last_op_attack,
+			qwd_state.last_op_impulse,
+			/*has_impulse=*/qwd_state.last_weapon_impulse != 0);
+	}
 
 	/* fb/lr: always feasible — pmove processes fmove/smove in every
 	 * physics branch (ground, air, water). Set BOTH direction bits to

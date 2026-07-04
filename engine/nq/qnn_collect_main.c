@@ -71,22 +71,22 @@ static void QNN_InferEmitAction(qnn_action_t *action, const qnn_snapshot_t *snap
 
 	if (snapshot->weapon_id > 0)
 		action->weapon = snapshot->weapon_id;
-	if (qnn_runtime.native_fire_this_window)
+	if (qnn_runtime.native_attack_this_window)
 		action->move |= 0x01; /* bit 0 = attack press */
 }
 
-/* Per-native-frame: infer fire from sound/ammo cues.  Shared with the
- * QW MVD path via qnn_collect_helpers — see QNN_DetectFireEvent.
+/* Per-native-frame: infer attack from sound/ammo cues.  Shared with the
+ * QW MVD path via qnn_collect_helpers — see QNN_DetectAttackEvent.
  * Jump is set per-emit from QNN_SnapshotHasSelfJumpSound in QNN_SnapMove
  * below, not aggregated here. */
 static void QNN_InferNativeAction(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot)
 {
 	QNN_ClearAction(action);
-	if (QNN_DetectFireEvent(snapshot))
+	if (QNN_DetectAttackEvent(snapshot))
 	{
 		action->move |= 0x01; /* bit 0 = attack press */
-		qnn_runtime.native_fire_this_window = true;
+		qnn_runtime.native_attack_this_window = true;
 	}
 }
 
@@ -236,7 +236,7 @@ static void QNN_SaveEmitAnchor(const qnn_snapshot_t *snapshot)
 	qnn_runtime.emit_weapon_id = snapshot->weapon_id;
 	qnn_runtime.has_emit_anchor = true;
 	qnn_runtime.native_frame_count = 0;
-	qnn_runtime.native_fire_this_window = false;
+	qnn_runtime.native_attack_this_window = false;
 
 	/* Snapshot mover origins at the emission anchor. */
 	{

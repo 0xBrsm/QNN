@@ -19,7 +19,7 @@ extern int onground;
 extern int waterlevel;
 extern int watertype;
 
-int qnn_pmove_jump_fired = 0;
+int qnn_pmove_jump_attacked = 0;
 
 void QNN_PmoveSave(qnn_pmove_save_t *save)
 {

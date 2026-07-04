@@ -226,6 +226,9 @@ def validate_collect(
     min_target_pid_rate: float = 0.99,
     min_target_rel_rate: float = 0.95,
     unique_pid_slack: int = 0,
+    demo_dir: Path | None = None,
+    validate_labels: bool = True,
+    drift_ref: Path | None = None,
 ) -> int:
     corpus = _load_corpus_manifest(corpus_manifest)
     failures: list[str] = []
@@ -269,6 +272,39 @@ def validate_collect(
         if total.suspect_episode_count:
             failures.append(f"{split}: {total.suspect_episode_count} episodes exceed manifest maxclients")
 
+    # Attack/jump label validation against the demo svc_sound byte truth.
+    # Needs the source demos + the corpus manifest (collect has both). Runs
+    # the canonical qnn.bc.validate_labels gate (default 5% tolerance) and
+    # folds any deviation into the same FAILED summary.
+    if validate_labels and demo_dir is not None and corpus_manifest is not None:
+        from qnn.bc import validate_labels as _vl
+        print()
+        rc = _vl.validate_labels(
+            data_dir,
+            demo_dir=demo_dir,
+            manifest_path=corpus_manifest,
+        )
+        if rc != 0:
+            failures.append("attack/jump label validation failed (see above)")
+
+    # Look turn-delta grid drift (informational): EMD of this collect's theta
+    # distribution vs a reference collect's. Rate changes legitimately shift it,
+    # so this never fails the gate — it flags when a pinned grid may be stale.
+    if drift_ref is not None and drift_ref.resolve() != data_dir.resolve():
+        import json as _json
+        try:
+            from qnn.model import look_grid as _lg
+            this_lg = _json.loads((data_dir / "collect_metadata.json").read_text()).get("look_grid")
+            ref_lg = _json.loads((drift_ref / "collect_metadata.json").read_text()).get("look_grid")
+            if this_lg and ref_lg:
+                emd = _lg.emd_theta(this_lg["theta_hist"]["counts"], ref_lg["theta_hist"]["counts"])
+                print()
+                print(f"look-grid drift vs {drift_ref}: theta EMD={emd:.2f}deg  "
+                      f"hold_frac {ref_lg['hold_frac']:.3f}->{this_lg['hold_frac']:.3f}"
+                      + ("  [LARGE — refit/repin the grid for this corpus]" if emd > 2.0 else ""))
+        except (FileNotFoundError, KeyError, TypeError):
+            pass  # reference or look_grid block absent — skip drift readout
+
     if failures:
         print("FAILED:")
         for failure in failures:
@@ -283,22 +319,33 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Validate BC collect actor and target labels")
     parser.add_argument("data_dir", nargs="?", default="artifacts/collect/qwd")
     parser.add_argument("--corpus-manifest", default="artifacts/corpus/qwd_manifest.ndjson")
+    parser.add_argument("--demo-dir", default="artifacts/corpus/qwd",
+                        help="Source demo dir for attack/jump label validation")
+    parser.add_argument("--no-validate-labels", dest="validate_labels",
+                        action="store_false", default=True,
+                        help="Skip the attack/jump label byte-truth gate")
     parser.add_argument("--min-live-actor-frame-rate", type=float, default=0.95)
     parser.add_argument("--min-moving-actor-token-rate", type=float, default=0.001)
     parser.add_argument("--min-target-pid-rate", type=float, default=0.99)
     parser.add_argument("--min-target-rel-rate", type=float, default=0.95)
     parser.add_argument("--unique-pid-slack", type=int, default=0)
+    parser.add_argument("--drift-ref", default="artifacts/collect/qwd",
+                        help="Reference collect for look-grid theta drift readout "
+                             "(informational; empty to skip)")
     args = parser.parse_args()
 
     manifest = Path(args.corpus_manifest) if args.corpus_manifest else None
     raise SystemExit(validate_collect(
         Path(args.data_dir),
         corpus_manifest=manifest,
+        drift_ref=Path(args.drift_ref) if args.drift_ref else None,
         min_live_actor_frame_rate=args.min_live_actor_frame_rate,
         min_moving_actor_token_rate=args.min_moving_actor_token_rate,
         min_target_pid_rate=args.min_target_pid_rate,
         min_target_rel_rate=args.min_target_rel_rate,
         unique_pid_slack=args.unique_pid_slack,
+        demo_dir=Path(args.demo_dir) if args.demo_dir else None,
+        validate_labels=args.validate_labels,
     ))
 
 

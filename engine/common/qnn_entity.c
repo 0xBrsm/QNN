@@ -344,8 +344,20 @@ int QNN_SubjectPickupCategory(int subject_id)
 
 /* Model's view-cone aperture. Decoupled from the renderer's "fov" cvar
  * (which the engine clamps to [10,170] in SCR_CalcRefdef) so we can open
- * the perception cone past a hemisphere. Registered in QNN_IOInit. */
+ * the perception cone past a hemisphere. Registered via
+ * QNN_RegisterPerceptionCvars (QNN_IOInit, plus client startup so configs
+ * exec'd before the first QNN tick can set it). */
 cvar_t qnn_fov = {"qnn_fov", "120"};
+
+/* Idempotent: a cvar set from a config keeps its value across re-calls
+ * (QNN_IOInit re-runs per map load). Must run before any config exec
+ * that sets qnn_fov — an unregistered cvar is "Unknown command" and the
+ * set is silently dropped. */
+void QNN_RegisterPerceptionCvars(void)
+{
+	if (Cvar_FindVar("qnn_fov") == NULL)
+		Cvar_RegisterVariable(&qnn_fov);
+}
 
 /*
  * Emit FOV cone aperture, in total degrees, read live from "qnn_fov".

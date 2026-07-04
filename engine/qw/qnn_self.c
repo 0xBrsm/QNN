@@ -13,7 +13,7 @@
  */
 
 #include "qnn_io.h"
-#include "qnn_collect_helpers.h"   /* qnn_runtime: force_mvd_emit / labeler_mode */
+#include "qnn_collect_helpers.h"   /* qnn_runtime: force_mvd_emit */
 
 #include <string.h>
 
@@ -272,15 +272,14 @@ void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot)
 
 	/* Origin / velocity: prefer cl.simorg / cl.simvel (predicted via
 	 * CL_PredictMove on QWD's usercmds) and fall back to the server
-	 * playerstate.  EXCEPT under force_mvd_emit or labeler_mode, where
-	 * we must not leak QWD-specific pmove integration into the obs.
-	 * Real MVD playback delivers only server-authoritative origin /
-	 * velocity to the client; this branch takes the same path on QWD
-	 * so the inference / training pipeline operates on the same
-	 * distribution it would see during true MVD playback. */
+	 * playerstate.  EXCEPT under force_mvd_emit, where we must not leak
+	 * QWD-specific pmove integration into the obs.  Real MVD playback
+	 * delivers only server-authoritative origin / velocity to the
+	 * client; this branch takes the same path on QWD so the inference /
+	 * training pipeline operates on the same distribution it would see
+	 * during true MVD playback. */
 	{
-		qboolean mvd_faithful = (qnn_runtime.force_mvd_emit
-			|| qnn_runtime.labeler_mode);
+		qboolean mvd_faithful = qnn_runtime.force_mvd_emit;
 		if (!mvd_faithful
 			&& (cl.simorg[0] != 0.0f || cl.simorg[1] != 0.0f
 				|| cl.simorg[2] != 0.0f))
@@ -326,10 +325,47 @@ void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot)
 	/* Ground/water: from playerstate + pmove globals.  The QW client
 	 * runs CL_PredictMove every Host_Frame, which updates the module-
 	 * level `waterlevel` to the tracked player's current value.  We
-	 * capture it here before any candidate physics sim clobbers it. */
-	if (ps != NULL)
-		snapshot->grounded = (ps->onground != -1) ? true : false;
-	snapshot->waterlevel = waterlevel;
+	 * capture it here before any candidate physics sim clobbers it.
+	 *
+	 * MVD-path exception: the MVD playerinfo parser never writes
+	 * onground (memset 0 reads as "!= -1" = always grounded — real
+	 * collects came out 100% ground), and CL_PredictMove's waterlevel
+	 * tracks the idle local client, not the tracked player.  Derive
+	 * both from the BSP instead: standing = the player hull is blocked
+	 * one unit below the origin; water = point contents at the origin.
+	 * pmove.physents are maintained by QNN_PhysInit on these paths.
+	 * force_mvd_emit uses the same derivation so paired evals and the
+	 * GBT labeler's features see real-MVD semantics. */
+	if ((cls.mvdplayback || qnn_runtime.force_mvd_emit)
+		&& cl.worldmodel != NULL)
+	{
+		/* Query the worldmodel hulls directly — pmove.physents are
+		 * not reliably populated at snapshot-capture time.  hull 1 is
+		 * the player-size expanded hull, so a point query at the
+		 * origin answers "would a player whose origin is here clip
+		 * solid"; one unit below the origin that means standing. */
+		hull_t *player_hull = &cl.worldmodel->hulls[1];
+		hull_t *point_hull = &cl.worldmodel->hulls[0];
+		vec3_t below;
+		int contents;
+
+		VectorCopy(snapshot->player_origin, below);
+		below[2] -= 1.0f;
+		snapshot->grounded =
+			(PM_HullPointContents(player_hull,
+				player_hull->firstclipnode, below) == CONTENTS_SOLID);
+		contents = PM_HullPointContents(point_hull,
+			point_hull->firstclipnode, snapshot->player_origin);
+		snapshot->waterlevel =
+			(contents == CONTENTS_WATER || contents == CONTENTS_SLIME
+			 || contents == CONTENTS_LAVA) ? 2 : 0;
+	}
+	else
+	{
+		if (ps != NULL)
+			snapshot->grounded = (ps->onground != -1) ? true : false;
+		snapshot->waterlevel = waterlevel;
+	}
 
 	snapshot->current_region_id = 0;
 }

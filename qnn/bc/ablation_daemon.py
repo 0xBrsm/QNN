@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -67,6 +68,7 @@ class _AblationJob:
     source_key: tuple[Any, ...]
     seed_checkpoint: str
     model_factory: Callable[[int, Any], Any] | None
+    graph: Any | None
     side_channel_provider: Callable[..., Any] | None
     submitted_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -108,12 +110,13 @@ def _build_job(job_id: str, run_dir: Path) -> _AblationJob:
         _validate_bc_config_dict(raw_cfg)
         bc_config = BCConfig(**raw_cfg)
         model_factory = None
+        graph = None
         side_channel_provider = None
     elif ctx.mode == "head_probe":
         from qnn.model.bench.runner import _build_head_probe_bc_config
         from qnn.model.bench.side_channels import bench_side_channel_scope
 
-        bc_config, model_factory = _build_head_probe_bc_config(ctx.run_cfg, ctx.device)
+        bc_config, model_factory, graph = _build_head_probe_bc_config(ctx.run_cfg, ctx.device)
         side_channel_provider = bench_side_channel_scope
     else:
         raise RuntimeError(
@@ -128,6 +131,7 @@ def _build_job(job_id: str, run_dir: Path) -> _AblationJob:
         source_key=source_compatibility_key_for_config(bc_config),
         seed_checkpoint=str(ctx.run_cfg.get("checkpoint_path", "") or ""),
         model_factory=model_factory,
+        graph=graph,
         side_channel_provider=side_channel_provider,
     )
 
@@ -428,6 +432,17 @@ class AblationDaemon:
                 except Exception as exc:
                     bundle = None
                     loaded_error = exc
+                    # Fail LOUDLY: a swallowed source-load error (e.g. a
+                    # collection_fingerprint mismatch) reads as a silent hang
+                    # to anyone watching `docker logs`. Emit the full
+                    # traceback to stderr so the real reason is visible
+                    # without having to query the daemon's _failed list.
+                    print(
+                        f"  [bc/daemon] ERROR: source load FAILED for "
+                        f"{first.ctx.run_dir}\n{traceback.format_exc()}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 with self._cv:
                     self._loading = False
                     if loaded_error is not None:
@@ -476,6 +491,7 @@ class AblationDaemon:
                 job.config,
                 seed_checkpoint=job.seed_checkpoint,
                 model_factory=job.model_factory,
+                graph=job.graph,
                 side_channel_provider=job.side_channel_provider,
                 source_bundle=source_bundle,
                 release_sources=False,
@@ -506,6 +522,15 @@ class AblationDaemon:
                 f"  [bc/daemon] {status} {job.job_id}: {job.ctx.run_dir}",
                 flush=True,
             )
+            if status == "failed" and job.error:
+                # Surface the run-failure traceback to logs, not just the
+                # one-word status — same loud-failure rationale as the
+                # source-load path above.
+                print(
+                    f"  [bc/daemon] ERROR: {job.job_id} traceback:\n{job.error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
 
 def main() -> None:

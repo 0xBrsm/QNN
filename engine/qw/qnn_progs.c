@@ -21,6 +21,7 @@
  */
 
 #include "qwsvdef.h"
+#include "qnn_weapon.h"
 #include <stddef.h>
 
 extern builtin_t *pr_builtins;
@@ -38,10 +39,11 @@ extern void         ED_ClearEdict(edict_t *e);
 static qboolean qnn_progs_inited = false;
 static int      qnn_progs_hunk_mark = 0;
 /* Persistent self.attack_finished across QNN_ProgsEvalAttack calls.
- * Reset on each QNN_ProgsInit (= once per demo).  Caller (labeler)
- * sets pr_global_struct->time per tick from native tick / tick_hz so
- * the QC's cooldown gate (`time < self.attack_finished`) decides
- * correctly without us having to advance a fake clock. */
+ * Reset on each QNN_ProgsInit (= once per demo).  Each predicate sets
+ * pr_global_struct->time from the now_seconds the caller passes (the
+ * engine real-seconds clock, tick-rate-independent) so the QC's
+ * cooldown gate (`time < self.attack_finished`) decides correctly
+ * without us having to advance a fake clock. */
 static float    qnn_progs_attack_finished = 0.0f;
 /* Field offset (in float-sized units, multiply by 4 for byte offset)
  * for self.attack_finished — declared by progs.qc but absent from
@@ -67,6 +69,14 @@ static int qnn_progs_self_weapon = 0;
  * switches (pickup auto-select, ammo-out W_BestWeapon, respawn) so
  * we know when to resync qnn_progs_self_weapon to the snapshot. */
 static int qnn_progs_prev_snapshot_weapon = 0;
+
+/* Set by QNN_ProgsNotifyWorldReset (called from the patched
+ * CL_ParseServerData, right after CL_ClearState) when a — possibly
+ * mid-demo — svc_serverdata frees the hunk the QC VM was allocated into.
+ * Consumed by qnn_progs_reinit_if_world_reset, which reloads the VM onto
+ * the post-reset hunk before the next QC call.  Without this, multi-map /
+ * multi-session demos fault in ED_FindFunction on dangling progs memory. */
+static qboolean qnn_progs_world_reset_pending = false;
 
 /* QC flag bits (from defs.qc) — duplicated here because progdefs.h
  * doesn't surface them. */
@@ -239,6 +249,8 @@ qboolean QNN_ProgsInit(void)
 	}
 
 	qnn_progs_inited = true;
+	/* Fresh VM on the current hunk top — any prior reset is now consumed. */
+	qnn_progs_world_reset_pending = false;
 	fprintf(stderr,
 		"qnn_progs: pr_edict_size=%d  pr_numbuiltins=%d\n",
 		pr_edict_size, pr_numbuiltins);
@@ -254,6 +266,41 @@ qboolean QNN_ProgsInit(void)
 		fprintf(stderr, "qnn_progs: fn idx = %ld\n", (long)(fn - pr_functions));
 	fflush(stderr);
 	return true;
+}
+
+/* ── world-reset / hunk-free recovery ───────────────────────────────
+ *
+ * QNN_ProgsInit allocates the QC VM (progs / pr_functions / pr_strings /
+ * sv.edicts) once, at the top of the QW client hunk.  But a demo can
+ * carry more than one svc_serverdata — multi-map matches, and the
+ * multi-session demos handled by the svc_disconnect patch in
+ * cl_parse.c.  Each one runs CL_ClearState -> Hunk_FreeToLowMark, which
+ * frees the very region the VM lives in; every later QC call then
+ * dereferences dangling (reused) hunk memory and faults inside
+ * ED_FindFunction / PR_GetString.
+ *
+ * The patched CL_ParseServerData calls QNN_ProgsNotifyWorldReset right
+ * after CL_ClearState to flag the free.  We reload the VM lazily — at
+ * the next QC entry — rather than inline, so the reallocation lands on
+ * top of the new segment's hunk (after CL_ParseServerData has finished
+ * its own precache allocations) and stays valid until the next reset. */
+void QNN_ProgsNotifyWorldReset(void)
+{
+	qnn_progs_world_reset_pending = true;
+}
+
+static void qnn_progs_reinit_if_world_reset(void)
+{
+	if (!qnn_progs_world_reset_pending)
+		return;
+	/* Only meaningful once we were up.  If the flag was set by the first
+	 * serverdata (before QNN_HandleCollect's explicit QNN_ProgsInit), leave
+	 * it pending — that init clears it.  QNN_ProgsInit reloads qwprogs.dat
+	 * and resets per-demo state (self.weapon=0, attack_finished=0), which is
+	 * exactly right for a fresh map segment; the next StepWeaponFrame reseeds
+	 * self.weapon from the snapshot. */
+	if (qnn_progs_inited)
+		QNN_ProgsInit();
 }
 
 /* ── smoke test ─────────────────────────────────────────────────── */
@@ -310,6 +357,7 @@ int QNN_ProgsEvalWeaponImpulse(
 	edict_t *self_ed;
 	dfunction_t *fn;
 
+	qnn_progs_reinit_if_world_reset();
 	if (!qnn_progs_inited)
 		return 0;
 	/* 1..8 direct select (W_ChangeWeapon), 10 cycle next, 12 cycle prev.
@@ -367,7 +415,7 @@ static int qnn_impulse_to_currentammo(int impulse,
 }
 
 int QNN_ProgsEvalAttack(
-	int tick, int tick_hz,
+	float now_seconds,
 	int health, int items_owned,
 	int ammo_shells, int ammo_nails, int ammo_rockets, int ammo_cells,
 	int weapon_id, int button0_pressed)
@@ -375,17 +423,14 @@ int QNN_ProgsEvalAttack(
 	edict_t *self_ed;
 	dfunction_t *fn;
 	float pre_attack_finished;
-	float now_seconds;
 
+	qnn_progs_reinit_if_world_reset();
 	if (!qnn_progs_inited) return 0;
-	if (tick_hz <= 0) return 0;
 	if (health <= 0) return 0;
-	if (weapon_id < 1 || weapon_id > 8) return 0;
+	if (!QNN_WeaponIsValid(weapon_id)) return 0;
 
 	fn = ED_FindFunction("W_WeaponFrame");
 	if (!fn) return 0;
-
-	now_seconds = (float)tick / (float)tick_hz;
 
 	self_ed = EDICT_NUM(1);
 	memset(&self_ed->v, 0, sizeof(self_ed->v));
@@ -412,7 +457,7 @@ int QNN_ProgsEvalAttack(
 	PR_ExecuteProgram(fn - pr_functions);
 
 	/* W_Attack sets self.attack_finished = time + cd[weapon] iff it
-	 * actually fired (passed the cooldown gate, had ammo, etc.).
+	 * actually attacked (passed the cooldown gate, had ammo, etc.).
 	 * Compare against the value we injected to detect a flip. */
 	{
 		float post = qnn_progs_get_attack_finished(self_ed);
@@ -423,6 +468,127 @@ int QNN_ProgsEvalAttack(
 		}
 	}
 	return 0;
+}
+
+
+/* ── unified per-cmd think advance ───────────────────────────────────
+ *
+ * QNN_ProgsStepWeaponFrame drives the REAL W_WeaponFrame on the shared
+ * persistent player state (qnn_progs_self_weapon + qnn_progs_attack_finished)
+ * once per usercmd.  W_WeaponFrame is the engine's own per-frame weapon
+ * routine:
+ *
+ *     if (time < self.attack_finished) return;   // cooldown gate
+ *     ImpulseCommands();                          // -> W_ChangeWeapon
+ *     if (self.button0) W_Attack();               // attack
+ *
+ * so weapon-select and attack share ONE cooldown (attack_finished) and the
+ * select is realized only WHEN THE ENGINE WOULD realize it.  A select
+ * pressed during cooldown is gated exactly as the live server gates it —
+ * no processing-it-early, hence no stuck divergence from the held weapon.
+ * Persistence is the engine's: self.weapon and attack_finished carry in
+ * the statics across calls; server-forced switches (pickup / ammo-out
+ * W_BestWeapon / respawn) resync self.weapon from the snapshot.
+ *
+ * This is the single actual-advance path for BOTH the weapon label and
+ * the attack op-bit, replacing the separate ungated QNN_ProgsEvalWeaponImpulse*
+ * advance and the per-cmd QNN_ProgsEvalAttack advance.  Feasibility probes
+ * (counterfactual button0=1 with save/restore) stay on QNN_ProgsEvalAttack.
+ *
+ * Extensible: to fold in more native think later (e.g. powerups), add the
+ * field to the persistent state and call the QC routine here in engine
+ * order — callers keep one Step entry point. */
+void QNN_ProgsStepWeaponFrame(
+	float now_seconds,
+	int health, int items_owned,
+	int ammo_shells, int ammo_nails, int ammo_rockets, int ammo_cells,
+	int snapshot_weapon_id, int impulse, int button0_pressed,
+	int *out_weapon, int *out_weapon_op, int *out_fire_op)
+{
+	edict_t *self_ed;
+	dfunction_t *fn;
+	float pre_af, post_af;
+	int pre_flag, post_flag, w;
+
+	qnn_progs_reinit_if_world_reset();
+	if (out_weapon)    *out_weapon = qnn_progs_self_weapon;
+	if (out_weapon_op) *out_weapon_op = 0;
+	if (out_fire_op)   *out_fire_op = 0;
+	if (!qnn_progs_inited) return;
+
+	/* Server-forced switch detection / first-time seed.  Runs every call
+	 * regardless of impulse so the prev-tick snapshot baseline stays
+	 * current — identical rule to the old Operative predicate. */
+	if (snapshot_weapon_id != qnn_progs_prev_snapshot_weapon
+		&& snapshot_weapon_id != qnn_progs_self_weapon)
+		qnn_progs_self_weapon = snapshot_weapon_id;
+	qnn_progs_prev_snapshot_weapon = snapshot_weapon_id;
+	if (qnn_progs_self_weapon == 0)
+		qnn_progs_self_weapon = snapshot_weapon_id;
+	if (out_weapon) *out_weapon = qnn_progs_self_weapon;
+
+	if (health <= 0) return;             /* dead: no think; weapon carries */
+	/* Only drive the think with a live, valid held weapon (1..8) — the
+	 * same gate QNN_ProgsEvalAttack applies.  W_Attack dispatches on
+	 * self.weapon and W_CheckNoAmmo calls W_BestWeapon when currentammo==0;
+	 * running it with self.weapon outside 1..8 exercises QC paths the
+	 * proven predicate never did.  Weapon was seeded/resynced above, so an
+	 * alive player is always 1..8 here; this only skips pre-signon /
+	 * transition frames (weapon carries). */
+	if (!QNN_WeaponIsValid(qnn_progs_self_weapon)) return;
+
+	fn = ED_FindFunction("W_WeaponFrame");
+	if (!fn) return;
+
+	self_ed = EDICT_NUM(1);
+	memset(&self_ed->v, 0, sizeof(self_ed->v));
+	self_ed->free = false;
+
+	self_ed->v.health       = (float)health;
+	self_ed->v.items        = (float)items_owned;
+	self_ed->v.ammo_shells  = (float)ammo_shells;
+	self_ed->v.ammo_nails   = (float)ammo_nails;
+	self_ed->v.ammo_rockets = (float)ammo_rockets;
+	self_ed->v.ammo_cells   = (float)ammo_cells;
+	self_ed->v.weapon       = (float)QNN_ImpulseToItemFlag(qnn_progs_self_weapon);
+	self_ed->v.currentammo  = (float)qnn_impulse_to_currentammo(
+		qnn_progs_self_weapon, ammo_shells, ammo_nails, ammo_rockets, ammo_cells);
+	self_ed->v.button0      = button0_pressed ? 1.0f : 0.0f;
+	/* Only the weapon-relevant impulses (1..12) are handled by
+	 * ImpulseCommands; clamp anything else to 0 so a stray impulse byte
+	 * never reaches the QC dispatcher. */
+	self_ed->v.impulse      = (impulse >= 1 && impulse <= 12) ? (float)impulse : 0.0f;
+	qnn_progs_set_attack_finished(self_ed, qnn_progs_attack_finished);
+
+	pre_flag = (int)self_ed->v.weapon;
+	pre_af   = qnn_progs_attack_finished;
+	pr_global_struct->time = now_seconds;
+	pr_global_struct->self = EDICT_TO_PROG(self_ed);
+	PR_ExecuteProgram(fn - pr_functions);
+
+	/* Weapon: W_ChangeWeapon (via ImpulseCommands, gated by attack_finished)
+	 * may have flipped self.weapon.  Map the IT_* flag back to impulse form
+	 * and persist. */
+	post_flag = (int)self_ed->v.weapon;
+	if (post_flag != pre_flag && post_flag != 0)
+	{
+		for (w = 1; w <= 8; ++w)
+			if (QNN_ImpulseToItemFlag(w) == post_flag)
+			{
+				qnn_progs_self_weapon = w;
+				if (out_weapon_op) *out_weapon_op = 1;
+				break;
+			}
+	}
+	if (out_weapon) *out_weapon = qnn_progs_self_weapon;
+
+	/* Attack: W_Attack advances attack_finished iff it actually attacked. */
+	post_af = qnn_progs_get_attack_finished(self_ed);
+	if (post_af > pre_af)
+	{
+		qnn_progs_attack_finished = post_af;
+		if (out_fire_op) *out_fire_op = 1;
+	}
 }
 
 
@@ -447,7 +613,7 @@ int QNN_ProgsEvalAttack(
  *
  * Sync runs unconditionally on every call so callers don't have to
  * gate on cmd_impulse != 0; the predicate-execution branch (which
- * actually runs QC ImpulseCommands) only fires for valid impulses
+ * actually runs QC ImpulseCommands) only runs for valid impulses
  * 1..12 on an alive player. */
 int QNN_ProgsEvalWeaponImpulseOperative(
 	int health, int items_owned,
@@ -458,6 +624,7 @@ int QNN_ProgsEvalWeaponImpulseOperative(
 	int post_flag;
 	int w;
 
+	qnn_progs_reinit_if_world_reset();
 	if (!qnn_progs_inited) return 0;
 
 	/* Server-forced switch detection / first-time seed.  Runs every
@@ -501,34 +668,47 @@ int QNN_ProgsEvalWeaponImpulseOperative(
 
 
 /* Native-frame remainder of the QC-tracked attack_finished cooldown.
- * Returns 0 when the engine would process the next fire immediately;
+ * Returns 0 when the engine would process the next attack immediately;
  * >0 = engine will reject (or queue) presses for that many frames.
  * Source of truth: qnn_progs_attack_finished, written by W_Attack on
- * every fire QC processes.  Replaces the labeler's earlier hand-coded
+ * every attack QC processes.  Replaces the labeler's earlier hand-coded
  * k_fire_cd_native[9] table. */
-int QNN_ProgsGetAttackCdRemaining(int tick, int tick_hz)
+float QNN_ProgsGetAttackCdRemainingSec(float now_seconds)
 {
-	float now_seconds;
 	float remaining_seconds;
-	int   remaining_frames;
 
-	if (!qnn_progs_inited) return 0;
-	if (tick_hz <= 0)      return 0;
+	if (!qnn_progs_inited) return 0.0f;
 
-	now_seconds = (float)tick / (float)tick_hz;
 	remaining_seconds = qnn_progs_attack_finished - now_seconds;
-	if (remaining_seconds <= 0.0f) return 0;
-
-	remaining_frames = (int)(remaining_seconds * (float)tick_hz + 0.5f);
-	if (remaining_frames < 0)   return 0;
-	if (remaining_frames > 255) return 255;
-	return remaining_frames;
+	if (remaining_seconds <= 0.0f) return 0.0f;
+	return remaining_seconds;
 }
 
 
 float QNN_ProgsGetAttackFinished(void)
 {
 	return qnn_progs_attack_finished;
+}
+
+/* Current QC-tracked self.weapon (impulse 1..8 form), maintained across
+ * calls by QNN_ProgsEvalWeaponImpulseOperative.  0 until the first call
+ * seeds it from snapshot.weapon_id.  This IS the canonical action.weapon
+ * label: the weapon the engine's own W_ChangeWeapon would have equipped
+ * (ownership + ammo gated) plus server-forced resyncs. */
+int QNN_ProgsGetSelfWeapon(void)
+{
+	return qnn_progs_self_weapon;
+}
+
+/* MVD-path access to the persistent JUMPRELEASED carry.  The QWD
+ * per-cmd loop maintains it from real button2 transitions; the MVD
+ * path has no cmds, so its mask packer asserts "released since last
+ * tick" before each feasibility eval (players rarely hold jump —
+ * QWD op_jump ≈ grounded∧alive; the held-press frames this slightly
+ * overcounts are ~4% of frames and only bias bit 7 toward feasible). */
+void QNN_ProgsSetJumpReleased(qboolean released)
+{
+	qnn_progs_jump_released = released ? true : false;
 }
 
 void QNN_ProgsSetAttackFinished(float value)
@@ -538,16 +718,15 @@ void QNN_ProgsSetAttackFinished(float value)
 
 
 int QNN_ProgsEvalJump(
-	int tick, int tick_hz,
+	float now_seconds,
 	int health, int grounded, int waterlevel, int button2_pressed)
 {
 	edict_t *self_ed;
 	dfunction_t *fn;
 	int flags_pre;
-	float now_seconds;
 
+	qnn_progs_reinit_if_world_reset();
 	if (!qnn_progs_inited) return 0;
-	if (tick_hz <= 0) return 0;
 	if (health <= 0) return 0;
 
 	/* Mirror the QC dispatch (client.qc:924-929):
@@ -566,8 +745,6 @@ int QNN_ProgsEvalJump(
 
 	fn = ED_FindFunction("PlayerJump");
 	if (!fn) return 0;
-
-	now_seconds = (float)tick / (float)tick_hz;
 
 	self_ed = EDICT_NUM(1);
 	memset(&self_ed->v, 0, sizeof(self_ed->v));
@@ -722,11 +899,10 @@ void QNN_ProgsSmokeTest(void)
 	 * here; instead we set tick monotonically so the QC's cooldown
 	 * gate sees us "past" any prior attack_finished. */
 
-	/* Case 7: SG held, has shells, button0=1, no cooldown → should fire. */
+	/* Case 7: SG held, has shells, button0=1, no cooldown → should attack. */
 	{
 		int op = QNN_ProgsEvalAttack(
-			/*tick*/        100,  /* time = 100/77 ≈ 1.3s, > any prior af */
-			/*tick_hz*/     77,
+			/*now_seconds*/ 1.30f,  /* > any prior attack_finished */
 			/*health*/      100,
 			/*items*/       IT_AXE | IT_SHOTGUN,
 			/*shells*/      25, /*nails*/0, /*rockets*/0, /*cells*/0,
@@ -736,11 +912,10 @@ void QNN_ProgsSmokeTest(void)
 			"operative=%d (expected 1)\n", op);
 	}
 
-	/* Case 8: Same state, button0=0 → should NOT fire. */
+	/* Case 8: Same state, button0=0 → should NOT attack. */
 	{
 		int op = QNN_ProgsEvalAttack(
-			/*tick*/        200,  /* well past case 7's attack_finished */
-			/*tick_hz*/     77,
+			/*now_seconds*/ 2.60f,  /* well past case 7's attack_finished */
 			/*health*/      100,
 			/*items*/       IT_AXE | IT_SHOTGUN,
 			/*shells*/      25, /*nails*/0, /*rockets*/0, /*cells*/0,
@@ -750,11 +925,10 @@ void QNN_ProgsSmokeTest(void)
 			"operative=%d (expected 0)\n", op);
 	}
 
-	/* Case 9: SG, no shells, button0=1 → should NOT fire. */
+	/* Case 9: SG, no shells, button0=1 → should NOT attack. */
 	{
 		int op = QNN_ProgsEvalAttack(
-			/*tick*/        300,
-			/*tick_hz*/     77,
+			/*now_seconds*/ 3.90f,
 			/*health*/      100,
 			/*items*/       IT_AXE | IT_SHOTGUN,
 			/*shells*/      0, /*nails*/0, /*rockets*/0, /*cells*/0,
@@ -775,7 +949,7 @@ void QNN_ProgsSmokeTest(void)
 	/* Case 10: grounded, dry land, button2=1 (just pressed jump) → jump. */
 	{
 		int op = QNN_ProgsEvalJump(
-			/*tick*/  400, /*tick_hz*/ 77,
+			/*now_seconds*/ 5.19f,
 			/*health*/ 100,
 			/*grounded*/ 1, /*waterlevel*/ 0,
 			/*button2*/ 1);
@@ -786,7 +960,7 @@ void QNN_ProgsSmokeTest(void)
 	/* Case 11: same state, button2=1 still held (no release between) → anti-pogo, no jump. */
 	{
 		int op = QNN_ProgsEvalJump(
-			/*tick*/  401, /*tick_hz*/ 77,
+			/*now_seconds*/ 5.21f,
 			/*health*/ 100,
 			/*grounded*/ 1, /*waterlevel*/ 0,
 			/*button2*/ 1);
@@ -797,7 +971,7 @@ void QNN_ProgsSmokeTest(void)
 	/* Case 12: button2 released (=0).  Should re-arm JUMPRELEASED but not jump. */
 	{
 		int op = QNN_ProgsEvalJump(
-			/*tick*/  402, /*tick_hz*/ 77,
+			/*now_seconds*/ 5.22f,
 			/*health*/ 100,
 			/*grounded*/ 1, /*waterlevel*/ 0,
 			/*button2*/ 0);
@@ -808,7 +982,7 @@ void QNN_ProgsSmokeTest(void)
 	/* Case 13: pressed again after release → should jump. */
 	{
 		int op = QNN_ProgsEvalJump(
-			/*tick*/  403, /*tick_hz*/ 77,
+			/*now_seconds*/ 5.23f,
 			/*health*/ 100,
 			/*grounded*/ 1, /*waterlevel*/ 0,
 			/*button2*/ 1);
@@ -820,7 +994,7 @@ void QNN_ProgsSmokeTest(void)
 	{
 		qnn_progs_jump_released = true;
 		int op = QNN_ProgsEvalJump(
-			/*tick*/  500, /*tick_hz*/ 77,
+			/*now_seconds*/ 6.49f,
 			/*health*/ 100,
 			/*grounded*/ 0, /*waterlevel*/ 0,
 			/*button2*/ 1);
