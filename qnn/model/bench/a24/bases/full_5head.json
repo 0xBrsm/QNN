@@ -1,0 +1,23 @@
+{
+  "graph_version": 1,
+  "tokens": {
+    "cls": {"kind": "cls"},
+    "state": {"scalars": ["health_armor"], "vocab": ["armor_type"], "vocab_sum": ["powerup_state"]},
+    "arsenal": {"readiness": true, "vocab_sum": ["powerup_arsenal"]},
+    "motion": {"scalars": ["velocity", "view_pitch", "look_delta"], "vocab": ["movement_id"], "vocab_sum": ["powerup_motion"]},
+    "held_weapon": {"scalars": ["weapon_static", "attack_finished"], "vocab": ["weapon_id"]},
+    "spatial": {"kind": "spatial"},
+    "entities": {"kind": "entities"}
+  },
+  "encoder": {"type": "transformer", "d_model": 64, "n_heads": 2, "n_layers": 2, "d_ffn": 256, "attn_dropout": 0.0},
+  "temporal": {"type": "gru", "d_gru": 64},
+  "pointers": {
+    "target": {"type": "mlp", "d_target": 16}
+  },
+  "heads": {
+    "move": {"type": "cls", "inputs": ["readout", "target.feat"], "d_hidden": 64, "activation": "gelu"},
+    "look": {"type": "polar", "inputs": ["readout", "target.feat"], "d_hidden": 64, "activation": "gelu"},
+    "attack": {"type": "cls", "inputs": ["readout", "target.feat"], "d_hidden": 64, "activation": "gelu"},
+    "weapon": {"type": "cls", "inputs": ["gru", "target.feat"], "d_hidden": 64, "activation": "gelu", "context_from_obs": false}
+  }
+}

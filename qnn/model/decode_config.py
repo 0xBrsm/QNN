@@ -12,7 +12,7 @@ exact decode/guard source is recoverable from a shipped model.
 
 Schema (``decode_version`` 1):
   decode_module   dotted import path — gen decode geometry (must read the head params).
-  guard_module    dotted import path | "none" — exposes guard_fire_logit_for_export +
+  guard_module    dotted import path | "none" — exposes guard_attack_logit_for_export +
                   policy_decode_action_postprocess.
   version         named build id (provenance only), e.g. "a24rc1".
   look_grid       path (run-relative) to the polar look grid; null = code default.
@@ -32,19 +32,24 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Entry points a guard adapter MUST expose — the bit-for-bit eval/export contract.
-_GUARD_REQUIRED = ("guard_fire_logit_for_export", "policy_decode_action_postprocess")
+_GUARD_REQUIRED = ("guard_attack_logit_for_export", "policy_decode_action_postprocess")
 
 # Legacy --decode-regime / eval regime names → their bundled decode-config JSON.
 # The rc-module chain folded into one param-gated guard; regime selection is now
 # picking a decode config. Shared by tools/export_onnx + qnn.eval.run.
 _TEMPLATES = _REPO_ROOT / "src/qnn/model/bench/templates"
 REGIME_CONFIGS: dict[str, Path] = {
-    "a24rc1": _TEMPLATES / "decode.json",          # a24rc1m operating point (20Hz)
+    "a24rc1": _TEMPLATES / "decode.a24rc1.json",   # correctness baseline: anti-broken floor, all aim assist neutralized
+    "a24rc1m": _TEMPLATES / "decode.a24rc1m.json", # first tuned operating point (gain 0.03 + snap + weapon_ban)
     "a24rc1n": _TEMPLATES / "decode.a24rc1n.json", # rc1m heads + rc3 hazard table & "any" dodge (20Hz)
     "a24rc1o": _TEMPLATES / "decode.a24rc1o.json", # rc1n + non-combat baseline hazard + engagement-gated tau + gain 0.02 (20Hz)
     "a24rc1p": _TEMPLATES / "decode.a24rc1p.json", # rc1o + log-normal non-combat hazard (tau 0.75/0.91) + skilled lock-on look schedule (gain 0.015, gentle_all) (20Hz)
     "a24rc2": _TEMPLATES / "decode.a24rc2.json",   # a24rc2a operating point (10Hz)
     "a24rc3": _TEMPLATES / "decode.a24rc3.json",   # newest 20Hz (rc2-lineage @ 20Hz)
+    "a24rc1q": _TEMPLATES / "decode.a24rc1q.json", # FINAL skill-system decode: dampener turn_mag_scale=0.7 + aim p90 (gain 0.20) + all-humans pins + rc1 SG-ban + rc2/3 guards; rc2/3 non-guard decode superseded
+    "a24rc1r": _TEMPLATES / "decode.a24rc1r.json", # rc1q + VALIDATED RL splash feet-aiming (look.weapon_pitch_gain RL=0.3; closed-loop A/B PASS) + wire.11 in-graph decided ATTACK
+    "a24rc1s": _TEMPLATES / "decode.a24rc1s.json", # rc1r + sampled jump; PATCHED in-place with RL feet-aim pitch bias 3.5° (look.weapon_pitch_bias) — bugfix for RL firing ~1.5° high / landing behind
+    "a24rc4": _TEMPLATES / "decode.a24rc4.json",   # de-scripted-label baseline (weapon-head.md §13): per-model pins (weapon gate 0.65/0.0, attack thr 0.46), p99 aim (= rc1v), argmax jump/fire, NO SG ban (rc1-era label-defect compensation retired)
 }
 
 
@@ -69,7 +74,10 @@ PARAM_TO_KWARG: dict[str, str] = {
     "move.sticky_tau_fb": "move_sticky_tau_fb",
     "move.sticky_tau_lr": "move_sticky_tau_lr",
     "move.switchback_eps": "move_switchback_eps",
-    "attack.threshold": "attack_threshold",
+    # attack.threshold RETIRED at wire.11: attack is decoded IN-GRAPH (decided
+    # bit), so there is no engine-side sigmoid>threshold to configure. attack.bias
+    # stays — it is applied inside the in-graph attack decode.
+    "attack.bias": "attack_bias",
 }
 
 

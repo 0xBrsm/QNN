@@ -38,6 +38,7 @@
 #include "qnn_fault.h"
 #include "qnn_io.h"
 #include "qnn_onnx.h"
+#include "qnn_predict.h"
 #include "qnn_tick.h"
 
 #include <stdlib.h>
@@ -54,6 +55,11 @@ static char qnn_client_map_id[QNN_MAX_MAP_ID];
 static FILE *qnn_client_engine_log = NULL;
 static FILE *qnn_client_action_log = NULL;
 static int qnn_client_tick_index = 0;
+
+/* Console terminal + chat-driven remote console (qnn_client_console.c). */
+void QNN_ClientConsoleInit(void);
+void QNN_ConsoleRegisterCvars(void);
+void QNN_ConsoleExecPending(void);
 
 /* Active ONNX policy.  NULL until `model <path>` (or `+model <path>` on
  * argv via stuffcmds) loads one; the tick loop skips inference and the
@@ -118,6 +124,19 @@ static void QNN_Cmd_Model_f(void)
 	if (qnn_client_onnx_ctx != NULL)
 		QNN_OnnxFree(qnn_client_onnx_ctx);
 	qnn_client_onnx_ctx = new_ctx;
+
+	/* Adopt the model's decision cadence: QNN_OnnxInit refused the load unless
+	 * the model carried a valid `tick_hz` stamp, so this is always > 0 (no
+	 * default). The whole client loop is driven off qnn_client_fixed_dt — the
+	 * decision-tick scheduler, Host_Frame step, and prediction dt — and
+	 * qnn_runtime.fixed_tick_hz feeds the latency/back-shift + attack_finished
+	 * normalization. A 10 Hz model now decides every 100 ms, holding the
+	 * usercmd between decisions. */
+	{
+		int model_hz = QNN_OnnxTickHz(new_ctx);
+		qnn_runtime.fixed_tick_hz = model_hz;
+		qnn_client_fixed_dt = 1.0f / (float)model_hz;
+	}
 	/* The clean load line ("model: loaded <path> [wire / semantics]") is
 	 * printed by QNN_OnnxInit, which knows the stamp-selected codec. */
 }
@@ -169,7 +188,8 @@ static void QNN_LogEngineState(void)
 		"\"signon\":%d,\"viewent\":%d,\"num_entities\":%d,"
 		"\"maxclients\":%d,\"viewangles\":[%.1f,%.1f,%.1f],"
 		"\"velocity\":[%.1f,%.1f,%.1f],\"hp\":%d,\"weapon\":%d,"
-		"\"items\":%d,\"scoreboard\":[",
+		"\"items\":%d,"
+		"\"ammo\":[%d,%d,%d,%d],\"scoreboard\":[",
 		qnn_client_tick_index, Sys_FloatTime(),
 		(double)cl.mtime[0], (double)cl.mtime[1],
 		cls.signon, cl.viewentity,
@@ -177,7 +197,9 @@ static void QNN_LogEngineState(void)
 		cl.viewangles[0], cl.viewangles[1], cl.viewangles[2],
 		cl.velocity[0], cl.velocity[1], cl.velocity[2],
 		cl.stats[STAT_HEALTH], cl.stats[STAT_ACTIVEWEAPON],
-		cl.items);
+		cl.items,
+		cl.stats[STAT_SHELLS], cl.stats[STAT_NAILS],
+		cl.stats[STAT_ROCKETS], cl.stats[STAT_CELLS]);
 	if (cl.scores != NULL)
 	{
 		n = cl.maxclients < 16 ? cl.maxclients : 16;
@@ -333,6 +355,14 @@ static qboolean QNN_BuildAndInfer(
 	qnn_tick_result_t result;
 
 	QNN_CaptureBaseSnapshot(&snapshot);
+	/* Self-state prediction: replay this client's own issued cmds onto the
+	 * (transport-lagged) server velocity so the obs match the model's
+	 * server-aligned training semantics. Reset clears the cmd ring with
+	 * the episode; the lag estimate persists (transport doesn't change). */
+	if (reset_flag)
+		QNN_PredictReset();
+	QNN_PredictTick(qnn_client_fixed_dt);
+	QNN_PredictSelfVelocity(snapshot.player_velocity);
 	snapshot.action_label = *prev_action;
 	QNN_DrainSounds(&snapshot);
 
@@ -354,7 +384,9 @@ int main(int argc, char **argv)
 	qnn_action_t *next_action = &action_b;
 	qboolean was_ready = false;
 
+	QNN_ClientConsoleInit();
 	QNN_FaultInit("nq_client");
+	QNN_PredictInit();
 	QNN_ResolveBasedir(qnn_basedir_storage, sizeof(qnn_basedir_storage));
 	QNN_ClearAction(&qnn_pending_action);
 	QNN_ClearAction(&action_a);
@@ -402,6 +434,13 @@ int main(int argc, char **argv)
 	 * `+model <path>` on argv as the initial load. */
 	Cmd_AddCommand("model", QNN_Cmd_Model_f);
 
+	/* Same timing requirement for the perception cvars: without this,
+	 * `qnn_fov` set from argv or a startup cfg (e.g. nqdev's qnn.cfg) is
+	 * "Unknown command" — silently dropped — because QNN_IOInit only runs
+	 * at the first QNN tick, long after configs exec. */
+	QNN_RegisterPerceptionCvars();
+	QNN_ConsoleRegisterCvars();
+
 	/* Sound-subsystem no-ops (see QNN_Cmd_SoundStub_f comment). */
 	Cmd_AddCommand("play",      QNN_Cmd_SoundStub_f);
 	Cmd_AddCommand("playvol",   QNN_Cmd_SoundStub_f);
@@ -409,10 +448,15 @@ int main(int argc, char **argv)
 	Cmd_AddCommand("soundlist", QNN_Cmd_SoundStub_f);
 	Cmd_AddCommand("soundinfo", QNN_Cmd_SoundStub_f);
 
-	/* Flush quake.rc (queued by Host_Init) — its `stuffcmds` runs the +args,
-	 * including `+model`. We deliberately do NOT add a second `stuffcmds`: that
-	 * ran `+model` twice and loaded the model twice. */
-	Cbuf_Execute();
+	/* Drain the startup command buffer (quake.rc stuffcmds: +model, connect,
+	 * configs) by running one frame, so the buffer executes inside _Host_Frame's
+	 * host_abortserver setjmp — exactly how stock Quake processes it. A failed
+	 * `connect` (or any other Host_Error) then unwinds back here and we fall
+	 * through to the idle loop, instead of longjmp'ing into an unset jump buffer
+	 * and crashing (which boot-loops under a restart policy). Loading `+model`
+	 * here also adopts the model's tick cadence before the loop sets its pacing
+	 * below. (We still don't add a second `stuffcmds` — that loaded +model twice.) */
+	Host_Frame(qnn_client_fixed_dt);
 
 	if (qnn_client_onnx_ctx == NULL)
 		fprintf(stderr, "qnn_client: no model loaded; type `model <path.onnx>` "
@@ -433,6 +477,20 @@ int main(int argc, char **argv)
 		else
 			qnn_client_next_tick_time = now;
 		qnn_client_next_tick_time += qnn_client_fixed_dt;
+
+		/* Interactive console: run any command line typed at the terminal.
+		 * Cbuf executes it inside Host_Frame regardless of key_dest. */
+		{
+			char *line = Sys_ConsoleInput();
+			if (line != NULL)
+			{
+				Cbuf_AddText(line);
+				Cbuf_AddText("\n");
+			}
+		}
+
+		/* Run any pending chat (qnn_rcon) command and reply to the sender. */
+		QNN_ConsoleExecPending();
 
 		qnn_pending_action = *cur_action;
 		Host_Frame(qnn_client_fixed_dt);

@@ -18,5 +18,5 @@ zero-filling dead fields, its semantics are **not** automatically recoverable â€
 `semantics.0aâ€“0d` use different scales/vocab than `semantics.1`, and the flat era
 (`0a`) applied some scaling C-side. Any pre-v11 codec would need its own
 semantics id wired in, not a reuse of `semantics.1`. Full per-epoch detail is in
-the archived bundled docs (`docs/archive/token-spec-v*`, `obs-spec-v*`,
+the archived bundled docs (`research/archive/token-spec-v*`, `obs-spec-v*`,
 `vocab-v*`).

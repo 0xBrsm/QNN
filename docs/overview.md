@@ -7,9 +7,12 @@ action heads (move, look, attack, weapon) drive the engine. The pipeline is
 seeded by behavioral cloning on Quake demos and fine-tuned via Sample Factory
 APPO against FrikBotNex opponents.
 
-Related docs: [head-metrics.md](head-metrics.md) (the canonical metric contract —
+Related docs: [RESEARCH.md](../../docs/RESEARCH.md) (the research spine — hypothesis,
+endpoints, claims register, roadmap),
+[head-metrics.md](../../docs/head-metrics.md) (the canonical metric contract —
 how every action head is judged), [contracts/](contracts/README.md) (wire / semantics /
 arch contract versions + I/O signatures), [vocab.md](vocab.md) (IDs and event mapping), [run.md](run.md) (config schema),
+[release-flow.md](release-flow.md) (per-head ablation → assembled RC line → PPO rc1),
 [vendor.md](vendor.md) (dependencies),
 [diag.md](diag.md) (capacity diagnostics on trained policies —
 `python -m qnn.diag analyze` for unified per-head analysis,
@@ -121,7 +124,7 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 |------|---------|
 | `qnn/vocab.py` | shared semantic IDs (source of truth) |
 | `qnn/actions.py` | canonical mixed action schema, move pack/unpack, look decoding |
-| `qnn/wire.py` | binary wire format parser, action struct layout, LOBS labeler frame |
+| `qnn/wire.py` | binary wire format parser, action struct layout (QOBS) |
 | `qnn/schema.py` | OBS_SCHEMA, observation-embedding input shapes |
 | `qnn/filter_dsl.py` | shared filter mini-language (collect + train) |
 | `qnn/collection_fingerprint.py` | collect-identity hash recorded at train time |
@@ -150,7 +153,6 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 | `engine/common/` | shared C worker: store, oracle, entity, event, io, sound, spatial, fault, watchdog, tick |
 | `engine/common/qnn_mvd_collect.{c,h}` | shared MVD/QWD demo collect runtime |
 | `engine/common/qnn_qwd_collect.{c,h}` | QWD usercmd-path collect helpers |
-| `engine/common/qnn_labeler_collect.{c,h}` | native-rate labeler LOBS emit |
 | `engine/nq/` | NetQuake collect/trainer/client main loops, physics, input |
 | `engine/qw/` | QuakeWorld collect main loop, physics, input |
 | `engine/build/` | build scripts for `ppo_worker`, `nq_demo_worker`, `nq_client`, `qw_demo_worker`, `qw_classifier` |

@@ -1,0 +1,110 @@
+{
+  "decode_version": 1,
+  "version": "a24rc1v",
+  "description": "a24rc1r + jump (ud) as a SAMPLED attack-style impulse: move.jump_sample=true replaces the legacy ud argmax with a per-tick Bernoulli on sigmoid((pos-none+jump_bias)/jump_temp) off the move decode threaded rng. Op-masked +jump is a 1-tick impulse (median 1f, 80% single-tick), NOT a dwell, so no sticky/hazard/hold; engine gates feasibility. Fixes the argmax jump-collapse. Also bumped to p99 overall aim skill (look.aim_mag_gain alpha=0.1, super-band p99 anchor; rc1r was p95/0.05). Other move/weapon/guard params identical to rc1r. jump_bias=-0.21 calibrated to human P(jump|feasible)=2.27% (input_mask bit7 feasible / op_input bit2 executed). PATCH (bugfix, aim-only, no other behavior change): + RL feet-aim pitch bias 3.5° via look.weapon_pitch_bias[7]. RL was firing a static ~1.5° ABOVE the feet anchor (straight no-gravity rocket → flies over → lands behind); offset is immune to β and z_rate feed-forward (a static az/el-coupled decode gap), so a fixed downward bias is the right compensation. Closed-loop (β=0.8): fire-pitch −1.51°→−0.08°, acc 0.438→0.459, dmg +12%. JUMP REVERT: move.jump_sample=false → TRUE deterministic argmax jump (the export jump-gumbel is now gated off under argmax, so deployed == offline argmax; jump_bias/jump_temp are inert in this mode). Sampled jump fired at ~human rate but RANDOM times (head onset signal is weak), reading as over-frequent unmotivated hops; argmax fires only the model most-confident jump frames (fewer, higher-precision). No threshold. ATTACK→GREEDY: attack.threshold=0.25 (reuses the retired engine-side sigmoid>threshold, now in-graph) → deterministic fire iff sigmoid(fire_logit+bias)≥0.25 (replaces per-tick Bernoulli). Calibrated to human fire frequency (137 shots/ep, == sampled; closed-loop sweep). Deterministic fire commits on the confident tick so it co-occurs with jump+aim → restores coordinated actions (rocket-jump) that independent fire-sampling broke. Costs ~+0.02 accuracy; ~−0.35° RL fire-pitch erosion (determinism selects body-aimed frames; RL pitch bias RE-SWEPT to 4.0 under greedy attack (centers fire-pitch on the feet; 3.5 was fit under sampled fire and left it ~0.56° high)); void-fire unchanged (an aim, not confidence, problem). | a24rc1t = rc1s params + eye-frame vertical anchor (compute_lead_aim shifts aim to the eye, view_ofs 22u; commit 985d2499). Fixes RL fly-over: +17% acc, +35% dmg/frags. No wire/param change. | a24rc1u = rc1t + HUMAN-LIKE feet-aim: weapon_pitch_mode=shift (strength 0.8) replaces the aimbot lock, tuned against an uncorrected human reference (proxy: any RL-held LOS frame, val-only, mean +0.5/std 18). | a24rc1v = a24rc1u with shift_strength 0.8→0.4, re-tuned against the CORRECTED human reference: real fire frames (qnn.bc.train._unpack_attack_bit) pooled across val+train (1928 players, 699k fire frames, skill-invariant) → mean -2.08° std 16.2° (scripts/analysis/rl_vertical_aim_by_skill.py, runs/head_probe/_rl_vertical_aim_by_skill.json). Closed-loop shift_strength sweep (scripts/analysis/rl_shift_strength_sweep.py, runs/head_probe/_rl_shift_strength_sweep.json) vs this target: shift 0.4 fp_mean -2.05 (delta 0.04, best match) vs shift 0.8's fp_mean -1.10 (delta 0.98, over-shot). No tested strength reaches the human's full spread (16.2) even at 0.8 (plateaus ~12.6) -- a genuine closed-loop rate ceiling (20Hz, not 10Hz -- see research/rl-feet-aim-human-likeness.md §3/§6 correction), not fixable by this knob alone. See research/rl-feet-aim-human-likeness.md §6.",
+  "decode_module": "qnn.model.bench.a24.decode",
+  "guard_module": "qnn.model.bench.a24.guard",
+  "look_grid": "config/look_grid.json",
+  "move_hazard": {
+    "schema": "move_hazard_v1",
+    "method": "lognorm",
+    "provenance": "NON-COMBAT (target==0) train frames; contiguous non-combat runs",
+    "tick_hz": 20,
+    "lognorm": {
+      "noncombat": true,
+      "fb": [
+        [
+          1.47982,
+          0.77623
+        ],
+        [
+          1.58431,
+          1.28612
+        ],
+        [
+          2.26121,
+          1.03759
+        ]
+      ],
+      "lr": [
+        [
+          1.591,
+          0.86096
+        ],
+        [
+          1.15904,
+          1.39641
+        ],
+        [
+          1.58811,
+          0.8665
+        ]
+      ],
+      "param_names": [
+        "mu",
+        "sigma"
+      ],
+      "maxage": 400
+    }
+  },
+  "params": {
+    "look.aim_prior_gain": 0.2,
+    "look.aim_ffwd_gain": 0.0,
+    "look.aim_mag_gain": 0.1,
+    "look.turn_mag_scale": 0.7,
+    "look.lead_hold_cap_frames": 4.0,
+    "look.lead_hold_cap_radial_frames": 5.0,
+    "attack.bias": -1.1,
+    "move.sticky_tau_fb": 0.74,
+    "move.sticky_tau_lr": 0.92,
+    "move.tau_engagement_gated": true,
+    "move.stop_onset": true,
+    "move.switchback_eps": 0.1,
+    "weapon.sticky_confidence": 0.57,
+    "weapon.sticky_margin": 0.0,
+    "weapon_ban": [
+      2
+    ],
+    "guard.attack_splash": true,
+    "guard.rocket_ehr": true,
+    "guard.rocket_ehr_safety_margin_hp": 10.0,
+    "guard.rocket_floor_min_pitch_deg": 12.0,
+    "guard.lg_range": true,
+    "guard.lg_range_u": 600.0,
+    "guard.lg_align_half_angle_deg": 15.0,
+    "guard.projectile_release": true,
+    "guard.projectile_release_mode": "any",
+    "guard.projectile_release_horizon_s": 1.0,
+    "guard.projectile_hit_radius_u": 45.0,
+    "guard.projectile_release_splash": true,
+    "guard.projectile_release_arc": true,
+    "look.weapon_pitch_gain": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    "move.jump_sample": false,
+    "move.jump_bias": -0.21,
+    "move.jump_temp": 1.0,
+    "look.weapon_pitch_bias": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "attack.threshold": 0.25,
+    "look.weapon_pitch_mode": "shift",
+    "look.weapon_pitch_shift_strength": 0.4
+  }
+}

@@ -420,14 +420,15 @@ def build_run_eval_config(
         ),
         # Optional: dump per-episode decoded move streams (diagnostics).
         "log_action_streams": bool(train.get("eval_log_action_streams", False)),
-        # Optional: semi-Markov hazard decode tables (dict with edges +
-        # per-axis fb/lr/ud release probabilities). Requires the sticky taus.
+        # Optional: semi-Markov dwell hazard (dict with a "lognorm" block of
+        # per-axis fb/lr (mu,sigma); the decode evaluates h(t) per dwell-age,
+        # no bucketed table). Requires the sticky taus.
         "move_hazard": (
             dict(train["eval_move_hazard"])
             if isinstance(train.get("eval_move_hazard"), Mapping) else None
         ),
         # Optional: latency-agnostic switch-back suppression (watermark on the
-        # abandoned class's softmax prob; see docs/move-head.md). Requires
+        # abandoned class's softmax prob; see research/move-head.md). Requires
         # the sticky taus.
         "move_switchback_eps": (
             float(train["eval_move_switchback_eps"])
@@ -451,8 +452,12 @@ def build_run_eval_config(
             str(train["eval_decode_regime"])
             if "eval_decode_regime" in train else None
         ),
-        "look_aim_snap_thresholds_deg": train.get("eval_look_aim_snap_thresholds_deg"),
-        "look_aim_snap_scales":         train.get("eval_look_aim_snap_scales"),
+        # Optional: opt-in batched-forward decode — stack all active envs into
+        # one model.act(B=N) per macro-step so the CPU saturates instead of
+        # idling in the per-env ping-pong. NOT bit-identical to the default B=1
+        # path; only for evals robust to float-level batching differences (e.g.
+        # the aim grid's coh_5deg). See EvalConfig.batched_forward.
+        "batched_forward": bool(train.get("eval_batched_forward", False)),
     }
 
 

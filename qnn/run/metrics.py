@@ -9,6 +9,9 @@ from typing import Dict
 EPISODE_MEAN_ALIASES = {
     "frags": "frags_mean",
     "deaths": "deaths_mean",
+    "suicides": "suicides_mean",
+    "deaths_by_opponent": "deaths_by_opponent_mean",
+    "suicide_rate": "suicide_rate_mean",
     "kd_ratio": "kd_ratio_mean",
     "damage_dealt": "episode_damage_dealt_mean",
     "damage_taken": "episode_damage_taken_mean",
@@ -42,6 +45,8 @@ PPO_REPORT_METRICS = (
     "mean_episode_return",
     "effective_game_minutes_per_wall_minute",
     "deaths_mean",
+    "suicides_mean",
+    "suicide_rate_mean",
     "frag_delta_mean",
     "damage_dealt_mean",
     "hit_count_mean",
@@ -62,6 +67,9 @@ PPO_REPORT_METRICS = (
 EVAL_REPORT_METRICS = (
     "mean_episode_return",
     "death_rate",
+    "suicides_mean",
+    "deaths_by_opponent_mean",
+    "suicide_rate_mean",
     "frag_delta_mean",
     "damage_dealt_mean",
     "hit_count_mean",
@@ -102,6 +110,7 @@ def build_episode_extra_stats(
     *,
     frags: int,
     deaths: int,
+    suicides: int,
     damage_dealt: float,
     damage_taken: float,
     steps: int,
@@ -127,6 +136,9 @@ def build_episode_extra_stats(
     return {
         "frags": float(frags),
         "deaths": float(deaths),
+        "suicides": float(suicides),
+        "deaths_by_opponent": float(deaths - suicides),
+        "suicide_rate": float(suicides / max_deaths),
         "kd_ratio": float(frags / max_deaths),
         "damage_dealt": float(damage_dealt),
         "damage_taken": float(damage_taken),
@@ -156,6 +168,7 @@ class EpisodeStatAccumulator:
 
     frags: int = 0
     deaths: int = 0
+    suicides: int = 0
     damage_dealt: float = 0.0
     damage_taken: float = 0.0
     steps: int = 0
@@ -185,6 +198,8 @@ class EpisodeStatAccumulator:
         )
         if player_died:
             self.deaths += 1
+            if bool(info.get("player_suicide")):
+                self.suicides += 1
         self.damage_dealt += float(info.get("damage_dealt", 0.0))
         self.damage_taken += float(info.get("damage_taken", 0.0))
         self.steps += 1
@@ -207,6 +222,7 @@ class EpisodeStatAccumulator:
         return build_episode_extra_stats(
             frags=self.frags,
             deaths=self.deaths,
+            suicides=self.suicides,
             damage_dealt=self.damage_dealt,
             damage_taken=self.damage_taken,
             steps=self.steps,

@@ -21,11 +21,9 @@
 
 void QNN_IOInit(const qnn_map_state_t *map_state)
 {
-	/* Register the perception cone cvar once. IOInit re-runs per map
-	 * load; the guard keeps Cvar_RegisterVariable from warning on the
-	 * repeats and preserves any console-set value across map changes. */
-	if (Cvar_FindVar("qnn_fov") == NULL)
-		Cvar_RegisterVariable(&qnn_fov);
+	/* Register the perception cone cvar once (idempotent — IOInit
+	 * re-runs per map load; a console-set value survives map changes). */
+	QNN_RegisterPerceptionCvars();
 
 	QNN_PlayersResetTeamCache();
 	QNN_EventInit(map_state);
@@ -62,6 +60,14 @@ void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
 {
 	memset(out, 0, sizeof(*out));
 
+	/* Compute-gate: skip the expensive entity oracle / spatial raycast
+	 * when their blocks are not selected for this collect.  The memset
+	 * above already zeroed out->entities / out->spatial / out->entity_count,
+	 * so the wire buffer stays valid (entity stream n_tokens=0, spatial
+	 * all-zero) without inventing a new variable-length layout.  Both
+	 * flags default true (set in QNN_HandleCollect), so the full BC
+	 * collect is unchanged. */
+	if (!qnn_runtime.skip_entities)
 	{
 		int player_cluster_id;
 		out->entity_count = QNN_OracleEmitTokens(out->entities,
@@ -69,7 +75,8 @@ void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
 			snapshot, &qnn_map_state, &player_cluster_id);
 	}
 	QNN_SelfEmitToken(&out->self, snapshot);
-	QNN_SpatialEmitTokens(snapshot, out->spatial);
+	if (!qnn_runtime.skip_spatial)
+		QNN_SpatialEmitTokens(snapshot, out->spatial);
 }
 
 /* ── Obs buffer serialization ─────────────────────────────────── */

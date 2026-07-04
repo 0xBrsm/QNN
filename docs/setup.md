@@ -244,7 +244,7 @@ python scripts/make_random_checkpoint.py \
     --output assets/seeds/rand_seed29/rand_seed29.pth
 ```
 
-The checkpoint has the same architecture/sidecar layout as a BC `bc_best_model.pth`, so `qnn.run.init --mode ppo --checkpoint-path ...` accepts it directly.
+The checkpoint has the same architecture/sidecar layout as a BC best model (`best_<run_id>.pth`), so `qnn.run.init --mode ppo --checkpoint-path ...` accepts it directly.
 
 ### Live Play
 
@@ -253,7 +253,7 @@ binary:
 
 ```bash
 python -m qnn.eval.live \
-    --checkpoint runs/bc/bc_v1/checkpoints/bc_best_model.pth \
+    --checkpoint runs/bc/<run>/checkpoints/best_<run_id>.pth \
     --server <host>:<port>
 ```
 

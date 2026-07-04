@@ -1,4 +1,9 @@
-# Wire contract `wire.9` — native split + in-graph MOVE decode (current)
+# Wire contract `wire.9` — native split + in-graph MOVE decode
+
+> **SUPERSEDED by [`wire.11`](wire.11.md).** `wire.11` = `wire.9` + the in-graph
+> ATTACK decode (decided `attack` bit instead of `fire_logit`). The a24 gen
+> migrates to `wire.11` by re-export; this page documents the move-decode half,
+> which `wire.11` inherits unchanged.
 
 The current wire contract — what `tools/export_onnx.py` produces for a
 `full_4head` model at HEAD. `wire.9` = [`wire.8`](wire.8.md) + `look_delta`
@@ -21,8 +26,7 @@ metadata.
   the decided-`move` / decided-weapon decode; the move difference vs the legacy
   logit-move path is keyed on the resolved **wire-version** `ctx->wire_major` —
   ACTION interpretation only, never state).
-- **Artifacts:** `/tmp/qnn_v24*.onnx`, the deployed bot on `\\pi.local\qnn`,
-  `runs/bc/bench/**` checkpoints.
+- **Artifacts:** the v24-era ONNX exports and the deployed bot.
 - **Source of truth:** `src/qnn/engine_norm.py` + `NATIVE_INPUTS` /
   `_output_names` in `tools/export_onnx.py`; C side `src/engine/common/qnn_onnx.c`.
 

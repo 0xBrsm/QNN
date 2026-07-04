@@ -236,15 +236,47 @@ static void QNN_StampPvs(qnn_entity_t *e, float now, qboolean in_fov)
 		e->vis = now;
 }
 
-/* Compute velocity from positional delta, clamped at 1000 u/s. */
-static void QNN_ComputeStoreVelocity(qnn_entity_t *e, const vec3_t new_origin, float emit_dt)
+/* Only ACTORS teleport (slipgates, respawns); projectiles/items/movers
+ * obey physics and never do, so they keep their finite-diff velocity
+ * unclamped (slot-reuse / first-sight garbage is handled by valid_prev,
+ * not a magnitude limit). The engine clamps live player velocity to
+ * sv_maxvelocity (~2000 u/s) PER AXIS, so any per-component speed beyond
+ * that is a teleport — which jumps a whole map segment in one native
+ * frame (0.05-0.073 s = tens of thousands of u/s). A per-axis threshold
+ * just above the cap rejects teleports while preserving fast real motion
+ * (a diagonal/vertical burst can reach ~2000 on each axis, ~3464
+ * magnitude — a single magnitude limit would clip it). */
+#define QNN_ACTOR_TELEPORT_LIMIT 2100.0f
+
+/* Compute velocity from positional delta over one emit interval.
+ * `valid_prev` must be false on first-sight or when this store slot's
+ * previous origin belonged to a different entity (edict-slot reuse) —
+ * finite-differencing across an identity change yields a cross-map
+ * delta that is not real movement.  In that case velocity is zeroed
+ * (no prior position to difference against) rather than fabricated. */
+static void QNN_ComputeStoreVelocity(qnn_entity_t *e, const vec3_t new_origin,
+	float emit_dt, qboolean valid_prev)
 {
 	vec3_t delta;
-	float speed_sq;
+	if (!valid_prev)
+	{
+		/* No trustworthy prior sample (first sight / slot reuse) — velocity
+		 * is unknown, not zero-because-stationary, but zero is the honest
+		 * "no info" emission. */
+		e->velocity[0] = 0.0f;
+		e->velocity[1] = 0.0f;
+		e->velocity[2] = 0.0f;
+		return;
+	}
 	VectorSubtract(new_origin, e->origin, delta);
 	VectorScale(delta, 1.0f / emit_dt, e->velocity);
-	speed_sq = DotProduct(e->velocity, e->velocity);
-	if (speed_sq > 1000.0f * 1000.0f)
+	/* Teleport rejection — actors only, per axis (see QNN_ACTOR_TELEPORT_LIMIT).
+	 * Non-actors are never clamped: their finite-diff is real velocity. A
+	 * teleported player's post-teleport velocity is unknown, so zero it. */
+	if (e->type == QNN_ENT_ACTOR
+		&& (fabsf(e->velocity[0]) > QNN_ACTOR_TELEPORT_LIMIT
+		||  fabsf(e->velocity[1]) > QNN_ACTOR_TELEPORT_LIMIT
+		||  fabsf(e->velocity[2]) > QNN_ACTOR_TELEPORT_LIMIT))
 	{
 		e->velocity[0] = 0.0f;
 		e->velocity[1] = 0.0f;
@@ -561,10 +593,32 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 			e->qualifier_id = eu->qualifier_id;
 			e->entity_num = eu->entity_num;
 
-			if (e->pvs > 0.0f || e->snd > 0.0f || e->mem > 0.0f)
-				QNN_ComputeStoreVelocity(e, eu->origin, emit_dt);
-			else
+			/* Velocity: prefer the wire-authoritative player velocity
+			 * (eu->velocity = playerstate->velocity, the server's own
+			 * value carried in svc_playerinfo).  QWD/MVD player packets
+			 * arrive slower (~10-13 Hz) than the emit rate (20+ Hz), so
+			 * an origin finite-difference reads zero on every in-between
+			 * emit where the packet — and hence the cached origin — has
+			 * not advanced, flickering a moving player to standstill
+			 * (~10pp of all actor observations).  The wire velocity does
+			 * not suffer the cadence gap: it is the player's real speed
+			 * at packet time, and is exactly zero for a genuinely parked
+			 * player (PF_VELOCITY suppressed).  Fall back to the origin
+			 * finite-difference only when the wire carries no velocity
+			 * (e.g. a frame the server omitted it but the origin moved). */
+			if (eu->velocity[0] != 0.0f || eu->velocity[1] != 0.0f
+				|| eu->velocity[2] != 0.0f)
+			{
 				VectorCopy(eu->velocity, e->velocity);
+			}
+			else if (e->pvs > 0.0f || e->snd > 0.0f || e->mem > 0.0f)
+			{
+				QNN_ComputeStoreVelocity(e, eu->origin, emit_dt, true);
+			}
+			else
+			{
+				VectorCopy(eu->velocity, e->velocity);
+			}
 			VectorCopy(eu->origin, e->origin);
 			VectorCopy(eu->angles, e->angles);
 			QNN_StampPvs(e, now, eu->in_fov);
@@ -593,13 +647,32 @@ void QNN_StoreUpdate(const qnn_snapshot_t *snapshot, float emit_dt)
 		/* Ephemeral: projectiles + backpacks */
 		if (QNN_IsEphemeral(eu->subject_id))
 		{
-			entity_t *cl_ent = &cl_entities[eu->entity_num];
+			int new_type = (eu->subject_id == QNN_SUBJECT_BACKPACK)
+				? QNN_ENT_BACKPACK : QNN_ENT_PROJECTILE;
 
-			e->type = (eu->subject_id == QNN_SUBJECT_BACKPACK) ? QNN_ENT_BACKPACK : QNN_ENT_PROJECTILE;
+			/* Velocity is only meaningful when e->origin holds THIS
+			 * same projectile's position from the previous emit.  QW
+			 * recycles edict slots, so a freshly-spawned rocket can land
+			 * in a slot whose stored origin belonged to the rocket (or
+			 * backpack) that lived there before — differencing across
+			 * that identity change produces a spurious cross-map delta.
+			 * Require: same store identity (type + subject) AND observed
+			 * within the previous emit interval (pvs stamp not stale). */
+			qboolean valid_prev = (e->type == new_type)
+				&& (e->subject_id == eu->subject_id)
+				&& (e->pvs > 0.0f)
+				&& (now - e->pvs <= 1.5f * emit_dt);
+
+			e->type = new_type;
 			e->subject_id = eu->subject_id;
 			e->entity_num = eu->entity_num;
 
-			QNN_ComputeStoreVelocity(e, cl_ent->msg_origins[0], emit_dt);
+			/* Difference the anchored origin against the anchored origin
+			 * stored last emit (e->origin), not the raw msg_origins[0]:
+			 * mixing the model-anchored previous position with the raw
+			 * current one injected a constant per-model bias into the
+			 * delta. */
+			QNN_ComputeStoreVelocity(e, eu->origin, emit_dt, valid_prev);
 			VectorCopy(eu->origin, e->origin);
 			QNN_StampPvs(e, now, eu->in_fov);
 

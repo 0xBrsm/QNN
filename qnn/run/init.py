@@ -70,6 +70,7 @@ def main() -> None:
     parser.add_argument("--machine", help="Path to machine.json (overrides template)")
     parser.add_argument("--model", help="Path to model.json (overrides template)")
     parser.add_argument("--probe", help="Path to probe.json (overrides template; head_probe mode)")
+    parser.add_argument("--decode", help="Path to decode.json (overrides template; e.g. a versioned templates/decode.*.json)")
     args = parser.parse_args()
 
     template_dir = _template_dir_for_mode(args.mode)

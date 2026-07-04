@@ -1,0 +1,13 @@
+{
+  "decode_version": 1,
+  "version": "a17",
+  "decode_module": "qnn.model.decode",
+  "guard_module": "none",
+  "look_grid": null,
+  "move_hazard": null,
+  "_note": "old convention (wire.7, pre-decode-stamp); for re-stamping the deployed model, not a24-path export",
+  "params": {
+    "look.aim_prior_gain": 0.0,
+    "weapon_ban": []
+  }
+}

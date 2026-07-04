@@ -7,6 +7,7 @@
 
 #include "qnn_navmesh.h"
 #include "qnn_vocab.h"
+#include "qnn_weapon.h"
 #include "quakedef.h"
 
 #ifndef QNN_ROUTE_RUNTIME_FWD
@@ -133,7 +134,17 @@ typedef struct
 				 * labels. Bit layout matches `move` above
 				 * (packed by QNN_PackInputMask). Trainer uses
 				 * when input_mask=true in train.json. */
-	uint8_t	_pad;
+	uint8_t	op_input;	/* strict per-axis OPERATIVENESS mask (packed by
+				 * QNN_PackOpInput): bit i = 1 iff the player
+				 * pressed axis i AND the engine acted on it this
+				 * tick.  Semantically DISTINCT from input_mask
+				 * (pure feasibility): op_input AND's the press
+				 * with the per-axis op predicate.
+				 *   bit0 = fb       bit1 = lr
+				 *   bit2 = ud       bit3 = fire
+				 *   bit4 = impulse  (bits 5..7 reserved)
+				 * 0 on paths that don't compute it (e.g. NQ,
+				 * MVD-inference). */
 	float	look[3];
 } qnn_action_t;
 
@@ -210,6 +221,18 @@ extern qnn_action_t qnn_pending_action;
 extern qnn_sound_event_t qnn_sound_buffer[QNN_MAX_SOUNDS];
 extern int qnn_sound_count;
 
+/* MVD anchor player: the client slot we are "locked" to during MVD
+ * playback.  The whole self/observation pipeline keys off cl.playernum
+ * (QNN_SyncEngineCompat sets viewentity = playernum+1 and reads self
+ * state from qnn_mvd_latest_playerstate[playernum]); locking drives
+ * playernum to a real slot instead of the spectator override, so the
+ * proven single-POV QWD emission path applies to MVD verbatim.  It also
+ * gates the MVD demux: dem_single/dem_multiple blocks not addressed to
+ * this slot are skipped, so the worker sees exactly the event/sound
+ * stream this player received (its own fire sound is always in it).
+ * -1 = unlocked (legacy spectator behavior).  Defined in cl_ents.c. */
+extern int qnn_mvd_anchor_player;
+
 /* Shared globals (defined in qnn_sys.c) */
 extern qnn_map_state_t qnn_map_state;
 extern char qnn_basedir_storage[MAX_OSPATH];
@@ -266,13 +289,20 @@ int QNN_WeaponId(void);
 int QNN_CurrentFrags(void);
 void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot);
 void QNN_DrainSounds(qnn_snapshot_t *snapshot);
-qboolean QNN_SnapshotHasSelfWeaponFireSound(const qnn_snapshot_t *snapshot);
+qboolean QNN_SnapshotHasSelfWeaponAttackSound(const qnn_snapshot_t *snapshot);
 qboolean QNN_SnapshotHasSelfJumpSound(const qnn_snapshot_t *snapshot);
 /* Per-sound check used by the per-event MVD fire back-shift.  See
- * qnn_event.c — same rules as QNN_SnapshotHasSelfWeaponFireSound
+ * qnn_event.c — same rules as QNN_SnapshotHasSelfWeaponAttackSound
  * but on one sound so the caller can route per native_time. */
-qboolean QNN_IsSelfWeaponFireSound(const qnn_sound_event_t *sound);
+qboolean QNN_IsSelfWeaponAttackSound(const qnn_sound_event_t *sound);
 qboolean QNN_IsSelfJumpSound(const qnn_sound_event_t *sound);
+/* Raw weapon id (1..8) of the weapon whose fire-sound this is, or
+ * QNN_WEAPON_NONE if `sound` is not a self weapon-fire multicast.  The
+ * sound's own class is the demo's byte truth — used by the MVD fire
+ * back-shift to stamp the firing weapon onto the same slot as the attack
+ * bit (phase-locked attribution), instead of trusting the held-weapon
+ * snapshot at a separately-shifted frame. */
+int QNN_WeaponIdFromAttackSound(const qnn_sound_event_t *sound);
 
 /* IO (qnn_io.c) — see qnn_io.h for full typed token API */
 
@@ -294,6 +324,13 @@ void QNN_PhysInit(void);
  * with --sanitize-inputs.  Returns false if progs.dat load fails. */
 qboolean QNN_ProgsInit(void);
 void     QNN_ProgsSmokeTest(void);
+
+/* Called from the patched CL_ParseServerData (right after CL_ClearState)
+ * when a — possibly mid-demo — svc_serverdata frees the hunk the QC VM was
+ * allocated into.  Flags a deferred VM reload; the next QC entry reloads it
+ * onto the post-reset hunk.  Without this, multi-map / multi-session demos
+ * fault on dangling progs memory.  Safe to call before QNN_ProgsInit. */
+void     QNN_ProgsNotifyWorldReset(void);
 
 /* Per-tick predicate eval.  Run the real QC ImpulseCommands dispatcher
  * against a freshly-populated edict with the supplied state and return
@@ -328,22 +365,45 @@ int QNN_ProgsEvalWeaponImpulseOperative(
 	int ammo_shells, int ammo_nails, int ammo_rockets, int ammo_cells,
 	int snapshot_weapon_id, int impulse);
 
+/* Current QC-tracked self.weapon (impulse 1..8 form) maintained by
+ * QNN_ProgsStepWeaponFrame; 0 until seeded from the snapshot.
+ * Read once per emit tick as the canonical action.weapon label. */
+int QNN_ProgsGetSelfWeapon(void);
+
+/* Unified per-cmd QC think advance.  Drives the real W_WeaponFrame on the
+ * shared persistent player state (self.weapon + attack_finished), so the
+ * weapon select and the fire share ONE cooldown gate and the select is
+ * realized only when the engine would realize it (no early-process stuck
+ * divergence).  Resyncs self.weapon from snapshot_weapon_id on
+ * server-forced switches.  Outputs (any may be NULL): the post-step
+ * weapon (impulse form, = the canonical action.weapon label), whether the
+ * weapon flipped this cmd, and whether W_Attack fired this cmd.  Replaces
+ * the separate per-cmd weapon-impulse advance and per-cmd QNN_ProgsEvalAttack
+ * advance; feasibility probes stay on QNN_ProgsEvalAttack. */
+void QNN_ProgsStepWeaponFrame(
+	float now_seconds,
+	int health, int items_owned,
+	int ammo_shells, int ammo_nails, int ammo_rockets, int ammo_cells,
+	int snapshot_weapon_id, int impulse, int button0_pressed,
+	int *out_weapon, int *out_weapon_op, int *out_fire_op);
+
 /* impulse byte (1..8) -> IT_* item flag.  Returns 0 for impulses 9..12
  * (which don't map to a single weapon — cycle/cheat/serverflags). */
 int QNN_ImpulseToItemFlag(int impulse);
 
 /* Per-tick W_Attack predicate.  Runs the real QC W_WeaponFrame against
- * an injected edict at server-time = tick / tick_hz.  Returns 1 iff
- * self.attack_finished was advanced (= W_Attack actually fired this
- * tick).  Caller must invoke once per native tick where button0 might
- * be pressed so the persistent attack_finished state stays correct
- * across cooldown windows.  Returns 0 on dead player, invalid weapon,
- * VM not inited, or when the cooldown gate / no-ammo branch rejects.
+ * an injected edict at server-time = now_seconds (the engine real-seconds
+ * clock; see QNN_RuntimeNowSeconds).  Returns 1 iff self.attack_finished
+ * was advanced (= W_Attack actually fired this tick).  Caller must invoke
+ * once per native tick where button0 might be pressed so the persistent
+ * attack_finished state stays correct across cooldown windows.  Returns 0
+ * on dead player, invalid weapon, VM not inited, or when the cooldown gate
+ * / no-ammo branch rejects.
  *
  * State: a single static float persists between calls and is reset on
  * each QNN_ProgsInit (= once per demo). */
 int QNN_ProgsEvalAttack(
-	int tick, int tick_hz,
+	float now_seconds,
 	int health, int items_owned,
 	int ammo_shells, int ammo_nails, int ammo_rockets, int ammo_cells,
 	int weapon_id, int button0_pressed);
@@ -355,22 +415,23 @@ int QNN_ProgsEvalAttack(
  * per native tick with the current usercmd button2 state (1=pressing
  * jump, 0=not). */
 int QNN_ProgsEvalJump(
-	int tick, int tick_hz,
+	float now_seconds,
 	int health, int grounded, int waterlevel, int button2_pressed);
 
-/* Native-frame remainder of the QC-tracked attack_finished cooldown at
- * the given (tick, tick_hz).  0 = engine will process the next fire
- * this tick; >0 = engine will reject (and queue) presses for that many
- * frames.  Reads qnn_progs_attack_finished, which W_Attack writes on
- * every successful fire.  Replaces the labeler's earlier hand-coded
- * k_fire_cd_native[9] table. */
-int QNN_ProgsGetAttackCdRemaining(int tick, int tick_hz);
+/* Seconds remaining on the QC-tracked attack_finished cooldown at the
+ * given now_seconds (engine real-seconds clock; see QNN_RuntimeNowSeconds).
+ * 0 = engine will process the next fire this frame; >0 = engine will
+ * reject (and queue) presses for that long.  Reads qnn_progs_attack_finished,
+ * which W_Attack writes on every successful fire.  Replaces the labeler's
+ * earlier hand-coded k_fire_cd_native[9] table. */
+float QNN_ProgsGetAttackCdRemainingSec(float now_seconds);
 
 /* Direct accessor for the persistent qnn_progs_attack_finished float.
  * Used by QwdPackInputMask to save/restore around a synthetic feasibility
  * call to QNN_ProgsEvalAttack — preventing the synthetic press from
  * advancing the cooldown for subsequent real per-cmd evals. */
 float QNN_ProgsGetAttackFinished(void);
+void QNN_ProgsSetJumpReleased(qboolean released);
 void  QNN_ProgsSetAttackFinished(float value);
 
 /* QWD-side per-cmd operative-predicate driver (engine-specific impl
@@ -382,7 +443,7 @@ void  QNN_ProgsSetAttackFinished(float value);
  * QNN_QwdEvalPmoveJump (pmove-driven), not here. */
 void QNN_QwdEvalOperativePerCmd(
 	const qnn_snapshot_t *snapshot,
-	int *out_op_fire,
+	int *out_op_attack,
 	int *out_fmove,
 	int *out_smove,
 	int *out_umove,
@@ -439,76 +500,35 @@ qboolean QNN_ActionIsFrozen(const qnn_action_t *a);
 void QNN_EmitTick(FILE *out, const uint8_t *obs, const qnn_action_t *action,
 	int tick, int steps, int tick_hz, uint16_t flags);
 
-/* LOBS (Labeler OBS): slim per-native-tick stream for labeler training /
- * apply.  Fixed-size frame, no obs buffer overhead.  Used only when
- * qnn_runtime.labeler_mode is set; the worker writes LOBS instead of
- * QOBS so the labeler reader is decoupled from the BC obs schema.
- *
- * Wire layout puts two parallel columns side-by-side per tick:
- *   cmd_*    — aggregated raw usercmd bytes the player sent
- *   op_input — strict per-axis op mask of that usercmd
- * Training-keep mask is derived consumer-side as
- * `no_press_axis | op_input_bit_axis` per axis.
- *
- * Wire layout (little-endian, all fields contiguous):
- *   "LOBS"            4 bytes magic
- *   tick              u32        4
- *   tick_hz           u32        4
- *   flags             u16        2  (bit1=done; bits else reserved)
- *   pos_delta_vel[3]  fp16       6  (body-frame velocity, normalized
- *                                    by QNN_VELOCITY_SCALE — obs feature)
- *   movement_id       u8         1  (0=gnd / 1=air / 2..=water — obs)
- *   cmd_angles[3]     int16      6  (usercmd: pitch/yaw/roll, encoded
- *                                    as deg × 65536/360 — matches QW
- *                                    MSG_WriteAngle16)
- *   cmd_move[3]       int16      6  (usercmd: forwardmove/sidemove/
- *                                    upmove in raw QW units, aggregated
- *                                    across the cmd window: mean for
- *                                    fb/lr; jump-canonical-or-most-
- *                                    negative for ud)
- *   cmd_buttons       u8         1  (usercmd: bits OR'd across cmd
- *                                    window — bit 0 fire, bit 1 jump
- *                                    button2, bits 2..7 mod-specific)
- *   cmd_impulse       u8         1  (usercmd: last non-zero impulse in
- *                                    cmd window — matches sv_user.c
- *                                    overwrite semantics)
- *   op_input          u8         1  (strict per-axis op mask of the
- *                                    cmd_* fields.  bit i = 1 iff the
- *                                    player pressed axis i AND the
- *                                    engine acted on it this tick.
- *                                    bit0=fb, bit1=lr, bit2=ud,
- *                                    bit3=fire, bit4=impulse.  Dead
- *                                    frames = 0x00.  Trainer derives
- *                                    keep mask as no_press | op_bit.)
- *   weapon_id         u8         1  (server-held weapon byte 1..8, 0
- *                                    if none — obs.  Lags impulses by
- *                                    the cmd-pipeline delay.)
- *   c_rule_fire       u8         1  (sound-derived: 1 iff a weapon-fire
- *                                    PHS sound for the self entity was
- *                                    multicast in this snapshot.  Same
- *                                    generator MVD inference uses at
- *                                    apply time, so train-time and
- *                                    apply-time feature distributions
- *                                    match.)
- *   c_rule_jump       u8         1  (sound-derived: 1 iff a self-entity
- *                                    plyrjmp8.wav PHS multicast landed
- *                                    in this snapshot.  Sparse one-tick
- *                                    -per-event — no hold extension.)
- *                              ---
- *                              39 bytes/tick (4 magic + 10 header + 25 payload)
- */
-void QNN_EmitLabelerTick(FILE *out,
-	int tick, int tick_hz, uint16_t flags,
-	const float pos_delta_vel[3],     /* body-frame, pre-normalized */
-	int movement_id,
-	const int16_t cmd_angles[3],
-	const int16_t cmd_move[3],
-	uint8_t cmd_buttons,
-	uint8_t cmd_impulse,
-	uint8_t op_input,
-	uint8_t weapon_id,
-	uint8_t c_rule_fire,
-	uint8_t c_rule_jump);
+/* Slim per-native-frame record emitted in matched-emit mode alongside the
+ * 20 Hz QOBS stream.  Framing: "MLOB" magic + this fixed payload (no obs
+ * buffer).  Carries the move-labeler input subset (view-frame velocity,
+ * movement/weapon ids) plus the full action label (usercmd-truth move,
+ * look, op_input) and the native frame index this record was sampled at.
+ * The native_index is what each 20 Hz QOBS frame stamps into its header
+ * `steps` field so labeler predictions can be resampled to 20 Hz by exact
+ * index lookup.  Little-endian, packed; Python parser in qnn.wire. */
+typedef struct
+{
+	uint32_t	native_index;	/* qnn_runtime.tick at this native frame */
+	uint16_t	flags;		/* FLAG_DONE / FLAG_RESET, same bits as QOBS */
+	int16_t		vel[3];		/* view-frame velocity, raw Quake units */
+	uint8_t		self_movement_id;	/* 0=ground 1=air 2..4=water */
+	uint8_t		self_weapon_id;	/* subject-form weapon id */
+	qnn_action_t	action;		/* move(press)/weapon/input_mask/op_input/look */
+} qnn_mlob_record_t;
+
+#define QNN_MLOB_MAGIC "MLOB"
+
+/* Tick/record flag bits — shared by the QOBS header flags and the MLOB
+ * record flags (must match qnn.wire FLAG_RESET / FLAG_DONE).  The
+ * single-stream emit path packs these inline as 0x01 / 0x02; named here
+ * so the matched-emit path and any new caller stay in sync. */
+#define QNN_FLAG_RESET 0x01
+#define QNN_FLAG_DONE  0x02
+
+/* Emit one slim MLOB record to `out` (magic + packed qnn_mlob_record_t). */
+void QNN_EmitMlob(FILE *out, const qnn_mlob_record_t *rec);
 
 /* Shared tick-emission state for collect workers (NQ + QW).
  * Handles the two-level buffer (obs delay + 3-frame jitter filter on
@@ -528,9 +548,9 @@ typedef struct
 	float		press_offset;
 	int		deterministic_offset;
 	int		route_offset;
-} qnn_fire_route_event_t;
+} qnn_attack_route_event_t;
 
-#define QNN_MAX_FIRE_ROUTE_EVENTS 32
+#define QNN_MAX_ATTACK_ROUTE_EVENTS 32
 
 typedef struct
 {
@@ -544,8 +564,8 @@ typedef struct
 	uint16_t	jitter_flags;
 	FILE		*jitter_out;
 	qboolean	has_jitter_buf;
-	qnn_fire_route_event_t jitter_fire_routes[QNN_MAX_FIRE_ROUTE_EVENTS];
-	int		jitter_fire_route_count;
+	qnn_attack_route_event_t jitter_attack_routes[QNN_MAX_ATTACK_ROUTE_EVENTS];
+	int		jitter_attack_route_count;
 	uint8_t		prev_prev_move;
 	qboolean	has_prev_prev_move;
 	qboolean	has_prev_emitted;
@@ -572,10 +592,10 @@ void QNN_WriteObsTickPrepacked(qnn_tick_emit_state_t *st, FILE *out,
 	qboolean done, int tick, int steps, int tick_hz,
 	qboolean reset_flag);
 
-void QNN_WriteObsTickPrepackedWithFireRoutes(qnn_tick_emit_state_t *st,
+void QNN_WriteObsTickPrepackedWithAttackRoutes(qnn_tick_emit_state_t *st,
 	FILE *out, const uint8_t *obs_bytes, const qnn_action_t *action,
 	qboolean done, int tick, int steps, int tick_hz,
-	qboolean reset_flag, const qnn_fire_route_event_t *routes,
+	qboolean reset_flag, const qnn_attack_route_event_t *routes,
 	int route_count);
 
 void QNN_FlushTickEmit(qnn_tick_emit_state_t *st);
@@ -726,24 +746,49 @@ void QNN_WriteI16LE(FILE *out, int value);
 void QNN_WriteI32LE(FILE *out, int32_t value);
 void QNN_WriteF32LE(FILE *out, float value);
 
-/* ── Weapon class mapping ────────────────────────────────────────── */
-/* Maps Quake weapon_id (1-8) to subject_embed vocabulary.
-   Values must match QNN_SUBJECT_* in qnn_vocab.h. */
+/* ── Weapon id-space conversion (THE only boundary between the two) ──
+ * Raw weapon id (qnn_weapon.h, QNN_WEAPON_* = 1..8) <-> embedding subject
+ * id (qnn_vocab.h, QNN_SUBJECT_* = 3..10). These two inlines are the only
+ * sanctioned place the +2 offset appears — every other site stays in raw
+ * 1..8 (see qnn_weapon.h). The conversion exists solely because the
+ * embedding vocab reserves rows 0/1/2; it is not a weapon property. */
 
-static inline int qnn_weapon_subject_from_id(int weapon_id)
+static inline int QNN_WeaponSubjectFromRawId(int weapon_id)
 {
 	switch (weapon_id)
 	{
-	case 1: return QNN_SUBJECT_AXE;
-	case 2: return QNN_SUBJECT_SHOTGUN;
-	case 3: return QNN_SUBJECT_SUPER_SHOTGUN;
-	case 4: return QNN_SUBJECT_NAILGUN;
-	case 5: return QNN_SUBJECT_SUPER_NAILGUN;
-	case 6: return QNN_SUBJECT_GRENADE_LAUNCHER;
-	case 7: return QNN_SUBJECT_ROCKET_LAUNCHER;
-	case 8: return QNN_SUBJECT_THUNDERBOLT;
-	default: return QNN_SUBJECT_NONE;
+	case QNN_WEAPON_AXE:           return QNN_SUBJECT_AXE;
+	case QNN_WEAPON_SHOTGUN:       return QNN_SUBJECT_SHOTGUN;
+	case QNN_WEAPON_SUPER_SHOTGUN: return QNN_SUBJECT_SUPER_SHOTGUN;
+	case QNN_WEAPON_NAILGUN:       return QNN_SUBJECT_NAILGUN;
+	case QNN_WEAPON_SUPER_NAILGUN: return QNN_SUBJECT_SUPER_NAILGUN;
+	case QNN_WEAPON_GRENADE:       return QNN_SUBJECT_GRENADE_LAUNCHER;
+	case QNN_WEAPON_ROCKET:        return QNN_SUBJECT_ROCKET_LAUNCHER;
+	case QNN_WEAPON_LIGHTNING:     return QNN_SUBJECT_THUNDERBOLT;
+	default:                       return QNN_SUBJECT_NONE;
 	}
+}
+
+static inline int QNN_RawWeaponIdFromSubject(int subject_id)
+{
+	switch (subject_id)
+	{
+	case QNN_SUBJECT_AXE:             return QNN_WEAPON_AXE;
+	case QNN_SUBJECT_SHOTGUN:         return QNN_WEAPON_SHOTGUN;
+	case QNN_SUBJECT_SUPER_SHOTGUN:   return QNN_WEAPON_SUPER_SHOTGUN;
+	case QNN_SUBJECT_NAILGUN:         return QNN_WEAPON_NAILGUN;
+	case QNN_SUBJECT_SUPER_NAILGUN:   return QNN_WEAPON_SUPER_NAILGUN;
+	case QNN_SUBJECT_GRENADE_LAUNCHER: return QNN_WEAPON_GRENADE;
+	case QNN_SUBJECT_ROCKET_LAUNCHER: return QNN_WEAPON_ROCKET;
+	case QNN_SUBJECT_THUNDERBOLT:     return QNN_WEAPON_LIGHTNING;
+	default:                          return QNN_WEAPON_NONE;
+	}
+}
+
+/* Back-compat alias for existing callers (obs-token emit boundary). */
+static inline int qnn_weapon_subject_from_id(int weapon_id)
+{
+	return QNN_WeaponSubjectFromRawId(weapon_id);
 }
 
 #endif

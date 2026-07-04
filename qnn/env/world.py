@@ -176,6 +176,18 @@ class NativeWorldEnv:
         elif worker_done:
             done_reason = "done"
 
+        # Death attribution: when the model died this frame, was it self-inflicted
+        # (own rocket splash / environment-via-self -> attacker == self) or a kill
+        # by the opponent? The engine emits one death record per death carrying the
+        # victim and attacker entity nums; attacker == victim == self is a suicide.
+        player_suicide = False
+        if te is not None and te.player_died:
+            self_ent = te.self_entity_num
+            for d in te.death_records:
+                if d.victim_entity_num == self_ent:
+                    player_suicide = d.attacker_entity_num == self_ent
+                    break
+
         # Split damage by type from per-record flags.
         _FLAG_SPLASH = 0x0004
         damage_direct = 0.0
@@ -194,10 +206,15 @@ class NativeWorldEnv:
         # Lean info dict: only what EpisodeStatAccumulator and SF need.
         info: Dict[str, object] = {
             "done_reason": done_reason,
-            "scenario_id": self.map_id,
+            # Prefer the eval's scenario spec id (options["scenario_id"]) when
+            # set, so multiple scenarios sharing one map (e.g. the aim grid's
+            # per-weapon cells) report distinct ids; fall back to the map id
+            # (procgen / single-scenario evals leave it unset).
+            "scenario_id": self.options.get("scenario_id", self.map_id),
             "frag_delta": float(frag_gain),
             "frag_loss": float(frag_loss),
             "player_died": bool(te.player_died) if te is not None else False,
+            "player_suicide": bool(player_suicide),
             "damage_dealt": float(te.damage_dealt) if te is not None else 0.0,
             "damage_dealt_self": float(te.damage_dealt_self) if te is not None else 0.0,
             "damage_dealt_other": float(te.damage_dealt - te.damage_dealt_self) if te is not None else 0.0,
@@ -210,6 +227,15 @@ class NativeWorldEnv:
             "armor_gain": float(te.pickup_armor) if te is not None else 0.0,
             "weapon_pickups": float(te.weapon_pickups) if te is not None else 0.0,
             "tracking_cos": float(te.tracking_cos) if te is not None else 0.0,
+            # v3 lead-aim geometry (QTRN v3): view-frame rel pos + ABSOLUTE world
+            # velocity (raw u / u·s⁻¹) of the SAME nearest in-LOS actor that
+            # tracking_cos selects, plus the currently-held weapon id and a valid
+            # flag. The eval recomputes a LEAD-POINT-referenced aim cosine from
+            # these via the shared lead kernel (lead_aim.compute_lead_aim).
+            "lead_rel": tuple(te.lead_rel) if te is not None else (0.0, 0.0, 0.0),
+            "lead_vel": tuple(te.lead_vel) if te is not None else (0.0, 0.0, 0.0),
+            "lead_weapon_id": int(te.lead_weapon_id) if te is not None else 0,
+            "lead_valid": bool(te.lead_valid) if te is not None else False,
             "blind_fire": 0,
             "stuck": False,
         }

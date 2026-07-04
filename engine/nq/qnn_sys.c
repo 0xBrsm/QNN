@@ -34,7 +34,7 @@ void Sys_DebugNumber(int y, int val)
 	(void)val;
 }
 
-void Sys_Printf(char *fmt, ...)
+__attribute__((weak)) void Sys_Printf(char *fmt, ...)
 {
 	va_list ap;
 	static int route_resolved = 0;
@@ -266,4 +266,3 @@ void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
 	SV_RecursiveHullCheck(cl.worldmodel->hulls, 0, 0, 1,
 		(float *)start, (float *)end, trace);
 }
-

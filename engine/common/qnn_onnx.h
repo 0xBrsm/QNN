@@ -44,6 +44,12 @@ int QNN_OnnxStep(qnn_onnx_ctx_t *ctx, const qnn_tick_result_t *result, qnn_actio
 /* Free the context. Safe to pass NULL. */
 void QNN_OnnxFree(qnn_onnx_ctx_t *ctx);
 
+/* The model's REQUIRED decision cadence (Hz) from its `tick_hz` stamp — the
+ * rate the weights were trained at. Always > 0 for a successfully-loaded model
+ * (QNN_OnnxInit refuses an unstamped model). The live client runs inference at
+ * this rate. Returns 0 if ctx is NULL. */
+int QNN_OnnxTickHz(const qnn_onnx_ctx_t *ctx);
+
 /* Thread-local last error message. "" if no error has been raised
  * on this thread. */
 const char *QNN_OnnxLastError(void);

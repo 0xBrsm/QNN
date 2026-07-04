@@ -1,0 +1,93 @@
+{
+  "decode_version": 1,
+  "version": "a24rc4",
+  "description": "decode-fit pipeline @ s=p99 on head_probe_full_5head_weapon_descript_seed17: aim super/alpha {'look.aim_prior_gain': 0.2, 'look.aim_mag_gain': 0.1, 'look.aim_degrade_lag_frames': 0.0}; all-humans pins + turn_mag_scale=0.7 dampener; corpus_fp=sha256:44a4730af look_grid_sha=a086af35c570",
+  "decode_module": "qnn.model.bench.a24.decode",
+  "guard_module": "qnn.model.bench.a24.guard",
+  "look_grid": "config/look_grid.json",
+  "move_hazard": {
+    "method": "lognorm",
+    "lognorm": {
+      "regime": "all",
+      "noncombat": false,
+      "fb": [
+        [
+          1.52639,
+          0.7611
+        ],
+        [
+          1.45436,
+          1.24953
+        ],
+        [
+          2.16991,
+          0.98228
+        ]
+      ],
+      "lr": [
+        [
+          1.61247,
+          0.84356
+        ],
+        [
+          1.08256,
+          1.3771
+        ],
+        [
+          1.60711,
+          0.8472
+        ]
+      ],
+      "param_names": [
+        "mu",
+        "sigma"
+      ],
+      "maxage": 400
+    },
+    "tick_hz": 20
+  },
+  "params": {
+    "look.aim_prior_gain": 0.2,
+    "look.aim_ffwd_gain": 0.0,
+    "look.aim_mag_gain": 0.1,
+    "look.turn_mag_scale": 0.7,
+    "attack.bias": 0.0,
+    "move.sticky_tau_fb": 0.8,
+    "move.sticky_tau_lr": 0.99,
+    "move.tau_engagement_gated": true,
+    "move.stop_onset": true,
+    "move.switchback_eps": 0.1,
+    "weapon.sticky_confidence": 0.65,
+    "weapon.sticky_margin": 0.0,
+    "weapon_ban": [],
+    "guard.attack_splash": true,
+    "guard.rocket_ehr": true,
+    "guard.rocket_ehr_safety_margin_hp": 10.0,
+    "guard.rocket_floor_min_pitch_deg": 12.0,
+    "guard.lg_range": true,
+    "guard.lg_range_u": 600.0,
+    "guard.lg_align_half_angle_deg": 15.0,
+    "guard.projectile_release": true,
+    "guard.projectile_release_mode": "any",
+    "guard.projectile_release_horizon_s": 1.0,
+    "guard.projectile_hit_radius_u": 45.0,
+    "guard.projectile_release_splash": true,
+    "guard.projectile_release_arc": true,
+    "look.weapon_pitch_gain": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.5,
+      0.5,
+      0.0,
+      0.5,
+      0.0
+    ],
+    "attack.threshold": 0.46,
+    "look.aim_degrade_lag_frames": 0.0,
+    "move.jump_sample": false,
+    "move.jump_bias": 0.0,
+    "move.jump_temp": 1.0
+  }
+}

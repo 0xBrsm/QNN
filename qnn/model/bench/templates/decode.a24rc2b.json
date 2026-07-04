@@ -1,0 +1,128 @@
+{
+  "decode_version": 1,
+  "version": "a24rc2b",
+  "decode_module": "qnn.model.bench.a24.decode",
+  "guard_module": "qnn.model.bench.a24.guard",
+  "look_grid": "config/look_grid.json",
+  "move_hazard": {
+    "edges": [
+      1,
+      2,
+      3,
+      4,
+      6,
+      9,
+      13,
+      19,
+      28,
+      42
+    ],
+    "fb": [
+      [
+        0.085849,
+        0.315969,
+        0.347283,
+        0.322529,
+        0.293166,
+        0.266111,
+        0.258054,
+        0.230862,
+        0.192955,
+        0.141787,
+        0.049798
+      ],
+      [
+        0.241725,
+        0.246902,
+        0.218426,
+        0.197699,
+        0.16147,
+        0.120872,
+        0.116529,
+        0.093888,
+        0.075173,
+        0.059829,
+        0.040619
+      ],
+      [
+        0.04361,
+        0.139054,
+        0.138942,
+        0.137875,
+        0.137106,
+        0.126032,
+        0.114164,
+        0.103247,
+        0.088483,
+        0.070884,
+        0.052015
+      ]
+    ],
+    "lr": [
+      [
+        0.081275,
+        0.25418,
+        0.246274,
+        0.230467,
+        0.221886,
+        0.22028,
+        0.211574,
+        0.197853,
+        0.185281,
+        0.168238,
+        0.155425
+      ],
+      [
+        0.310385,
+        0.289641,
+        0.248405,
+        0.210813,
+        0.170709,
+        0.130163,
+        0.109045,
+        0.099112,
+        0.073967,
+        0.054193,
+        0.03949
+      ],
+      [
+        0.082254,
+        0.256272,
+        0.246854,
+        0.233371,
+        0.226344,
+        0.2251,
+        0.213749,
+        0.194981,
+        0.187274,
+        0.171593,
+        0.126364
+      ]
+    ]
+  },
+  "params": {
+    "look.aim_prior_gain": 0.03,
+    "look.aim_ffwd_gain": 1.0,
+    "look.aim_mag_gain": 1.0,
+    "move.sticky_tau_fb": 0.8,
+    "move.sticky_tau_lr": 0.9,
+    "move.stop_onset": true,
+    "move.switchback_eps": 0.1,
+    "weapon.sticky_confidence": 0.82,
+    "weapon.sticky_margin": 0.0,
+    "weapon_ban": [],
+    "guard.attack_splash": true,
+    "guard.rocket_ehr": true,
+    "guard.rocket_ehr_safety_margin_hp": 10.0,
+    "guard.rocket_floor_min_pitch_deg": 12.0,
+    "guard.lg_range": true,
+    "guard.projectile_release": true,
+    "guard.projectile_release_mode": "any",
+    "guard.lg_range_u": 600.0,
+    "guard.lg_align_half_angle_deg": 15.0,
+    "guard.projectile_release_horizon_s": 1.0,
+    "guard.projectile_hit_radius_u": 45.0,
+    "guard.projectile_release_splash": true,
+    "guard.projectile_release_arc": true
+  }
+}

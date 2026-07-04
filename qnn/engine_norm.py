@@ -178,8 +178,34 @@ import numpy as np
 #     wire.8  native split, 43 inputs — engine/Python wire at 0.21.0; NO ONNX
 #             graph was ever exported at 43 inputs (the native exporter postdates
 #             look_delta), so this id is reconstructed.
-#     wire.9  native split, 44 inputs = wire.8 + look_delta. Current HEAD; what
-#             this exporter produces; the deployed v24/full_4head.
+#     wire.9  native split, 44 obs (= wire.8 + look_delta) + the IN-GRAPH MOVE
+#             decode: the RECURRENT MOVE-DECODE STATE pair (move_state (B,11 f32)
+#             + move_state_rng (B, i64)) is threaded as I/O, and the a24 stateful
+#             MOVE decode (sticky gate / switch-back watermark / hazard /
+#             stop-onset + the continuous-fire hold-tail) runs IN-GRAPH — so
+#             `move` is the DECIDED 3-axis class (B,3 i64), NOT raw logits, and
+#             the engine threads move_state frame-to-frame like hidden/next_hidden.
+#             Current HEAD; what this exporter produces; the deployed full_4head.
+#             RECLAIMED: an earlier wire.9 (native-split obs + engine-side per-axis
+#             argmax of raw move_logits) and a wire.10 (the in-graph shape) were
+#             distinguished during the move-decode migration, but no wire.10 was
+#             ever finalized as a release — the in-graph migration stayed UNDER
+#             wire.9 through active a24 development rather than bumping the number,
+#             and the old engine-argmax wire.9 has no surviving artifact. Net:
+#             wire.9 now means the in-graph-decode native contract; wire.10 is gone.
+#     wire.11 = wire.9 + the IN-GRAPH ATTACK decode. The recurrent ATTACK-decode
+#             state — the continuous-fire hold-tail (attack_state, B,1 f32) AND
+#             attack's own xorshift rng (attack_rng, B,i64) — is threaded as I/O,
+#             and the SAMPLED attack decode (Bernoulli on sigmoid((fire_logit+bias)
+#             /temp) off attack_rng, + hold-tail) runs IN-GRAPH — so `attack` is the
+#             DECIDED bit (B,1 i64), the `fire_logit` output is REMOVED, and the
+#             engine ORs the bit into the Quake press byte and runs NO attack
+#             sigmoid/threshold/hold-tail of its own. (move_state also dropped its
+#             two dead trailing slots → (B,9).) With
+#             this, ALL FOUR actions (move/look/weapon/attack) are decided in-graph
+#             → the engine is decode-agnostic and decode-regime changes no longer
+#             touch the wire. wire.11 REPLACES wire.9 for the a24 gen (re-export);
+#             wire.10 stays burned (never reuse). (jumps 9→11 deliberately.)
 #   (wire.1–6 = older flat + packed lineages, pre-v11, out of the load set. The
 #    faithful-load floor is wire.7: below it action_history / recall / cluster
 #    are no longer emitted by the engine. See the registry.)
@@ -194,7 +220,7 @@ import numpy as np
 #
 # (The third axis, ARCH — model internals / weight layout — is checkpoint-side
 #  only; the live bin ignores it. Tracked by qnn/utils/checkpoint_converter.py.)
-WIRE_CONTRACT_ID = "wire.9"
+WIRE_CONTRACT_ID = "wire.11"
 SEMANTICS_CONTRACT_ID = "semantics.1"
 
 
@@ -853,6 +879,23 @@ ACTION_FIELDS: Tuple[Field, ...] = (
                "aim precision; i8 = 0.008 step would be ~0.5° at typical "
                "view distances which is noticeable in look smoothness.",
     ),
+    Field(
+        name="act_op_input",
+        dtype=np.uint8, shape=(),
+        scale=None, transform="bitfield",
+        source="Strict per-axis OPERATIVENESS mask (QNN_PackOpInput): "
+               "bit i = 1 iff the player pressed axis i AND the engine "
+               "acted on it this tick. bit0=fb, bit1=lr, bit2=ud, "
+               "bit3=fire, bit4=impulse. Semantically DISTINCT from "
+               "input_mask (pure feasibility — would the engine accept a "
+               "press): op_input AND's the press with the per-axis op "
+               "predicate. Wire offset 3 (formerly the _pad byte), so the "
+               "addition is byte-additive — the action struct stays 16 B. "
+               "0 on paths that don't compute it (NQ, MVD inference). "
+               "Selected by the move-labeler subset collect; the BC "
+               "full collect emits it additively without touching any "
+               "pre-existing field.",
+    ),
     # act_target_probs was a sparse (T, 3) u8 encoding of the labeler's
     # (T, 17) f32 distribution. Now recomputed at training start from
     # obs+actions by qnn.bc.train._compute_target_probs instead of being
@@ -862,9 +905,11 @@ ACTION_FIELDS: Tuple[Field, ...] = (
 )
 
 ACTION_BLOCK_BYTES: int = sum(f.bytes_per_frame for f in ACTION_FIELDS)
-# Expected: 1 (move+fire) + 1 (weapon) + 6 (look) = 8 bytes
+# Expected: 1 (move+fire) + 1 (weapon) + 6 (look) + 1 (op_input) = 9 bytes
 # (was 11 with sparse target_probs; 12 before fire was packed into move;
-# ~86 B in the original float32 layout: 1+1+1+6+68).
+# ~86 B in the original float32 layout: 1+1+1+6+68).  Note: this is the
+# CACHE block; the on-wire action struct (qnn.wire.ACTION_SIZE) stays 16 B
+# (op_input reuses the former _pad slot — additive, byte-identical).
 
 
 # ── Total wire/cache budget ──────────────────────────────────────

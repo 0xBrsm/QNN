@@ -91,6 +91,11 @@ static cvar_t qnn_inv_armor_type_cvar = {"qnn_inv_armor_type", "0", false, false
 static cvar_t qnn_inv_health_cvar     = {"qnn_inv_health",     "0", false, false};
 static cvar_t qnn_inv_powerups_cvar   = {"qnn_inv_powerups",   "0", false, false};
 static cvar_t qnn_inv_selected_cvar   = {"qnn_inv_selected",   "0", false, false};
+/* FrikBot opponent weapon pin: weapon BIT (same encoding as qnn_inv_selected),
+   0 = off (default, range-based bot_weapon_switch). When non-zero, the QuakeC
+   bot is forced to hold this weapon, fixing its engagement range. Mirrors the
+   model-set "selected_weapon" surface. */
+static cvar_t qnn_bot_weapon_pin_cvar = {"qnn_bot_weapon_pin", "0", false, false};
 
 static qboolean QNN_ClientReady(void)
 {
@@ -252,6 +257,16 @@ static void QNN_ParseResetOptions(const char *line, qnn_reset_options_t *options
 		char train_name[32] = {0};
 		if (QNN_JsonExtractString(line, "\"train\"", train_name, sizeof(train_name)))
 			options->train = QNN_TrainModeFromName(train_name);
+	}
+	/* FrikBot opponent weapon pin (mirrors inventory.selected_weapon's
+	   name->bit surface): a weapon name forces the bot to hold that weapon,
+	   fixing its engagement range. Absent/0 => default range-based switching. */
+	{
+		char pin_name[32] = {0};
+		if (QNN_JsonExtractString(line, "\"bot_weapon_pin\"", pin_name, sizeof(pin_name)))
+			QNN_CvarSetInt("qnn_bot_weapon_pin", QNN_WeaponBit(pin_name));
+		else
+			QNN_CvarSetInt("qnn_bot_weapon_pin", 0);
 	}
 	QNN_JsonExtractString(line, "\"pre_map_commands\"", options->pre_map_commands, sizeof(options->pre_map_commands));
 	QNN_JsonExtractString(line, "\"post_map_commands\"", options->post_map_commands, sizeof(options->post_map_commands));
@@ -888,6 +903,7 @@ int main(int argc, char **argv)
 	Cvar_RegisterVariable(&qnn_inv_health_cvar);
 	Cvar_RegisterVariable(&qnn_inv_powerups_cvar);
 	Cvar_RegisterVariable(&qnn_inv_selected_cvar);
+	Cvar_RegisterVariable(&qnn_bot_weapon_pin_cvar);
 	cls.demonum = -1;
 
 	for (;;)

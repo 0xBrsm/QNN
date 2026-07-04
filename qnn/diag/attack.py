@@ -12,7 +12,7 @@ op-masked frames:
 
     op = input_mask & 1   (bit 0 of act.input_mask)
 
-This invariant is a correctness requirement documented in docs/attack-head.md §3.
+This invariant is a correctness requirement documented in research/attack-head.md §3.
 Do NOT remove or relax these filters at call sites.
 
 ``analyze(policy, source)`` runs the (policy, source)-compatible subset and returns a

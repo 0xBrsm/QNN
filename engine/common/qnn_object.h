@@ -249,8 +249,9 @@ void QNN_EventTick(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag
 void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace);
 
 /* Model view-cone aperture (total degrees, [0,360]); read by QNN_InFov,
- * registered in QNN_IOInit. See qnn_entity.c. */
+ * registered via QNN_RegisterPerceptionCvars. See qnn_entity.c. */
 extern cvar_t qnn_fov;
+void QNN_RegisterPerceptionCvars(void);
 
 qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target);
 qboolean QNN_EntityInPvs(const vec3_t viewer, const vec3_t target);
@@ -297,6 +298,7 @@ int QNN_EventClassifySounds(const qnn_snapshot_t *snapshot, qnn_event_record_t *
 void QNN_CaptureBaseSnapshot(qnn_snapshot_t *snapshot);
 int QNN_WeaponId(void);
 int QNN_ItemFlagFromImpulse(int impulse);
+int QNN_ImpulseFromItemFlag(int item_flag);
 int QNN_NextWeaponId(int reverse);
 float QNN_LatencySeconds(void);
 int QNN_LatencyFrames(int emit_hz);

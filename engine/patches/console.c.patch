@@ -1,0 +1,18 @@
+# console.c — route Quake console output through the QNN system layer
+#
+# Direct Sys_Printf calls are engine/system debug output (e.g. COM_FindFile
+# traces). Con_Printf is the actual Quake client console stream. Keep those
+# streams separate so headless clients can expose the game console without
+# inheriting filesystem debug chatter.
+#
+--- console.c
++++ console.c
+@@ -391,8 +391,8 @@
+ 	va_end (argptr);
+ 	
+ // also echo to debugging console
+-	Sys_Printf ("%s", msg);	// also echo to debugging console
++	QNN_ConsoleOutput (msg);	// route the console stream to the terminal
+ 
+ // log all messages to file
+ 	if (con_debuglog)

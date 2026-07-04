@@ -57,6 +57,24 @@ runs/<mode>/<name>/
   logs/
 ```
 
+## Checkpoint artifacts
+
+Naming and retention are defined in `qnn.utils.artifacts`; identity comes
+from `run.json.run_id`, never from directory names.
+
+| File | Purpose |
+|------|---------|
+| `checkpoints/ckpt_e<epoch>_<run_id>.pt` | rolling resume checkpoint (model + optimizer). Exactly one per run: each epoch's atomic write (tmp + fsync + rename) supersedes and deletes the previous epoch's file |
+| `checkpoints/best_<run_id>.pth` (+ `.json` sidecar) | best model by selection score; the deploy/eval artifact. PPO mirrors its newest SF best to `best/best_<run_id>.pth` |
+| `checkpoints/snapshot.pt` | mid-epoch resume state, removed at each clean epoch boundary |
+
+There is no per-epoch checkpoint archive. At end of run, BC pushes
+`best_<run_id>.pth` + the final resume checkpoint + `bc_summary.json` to the
+NAS under `bc_checkpoints/<run_id>/` (connection from `QNN_NAS_*` env vars,
+defaults in `corpus/nas.py`; failure is non-fatal). Pre-rename run dirs keep
+their legacy names (`bc_training_checkpoint.pt` / `bc_best_model.pth`) —
+loaders discover both.
+
 ## Ownership
 
 | File | Owns |
@@ -72,7 +90,9 @@ runs/<mode>/<name>/
 
 | Path | Purpose |
 |------|---------|
-| `name` | run name |
+| `name` | run name (human label — never an identity key) |
+| `run_id` | immutable run identity, `YYYYMMDD-xxxxxx` (qnn.utils.artifacts); stamped into checkpoint names/meta, bc_summary, eval summaries, the trainer ledger, and ONNX metadata |
+| `parent_run_id` | lineage edge for derived runs (empty otherwise) |
 | `mode` | `bc`, `ppo`, `pbt`, `eval`, or `optuna` |
 | `runtime_scale` | metadata label, usually `live` or `verify` |
 | `resume` | `true` resumes this run’s own outputs when they exist; `false` archives them and starts fresh |
@@ -103,7 +123,7 @@ BC:
 | `batch_size` | BC batch size — per-step frame count (frame-shuffled / non-recurrent) or parallel-lane count (lane-packed / recurrent) |
 | `pin_memory` | pin host tensors for GPU transfer |
 | `prefetch` | batch prefetch toggle |
-| `snapshot_interval` | epochs between archived checkpoints |
+| `snapshot_interval` | mid-epoch snapshot save interval (`snapshot.pt`, deterministic in-epoch resume) |
 
 PPO / PBT / Optuna trials:
 
@@ -205,8 +225,7 @@ PPO / PBT / Optuna trials:
 | `eval_policy_modes`, `eval_start_mode` | post-train eval scheduling |
 | `eval_holdout_seed_offset`, `eval_sample_seed_offset` | eval RNG offsets |
 | `eval_map_features_path` | eval map features path |
-| `eval_record_demos`, `eval_parallel_policy_modes` | eval execution controls |
-| `demo_policy_mode` | single-episode observation/demo mode |
+| `eval_parallel_policy_modes` | eval execution controls |
 
 Eval:
 
@@ -218,7 +237,7 @@ Eval:
 | `policy_modes`, `start_mode` or `eval_policy_modes`, `eval_start_mode` | policy scheduling |
 | `holdout_seed_offset`, `sample_seed_offset` or `eval_*` variants | RNG offsets |
 | `map_features_path` or `eval_map_features_path` | eval map features path |
-| `record_demos`, `parallel_policy_modes` or `eval_*` variants | eval execution controls |
+| `parallel_policy_modes` or `eval_parallel_policy_modes` | eval execution controls |
 
 ## PPO worker inference
 

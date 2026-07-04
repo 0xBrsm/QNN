@@ -44,8 +44,15 @@ import qnn.model.weapon_head          # noqa: F401  weapon "canonical"
 import qnn.model.temporal             # noqa: F401  temporal "gru"
 import qnn.model.target               # noqa: F401  pointer "mlp"
 import qnn.model.transformer          # noqa: F401  encoder "transformer"
+import qnn.model.bench.a24.move_head     # noqa: F401  move "cls"
+import qnn.model.bench.a24.look_head     # noqa: F401  look "polar"
+import qnn.model.bench.a24.attack_head   # noqa: F401  attack "cls"
+import qnn.model.bench.a24.weapon_head   # noqa: F401  weapon "cls" / "cls_prior"
+import qnn.model.bench.inputs.preattn_encoder    # noqa: F401  encoder "passthrough"
+import qnn.model.bench.inputs.gt_target_pointer  # noqa: F401  pointer "gt"
 # Base-graph compositions — each generation registers its own (arch lives with
 # the generation, not here). base_graph_dict resolves names from the registry.
+import qnn.model.bench.a24.graphs  # noqa: F401  full_4head / full_5head
 
 
 def _build_head(head: HeadNodeSpec, dims: dict[str, int], d_model: int) -> nn.Module:

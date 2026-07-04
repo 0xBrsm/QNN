@@ -7,10 +7,17 @@ source "${SCRIPT_DIR}/build_common.sh"
 
 OUTPUT_PATH=${1:-"${REPO_ROOT}/assets/bin/nq_client"}
 
-# Same patches as the trainer/collect builds.
+# Same patches as the trainer/collect builds, plus client-only hooks:
+#  - host.c.patch
+#  - console.c.patch: route the Quake console (Con_Printf) to the terminal;
+#    only nq_client wires QNN_ConsoleOutput, so workers keep stock console.c.
+#  - cl_parse_rcon.c.patch: route svc_print through QNN_ConsoleRelay for the
+#    chat-driven (tell) remote console; client-only for the same reason.
 PATCHES=(
   "${COMMON_PATCHES[@]}"
   "${ENGINE_DIR}/patches/host.c.patch"
+  "${ENGINE_DIR}/patches/console.c.patch"
+  "${ENGINE_DIR}/patches/cl_parse_rcon.c.patch"
 )
 
 # Client-only source set: drops training (qnn_reward), collect helpers
@@ -19,9 +26,11 @@ PATCHES=(
 # obs/action path that remains is pure cl.* state.
 CUSTOM_SOURCES=(
   "${ENGINE_DIR}/nq/qnn_sys.c"
+  "${ENGINE_DIR}/nq/qnn_client_console.c"
   "${ENGINE_DIR}/common/qnn_sys_common.c"
   "${ENGINE_DIR}/nq/qnn_client_main.c"
   "${ENGINE_DIR}/nq/qnn_input.c"
+  "${ENGINE_DIR}/nq/qnn_predict.c"
   "${ENGINE_DIR}/common/qnn_map.c"
   "${ENGINE_DIR}/common/qnn_entity.c"
   "${ENGINE_DIR}/nq/qnn_players.c"

@@ -29,7 +29,7 @@ from qnn.model._mlp import make_head_mlp
 import torch.nn.functional as F
 
 from qnn.model.look_bins import (
-    DIR_CENTERS, MAG_CENTERS, N_DIR, N_MAG, polar_targets, polar_to_tangent,
+    N_DIR, N_MAG, polar_targets, polar_to_tangent,
     tangent_expmap, tangent_logmap,
 )
 from qnn.model.look_head import LookHeadInput, LookHeadOutput
@@ -108,3 +108,12 @@ class PurePolarLookHead(nn.Module):
                     for b in range(N_BINS):
                         metrics[f"lookdist_h_{a}_{b}"] = h[b].detach()
         return loss, metrics
+
+
+# -- graph node registration ------------------------------------------------
+from qnn.model.node_registry import register_head  # noqa: E402
+
+
+@register_head("look", "polar")
+def _build_look_polar(head, dims, d_model):
+    return PurePolarLookHead(dims["motor_in"], head.d_hidden, head.activation)

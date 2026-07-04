@@ -246,7 +246,6 @@ def main() -> None:
             scenario_config_path="",
             fixed_tick_hz=int(trainer.get("fixed_tick_hz", 20)),
             reward_json_path=str(run_cfg["config_paths"]["reward"]),
-            record_demos=False,
             parallel_policy_modes=False,
             device=args.device,
         )

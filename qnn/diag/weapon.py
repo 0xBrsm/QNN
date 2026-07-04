@@ -1031,7 +1031,8 @@ def _matched_frac(h_fr, h_w, h_ep, m_by, W, backward_only):
     return hit / len(h_fr)
 
 
-def decode_sweep(npz: Path, *, well_timed: float = 0.5) -> dict:
+def decode_sweep(npz: Path, *, well_timed: float = 0.5,
+                 onset_classes: Path | None = None) -> dict:
     """Intent-aware (C,M) decode sweep from a probs npz.
 
     Uses the canonical _committed_stream (seeded from self_imp = self_weapon_id
@@ -1052,6 +1053,13 @@ def decode_sweep(npz: Path, *, well_timed: float = 0.5) -> dict:
         Probs npz with arrays: probs, weapon, self_imp, offsets, hz.
     well_timed:
         Match window in seconds.
+    onset_classes:
+        Optional npz from ``_weapon_onset_classes.py`` (script-aware onset
+        classification, weapon-head.md §10). When given, the INTENT reference
+        is ``class == deliberate`` — script cycles (dump/return) and forced
+        switches are all excluded from the reference AND from the spurious
+        budget rate. Without it the legacy impulse-lead test is used, which
+        §10 showed is cooldown-gated detectability, not deliberateness.
     """
     d = np.load(npz)
     weapon = d["weapon"].astype(int); si = d["self_imp"].astype(int)
@@ -1062,7 +1070,19 @@ def decode_sweep(npz: Path, *, well_timed: float = 0.5) -> dict:
     W = int(round(well_timed * hz))
 
     h_idx, h_w, h_ep = _ds_events(weapon, offs, True)
-    is_intent = si[h_idx] != h_w
+    class_counts = None
+    if onset_classes is not None:
+        oc = np.load(onset_classes)
+        if not np.array_equal(oc["onset_idx"].astype(int), h_idx):
+            raise ValueError(
+                f"{onset_classes}: onset population mismatch — the classes npz "
+                "was built for a different cache/segment than this probs dump")
+        names = [str(x) for x in oc["class_names"]]
+        cls = oc["classes"].astype(int)
+        is_intent = cls == names.index("deliberate")
+        class_counts = {n: int((cls == i).sum()) for i, n in enumerate(names)}
+    else:
+        is_intent = si[h_idx] != h_w
     hi_fr, hi_w, hi_ep = h_idx[is_intent], h_w[is_intent], h_ep[is_intent]
     hf_fr, hf_w, hf_ep = h_idx[~is_intent], h_w[~is_intent], h_ep[~is_intent]
     intent_rate = len(hi_fr) / sim_min
@@ -1119,6 +1139,7 @@ def decode_sweep(npz: Path, *, well_timed: float = 0.5) -> dict:
         "human_intent_rate": intent_rate,
         "intent_switch_count": int(len(hi_fr)),
         "forced_switch_count": int(len(hf_fr)),
+        "onset_class_counts": class_counts,
         "rows": rows,
         "recommendations": recommendations,
     }

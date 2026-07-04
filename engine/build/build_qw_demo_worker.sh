@@ -100,10 +100,9 @@ QW_CUSTOM_SOURCES=(
   "${ENGINE_DIR}/common/qnn_sys_common.c"
   "${ENGINE_DIR}/qw/qnn_collect_main.c"
   "${ENGINE_DIR}/common/qnn_collect_helpers.c"
-  "${ENGINE_DIR}/common/qnn_hold_samplers.c"
+  "${ENGINE_DIR}/common/qnn_weapon.c"
   "${ENGINE_DIR}/common/qnn_mvd_collect.c"
   "${ENGINE_DIR}/qw/qnn_qwd_collect.c"
-  "${ENGINE_DIR}/common/qnn_labeler_collect.c"
   "${ENGINE_DIR}/qw/qnn_self.c"
   "${ENGINE_DIR}/common/qnn_self_common.c"
   "${ENGINE_DIR}/qw/qnn_input.c"
@@ -990,6 +989,7 @@ qboolean CL_GetMVDMessage (void)
     int     r, i;
     byte    c, msec_byte;
     float   demotime;
+    extern int qnn_mvd_anchor_player;
 
 readnext:
     /* Read 1-byte msec delta */
@@ -1001,6 +1001,16 @@ readnext:
     }
     cls.demopackettime += msec_byte * 0.001f;
     demotime = cls.demopackettime;
+
+    /* Stamp message time from demo time.  QWD playback gets cl.mtime
+     * from packet parsing; nothing on the MVD path writes it, leaving
+     * cl.mtime[0] at 0.0 forever.  Everything timestamped off mtime
+     * then breaks silently: sound events carry native_time 0, so the
+     * fire/jump back-shift ring computes an out-of-range press offset
+     * and drops every sound-driven label write; entity msgtime (the
+     * recency obs) never advances. */
+    cl.mtime[1] = cl.mtime[0];
+    cl.mtime[0] = demotime;
 
     /* Increment netchan sequences on new time frames.
      * CL_ParseClientdata uses incoming_acknowledged to index cl.frames[].
@@ -1087,6 +1097,29 @@ readnext:
         return 0;
     }
 
+    /* Per-recipient demux.  When locked to an anchor player, skip blocks
+     * not addressed to that slot so the worker sees exactly the stream
+     * the player received — including its own weapon-fire sound (a player
+     * is always in its own PHS), and excluding fires it never heard.  The
+     * payload was already consumed above, so the file position is correct
+     * to fetch the next block.  Broadcast blocks (dem_all/dem_read) and
+     * the unlocked case (anchor < 0) are never gated.  dem_single carries
+     * a 5-bit target; dem_multiple a 32-bit recipient mask. */
+    if (cls.mvdplayback && qnn_mvd_anchor_player >= 0
+        && qnn_mvd_anchor_player < MAX_CLIENTS)
+    {
+        if (cls.mvd_lasttype == dem_single)
+        {
+            if (cls.mvd_lastto != (unsigned)qnn_mvd_anchor_player)
+                goto readnext;
+        }
+        else if (cls.mvd_lasttype == dem_multiple)
+        {
+            if (!(cls.mvd_lastto & (1u << qnn_mvd_anchor_player)))
+                goto readnext;
+        }
+    }
+
     return 1;
 }
 '''
@@ -1126,6 +1159,10 @@ mvd_playerinfo = r'''
  * svc_playerinfo for a given player.  Read directly by
  * QNN_SyncEngineCompat / QNN_GetPlayerState during MVD playback. */
 player_state_t qnn_mvd_latest_playerstate[MAX_CLIENTS];
+
+/* MVD anchor player slot (see qnn.h).  -1 = unlocked / legacy spectator.
+ * Set by the worker before each per-player collect pass. */
+int qnn_mvd_anchor_player = -1;
 
 /* ── MVD playerinfo parser ─────────────────────────────────────── */
 
@@ -1272,11 +1309,23 @@ new_netchan = """\t\tif (cls.demoplayback)
 \t\t\tif (!cls.mvdplayback)
 \t\t\t{
 \t\t\t\t/* QWD dem_read: strip 8-byte netchan header and
-\t\t\t\t * update sequences for cl.frames[] indexing. */
-\t\t\t\tunsigned seq = (unsigned)MSG_ReadLong ();
-\t\t\t\tunsigned ack = (unsigned)MSG_ReadLong ();
-\t\t\t\tcls.netchan.incoming_sequence = seq & ~(1u << 31);
-\t\t\t\tcls.netchan.incoming_acknowledged = ack & ~(1u << 31);
+\t\t\t\t * update sequences for cl.frames[] indexing.
+\t\t\t\t *
+\t\t\t\t * CL_GetDemoMessage returns 1 for dem_cmd / dem_set
+\t\t\t\t * too, but only dem_read refreshes net_message — so
+\t\t\t\t * after a dem_cmd this same server packet is still in
+\t\t\t\t * net_message and would be RE-PARSED, re-firing every
+\t\t\t\t * non-idempotent event (sounds, temp entities). Upstream
+\t\t\t\t * QW relies on Netchan_Process to drop the stale/
+\t\t\t\t * duplicate sequence (seq <= incoming_sequence); we
+\t\t\t\t * bypass Netchan_Process here, so replicate that guard. */
+\t\t\t\tunsigned seq = (unsigned)MSG_ReadLong () & ~(1u << 31);
+\t\t\t\tunsigned ack = (unsigned)MSG_ReadLong () & ~(1u << 31);
+\t\t\t\tif (seq <= (unsigned)cls.netchan.incoming_sequence
+\t\t\t\t\t&& cls.netchan.incoming_sequence != 0)
+\t\t\t\t\tcontinue;\t\t// stale net_message after dem_cmd/dem_set
+\t\t\t\tcls.netchan.incoming_sequence = seq;
+\t\t\t\tcls.netchan.incoming_acknowledged = ack;
 \t\t\t\tcls.netchan.last_received = realtime;
 \t\t\t}
 \t\t}
@@ -1369,14 +1418,26 @@ old_playernum = '''\t// parse player slot, high bit means spectator
 new_playernum = '''\t// parse player slot, high bit means spectator
 \tif (cls.mvdplayback)
 \t{
-\t\t/* MVD: demo start time (float) instead of playernum (byte).
-\t\t * Force spectator at slot MAX_CLIENTS-1 per ezQuake convention. */
+\t\textern int qnn_mvd_anchor_player;
+\t\t/* MVD: demo start time (float) instead of playernum (byte). */
 \t\t{
 \t\t\tfloat mvd_start = MSG_ReadFloat();
 \t\t\tcls.netchan.last_received = mvd_start;
 \t\t}
-\t\tcl.playernum = MAX_CLIENTS - 1;
-\t\tcl.spectator = true;
+\t\t/* Lock to the anchor player when set: the self/observation
+\t\t * pipeline keys on cl.playernum, so this makes the proven
+\t\t * single-POV emission path apply to MVD verbatim.  Unlocked
+\t\t * (-1) keeps the legacy spectator slot. */
+\t\tif (qnn_mvd_anchor_player >= 0 && qnn_mvd_anchor_player < MAX_CLIENTS)
+\t\t{
+\t\t\tcl.playernum = qnn_mvd_anchor_player;
+\t\t\tcl.spectator = false;
+\t\t}
+\t\telse
+\t\t{
+\t\t\tcl.playernum = MAX_CLIENTS - 1;
+\t\t\tcl.spectator = true;
+\t\t}
 \t}
 \telse
 \t{
@@ -1822,12 +1883,12 @@ if 'Multi-session demo recording' not in t:
 p.write_text(t, errors='surrogateescape')
 PY
 
-# 26. Hook pmove.c JumpButton success branch to set qnn_pmove_jump_fired
+# 26. Hook pmove.c JumpButton success branch to set qnn_pmove_jump_attacked
 #     so the QWD labeler's per-cmd pmove driver can detect physics jumps
 #     directly (no snapshot.grounded lag, no K-gate workaround).  Single
 #     line added inside JumpButton after the velocity+270 bump; guarded
 #     so rebuilds are idempotent.
-apply_subst pmove.c 'qnn_pmove_jump_fired' <<'EOF'
+apply_subst pmove.c 'qnn_pmove_jump_attacked' <<'EOF'
 	onground = -1;
 	pmove.velocity[2] += 270;
 
@@ -1837,10 +1898,26 @@ apply_subst pmove.c 'qnn_pmove_jump_fired' <<'EOF'
 	onground = -1;
 	pmove.velocity[2] += 270;
 
-	{ extern int qnn_pmove_jump_fired; qnn_pmove_jump_fired = 1; }
+	{ extern int qnn_pmove_jump_attacked; qnn_pmove_jump_attacked = 1; }
 
 	pmove.oldbuttons |= BUTTON_JUMP;	// don't jump again until released
 }
+EOF
+
+# 27. Reload the QC VM after a (mid-demo) map change.  CL_ParseServerData
+#     runs CL_ClearState -> Hunk_FreeToLowMark, which frees the hunk the QC
+#     VM (progs/pr_functions/pr_strings/edicts, allocated once by
+#     QNN_ProgsInit) lives in.  On multi-map / multi-session demos the next
+#     QC call then faults in ED_FindFunction on dangling memory.  Flag the
+#     reset here; qnn_progs.c reloads the VM lazily before the next QC call.
+#     Guarded so rebuilds are idempotent.
+apply_subst cl_parse.c 'QNN_ProgsNotifyWorldReset' <<'EOF'
+	CL_ClearState ();
+===NEW===
+	CL_ClearState ();
+	/* QNN: the hunk holding the QC VM was just freed by CL_ClearState;
+	   flag it so qnn_progs.c reloads the VM before the next QC call. */
+	{ extern void QNN_ProgsNotifyWorldReset(void); QNN_ProgsNotifyWorldReset(); }
 EOF
 
 echo "==> QW sources patched for headless build (with MVD support)"

@@ -1,0 +1,18 @@
+# cl_parse.c — route svc_print through the chat-driven remote console.
+#
+# CLIENT ONLY (not in COMMON_PATCHES): tell <bot> <qnn_rcon-secret> <command>
+# arrives as an svc_print; QNN_ConsoleRelay runs the command and suppresses the
+# raw line so the secret is never echoed. say/say_team are ignored (public).
+# Workers never apply this patch and so never reference QNN_ConsoleRelay.
+#
+--- cl_parse.c
++++ cl_parse.c
+@@ -791,3 +791,7 @@
+ 		case svc_print:
+-			Con_Printf ("%s", MSG_ReadString ());
++		{
++			char *qnn_msg = MSG_ReadString ();
++			if (!QNN_ConsoleRelay (qnn_msg))
++				Con_Printf ("%s", qnn_msg);
++		}
+ 			break;

@@ -13,7 +13,7 @@ operates on op-masked frames:
 
     jump_feas = ((im >> 7) | (im >> 6)) & 1   (ground-jump OR swim-up feasible)
 
-This invariant is a correctness requirement documented in docs/move-head.md.
+This invariant is a correctness requirement documented in research/move-head.md.
 Do NOT remove or relax these filters at call sites.
 
 ``analyze(policy, source, *, segment="all")`` runs the (policy, source)-

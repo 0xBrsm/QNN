@@ -1,5 +1,6 @@
 #include "qnn.h"
 #include "qnn_io.h"
+#include "qnn_predict.h"
 
 /* Move output is in [-1, 1].  Scale to sv_maxspeed: any larger value
  * is clipped to maxspeed by SV_AirMove anyway. */
@@ -72,6 +73,10 @@ void IN_Move(usercmd_t *cmd)
 		}
 	}
 
+	/* Self-state prediction: record the cmd exactly as it leaves — move
+	 * values plus the post-turn yaw the message will carry. */
+	QNN_PredictRecordCmd(cmd->forwardmove, cmd->sidemove, cl.viewangles[YAW]);
+
 	/* Auto-respawn: QuakeC PlayerDeathThink requires all buttons to be
 	   released before it will accept a press to respawn.  Alternate
 	   between releasing (even ticks) and pressing (odd ticks) so the
@@ -103,7 +108,13 @@ void IN_Move(usercmd_t *cmd)
 		in_jump.state = 0;
 
 	/* weapon byte 1..8 is a Quake impulse directly (axe..lightning);
-	 * the server's QC rejects impulses for unowned weapons. */
-	if (qnn_pending_action.weapon > 0)
+	 * the server's QC rejects impulses for unowned weapons.  Only send
+	 * it when it differs from the held weapon: stock W_ChangeWeapon has
+	 * no same-weapon guard, so a per-tick impulse re-runs
+	 * W_SetCurrentAmmo -> player_run() every server frame, playing the
+	 * run animation at 4x and stomping pain frames.  The action log
+	 * still records the raw decided weapon (qnn_client_main.c). */
+	if (qnn_pending_action.weapon > 0
+		&& qnn_pending_action.weapon != QNN_WeaponId())
 		in_impulse = qnn_pending_action.weapon;
 }

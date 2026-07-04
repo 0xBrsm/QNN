@@ -10,7 +10,7 @@ bin as the current model.
 - **Semantics:** [`semantics.1`](../semantics/semantics.1.md) (unchanged from `wire.9`).
 - **Arch:** v11 packed generation.
 - **Codec:** not yet built (Band A target).
-- **Artifacts:** `/tmp/qnn_v17.onnx`, `/tmp/qnn_v22.onnx`; both on `\\pi.local\qnn`.
+- **Artifacts:** the v17 and v22 ONNX exports.
 - **Authoritative source:** the deployed v17/v22 ONNX graphs (tensor signature)
   + the Python packed layout `wire.py:SELF_FIELDS`/`OBS_SCHEMA` at commit
   `b0f75210^`. **Not** the C `qnn_onnx.c` at that commit — that file was already

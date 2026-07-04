@@ -1,0 +1,61 @@
+{
+  "decode_version": 1,
+  "version": "a24rc1",
+  "decode_module": "qnn.model.bench.a24.decode",
+  "guard_module": "none",
+  "look_grid": "config/look_grid.json",
+  "move_hazard": {
+    "schema": "move_hazard_v1",
+    "method": "lognorm",
+    "provenance": "NON-COMBAT (target==0) train frames; contiguous non-combat runs",
+    "tick_hz": 20,
+    "lognorm": {
+      "noncombat": true,
+      "fb": [
+        [
+          1.47982,
+          0.77623
+        ],
+        [
+          1.58431,
+          1.28612
+        ],
+        [
+          2.26121,
+          1.03759
+        ]
+      ],
+      "lr": [
+        [
+          1.591,
+          0.86096
+        ],
+        [
+          1.15904,
+          1.39641
+        ],
+        [
+          1.58811,
+          0.8665
+        ]
+      ],
+      "param_names": [
+        "mu",
+        "sigma"
+      ],
+      "maxage": 400
+    }
+  },
+  "params": {
+    "look.aim_prior_gain": 0.0,
+    "look.aim_ffwd_gain": 0.0,
+    "weapon_ban": [],
+    "move.sticky_tau_fb": 0.74,
+    "move.sticky_tau_lr": 0.92,
+    "move.tau_engagement_gated": true,
+    "move.stop_onset": true,
+    "move.switchback_eps": 0.1,
+    "weapon.sticky_confidence": 0.57,
+    "weapon.sticky_margin": 0.0
+  }
+}

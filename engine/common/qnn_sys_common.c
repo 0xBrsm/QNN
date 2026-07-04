@@ -314,6 +314,26 @@ int QNN_ItemFlagFromImpulse(int impulse)
 	}
 }
 
+/* Inverse of QNN_ItemFlagFromImpulse: IT_* weapon bit-flag → raw weapon-
+ * select impulse (1-8).  Returns 0 for a non-weapon / unrecognized flag.
+ * Used to read the QC W_ChangeWeapon verdict (self.weapon, an IT_* flag)
+ * back into the RAW (1..8) act_weapon label space. */
+int QNN_ImpulseFromItemFlag(int item_flag)
+{
+	switch (item_flag)
+	{
+		case IT_AXE:              return 1;
+		case IT_SHOTGUN:          return 2;
+		case IT_SUPER_SHOTGUN:    return 3;
+		case IT_NAILGUN:          return 4;
+		case IT_SUPER_NAILGUN:    return 5;
+		case IT_GRENADE_LAUNCHER: return 6;
+		case IT_ROCKET_LAUNCHER:  return 7;
+		case IT_LIGHTNING:        return 8;
+		default: return 0;
+	}
+}
+
 /* QNN_NextWeaponId lives in per-game qnn_self.c — items source
  * differs between NQ (cl.items) and QW (cl.stats[STAT_ITEMS]). */
 

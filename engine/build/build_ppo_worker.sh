@@ -15,6 +15,7 @@ CUSTOM_SOURCES=(
   "${ENGINE_DIR}/nq/qnn_trainer_main.c"
   "${ENGINE_DIR}/common/qnn_collect_helpers.c"
   "${ENGINE_DIR}/nq/qnn_input.c"
+  "${ENGINE_DIR}/nq/qnn_predict.c"
   "${ENGINE_DIR}/common/qnn_map.c"
   "${ENGINE_DIR}/common/qnn_entity.c"
   "${ENGINE_DIR}/nq/qnn_players.c"

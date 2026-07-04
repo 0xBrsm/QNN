@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define QNN_TRAIN_BINARY_MAGIC "QTRN"
-#define QNN_TRAIN_BINARY_VERSION 2
+#define QNN_TRAIN_BINARY_VERSION 3
 
 #define QNN_TRAIN_FLAG_RESET 0x0001
 #define QNN_TRAIN_FLAG_DONE  0x0002
@@ -106,6 +106,19 @@ typedef struct
 	float _computed_reward;
 	float _tracking_cos;
 	float _damage_dealt_self;
+	/* Transient: v3 lead-aim geometry for the nearest in-LOS actor (the same
+	   actor QNN_TrackingCosine selects), in the player VIEW frame to match the
+	   obs convention (QNN_ComputeRel/QNN_ComputeVel via QNN_RelativeFrame).
+	   _lead_valid is 0 when no actor participates this tick. rel is raw Quake
+	   units; vel is the actor's ABSOLUTE world velocity in view frame (NOT
+	   relative) — exactly what the entity obs token carries, so the Python
+	   lead kernel computes the same intercept it does for the human curve.
+	   _lead_weapon_id is the player's CURRENTLY-HELD weapon (snapshot->weapon_id
+	   = QNN_WeaponId()), needed to pick projectile speed and the ground anchor. */
+	float _lead_rel[3];
+	float _lead_vel[3];
+	float _lead_weapon_id;
+	float _lead_valid;
 } qnn_record_state_t;
 
 static qnn_record_state_t qnn_record_state;
@@ -191,9 +204,16 @@ static float QNN_TrackingCosine(const qnn_snapshot_t *snapshot)
 	float best_dist_sq = 1e30f;
 	float now = (float)cl.mtime[0];
 	int entity_num;
+	int best_entity = -1;
 	vec3_t forward;
 
 	QNN_ForwardFromAngles(snapshot->player_view_angles, forward);
+
+	/* Reset the v3 lead geometry; populated only if an actor participates. */
+	qnn_record_state._lead_valid = 0.0f;
+	qnn_record_state._lead_rel[0] = qnn_record_state._lead_rel[1] = qnn_record_state._lead_rel[2] = 0.0f;
+	qnn_record_state._lead_vel[0] = qnn_record_state._lead_vel[1] = qnn_record_state._lead_vel[2] = 0.0f;
+	qnn_record_state._lead_weapon_id = (float)snapshot->weapon_id;
 
 	/* Only actors whose primary observation channel is current this tick
 	   participate in tracking reward. Bodyque corpses have entity_num >
@@ -225,7 +245,29 @@ static float QNN_TrackingCosine(const qnn_snapshot_t *snapshot)
 		{
 			best_dist_sq = dist_sq;
 			best_cos = cos_val;
+			best_entity = entity_num;
 		}
+	}
+
+	/* Capture view-frame rel pos + ABSOLUTE world velocity of the SAME nearest
+	   actor for the lead-referenced aim metric. QNN_RelativeFrame uses the
+	   AngleVectors (forward/right/up) basis — identical to the obs-token
+	   QNN_ComputeRel/QNN_ComputeVel, so the Python lead kernel sees the same
+	   geometry it sees in the human corpus. */
+	if (best_entity >= 0)
+	{
+		const qnn_entity_t *ent = &qnn_store[best_entity];
+		vec3_t delta, rel, vel;
+		VectorSubtract(ent->origin, snapshot->player_origin, delta);
+		QNN_RelativeFrame(snapshot->player_view_angles, delta, rel);
+		QNN_RelativeFrame(snapshot->player_view_angles, ent->velocity, vel);
+		qnn_record_state._lead_rel[0] = rel[0];
+		qnn_record_state._lead_rel[1] = rel[1];
+		qnn_record_state._lead_rel[2] = rel[2];
+		qnn_record_state._lead_vel[0] = vel[0];
+		qnn_record_state._lead_vel[1] = vel[1];
+		qnn_record_state._lead_vel[2] = vel[2];
+		qnn_record_state._lead_valid = 1.0f;
 	}
 	return best_cos;
 }
@@ -750,6 +792,21 @@ void QNN_WriteTrainingExtrasBinary(FILE *out, const qnn_snapshot_t *snapshot, in
 	QNN_WriteF32LE(out, qnn_record_state._computed_reward);
 	QNN_WriteF32LE(out, qnn_record_state._tracking_cos);
 	QNN_WriteF32LE(out, qnn_record_state._damage_dealt_self);
+
+	/* Version 3 extension: lead-aim geometry for the nearest in-LOS actor
+	   (the QNN_TrackingCosine actor). View-frame rel pos (raw u), view-frame
+	   ABSOLUTE world velocity (raw u/s), the player's currently-held weapon id,
+	   and a validity flag. Lets the Python eval recompute a lead-referenced
+	   (ground-referenced for floored weapons) aim cosine with the SAME shared
+	   lead kernel the human coh_5deg curve uses (lead_aim.compute_lead_aim). */
+	QNN_WriteF32LE(out, qnn_record_state._lead_rel[0]);
+	QNN_WriteF32LE(out, qnn_record_state._lead_rel[1]);
+	QNN_WriteF32LE(out, qnn_record_state._lead_rel[2]);
+	QNN_WriteF32LE(out, qnn_record_state._lead_vel[0]);
+	QNN_WriteF32LE(out, qnn_record_state._lead_vel[1]);
+	QNN_WriteF32LE(out, qnn_record_state._lead_vel[2]);
+	QNN_WriteF32LE(out, qnn_record_state._lead_weapon_id);
+	QNN_WriteF32LE(out, qnn_record_state._lead_valid);
 
 	for (idx = 0; idx < qnn_record_state.damage_count; ++idx)
 	{

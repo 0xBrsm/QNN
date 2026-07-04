@@ -1,17 +1,30 @@
-# quakedef.h — bump MAX_OSPATH from 128 to 512
+# quakedef.h — QNN path/console integration
 #
 # Some demo and corpus paths exceed 128 chars when nested under our asset
 # tree.  Doubling-plus the original limit keeps COM_FindFile / Sys_FileOpenRead
 # from silently truncating filenames.
 #
+# QNN_ConsoleOutput / QNN_ConsoleRelay are implemented by the nq_client console
+# layer (qnn_client_console.c): QNN_ConsoleOutput receives Con_Printf output,
+# QNN_ConsoleRelay inspects svc_print for chat-driven remote-console commands.
+#
 --- quakedef.h
 +++ quakedef.h
 @@ -94,7 +94,7 @@
- 
- 
+
+
  #define	MAX_QPATH		64			// max length of a quake game pathname
 -#define	MAX_OSPATH		128			// max length of a filesystem pathname
 +#define	MAX_OSPATH		512			// max length of a filesystem pathname
- 
+
  #define	ON_EPSILON		0.1			// point on plane side epsilon
- 
+
+@@ -312,6 +312,8 @@
+ void Host_Frame (float time);
+ void Host_Quit_f (void);
+ void Host_ClientCommands (char *fmt, ...);
++void QNN_ConsoleOutput (char *text);
++qboolean QNN_ConsoleRelay (char *text);
+ void Host_ShutdownServer (qboolean crash);
+
+ extern qboolean		msg_suppress_1;		// suppresses resolution and cache size console output

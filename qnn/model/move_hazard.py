@@ -126,7 +126,7 @@ def tabulate_hazard(collect_dir: str | Path, edges: list[int]) -> dict:
 # the table — can never read 0.0 there (the statue-mode freeze) because its tail
 # is a smooth positive decay. Weibull/gamma are wrong (increasing hazard → forced
 # release); human move dwell is heavy-tailed = the log-normal family. See
-# docs/move-head.md and project memory.
+# research/move-head.md and project memory.
 #
 # The decode/C/export wire contract is unchanged: this fits (mu, sigma) per cell
 # from fine integer-age counts, then EXPANDS the equation back into the same
@@ -165,16 +165,22 @@ def _accum_fine(rel: np.ndarray, tot: np.ndarray, ax: int, cseq: np.ndarray) -> 
 
 
 def _fine_counts(collect_dir: str | Path,
-                 noncombat: bool = False) -> "tuple[np.ndarray, np.ndarray, int]":
+                 noncombat: bool = False,
+                 combat: bool = False) -> "tuple[np.ndarray, np.ndarray, int]":
     """Walk train-split move labels accumulating per-(axis, held, integer-age)
     release/total counts (the un-bucketed sufficient stats the equation is fit to).
     Returns (rel, tot) of shape (N_AXES, N_HELD, LOGNORM_MAXAGE+1) — index t holds
     dwell-age t (1..MAXAGE; ages > MAXAGE lump into the top index) — plus n_frames.
 
-    ``noncombat=True`` restricts to NON-COMBAT frames (target_probs argmax == 0)
-    and feeds each contiguous non-combat run as its own dwell sequence, so a held
-    class never bridges a combat gap — the context-free locomotion baseline of the
-    rc1o move scheme (mirrors scripts/analysis/move_baseline_residual.py)."""
+    Conditioning (mutually exclusive; default = ALL frames, episode-run dwell):
+    ``noncombat=True`` restricts to NON-COMBAT frames (target_probs argmax == 0) —
+    the context-free locomotion baseline of the rc1o move scheme. ``combat=True``
+    is the inverse: ENGAGED frames (target_probs argmax != 0) — the in-fight
+    dwell law (juke/strafe under fire). Both feed each contiguous conditioned run
+    as its own dwell sequence so a held class never bridges a regime gap. These
+    three (combat / non-combat / all) are the core human-movement static tables."""
+    if noncombat and combat:
+        raise ValueError("noncombat and combat are mutually exclusive")
     collect_dir = Path(collect_dir)
     base = collect_dir / "precomputed_train"
     man = json.loads((base / "manifest.json").read_text())
@@ -186,18 +192,19 @@ def _fine_counts(collect_dir: str | Path,
         a = sh.get("actions", {})
         v = np.asarray(np.load(base / (a.get("move") or f"shard{si:06d}_act_move.npy"), mmap_mode="r"))
         fb, lr = unpack_move(v)
-        keep_nc = None
-        if noncombat:
+        keep = None
+        if noncombat or combat:
             tp = np.asarray(np.load(base / a["target_probs"], mmap_mode="r"), dtype=np.float32)
-            keep_nc = np.argmax(tp, axis=1) == 0      # target_probs[:,0] = no-target slot
+            engaged = np.argmax(tp, axis=1) != 0      # target_probs[:,0] = no-target slot
+            keep = engaged if combat else ~engaged
         off = 0
         for n in sh.get("episode_lengths", []):
             n = int(n)
             if n <= 0:
                 continue
             sl = slice(off, off + n); off += n
-            if noncombat:
-                for run in _contiguous_runs(keep_nc[sl]):
+            if keep is not None:
+                for run in _contiguous_runs(keep[sl]):
                     idx = run + sl.start
                     _accum_fine(rel, tot, 0, fb[idx])
                     _accum_fine(rel, tot, 1, lr[idx])
@@ -286,37 +293,44 @@ def lognorm_buckets(params: np.ndarray, edges: list[int],
 
 def lognorm_hazard_from_collect(collect_dir: str | Path,
                                 tick_hz: int | float | None = None,
-                                noncombat: bool = False) -> dict:
+                                noncombat: bool = False,
+                                combat: bool = False) -> dict:
     """Build the ``move_hazard`` block from the LOG-NORMAL equation: fit (mu,sigma)
     per cell from fine-age counts, expand to the tick-aware bucketed fb/lr table.
     Records the equation params (provenance + rate-invariant re-expansion) and the
     derived table the decode reads — same schema fields as the empirical block plus
     ``method`` and ``lognorm``.
 
-    ``noncombat=True`` fits the context-free locomotion baseline of the rc1o move
-    scheme (non-combat frames, contiguous-run dwell) — the engagement-gated tau
-    then carries the combat residual at decode time, so this table must be the
-    NON-COMBAT law, not a pooled blend."""
+    Conditioning (the three core static tables): default ALL train frames;
+    ``noncombat=True`` = the rc1o context-free locomotion baseline (target==0); the
+    deployed move scheme uses the NON-COMBAT law + engagement-gated tau. ``combat=True``
+    = the in-fight dwell law (target!=0) — used to PREDICT an engaged opponent's
+    movement (the aim-lead motion model), not for self-decode."""
     collect_dir = Path(collect_dir)
     if tick_hz is None:
         meta_path = collect_dir / "collect_metadata.json"
         if meta_path.exists():
             tick_hz = json.loads(meta_path.read_text()).get("tick_hz")
     edges = default_edges(tick_hz)
-    rel, tot, n_frames = _fine_counts(collect_dir, noncombat=noncombat)
+    rel, tot, n_frames = _fine_counts(collect_dir, noncombat=noncombat, combat=combat)
     params = fit_lognorm(rel, tot)
     table = lognorm_buckets(params, edges)
+    regime = "combat" if combat else ("noncombat" if noncombat else "all")
+    prov = {"combat": "COMBAT (target!=0) train frames; contiguous combat runs",
+            "noncombat": "NON-COMBAT (target==0) train frames; contiguous non-combat runs",
+            "all": "all train frames; episode-run dwell"}[regime]
     return {
         "schema": "move_hazard_v1",
         "method": "lognorm",
-        "provenance": ("NON-COMBAT (target==0) train frames; contiguous non-combat runs"
-                       if noncombat else "all train frames; episode-run dwell"),
+        "regime": regime,
+        "provenance": prov,
         "tick_hz": tick_hz,
         "n_frames": n_frames,
         "edges": list(edges),
         "fb": table[0].round(6).tolist(),
         "lr": table[1].round(6).tolist(),
         "lognorm": {
+            "regime": regime,
             "noncombat": bool(noncombat),
             "fb": [[round(float(m), 5), round(float(s), 5)] for m, s in params[0]],
             "lr": [[round(float(m), 5), round(float(s), 5)] for m, s in params[1]],
@@ -328,7 +342,8 @@ def lognorm_hazard_from_collect(collect_dir: str | Path,
 
 
 def compute_hazard_from_collect(collect_dir: str | Path, tick_hz: int | float | None = None,
-                                method: str = "empirical", noncombat: bool = False) -> dict:
+                                method: str = "empirical", noncombat: bool = False,
+                                combat: bool = False) -> dict:
     """Build the ``move_hazard`` metadata block for a collect: tick-aware bucket
     edges, the fb/lr release tables, and a statue-mode tail diagnostic (long-dwell
     'none' release must be > 0, else a no-contact bot can freeze).
@@ -343,7 +358,8 @@ def compute_hazard_from_collect(collect_dir: str | Path, tick_hz: int | float | 
 
     ``noncombat=True`` (lognorm only) fits the rc1o non-combat locomotion baseline."""
     if method == "lognorm":
-        return lognorm_hazard_from_collect(collect_dir, tick_hz=tick_hz, noncombat=noncombat)
+        return lognorm_hazard_from_collect(collect_dir, tick_hz=tick_hz,
+                                           noncombat=noncombat, combat=combat)
     collect_dir = Path(collect_dir)
     if tick_hz is None:
         meta_path = collect_dir / "collect_metadata.json"
@@ -414,11 +430,20 @@ def main() -> None:
                     help="empirical bucketed tabulation (default) or log-normal equation fit")
     ap.add_argument("--noncombat", action="store_true",
                     help="(lognorm) fit the rc1o non-combat locomotion baseline (target==0, contiguous runs)")
+    ap.add_argument("--combat", action="store_true",
+                    help="(lognorm) fit the in-fight dwell law (target!=0, contiguous combat runs)")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="write the computed move_hazard block to this JSON (the static-table artifact)")
     ap.add_argument("--tick-hz", type=float, default=None)
     args = ap.parse_args()
     block = (_backfill(args.collect_dir, method=args.method) if args.backfill
              else compute_hazard_from_collect(args.collect_dir, tick_hz=args.tick_hz,
-                                               method=args.method, noncombat=args.noncombat))
+                                               method=args.method, noncombat=args.noncombat,
+                                               combat=args.combat))
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(block, indent=2) + "\n")
+        print(f"wrote {args.out}")
     print(f"move_hazard: method={block.get('method','empirical')} tick_hz={block['tick_hz']} "
           f"edges={block['edges']} n_frames={block['n_frames']:,}")
     print("none-row last-bucket release (statue-mode check; 0.0 => freeze risk): "

@@ -4,7 +4,7 @@ Provides ``load_pooled_look``, a per-shard function that reads the ragged
 entity-token observation arrays from a precomputed cache shard and pools them
 to per-frame (F, 3) target vectors weighted by ground-truth ``target_probs``.
 
-Entity-token alignment (canonical reference: docs/target-head.md §2):
+Entity-token alignment (canonical reference: research/target-head.md §2):
   - ``target_probs[:, 0]``  = NO_TARGET mass; not mapped to any entity token.
   - entity token ``j``      ↔ ``target_probs[:, j+1]``.
 

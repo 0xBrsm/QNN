@@ -1,0 +1,15 @@
+{
+  "head": "full_multitrunk",
+  "d_model": 64,
+  "n_heads": 2,
+  "n_layers": 2,
+  "d_ffn": 256,
+  "d_gru": 64,
+  "trunks": [["move", "look"], ["attack", "weapon"]],
+  "d_move": 64,
+  "d_look": 64,
+  "d_attack": 64,
+  "d_weapon": 64,
+  "activation": "gelu",
+  "attn_dropout": 0.0
+}

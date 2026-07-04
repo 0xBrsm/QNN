@@ -71,9 +71,7 @@ id) are **server-time-aligned** — the alignment of the training data
 (`qnn_trainer_main.c`: the step's action is applied in the same `Host_Frame`
 that produces the response obs). A frontend that delivers self-state lagging
 this alignment feeds the model obs from a semantics it was never trained
-under; the measured consequence of a single tick of violation is the a24d
-live strafe-jitter (gate snap-back loop) and a closed-loop accuracy tax
-(0.27→0.21 at +1 tick) — see [`move-head.md`](../../move-head.md), lag triage.
+under.
 
 **Conformance layers.** Every protocol frontend must honor the clause by
 whatever means its protocol affords; the model is never asked to tolerate
@@ -94,7 +92,7 @@ transport.
    k=0 (raw NQ fails at k=1).
 2. **Stream human-band under the standard decode stack** — lr/fb
    switch-rate, dwell median, and dwell-age hazard curves within the human
-   band (`move_stream_dynamics.py` references); the a24e watermark must be a
+   band; the a24e watermark must be a
    behavioral no-op on a conformant frontend.
 3. **Physics-floor canary** — where a replay layer runs, its lag-vote EMA
    floor across ALL candidates stays low; a high floor fingerprints

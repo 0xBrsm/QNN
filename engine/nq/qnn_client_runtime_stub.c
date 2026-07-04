@@ -12,18 +12,26 @@
  * Set by qnn_client_main.c at init; advanced per frame from the
  * main step loop.
  *
- * QNN_PackInputMask lives in qnn_collect_helpers.c too (same excluded
- * source); qnn_onnx.c calls it to pack the model's per-axis move/attack
- * decision into the action press byte. It's pure bit-packing with no sv.*
- * dependency, so we provide a local copy here rather than pulling in the
- * whole collect stack. Keep this byte-identical to the canonical definition
- * (qnn_collect_helpers.c) — they must agree on the bit layout.
+ * QNN_PackInputMask and QNN_RuntimeNowSeconds live in qnn_collect_helpers.c
+ * too (same excluded source); qnn_onnx.c / qnn_self_common.c call them.
+ * QNN_PackInputMask is pure bit-packing; QNN_RuntimeNowSeconds reads only the
+ * locally-defined qnn_runtime (driven at 20 Hz by qnn_client_main.c) — neither
+ * has an sv.* dependency, so we provide local copies here rather than pulling
+ * in the whole collect stack. Keep these byte-identical to the canonical
+ * definitions (qnn_collect_helpers.c).
  */
 #include <stdint.h>
 
 #include "qnn_collect_helpers.h"
 
 qnn_runtime_t qnn_runtime;
+
+float QNN_RuntimeNowSeconds(void)
+{
+	if (qnn_runtime.fixed_tick_hz > 0)
+		return (float)qnn_runtime.tick / (float)qnn_runtime.fixed_tick_hz;
+	return qnn_runtime.emit_start_native;
+}
 
 uint8_t QNN_PackInputMask(
 	int alive,

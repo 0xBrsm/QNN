@@ -124,7 +124,7 @@ with its generation) is the self-describing, run-pinned record of that layer:
 | field | meaning |
 |-------|---------|
 | `decode_module` | dotted import path — the gen-coupled decode geometry (must read the head params) |
-| `guard_module`  | dotted path \| `"none"` — exposes `guard_fire_logit_for_export` + `policy_decode_action_postprocess` |
+| `guard_module`  | dotted path \| `"none"` — exposes `guard_attack_logit_for_export` + `policy_decode_action_postprocess` |
 | `params`        | flat `str→scalar\|list` map (`look.*`, `weapon.*`, `guard.*`, `weapon_ban`) |
 | `look_grid`     | run-relative path to the polar look grid (null = code default) |
 | `move_hazard`   | path to the hazard/dwell table JSON (null = none / head-driven) |
@@ -168,16 +168,19 @@ support feasibility (below).
 | 0.14–0.15 | `token-spec-v10` | `wire.6` | `semantics.0d` | move[3]/jump-collapse | v10 | No | B |
 | 0.17 | `token-spec.md` (v11) | **`wire.7`** | **`semantics.1`** | v11 packed | **v17, v22** | **Yes** | **A** |
 | 0.21 | (no doc bump) | `wire.8` | `semantics.1` | native split | — | No (never exported) | A |
-| HEAD | native 44-obs split + in-graph MOVE decode | **`wire.9`** | **`semantics.1`** | `full_4head` | **v24** | **Yes** | **A** |
+| (a24) | native split + in-graph MOVE decode | `wire.9` | `semantics.1` | `full_4head` | v24 | superseded by `wire.11` | A |
+| HEAD | native split + in-graph MOVE **and ATTACK** decode | **`wire.11`** | **`semantics.1`** | `full_4head` | **v24** | **Yes** | **A** |
 
 Distinct contracts across the full history: **9 wire × 5 semantics**. With a
-surviving runnable artifact: **2 wire** (`wire.7`, `wire.9`) **× 1 semantics**
+surviving runnable artifact: **2 wire** (`wire.7`, `wire.11`) **× 1 semantics**
 (`semantics.1`). `wire.8` is a reconstructed id — the native exporter postdates
-`look_delta`, so no 43-input graph was ever exported. `wire.9` = the native
-44-obs split + the recurrent MOVE-decode state pair as I/O, with `move` the
-decided 3-axis class (the a24 stateful move decode runs in-graph; the engine no
-longer runs the move state machine, and the legacy `wire.7` logit-move path runs
-plain per-axis argmax). See [`wire/wire.9.md`](wire/wire.9.md).
+`look_delta`, so no 43-input graph was ever exported. `wire.11` = `wire.9` (native
+44-obs split + in-graph decided `move`/`weapon` + the move-decode state pair) **+
+the in-graph ATTACK decode** (decided `attack` bit instead of `fire_logit`, plus
+the `attack_state` hold-tail loop-back) — so ALL four actions decode in-graph and
+the engine is decode-agnostic. `wire.11` REPLACES `wire.9` for the a24 gen
+(re-export); `wire.10` stays burned. The legacy `wire.7` logit path is unchanged.
+See [`wire/wire.11.md`](wire/wire.11.md).
 
 > **`wire.9` number reclaimed.** During active a24 development the in-graph
 > move-decode shape was briefly numbered `wire.10`, distinct from an
@@ -229,4 +232,4 @@ census-level summary + dead-field annotation is enough for diagnosis.
 - `src/qnn/model/decode_config.py` — resolves a decode-config JSON → decode/guard modules + params; computes the config sha256 the exporter stamps. NOT a contract axis (decode is decoupled from training). The per-generation config templates ship with their generation.
 - `tools/stamp_checkpoint.py` — add/backfill a `meta["contract"]` block on an archived `.pth`.
 - `qnn/utils/checkpoint_converter.py` — the arch migration chain + `resolve_checkpoint_contract` (load-time backfill).
-- `docs/archive/` — the historical bundled snapshots (`token-spec-v*`, `obs-spec-v*`).
+- `research/archive/` — the historical bundled snapshots (`token-spec-v*`, `obs-spec-v*`).

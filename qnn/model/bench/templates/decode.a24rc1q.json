@@ -1,0 +1,80 @@
+{
+  "decode_version": 1,
+  "version": "a24rc1q",
+  "description": "FINAL skill-system decode on head_probe_full_5head_weapon_target_seed17: validated all-humans pins (move hazard+tau, weapon sticky, attack.bias=-1.1, look turn_mag_scale=0.7 dampener) + aim_prior_gain=0.20 (p90, dampened substrate) + rc1 SG-ban + the rc2/rc3 competence guards (RL self-splash, lg_range, dodge-release). snap dropped (superseded by turn_mag_scale). rc2/rc3 non-guard decode superseded.",
+  "decode_module": "qnn.model.bench.a24.decode",
+  "guard_module": "qnn.model.bench.a24.guard",
+  "look_grid": "config/look_grid.json",
+  "move_hazard": {
+    "schema": "move_hazard_v1",
+    "method": "lognorm",
+    "provenance": "NON-COMBAT (target==0) train frames; contiguous non-combat runs",
+    "tick_hz": 20,
+    "lognorm": {
+      "noncombat": true,
+      "fb": [
+        [
+          1.47982,
+          0.77623
+        ],
+        [
+          1.58431,
+          1.28612
+        ],
+        [
+          2.26121,
+          1.03759
+        ]
+      ],
+      "lr": [
+        [
+          1.591,
+          0.86096
+        ],
+        [
+          1.15904,
+          1.39641
+        ],
+        [
+          1.58811,
+          0.8665
+        ]
+      ],
+      "param_names": [
+        "mu",
+        "sigma"
+      ],
+      "maxage": 400
+    }
+  },
+  "params": {
+    "look.aim_prior_gain": 0.2,
+    "look.aim_ffwd_gain": 0.0,
+    "look.aim_mag_gain": 0.0,
+    "look.turn_mag_scale": 0.7,
+    "attack.bias": -1.1,
+    "move.sticky_tau_fb": 0.74,
+    "move.sticky_tau_lr": 0.92,
+    "move.tau_engagement_gated": true,
+    "move.stop_onset": true,
+    "move.switchback_eps": 0.1,
+    "weapon.sticky_confidence": 0.57,
+    "weapon.sticky_margin": 0.0,
+    "weapon_ban": [
+      2
+    ],
+    "guard.attack_splash": true,
+    "guard.rocket_ehr": true,
+    "guard.rocket_ehr_safety_margin_hp": 10.0,
+    "guard.rocket_floor_min_pitch_deg": 12.0,
+    "guard.lg_range": true,
+    "guard.lg_range_u": 600.0,
+    "guard.lg_align_half_angle_deg": 15.0,
+    "guard.projectile_release": true,
+    "guard.projectile_release_mode": "any",
+    "guard.projectile_release_horizon_s": 1.0,
+    "guard.projectile_hit_radius_u": 45.0,
+    "guard.projectile_release_splash": true,
+    "guard.projectile_release_arc": true
+  }
+}

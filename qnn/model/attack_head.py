@@ -2,7 +2,7 @@
 
 Intentionally minimal — no prior, no extra signals. Variants that add a
 prior (aim alignment, hit-test physics, feasibility gating, etc.) were
-concluded bench ablations (findings in ``docs/fire-discrimination.md``);
+concluded bench ablations (findings in ``research/fire-discrimination.md``);
 any new variant is a standalone ``nn.Module`` implementing the same
 ``AttackHeadInput → AttackHeadOutput`` contract, slotted in via
 ``Network(attack_head=<variant>)``.

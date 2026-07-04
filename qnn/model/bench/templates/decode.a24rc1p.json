@@ -1,0 +1,85 @@
+{
+  "decode_version": 1,
+  "version": "a24rc1p",
+  "decode_module": "qnn.model.bench.a24.decode",
+  "guard_module": "qnn.model.bench.a24.guard",
+  "look_grid": "config/look_grid.json",
+  "move_hazard": {
+    "method": "lognorm",
+    "lognorm": {
+      "noncombat": true,
+      "fb": [
+        [
+          1.47982,
+          0.77623
+        ],
+        [
+          1.58431,
+          1.28612
+        ],
+        [
+          2.26121,
+          1.03759
+        ]
+      ],
+      "lr": [
+        [
+          1.591,
+          0.86096
+        ],
+        [
+          1.15904,
+          1.39641
+        ],
+        [
+          1.58811,
+          0.8665
+        ]
+      ],
+      "param_names": [
+        "mu",
+        "sigma"
+      ],
+      "maxage": 400
+    }
+  },
+  "params": {
+    "look.aim_prior_gain": 0.015,
+    "look.aim_ffwd_gain": 1.0,
+    "look.aim_mag_gain": 1.0,
+    "move.sticky_tau_fb": 0.74,
+    "move.sticky_tau_lr": 0.92,
+    "move.stop_onset": true,
+    "move.switchback_eps": 0.1,
+    "weapon.sticky_confidence": 0.57,
+    "weapon.sticky_margin": 0.0,
+    "weapon_ban": [
+      2
+    ],
+    "guard.attack_splash": true,
+    "guard.rocket_ehr": true,
+    "guard.rocket_ehr_safety_margin_hp": 10.0,
+    "guard.rocket_floor_min_pitch_deg": 12.0,
+    "guard.lg_range": true,
+    "guard.lg_range_u": 600.0,
+    "guard.lg_align_half_angle_deg": 15.0,
+    "guard.projectile_release": true,
+    "guard.projectile_release_mode": "any",
+    "guard.projectile_release_horizon_s": 1.0,
+    "guard.projectile_hit_radius_u": 45.0,
+    "guard.projectile_release_splash": true,
+    "guard.projectile_release_arc": true,
+    "move.tau_engagement_gated": true,
+    "look.aim_snap_thresholds_deg": [
+      5.0,
+      20.0,
+      45.0
+    ],
+    "look.aim_snap_scales": [
+      0.0,
+      0.0,
+      2.0,
+      10.0
+    ]
+  }
+}

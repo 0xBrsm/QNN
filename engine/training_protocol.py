@@ -8,7 +8,7 @@ from typing import Callable
 
 TRAINING_BINARY_MAGIC = b"QTRN"
 TRAINING_BINARY_VERSION_MIN = 1
-TRAINING_BINARY_VERSION_MAX = 2
+TRAINING_BINARY_VERSION_MAX = 3
 
 TRAINING_FLAG_RESET = 0x0001
 TRAINING_FLAG_DONE = 0x0002
@@ -19,6 +19,13 @@ TRAINING_BINARY_HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)
 # Version 2 appends 3 floats after the v1 header: computed_reward, tracking_cos, damage_dealt_self
 _V2_EXTENSION_FORMAT = "<3f"
 _V2_EXTENSION_SIZE = struct.calcsize(_V2_EXTENSION_FORMAT)
+
+# Version 3 appends 8 floats after the v2 extension: the nearest in-LOS actor's
+# view-frame rel pos (3, raw u), view-frame ABSOLUTE world velocity (3, raw u/s),
+# the currently-held weapon id, and a validity flag (1.0 when an actor was found).
+# Lead-aim geometry for the lead-referenced aim-coherence eval metric.
+_V3_EXTENSION_FORMAT = "<8f"
+_V3_EXTENSION_SIZE = struct.calcsize(_V3_EXTENSION_FORMAT)
 
 _DAMAGE_FORMAT = "<hhHH8f"
 _DAMAGE_SIZE = struct.calcsize(_DAMAGE_FORMAT)
@@ -115,6 +122,13 @@ class TrustedTrainingExtrasV1:
     computed_reward: float = 0.0
     tracking_cos: float = 0.0
     damage_dealt_self: float = 0.0
+    # Version 3 extension: lead-aim geometry for the nearest in-LOS actor
+    # (0.0 / lead_valid=0.0 for v1/v2 frames). rel/vel are view-frame raw Quake
+    # units; lead_weapon_id is the currently-held raw weapon id (1..8).
+    lead_rel: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    lead_vel: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    lead_weapon_id: int = 0
+    lead_valid: bool = False
 
 
 def decode_binary_training_extras(
@@ -171,6 +185,18 @@ def decode_binary_training_extras(
     if int(version) >= 2:
         ext_data = read_exact(_V2_EXTENSION_SIZE)
         computed_reward, tracking_cos, damage_dealt_self = struct.unpack(_V2_EXTENSION_FORMAT, ext_data)
+
+    # Version 3 extension: 8 floats appended after the v2 extension
+    lead_rel = (0.0, 0.0, 0.0)
+    lead_vel = (0.0, 0.0, 0.0)
+    lead_weapon_id = 0
+    lead_valid = False
+    if int(version) >= 3:
+        v3 = struct.unpack(_V3_EXTENSION_FORMAT, read_exact(_V3_EXTENSION_SIZE))
+        lead_rel = (v3[0], v3[1], v3[2])
+        lead_vel = (v3[3], v3[4], v3[5])
+        lead_weapon_id = int(round(v3[6]))
+        lead_valid = bool(v3[7] != 0.0)
 
     damage_records = tuple(
         TrainingDamageRecordV1(*struct.unpack(_DAMAGE_FORMAT, read_exact(_DAMAGE_SIZE)))
@@ -238,4 +264,8 @@ def decode_binary_training_extras(
         computed_reward=float(computed_reward),
         tracking_cos=float(tracking_cos),
         damage_dealt_self=float(damage_dealt_self),
+        lead_rel=(float(lead_rel[0]), float(lead_rel[1]), float(lead_rel[2])),
+        lead_vel=(float(lead_vel[0]), float(lead_vel[1]), float(lead_vel[2])),
+        lead_weapon_id=int(lead_weapon_id),
+        lead_valid=bool(lead_valid),
     )

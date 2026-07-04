@@ -131,16 +131,30 @@ _ARCH_V22 = "v22"
 # engine_norm constants) so backfilling an archived checkpoint records what it
 # actually shipped with, not whatever the current HEAD happens to be.
 #
-#   modern / full_4head → wire.9  / semantics.1   (arch derived from ModelConfig)
-#   v17, v22            → wire.7  / semantics.1
+#   modern / full_4head → wire.11 / semantics.1   (arch derived from ModelConfig)
+#   v17, v22            → wire.7 / semantics.1
+#
+# wire.11 (the a24 in-graph MOVE+ATTACK-decode contract) is HEAD: the exporter
+# ALWAYS bakes the stateful move decode + the attack decode + their recurrent
+# state I/O into the graph (tools/export_onnx.py ExportWrapper), so a freshly-
+# trained / re-exported full_4head model IS a wire.11 graph (native 44-obs split +
+# the in-graph decided `move`/`attack` + the move_state/attack_state loop-back
+# pairs) and is stamped wire.11. wire.11 REPLACES wire.9 for this generation: the
+# a24-rc series re-exports (coordinated model+engine deploy); there is no
+# wire.9/wire.11 coexistence.
+#
+# RECLAIMED NUMBERS: an in-graph move shape was briefly wire.10 (vs engine-argmax
+# wire.9) during a24 dev; wire.10 was never released and stays BURNED (never
+# reuse). wire.9 (in-graph move, engine-side attack) was the a24 contract until the
+# attack decode moved in-graph → wire.11. Net live wire set: {wire.7, wire.11}.
 #
 # (Older generations — wire.1–.6 — exist but the converter does not recognize
 #  them; they are deliberately absent here. recognize_generation returns None and
 #  backfill_contract refuses rather than guessing.)
 GENERATION_CONTRACTS: Dict[str, Contract] = {
-    MODERN:  {"wire": "wire.9", "semantics": "semantics.1", "arch": "full_4head"},
-    GEN_V17: {"wire": "wire.7", "semantics": "semantics.1", "arch": _ARCH_V17},
-    GEN_V22: {"wire": "wire.7", "semantics": "semantics.1", "arch": _ARCH_V22},
+    MODERN:  {"wire": "wire.11", "semantics": "semantics.1", "arch": "full_4head"},
+    GEN_V17: {"wire": "wire.7",  "semantics": "semantics.1", "arch": _ARCH_V17},
+    GEN_V22: {"wire": "wire.7",  "semantics": "semantics.1", "arch": _ARCH_V22},
 }
 
 # Defensive parity: the MODERN registry row pins wire.9/semantics.1, which must

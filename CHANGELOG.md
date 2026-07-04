@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.25.0
+
+### Added
+
+- Bench generation package on the declarative graph: `qnn.model.bench.a24` (cls move/attack/weapon heads, polar look, prior-residual weapon variant) and `bench.inputs` (passthrough encoder, GT target pointer, split obs embeddings)
+- a24 decode lineage as a swappable module: polar-look hybrid with aim-prior/lead primitives, sticky-weapon gate, and the unified guard set (attack-splash / RL self-splash / LG range guards; param-selected projectile dodge-release)
+- Decode-in-model serving: ONNX export bakes the decode regime into the graph, stamps contract + provenance into `metadata_props` (`stamp_onnx`, contract sidecar), with a C-side smoke harness (`tools/onnx_smoke`)
+- `qnn.eval` suite: batched offline eval, arena/live A/B orchestration, rate-matched human-likeness yardsticks
+- Per-model mechanical-aim decode-fit pipeline (`qnn.bc.decode_fit`): fits attack threshold + aim operating point per checkpoint, emits run-pinned decode config + skill curve
+
+### Changed
+
+- `QNNPolicy` decode split into cross-generation base ops (`model.decode`) and generation-specific modules resolved via the decode config (`decode_config` guard-module resolution)
+- C engine ONNX client (`qnn_onnx`, nq predict/client) consumes the in-graph decode outputs — engine-side move state machine removed
+- Bench run templates: 17 versioned decode configs (`decode.a17`–`decode.a24rc4`) ship with the templates
+
 ## 0.24.0
 
 ### Changed

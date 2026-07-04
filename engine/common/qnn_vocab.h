@@ -70,7 +70,7 @@
 /* ── Action IDs ────────────────────────────────────────────────── */
 
 #define QNN_ACTION_NONE         0
-#define QNN_ACTION_FIRE         1
+#define QNN_ACTION_ATTACK       1
 #define QNN_ACTION_JUMP         2
 #define QNN_ACTION_LAND         3
 #define QNN_ACTION_PICKUP       4

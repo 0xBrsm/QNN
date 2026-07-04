@@ -74,6 +74,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Sequence
 
+import numpy as np
+
 LOOK_BASE_DEGREES_PER_COUNT = 0.066
 LOOK_NONLINEAR_BASE_COUNT = 256.0
 LOOK_HIGH_GAIN_MULTIPLIER = 2.0  # sensitivity 3 near center, 6 at the edge
@@ -155,18 +157,48 @@ def move_axes_from_continuous(move: Sequence[float]) -> tuple[int, int, int]:
     return out[0], out[1], out[2]
 
 
-def pack_move_axes(fb: int, lr: int, ud: int) -> int:
-    """Pack three axis class indices (each in 0..2) into a uint8.
+# ── Array-level move decoder ─────────────────────────────────────
+#
+# There is ONE on-disk move packing: the PRESS-BYTE (qnn.bc.collect
+# `act_move`), one bit per direction mirroring the QNN_PackInputMask
+# layout — bit0=attack, bit1/2 = fb neg/pos, bit3/4 = lr neg/pos,
+# bit5/6 = ud neg/pos, bit7 = jump button.  Decoded by
+# `decode_move_pressbyte`; consumed by qnn.bc.train / streaming_source /
+# cache_target_probs / scripts.mvd_paired_data and (since the QOBS
+# unification) the move labeler.  The retired LOBS path stored a separate
+# "field3" packing (`fb | lr<<2 | ud<<4`) with its own decoder — that
+# packing no longer has any producer, so it has been removed.
 
-    Layout: bits 0-1 = fb, bits 2-3 = lr, bits 4-5 = ud, bits 6-7 reserved.
+
+def decode_move_pressbyte(packed) -> "np.ndarray":
+    """Decode the BC press-byte (act_move) into (T, 3) uint8 axis classes.
+
+    Press-byte / QNN_PackInputMask layout:
+      bit 0 = attack            bit 1 = fb neg   bit 2 = fb pos
+      bit 3 = lr neg            bit 4 = lr pos
+      bit 5 = ud neg            bit 6 = ud pos (swim-up / jumppad / ladder)
+      bit 7 = jump button press
+
+    Each axis returns a 3-class label in {0=neg, 1=none, 2=pos} via
+    ``class = 1 + pos_bit - neg_bit``.  The ud axis folds the jump bit
+    (bit 7) into ud_pos so the explicit jump button and an upmove>0 both
+    supervise the same "press +Z" class.  Attack / jump bits are
+    extracted separately by the callers that need them.
     """
-    return (int(fb) & 0x3) | ((int(lr) & 0x3) << 2) | ((int(ud) & 0x3) << 4)
-
-
-def unpack_move_axes(packed: int) -> tuple[int, int, int]:
-    """Inverse of pack_move_axes."""
-    p = int(packed)
-    return p & 0x3, (p >> 2) & 0x3, (p >> 4) & 0x3
+    arr = np.asarray(packed, dtype=np.uint8)
+    if arr.ndim != 1:
+        raise ValueError(f"expected (T,) packed move, got shape {arr.shape}")
+    one = np.uint8(1)
+    fb_neg = (arr >> 1) & one
+    fb_pos = (arr >> 2) & one
+    lr_neg = (arr >> 3) & one
+    lr_pos = (arr >> 4) & one
+    ud_neg = (arr >> 5) & one
+    ud_pos = ((arr >> 6) & one) | ((arr >> 7) & one)
+    fb = (one + fb_pos - fb_neg).astype(np.uint8)
+    lr = (one + lr_pos - lr_neg).astype(np.uint8)
+    ud = (one + ud_pos - ud_neg).astype(np.uint8)
+    return np.ascontiguousarray(np.stack([fb, lr, ud], axis=-1))
 
 
 def continuous_from_move_axes(axes: Sequence[int]) -> tuple[float, float, float]:
