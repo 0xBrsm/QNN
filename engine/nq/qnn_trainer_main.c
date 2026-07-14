@@ -18,6 +18,9 @@
 
 #define QNN_STEP_OUTPUT_OBS_BUFFER_V1   1
 
+#define QNN_ROUND_RESET_WORLD 0
+#define QNN_ROUND_RESET_MATCH 1
+
 typedef struct
 {
 	int	fixed_tick_hz;
@@ -61,6 +64,8 @@ typedef struct
 	int	timelimit;
 	int	samelevel;
 	int	train;
+	int	round_reset;
+	int	arena_selfplay;
 	char	pre_map_commands[QNN_WORKER_MAX_COMMAND_TEXT];
 	char	post_map_commands[QNN_WORKER_MAX_COMMAND_TEXT];
 } qnn_reset_options_t;
@@ -96,6 +101,11 @@ static cvar_t qnn_inv_selected_cvar   = {"qnn_inv_selected",   "0", false, false
    bot is forced to hold this weapon, fixing its engagement range. Mirrors the
    model-set "selected_weapon" surface. */
 static cvar_t qnn_bot_weapon_pin_cvar = {"qnn_bot_weapon_pin", "0", false, false};
+static cvar_t qnn_arena_selfplay_cvar = {"qnn_arena_selfplay", "0", false, false};
+
+/* pr_edict.c exports this without a header prototype. */
+extern dfunction_t *ED_FindFunction(char *name);
+extern ddef_t *ED_FindField(char *name);
 
 static qboolean QNN_ClientReady(void)
 {
@@ -124,6 +134,8 @@ static void QNN_ResetOptionsDefaults(qnn_reset_options_t *options)
 	options->timelimit = 0;
 	options->samelevel = 1;
 	options->train = 0;
+	options->round_reset = QNN_ROUND_RESET_WORLD;
+	options->arena_selfplay = 0;
 }
 
 /* Weapon name → IT_ bitmask. */
@@ -258,6 +270,14 @@ static void QNN_ParseResetOptions(const char *line, qnn_reset_options_t *options
 		if (QNN_JsonExtractString(line, "\"train\"", train_name, sizeof(train_name)))
 			options->train = QNN_TrainModeFromName(train_name);
 	}
+	{
+		char reset_name[32] = {0};
+		if (QNN_JsonExtractString(line, "\"round_reset\"", reset_name, sizeof(reset_name))
+			&& !strcmp(reset_name, "match"))
+			options->round_reset = QNN_ROUND_RESET_MATCH;
+	}
+	options->arena_selfplay = QNN_JsonExtractInt(
+		line, "\"arena_selfplay\"", options->arena_selfplay) ? 1 : 0;
 	/* FrikBot opponent weapon pin (mirrors inventory.selected_weapon's
 	   name->bit surface): a weapon name forces the bot to hold that weapon,
 	   fixing its engagement range. Absent/0 => default range-based switching. */
@@ -559,6 +579,43 @@ static void QNN_CommitSnapshot(const qnn_snapshot_t *snapshot, const qnn_action_
 	QNN_CacheEntityState();
 }
 
+static float QNN_LocalArenaMatchId(void)
+{
+	static int field_offset = -2;
+	edict_t *player;
+
+	if (!sv.active || progs == NULL || cl.viewentity <= 0 || cl.viewentity >= MAX_EDICTS)
+		return -1.0f;
+	if (field_offset == -2)
+	{
+		ddef_t *def = ED_FindField((char *)"qnn_match_id");
+		field_offset = def ? (int)def->ofs : -1;
+	}
+	if (field_offset < 0)
+		return -1.0f;
+	player = EDICT_NUM(cl.viewentity);
+	return ((eval_t *)((char *)&player->v + field_offset * 4))->_float;
+}
+
+static qboolean QNN_ResetLocalArenaMatch(void)
+{
+	dfunction_t *function;
+	func_t old_self;
+	edict_t *player;
+
+	if (QNN_LocalArenaMatchId() < 0.0f)
+		return false;
+	function = ED_FindFunction((char *)"qnn_arena_reset_local_match");
+	if (function == NULL)
+		return false;
+	player = EDICT_NUM(cl.viewentity);
+	old_self = pr_global_struct->self;
+	pr_global_struct->self = EDICT_TO_PROG(player);
+	PR_ExecuteProgram((func_t)(function - pr_functions));
+	pr_global_struct->self = old_self;
+	return true;
+}
+
 static qboolean QNN_ResetWorldLocal(int seed, char *error, size_t error_size)
 {
 	char command[2048];
@@ -600,6 +657,7 @@ static qboolean QNN_ResetWorldLocal(int seed, char *error, size_t error_size)
 	/* Publish train mode so QuakeC PlayerPreThink can branch on it.
 	   Cvar persists across map changes (unlike console commands in pre_map). */
 	QNN_CvarSetInt("qnn_train", qnn_reset_options.train);
+	QNN_CvarSetInt("qnn_arena_selfplay", qnn_reset_options.arena_selfplay);
 
 	QNN_AppendCommand(command, sizeof(command), qnn_reset_options.pre_map_commands);
 	snprintf(command + strlen(command), sizeof(command) - strlen(command),
@@ -652,6 +710,13 @@ static qboolean QNN_ResetWorldLocal(int seed, char *error, size_t error_size)
 				p++;
 		}
 	}
+	if (qnn_reset_options.round_reset == QNN_ROUND_RESET_MATCH
+		&& QNN_LocalArenaMatchId() < 0.0f)
+	{
+		snprintf(error, error_size,
+			"round_reset=match requires a qnn_match_id-tagged local arena seat");
+		return false;
+	}
 
 	/* Bot spawns via ``impulse 100`` can telefrag the player.
 	   Just let the player respawn naturally — bots are already
@@ -690,7 +755,7 @@ static qboolean QNN_ResetWorldLocal(int seed, char *error, size_t error_size)
 
 static void QNN_WriteHelloResponse(void)
 {
-	fprintf(stdout, "{\"capabilities\":[\"binary_step_v1\",\"listen_local\",\"navmesh_query_v1\",\"obs_buffer_v1\",\"reset_options\",\"training_extras_v1\",\"udp_networking\"],\"map_id\":");
+	fprintf(stdout, "{\"capabilities\":[\"binary_step_v1\",\"listen_local\",\"match_round_reset_v1\",\"navmesh_query_v1\",\"obs_buffer_v1\",\"reset_options\",\"training_extras_v1\",\"udp_networking\"],\"map_id\":");
 	QNN_WriteJsonString(stdout, qnn_map_state.requested_map_id);
 	fprintf(stdout, ",\"ok\":true,\"protocol_version\":");
 	QNN_WriteJsonString(stdout, QNN_WORKER_PROTOCOL);
@@ -726,6 +791,103 @@ static void QNN_WriteStepResponse(const qnn_snapshot_t *snapshot)
 	QNN_WriteObsToStdout(snapshot);
 	if (qnn_runtime.training_output_mode == QNN_TRAIN_OUTPUT_BINARY_V1)
 		QNN_WriteTrainingExtrasBinary(stdout, snapshot, qnn_runtime.tick, qnn_runtime.steps, false);
+}
+
+static void QNN_WriteSplitStepResponse(
+	const qnn_snapshot_t *obs_snapshot,
+	const qnn_snapshot_t *transition_snapshot)
+{
+	QNN_WriteObsToStdout(obs_snapshot);
+	if (qnn_runtime.training_output_mode == QNN_TRAIN_OUTPUT_BINARY_V1)
+		QNN_WriteTrainingExtrasBinary(
+			stdout, transition_snapshot, qnn_runtime.tick, qnn_runtime.steps, false);
+}
+
+static void QNN_ResetRoundRuntime(void)
+{
+	qnn_runtime.steps = 0;
+	qnn_runtime.recent_fire_steps = 0;
+	qnn_runtime.last_fire_weapon_id = 0;
+	qnn_runtime.total_damage_dealt = 0;
+	qnn_runtime.total_hit_count = 0;
+	qnn_runtime.total_shots_fired = 0;
+	memset(qnn_runtime.weapon_damage_dealt, 0, sizeof(qnn_runtime.weapon_damage_dealt));
+	memset(qnn_runtime.weapon_hits_landed, 0, sizeof(qnn_runtime.weapon_hits_landed));
+	memset(qnn_runtime.weapon_shots_fired, 0, sizeof(qnn_runtime.weapon_shots_fired));
+}
+
+static void QNN_ProcessStep(const qnn_action_t *action)
+{
+	static qnn_snapshot_t transition_snapshot;
+	static qnn_snapshot_t reset_snapshot;
+
+	qnn_pending_action = *action;
+	QNN_TrainingResetTick();
+	if (!qnn_runtime.done)
+	{
+		Host_Frame(qnn_runtime.fixed_dt);
+		qnn_runtime.tick += 1;
+		qnn_runtime.steps += 1;
+	}
+
+	QNN_CaptureSnapshotLocal(&transition_snapshot, action, false);
+	transition_snapshot.action_label = *action;
+
+	if (qnn_reset_options.round_reset == QNN_ROUND_RESET_MATCH
+		&& transition_snapshot.health <= 0
+		&& QNN_ResetLocalArenaMatch())
+	{
+		qnn_action_t reset_action;
+
+		/* Death telemetry and reward stay in transition_snapshot.  Advance one
+		   zero-action engine frame only to deliver the paired respawns to the
+		   local client, then emit that live state as s_{t+1}. */
+		QNN_ClearAction(&reset_action);
+		QNN_ClearAction(&qnn_pending_action);
+		Host_Frame(qnn_runtime.fixed_dt);
+		QNN_CaptureSnapshotLocal(&reset_snapshot, &reset_action, true);
+		reset_snapshot.action_label = reset_action;
+		QNN_IOUpdate(&reset_snapshot, qnn_runtime.fixed_dt, true);
+		QNN_CommitSnapshot(&reset_snapshot, &reset_action, true);
+		QNN_WriteSplitStepResponse(&reset_snapshot, &transition_snapshot);
+		QNN_ResetRoundRuntime();
+		return;
+	}
+
+	QNN_IOUpdate(&transition_snapshot, qnn_runtime.fixed_dt, false);
+	QNN_CommitSnapshot(&transition_snapshot, action, false);
+	QNN_ClearAction(&qnn_pending_action);
+	QNN_WriteStepResponse(&transition_snapshot);
+}
+
+static int QNN_HandleRoundReset(void)
+{
+	static qnn_snapshot_t snapshot;
+	qnn_action_t action;
+
+	if (!qnn_runtime.has_reset)
+	{
+		QNN_WriteError("Call reset before round_reset");
+		return 0;
+	}
+	if (qnn_reset_options.round_reset != QNN_ROUND_RESET_MATCH
+		|| !QNN_ResetLocalArenaMatch())
+	{
+		QNN_WriteError("round_reset requires an active match-scoped arena");
+		return 0;
+	}
+
+	QNN_ClearAction(&action);
+	QNN_ClearAction(&qnn_pending_action);
+	QNN_TrainingResetTick();
+	Host_Frame(qnn_runtime.fixed_dt);
+	QNN_CaptureSnapshotLocal(&snapshot, &action, true);
+	snapshot.action_label = action;
+	QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, true);
+	QNN_CommitSnapshot(&snapshot, &action, true);
+	QNN_ResetRoundRuntime();
+	QNN_WriteResetResponse(&snapshot);
+	return 0;
 }
 
 static int QNN_HandleHello(const char *line)
@@ -823,7 +985,6 @@ static int QNN_HandleReset(const char *line)
 
 static int QNN_HandleStep(const char *line)
 {
-	qnn_snapshot_t snapshot;
 	qnn_action_t action;
 
 	if (!qnn_runtime.has_reset)
@@ -855,22 +1016,7 @@ static int QNN_HandleStep(const char *line)
 			up_neg, up_pos,
 			jump_press, attack_press);
 	}
-	qnn_pending_action = action;
-	QNN_TrainingResetTick();
-
-	if (!qnn_runtime.done)
-	{
-		Host_Frame(qnn_runtime.fixed_dt);
-		qnn_runtime.tick += 1;
-		qnn_runtime.steps += 1;
-	}
-
-	QNN_CaptureSnapshotLocal(&snapshot, &action, false);
-	snapshot.action_label = action;
-	QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
-	QNN_CommitSnapshot(&snapshot, &action, false);
-	QNN_ClearAction(&qnn_pending_action);
-	QNN_WriteStepResponse(&snapshot);
+	QNN_ProcessStep(&action);
 	return 0;
 }
 
@@ -904,6 +1050,7 @@ int main(int argc, char **argv)
 	Cvar_RegisterVariable(&qnn_inv_powerups_cvar);
 	Cvar_RegisterVariable(&qnn_inv_selected_cvar);
 	Cvar_RegisterVariable(&qnn_bot_weapon_pin_cvar);
+	Cvar_RegisterVariable(&qnn_arena_selfplay_cvar);
 	cls.demonum = -1;
 
 	for (;;)
@@ -921,28 +1068,12 @@ int main(int argc, char **argv)
 			qnn_action_t action;
 			if (fread(&action, 1, QNN_BINARY_ACTION_SIZE, stdin) != (size_t)QNN_BINARY_ACTION_SIZE)
 				break;
-			qnn_pending_action = action;
-			QNN_TrainingResetTick();
 			if (!qnn_runtime.has_reset)
 			{
 				QNN_WriteError("Call reset before step");
 				continue;
 			}
-			if (!qnn_runtime.done)
-			{
-				Host_Frame(qnn_runtime.fixed_dt);
-				qnn_runtime.tick += 1;
-				qnn_runtime.steps += 1;
-			}
-			{
-				qnn_snapshot_t snapshot;
-				QNN_CaptureSnapshotLocal(&snapshot, &action, false);
-				snapshot.action_label = action;
-				QNN_IOUpdate(&snapshot, qnn_runtime.fixed_dt, false);
-				QNN_CommitSnapshot(&snapshot, &action, false);
-				QNN_ClearAction(&qnn_pending_action);
-				QNN_WriteStepResponse(&snapshot);
-			}
+			QNN_ProcessStep(&action);
 			continue;
 		}
 
@@ -954,6 +1085,11 @@ int main(int argc, char **argv)
 		if (strstr(line, "\"op\"") != NULL && strstr(line, "hello") != NULL)
 		{
 			QNN_HandleHello(line);
+			continue;
+		}
+		if (strstr(line, "\"op\":\"round_reset\"") != NULL)
+		{
+			QNN_HandleRoundReset();
 			continue;
 		}
 		if (strstr(line, "\"op\"") != NULL && strstr(line, "reset") != NULL)

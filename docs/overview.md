@@ -4,8 +4,9 @@ Competitive Quake PvP agent trained end-to-end: native C worker emits semantic
 tokens, a transformer encoder attends over them, a GRU maintains temporal
 state, supervised pointer attention picks an engagement target, and factored
 action heads (move, look, attack, weapon) drive the engine. The pipeline is
-seeded by behavioral cloning on Quake demos and fine-tuned via Sample Factory
-APPO against FrikBotNex opponents.
+seeded by behavioral cloning on Quake demos and fine-tuned by native bounded
+PPO against FrikBotNex opponents. PPO overlaps one immutable recurrent rollout
+with the preceding learner update and caps policy lag at exactly one update.
 
 Related docs: [RESEARCH.md](../../docs/RESEARCH.md) (the research spine — hypothesis,
 endpoints, claims register, roadmap),
@@ -143,9 +144,10 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 | `qnn/bc/token_filter.py` | train-time token mask compiler |
 | `qnn/bc/target_labeler.py` | offline target label generator |
 | `qnn/bc/collect.py` | demo collection pipeline (dispatches to engine workers) |
-| `qnn/ppo/env.py` | Sample Factory gymnasium wrapper |
-| `qnn/ppo/encoder.py` | PPO encoder wrapper |
-| `qnn/ppo/train.py` | PPO registration + config builder |
+| `qnn/ppo/vec_env.py` | vectorized native-worker lanes, batched drain, and async resets |
+| `qnn/ppo/collector.py` | fixed-window recurrent rollout collection |
+| `qnn/ppo/learner.py` | native recurrent PPO update and trainer-owned value head |
+| `qnn/ppo/train.py` | native PPO orchestration, checkpointing, and telemetry |
 | `qnn/env/reward.py` | PvP reward shaping |
 | `qnn/diag/` | unified trained-policy diagnostics: `analyze` (per-head) and `diagnostic` (checkpoint-based) subcommands; per-head modules `attack`, `look`, `move`, `weapon` consolidate all head-specific analysis scripts |
 | `qnn/labeler/probes/` | standalone target-head probes (causal TCN, GBT) |

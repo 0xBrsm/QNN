@@ -1,0 +1,14 @@
+--- net_dgrm.c
++++ net_dgrm.c
+@@ -1011,7 +1011,10 @@
+ 		if (s->driver != net_driverlevel)
+ 			continue;
+ 		ret = dfunc.AddrCompare(&clientaddr, &s->addr);
+-		if (ret >= 0)
++		/* The original server assumes one client per IP and treats a new
++		   source port as a crashed copy.  Grouped local PPO needs every
++		   loopback UDP endpoint to remain an independent client. */
++		if (ret == 0)
+ 		{
+ 			// is this a duplicate connection reqeust?
+ 			if (ret == 0 && net_time - s->connecttime < 2.0)

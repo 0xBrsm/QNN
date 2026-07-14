@@ -110,6 +110,8 @@ int QNN_AppendPlayerEntityUpdates(const qnn_snapshot_t *snapshot,
 
 		QNN_EntityAnchorFromModel(entity_num, entity->origin,
 			anchor_origin, half_extents);
+		if (!QNN_EntityInPvs(snapshot->player_origin, anchor_origin))
+			continue;
 
 		eu = &out_entities[count];
 		memset(eu, 0, sizeof(*eu));

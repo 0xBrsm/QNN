@@ -86,7 +86,11 @@ Motor heads (`move`, `look`, `attack`, `move_hazard`) must share identical `inpu
 
 The `weapon` head may additionally carry a `decode` block with `sticky_confidence` and `sticky_margin` (the sticky-gate thresholds baked into ONNX export). The decode regime is part of the model, never decided by the engine.
 
-The PPO critic is not a graph node: Sample Factory owns the value head inside its actor-critic. PPO consumes the graph's token/encoder/pointer nodes through its encoder wrapper (`qnn/ppo/encoder.py`, built from `--quake_model_graph`); `Network`'s `values` output remains a vestigial zeros tensor kept only for forward-contract stability.
+The PPO critic is not a graph node. The native trainer owns a small MLP value
+head over the graph's motor features; it is saved in RL resume checkpoints but
+is never part of deploy checkpoints or ONNX exports. `Network`'s `values`
+output remains a vestigial zeros tensor kept only for forward-contract
+stability.
 
 ## Self-Registering Node Builders
 
@@ -165,7 +169,11 @@ What does NOT live here: generation-specific geometry (polar-look hybrid, sticky
 
 - **BC** — `run_behavior_cloning(graph=...)` builds via `build_network` and stamps every checkpoint with the graph; bench probes are graph deltas (above).
 - **Eval / export** — both load through `load_checkpoint`, which prefers the embedded graph over legacy flat-meta rehydration; nothing else changed (eval was already meta-driven).
-- **PPO** — the pipeline reads the warm-start seed's `meta.model_graph` (sidecar JSON), fails loud if the run's `model.json` disagrees, and threads it to the SF encoder as `--quake_model_graph`; `QuakeTransformerEncoder` then builds the seed's exact token/encoder/pointer layout so BC weights map 1:1 (test-pinned). `sf_to_qnn` carries the graph back out, so converted PPO checkpoints stay self-describing. The SF-owned critic and action parameterization are unchanged.
+- **PPO** — the native trainer loads the warm-start seed through `QNNPolicy`,
+  prefers its embedded `meta.model_graph`, and fails loud if the frozen
+  `model.json` disagrees. PPO updates that exact network directly; deployable
+  best checkpoints remain self-describing QNN checkpoints with no intermediate
+  encoder or checkpoint conversion.
 
 ## Legacy Ablation Paths
 
@@ -198,6 +206,6 @@ Cache format is frozen (disk budget). A code audit proposed in-process levers; e
 | Per-step grad-norm `.item()` sync | Already done | Grad norms accumulate as tensors, flushed at epoch end. |
 | bf16 autocast | Already done | `dtype: "bf16"` is the template default (`QNN_AUTOCAST_DTYPE`). |
 | `torch.compile` | Ruled out (measured) | Net-negative at this model size (~189K params); documented in `bc/train.py`. |
-| PPO `worker_inference` | Already done | Template default `true`; recent runs all use it. |
+| Native PPO collection | Separate campaign | See `research/performance-tuning.md`; the bounded BF16 host-staged pipeline and confirmed 768-lane knee are the retained defaults. |
 
 The real, already-built levers remain the resident ablation daemon (~2.5× vs streaming) and parallel ablation containers (4× sweet spot, 5× practical limit). Further single-job BC throughput means changing the training itself (lane count / model size), not the harness.

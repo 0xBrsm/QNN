@@ -29,7 +29,7 @@ python -m qnn.run.router --run-dir runs/bc/bc_v1
 | `qnn/model/` | Declarative model graph (`graph/`, `node_registry`, `tokens/`): observation embedding, transformer encoder, GRU temporal core, TargetPointer, factored heads, and the decode layer |
 | `qnn/run/` | Run directory management, config, router |
 | `qnn/bc/` | Behavioral cloning — demo collection, target labeler, supervised loop |
-| `qnn/ppo/` | PPO — Sample Factory APPO integration and RL training |
+| `qnn/ppo/` | Native bounded PPO — vectorized collection, host-staged rollout pipeline, and recurrent learner |
 | `qnn/eval/` | Evaluation — run checkpoints against bots and live NQ servers |
 | `qnn/env/` | Live engine interface — NativeWorldEnv, reward, planning |
 | `qnn/diag/` | Per-head analysis (`qnn.diag analyze`) and capacity diagnostics |

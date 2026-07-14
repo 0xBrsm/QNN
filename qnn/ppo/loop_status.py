@@ -1,9 +1,14 @@
-"""Step-gated status for active PPO run directories."""
+"""Step-gated status for active PPO run directories.
+
+Reads the native trainer's ``ppo_history.json`` (one row per PPO
+iteration — see qnn.ppo.train). The step gates and recommended-action
+ladder are unchanged from the SF era; only the telemetry source moved
+(sf_log.txt parsing died with the Sample Factory backend).
+"""
 
 from __future__ import annotations
 
 import math
-import re
 from pathlib import Path
 from typing import Any
 
@@ -12,18 +17,7 @@ from qnn.utils.io import safe_read_json
 
 DEFAULT_STEP_GATES: tuple[int, ...] = (1_000_000, 3_000_000, 5_000_000)
 
-_LOAD_STATE_RE = re.compile(r"Loaded experiment state at self\.train_step=(\d+), self\.env_steps=(\d+)")
-_TOTAL_FRAMES_RE = re.compile(r"Total num frames: (\d+)\. Throughput: (.*?)\. Samples:")
-_AVG_REWARD_RE = re.compile(r"Avg episode reward: \[\(0, '([-\d.]+)'\)\]")
-_CHECKPOINT_STEP_RE = re.compile(r"(?:best|checkpoint)_\d+_(\d+)(?:_reward_[\-\d.]+)?\.pth$")
-
 _safe_read_json = safe_read_json
-
-
-def _read_text(path: Path) -> str:
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def _assert_supported_layout(run_root: Path) -> None:
@@ -35,43 +29,12 @@ def _assert_supported_layout(run_root: Path) -> None:
         )
 
 
-def _seed_steps_from_checkpoint_name(path: str | Path | None) -> int | None:
-    if not path:
-        return None
-    match = _CHECKPOINT_STEP_RE.search(Path(path).name)
-    if not match:
-        return None
-    return int(match.group(1))
-
-
-def _loaded_state_steps(log_text: str) -> tuple[int | None, int | None]:
-    match = _LOAD_STATE_RE.search(log_text)
-    if not match:
-        return None, None
-    return int(match.group(1)), int(match.group(2))
-
-
-def _latest_total_frames(log_text: str) -> tuple[int | None, float | None]:
-    frames: int | None = None
-    throughput: float | None = None
-    for match in _TOTAL_FRAMES_RE.finditer(log_text):
-        frames = int(match.group(1))
-        values: list[float] = []
-        for item in match.group(2).split(","):
-            _, _, raw = item.partition(":")
-            raw = raw.strip()
-            if not raw or raw == "nan":
-                continue
-            values.append(float(raw))
-        throughput = float(sum(values)) if values else None
-    return frames, throughput
-
-
-def _latest_avg_reward(log_text: str) -> float | None:
-    reward: float | None = None
-    for match in _AVG_REWARD_RE.finditer(log_text):
-        reward = float(match.group(1))
-    return reward
+def _history_rows(run_root: Path) -> list[dict[str, Any]]:
+    payload = _safe_read_json(run_root / "checkpoints" / "ppo_history.json")
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("history")
+    return rows if isinstance(rows, list) else []
 
 
 def _gate_rows(seed_env_steps: int, current_env_steps: int, gates: tuple[int, ...]) -> list[dict[str, Any]]:
@@ -106,47 +69,43 @@ def build_loop_status(
     run_root = Path(root)
     _assert_supported_layout(run_root)
     manifest = _safe_read_json(run_root / "run.json") or {}
-    ppo_dir = run_root / "checkpoints"
-    config_path = ppo_dir / "config.json"
-    log_path = ppo_dir / "sf_log.txt"
     from qnn.run.router import best_checkpoint
     best_path = best_checkpoint(run_root / "checkpoints") or (run_root / "checkpoints" / "nonexistent")
     eval_summary_path = run_root / "metrics" / "eval" / "eval_summary.json"
 
-    config = _safe_read_json(config_path) or {}
-    log_text = _read_text(log_path)
-    loaded_train_step, loaded_env_steps = _loaded_state_steps(log_text)
+    rows = _history_rows(run_root)
+    last = rows[-1] if rows else {}
+    # Native runs count RL env steps from 0 — the BC seed contributes no
+    # env steps, so the gate ladder is the RL delta directly.
+    seed_env_steps = 0
+    current_env_steps = int(last["env_steps"]) if "env_steps" in last else None
+    throughput = float(last["fps"]) if "fps" in last else None
+    current_avg_reward = last.get("return_ema", last.get("ep_return_mean"))
     seed_checkpoint_raw = manifest.get("checkpoint_path")
     seed_checkpoint = seed_checkpoint_raw if isinstance(seed_checkpoint_raw, str) else None
-    checkpoint_seed_steps = _seed_steps_from_checkpoint_name(seed_checkpoint)
-    seed_env_steps = loaded_env_steps if loaded_env_steps is not None else checkpoint_seed_steps
-    current_env_steps, throughput = _latest_total_frames(log_text)
-    current_avg_reward = _latest_avg_reward(log_text)
     eval_summary = _safe_read_json(eval_summary_path)
-    fixed_tick_hz = config.get("quake_fixed_tick_hz")
+
+    train_cfg = _safe_read_json(run_root / "config" / "train.json") or {}
+    fixed_tick_hz = train_cfg.get("fixed_tick_hz")
     effective_minutes = effective_game_minutes_per_wall_minute(throughput, fixed_tick_hz)
-    with_pbt_raw = config.get("with_pbt")
-    num_policies_raw = config.get("num_policies")
 
     status: dict[str, Any] = {
         "root": str(run_root),
         "checkpoint_path": seed_checkpoint,
-        "seed_train_step": loaded_train_step,
         "seed_env_steps": seed_env_steps,
         "current_env_steps": current_env_steps,
         "current_avg_episode_reward": current_avg_reward,
+        "iteration": last.get("iteration"),
         "fixed_tick_hz": int(fixed_tick_hz) if isinstance(fixed_tick_hz, (int, float)) else None,
         "throughput_fps": throughput,
         "effective_game_minutes_per_wall_minute": effective_minutes,
-        "with_pbt": bool(with_pbt_raw) if isinstance(with_pbt_raw, bool) else None,
-        "num_policies": int(num_policies_raw) if isinstance(num_policies_raw, (int, float)) else None,
         "eval_summary_path": str(eval_summary_path),
         "eval_present": eval_summary is not None,
     }
 
-    if seed_env_steps is None or current_env_steps is None:
+    if current_env_steps is None:
         status["recommended_action"] = "inspect_run_setup"
-        status["reason"] = "Could not determine seed or current env steps from the run artifacts."
+        status["reason"] = "No ppo_history.json rows yet — the run has not completed an iteration."
         return status
 
     delta_env_steps = max(0, current_env_steps - seed_env_steps)

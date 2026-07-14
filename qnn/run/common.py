@@ -167,7 +167,14 @@ def finalize_results(
 
 
 def best_checkpoint(checkpoints_dir: Path) -> Path | None:
-    """Return the highest-reward checkpoint under *checkpoints_dir*."""
+    """Return the best checkpoint under *checkpoints_dir*.
+
+    Native runs save best/best_model.pth directly (QNN format). The
+    checkpoint_p* globs keep legacy SF run dirs discoverable.
+    """
+    native_best = Path(checkpoints_dir) / "best" / "best_model.pth"
+    if native_best.exists():
+        return native_best
     best_files = _glob.glob(f"{checkpoints_dir}/checkpoint_p*/best_0*.pth")
     if best_files:
         return Path(max(best_files, key=_reward_from_name))
@@ -259,6 +266,11 @@ def assert_no_legacy_ppo_layout(run_cfg: dict[str, Any]) -> None:
 
 def ppo_checkpoint_paths(run_cfg: dict[str, Any]) -> list[Path]:
     checkpoints_dir = run_output_dirs(run_cfg)["checkpoints"]
+    # Native trainer resume state first; the checkpoint_p* glob keeps
+    # legacy SF run dirs discoverable (read-only artifacts).
+    native = sorted(checkpoints_dir.glob("ppo_state*.pt"))
+    if native:
+        return native
     return sorted(checkpoints_dir.glob("checkpoint_p*/*.pth"))
 
 
@@ -281,11 +293,15 @@ def prepare_ppo_run_outputs(run_cfg: dict[str, Any], *, resume: bool) -> bool:
         outputs["checkpoints"] / "best",
         outputs["metrics"] / "eval",
         outputs["checkpoints"] / "config.json",
-        outputs["checkpoints"] / "sf_log.txt",
+        outputs["checkpoints"] / "sf_log.txt",   # legacy SF run dirs
         outputs["checkpoints"] / "git.diff",
+        outputs["checkpoints"] / "ppo_history.json",
+        outputs["checkpoints"] / "ppo_summary.json",
     ):
         archive_path_if_exists(path)
     for path in outputs["checkpoints"].glob("checkpoint_p*"):
+        archive_path_if_exists(path)
+    for path in outputs["checkpoints"].glob("ppo_state*.pt"):
         archive_path_if_exists(path)
     return False
 
@@ -324,6 +340,22 @@ def ensure_worker(worker_binary: Path, rebuild: bool) -> Path:
     build_script = Path("src/engine/build/build_ppo_worker.sh")
     subprocess.run(["bash", str(build_script), str(worker_binary)], check=True)
     return worker_binary
+
+
+def ensure_arena_workers(
+    server_binary: Path,
+    client_binary: Path,
+    rebuild: bool,
+) -> tuple[Path, Path]:
+    """Build the grouped world host and remote policy observer together."""
+    binaries = (
+        (server_binary, Path("src/engine/build/build_ppo_arena_server.sh")),
+        (client_binary, Path("src/engine/build/build_ppo_arena_client.sh")),
+    )
+    for binary, build_script in binaries:
+        if rebuild or not binary.exists():
+            subprocess.run(["bash", str(build_script), str(binary)], check=True)
+    return server_binary, client_binary
 
 
 

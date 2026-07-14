@@ -303,17 +303,19 @@ def run(ctx: RunnerContext) -> dict[str, Any]:
             pass  # Another container may have finished this trial already
         return float(metric)
 
-    _STALE_SECONDS = 180  # 3 minutes — SF writes to sf_log at least once per minute
+    # The native trainer rewrites ppo_history.json once per PPO iteration
+    # (seconds at production topologies) — 5 minutes of silence means dead.
+    _STALE_SECONDS = 300
 
     def _is_trial_orphaned(trial_number: int) -> bool:
-        """Check if a RUNNING trial's container is dead via sf_log staleness."""
+        """Check if a RUNNING trial's container is dead via history staleness."""
         trial_dir = _trial_wrapper_dir(trial_root, trial_number)
         run_dir = _trial_run_dir(trial_dir)
-        sf_log = run_dir / "checkpoints" / "sf_log.txt"
-        if not sf_log.exists():
-            # No log yet — check if trial started long enough ago to have one
+        history = run_dir / "checkpoints" / "ppo_history.json"
+        if not history.exists():
+            # No history yet — check if trial started long enough ago to have one
             return (time.time() - trial_dir.stat().st_mtime) > _STALE_SECONDS
-        return (time.time() - sf_log.stat().st_mtime) > _STALE_SECONDS
+        return (time.time() - history.stat().st_mtime) > _STALE_SECONDS
 
     def _find_orphan() -> int | None:
         """Find one orphaned RUNNING trial. Returns trial number or None."""

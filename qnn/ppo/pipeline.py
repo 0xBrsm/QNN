@@ -12,6 +12,7 @@ from qnn.eval.run import EvalConfig, run_evaluation
 from qnn.run.common import (
     base_results,
     best_checkpoint,
+    ensure_arena_workers,
     ensure_worker,
     finalize_results,
     latest_ppo_checkpoint,
@@ -24,7 +25,7 @@ from qnn.run.common import (
     require_cfg_value,
 )
 from qnn.run.config import build_run_ppo_eval_config
-from qnn.utils.checkpoint_converter import checkpoint_model_graph, sf_to_qnn
+from qnn.utils.checkpoint_converter import checkpoint_model_graph
 from qnn.utils.io import read_json, trusted_torch_load
 
 
@@ -96,8 +97,8 @@ def _resolve_model_graph(ppo_cfg: dict[str, Any], init_checkpoint: str) -> dict[
 
     Graph-described seeds carry their architecture; the run's frozen
     model.json must match (fail loud, never silently diverge). Multi-seed
-    PBT reads the first seed — all seeds must share one architecture
-    already (SF requirement).
+    Legacy multi-seed configs read the first seed; all seeds must already
+    share one architecture.
     """
     graph = _warm_start_model_graph(init_checkpoint)
     if graph is None:
@@ -165,136 +166,24 @@ def run_training_job(
     worker_path: Path,
     device: str,
 ) -> dict[str, Any]:
-    """Execute a single PPO training job."""
-    from qnn.ppo.train import build_ppo_cfg, register_quake_components, run_ppo
+    """Execute a single native PPO training job.
 
-    register_quake_components()
+    The trainer consumes the flat ppo_cfg directly and saves native
+    QNNPolicy checkpoints (best/best_model.pth) — there is no post-hoc
+    format conversion step anymore.
+    """
+    from qnn.ppo.train import run_native_ppo
 
-    output_dir = str(Path(require_cfg_string(ppo_cfg, "output_dir", "PPO config")))
-    scenario = require_cfg_string(ppo_cfg, "map_id", "PPO config")
-    num_workers = int(require_cfg_value(ppo_cfg, "num_workers", "PPO config"))
-    num_envs_per_worker = int(require_cfg_value(ppo_cfg, "num_envs_per_worker", "PPO config"))
-    num_envs = int(require_cfg_value(ppo_cfg, "num_envs", "PPO config"))
-    if num_envs != num_workers * num_envs_per_worker:
-        raise RuntimeError(
-            f"PPO config num_envs={num_envs} does not match num_workers*num_envs_per_worker="
-            f"{num_workers * num_envs_per_worker}"
-        )
-    rollout = int(require_cfg_value(ppo_cfg, "rollout_steps", "PPO config"))
-    total_steps = int(require_cfg_value(ppo_cfg, "total_steps", "PPO config"))
-    total_env_steps = total_steps * num_envs
-
-    native_args = require_cfg_list(ppo_cfg, "native_args", "PPO config")
-    options = require_cfg_mapping(ppo_cfg, "options", "PPO config")
-    procgen_cfg = require_cfg_value(ppo_cfg, "procgen", "PPO config")
-    resume = bool(require_cfg_value(ppo_cfg, "resume", "PPO config"))
     init_checkpoint = str(ppo_cfg.get("init_ckpt", ""))
-    model_graph = _resolve_model_graph(ppo_cfg, init_checkpoint)
+    # Fail loud when the run's frozen model.json disagrees with the seed
+    # checkpoint's declarative graph — never silently diverge.
+    _resolve_model_graph(ppo_cfg, init_checkpoint)
 
-    cfg = build_ppo_cfg(
-        scenario=scenario,
-        num_workers=num_workers,
-        num_envs_per_worker=num_envs_per_worker,
-        worker_num_splits=int(require_cfg_value(ppo_cfg, "worker_num_splits", "PPO config")),
-        rollout=rollout,
-        total_env_steps=total_env_steps,
-        output_dir=output_dir,
-        experiment="",
-        run_id=str(ppo_cfg.get("run_id", "")),
-        executable=str(worker_path),
-        basedir=str(resolved_asset_root),
-        native_workdir=require_cfg_string(ppo_cfg, "native_workdir", "PPO config"),
-        native_args_json=json.dumps(native_args),
-        options_json=json.dumps(options),
-        procgen_json=json.dumps(procgen_cfg) if procgen_cfg is not None else "",
-        scenario_config_json=_scenario_config_json_from_cfg(ppo_cfg),
-        mode=require_cfg_string(ppo_cfg, "mode", "PPO config"),
-        max_steps_per_episode=int(require_cfg_value(ppo_cfg, "max_steps_per_episode", "PPO config")),
-        fixed_tick_hz=int(require_cfg_value(ppo_cfg, "fixed_tick_hz", "PPO config")),
-        seed=int(require_cfg_value(ppo_cfg, "seed", "PPO config")),
-        device=device,
-        init_checkpoint=init_checkpoint,
-        init_checkpoints=ppo_cfg.get("init_ckpts"),
-        resume=resume,
-        encoder_hidden=int(require_cfg_value(ppo_cfg, "encoder_hidden", "PPO config")),
-        d_gru=int(require_cfg_value(ppo_cfg, "d_gru", "PPO config")),
-        use_gru=bool(require_cfg_value(ppo_cfg, "use_gru", "PPO config")),
-        d_model=int(require_cfg_value(ppo_cfg, "d_model", "PPO config")),
-        n_heads=int(require_cfg_value(ppo_cfg, "n_heads", "PPO config")),
-        n_layers=int(require_cfg_value(ppo_cfg, "n_layers", "PPO config")),
-        d_ffn=int(require_cfg_value(ppo_cfg, "d_ffn", "PPO config")),
-        attn_dropout=float(require_cfg_value(ppo_cfg, "attn_dropout", "PPO config")),
-        ppo_epochs=int(require_cfg_value(ppo_cfg, "ppo_epochs", "PPO config")),
-        lr=float(require_cfg_value(ppo_cfg, "policy_lr", "PPO config")),
-        entropy_coef=float(require_cfg_value(ppo_cfg, "entropy_coef", "PPO config")),
-        bc_kl_coef=float(require_cfg_value(ppo_cfg, "bc_kl_coef", "PPO config")),
-        clip_ratio=float(require_cfg_value(ppo_cfg, "clip_ratio", "PPO config")),
-        gamma=float(require_cfg_value(ppo_cfg, "gamma", "PPO config")),
-        gae_lambda=float(require_cfg_value(ppo_cfg, "gae_lambda", "PPO config")),
-        max_grad_norm=float(require_cfg_value(ppo_cfg, "max_grad_norm", "PPO config")),
-        value_coef=float(require_cfg_value(ppo_cfg, "value_coef", "PPO config")),
-        with_pbt=bool(require_cfg_value(ppo_cfg, "with_pbt", "PPO config")),
-        num_policies=int(require_cfg_value(ppo_cfg, "num_policies", "PPO config")),
-        pbt_period_env_steps=int(require_cfg_value(ppo_cfg, "pbt_period_env_steps", "PPO config")),
-        pbt_start_mutation=int(require_cfg_value(ppo_cfg, "pbt_start_mutation", "PPO config")),
-        pbt_replace_fraction=float(require_cfg_value(ppo_cfg, "pbt_replace_fraction", "PPO config")),
-        pbt_mutation_rate=float(require_cfg_value(ppo_cfg, "pbt_mutation_rate", "PPO config")),
-        pbt_optimize_gamma=bool(require_cfg_value(ppo_cfg, "pbt_optimize_gamma", "PPO config")),
-        minibatch_size=int(require_cfg_value(ppo_cfg, "minibatch_size", "PPO config")),
-        policy_workers_per_policy=int(require_cfg_value(ppo_cfg, "policy_workers_per_policy", "PPO config")),
-        batched_sampling=bool(require_cfg_value(ppo_cfg, "batched_sampling", "PPO config")),
-        worker_inference=bool(ppo_cfg.get("worker_inference", False)),
-        worker_inference_device=str(ppo_cfg.get("worker_inference_device", "cpu")),
-        reward_json_path=require_cfg_string(ppo_cfg, "reward_json_path", "PPO config"),
-        head_loss_weights=str(ppo_cfg.get("head_loss_weights", "") or ""),
-        initial_stddev=float(require_cfg_value(ppo_cfg, "initial_stddev", "PPO config")),
-        model_graph_json=json.dumps(model_graph) if model_graph is not None else "",
-    )
+    ppo_result = run_native_ppo(ppo_cfg, resolved_asset_root, worker_path, device)
 
-    ppo_result = run_ppo(cfg)
-
-    exp_dir = Path(output_dir)
-    ppo_ckpt_path = best_checkpoint(exp_dir)
-    ppo_ckpt = str(ppo_ckpt_path) if ppo_ckpt_path else None
-
-    if ppo_ckpt:
-        best_dir = Path(output_dir) / "best"
-        best_dir.mkdir(parents=True, exist_ok=True)
-        qnn_ckpt_path = best_dir / "best_model.pth"
-        try:
-            from qnn.model.network import ModelConfig
-            # obs_dim comes from the config, the WARM-START seed's QNN meta,
-            # or the schema constant — never from the trained SF checkpoint
-            # (SF format carries no QNN meta; reading it failed every
-            # conversion and the error was swallowed into
-            # checkpoint_convert_error).
-            if "obs_dim" in ppo_cfg:
-                obs_dim = int(require_cfg_value(ppo_cfg, "obs_dim", "PPO config"))
-            elif init_checkpoint and Path(init_checkpoint).exists():
-                obs_dim = _detect_obs_dim_from_checkpoint(ppo_cfg, init_checkpoint)
-            else:
-                from qnn.schema import OBS_DIM
-                obs_dim = OBS_DIM
-            graph_spec = None
-            if model_graph is not None:
-                from qnn.model.graph import GraphSpec
-                graph_spec = GraphSpec.from_dict(model_graph)
-            qnn_policy = sf_to_qnn(
-                sf_checkpoint_path=ppo_ckpt,
-                obs_dim=obs_dim,
-                # Graph runs derive the bridge config from the graph —
-                # one source of truth; flat runs use the run's config.
-                model=None if graph_spec is not None else ModelConfig.from_flat_dict(ppo_cfg),
-                device="cpu",
-                graph=graph_spec,
-            )
-            qnn_policy.save(qnn_ckpt_path)
-            ppo_result["best_model_path"] = str(qnn_ckpt_path)
-            ppo_result["ppo_checkpoint_path"] = ppo_ckpt
-            ppo_result["sf_checkpoint_path"] = ppo_ckpt
-        except Exception as exc:
-            ppo_result["checkpoint_convert_error"] = str(exc)
-
+    best = Path(str(require_cfg_string(ppo_cfg, "output_dir", "PPO config"))) / "best" / "best_model.pth"
+    if best.exists():
+        ppo_result["best_model_path"] = str(best)
     return ppo_result
 
 
@@ -329,6 +218,20 @@ def run_pipeline(ctx: Any, *, post_train_eval: bool = True, write_report: bool =
         ppo_cfg.get("native_args") if isinstance(ppo_cfg.get("native_args"), list) else None,
     )
     worker_path = ensure_worker(ctx.worker_binary, rebuild=False)
+    if str(ppo_cfg.get("env_backend", "process")) == "arena_grid":
+        arena_server, arena_client = ensure_arena_workers(
+            Path(str(ppo_cfg["arena_server_binary"])),
+            Path(str(ppo_cfg["arena_client_binary"])),
+            rebuild=False,
+        )
+        arena_bsp = ctx.asset_root / "id1" / "maps" / f"{ppo_cfg['arena_map_id']}.bsp"
+        if not arena_bsp.is_file():
+            raise FileNotFoundError(
+                f"Grouped PPO arena map is missing: {arena_bsp}. "
+                "Run scripts/build_arena_grid.py first."
+            )
+        ppo_cfg["arena_server_binary"] = str(arena_server)
+        ppo_cfg["arena_client_binary"] = str(arena_client)
 
     started = time.monotonic()
     ppo_cfg["native_env"] = {"QUAKE_BASEDIR": str(ctx.asset_root)}
@@ -348,6 +251,12 @@ def run_pipeline(ctx: Any, *, post_train_eval: bool = True, write_report: bool =
             eval_cfg["checkpoint_path"] = prepare_eval_checkpoint(
                 str(eval_ckpt), str(eval_cfg["output_dir"]),
             )
+            if not eval_cfg.get("decode_regime"):
+                raise RuntimeError(
+                    "PPO post-train eval requires eval_decode_regime in the "
+                    "run's frozen train.json; model architecture is not a "
+                    "decode-regime default"
+                )
             results["eval"] = run_evaluation(EvalConfig(**eval_cfg))
         stage_timings["eval"] = time.monotonic() - started
 

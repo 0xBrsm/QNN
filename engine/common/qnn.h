@@ -609,6 +609,16 @@ void QNN_TrainingResetEpisode(void);
 void QNN_TrainingResetTick(void);
 void QNN_TrainingParseRewardWeights(const char *line);
 void QNN_WriteTrainingExtrasBinary(FILE *out, const qnn_snapshot_t *snapshot, int tick, int steps, qboolean reset_flag);
+void QNN_TrainingWriteNetwork(sizebuf_t *msg, edict_t *perspective, qboolean arena_ready);
+void QNN_TrainingSetNetworkResetMask(int match_mask);
+void QNN_TrainingReadNetwork(void);
+qboolean QNN_TrainingNetworkRoundReset(void);
+qboolean QNN_TrainingNetworkArenaReady(void);
+void QNN_ArenaProcessPending(void);
+qboolean QNN_ArenaResetMatch(int match_id);
+qboolean QNN_ArenaAddBot(float skill);
+int QNN_ArenaAssignNamedSeats(void);
+void QNN_ArenaRelinkEntities(void);
 /* ── Engine physics constants (shared by collector, physics, inference) ── */
 
 #define QNN_SV_MAXSPEED      320.0f

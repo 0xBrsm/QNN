@@ -273,6 +273,51 @@ def _unpack_native_entity_stream(
     regen       = np.zeros((n,),    dtype=np.float16)
     state       = np.zeros((n,),    dtype=np.uint8)
 
+    pos = _walk_entity_stream(
+        raw, pos, n,
+        types, subjects, modalities, players, evt_counts, evt_actions,
+        evt_sources, half_ext, rel, vel, path, path_dist, eta, recency,
+        facing, team, score, amount, regen, state,
+    )
+
+    return {
+        "entity_types":         types,
+        "entity_subject_id":    subjects,
+        "entity_modality_id":   modalities,
+        "entity_player_id":     players,
+        "entity_event_count":   evt_counts,
+        "entity_event_actions": evt_actions,
+        "entity_event_sources": evt_sources,
+        "entity_half_extents":  half_ext,
+        "entity_rel":           rel,
+        "entity_vel":           vel,
+        "entity_path":          path,
+        "entity_path_dist":     path_dist,
+        "entity_eta":           eta,
+        "entity_recency":       recency,
+        "entity_facing":        facing,
+        "entity_team":          team,
+        "entity_score":         score,
+        "entity_amount":        amount,
+        "entity_regen":         regen,
+        "entity_state":         state,
+        "entity_count":         np.array(n, dtype=np.uint8),
+    }, pos
+
+
+def _walk_entity_stream(
+    raw: bytes, pos: int, n: int,
+    types, subjects, modalities, players, evt_counts, evt_actions,
+    evt_sources, half_ext, rel, vel, path, path_dist, eta, recency,
+    facing, team, score, amount, regen, state,
+) -> int:
+    """The one wire-layout walk, writing rows [0..n) into caller arrays.
+
+    Callers pass either freshly allocated length-n arrays (per-lane
+    unpack) or per-lane row views of padded (B, MAX_TOKEN_OBJECTS, …)
+    batch arrays (``unpack_obs_buffer_native_batch``) — one
+    implementation to keep in sync with QNN_IOPackObsBuffer.
+    """
     for i in range(n):
         tag = _u8(raw, pos); pos += 1
         if tag not in (_TOK_PROJECTILE, _TOK_ACTOR, _TOK_ITEM, _TOK_MOVER):
@@ -327,29 +372,7 @@ def _unpack_native_entity_stream(
             state[i]    = _u8(raw, pos); pos += 1
             recency[i]  = _read_scalar(raw, pos, np.float16);   pos += 2
 
-    return {
-        "entity_types":         types,
-        "entity_subject_id":    subjects,
-        "entity_modality_id":   modalities,
-        "entity_player_id":     players,
-        "entity_event_count":   evt_counts,
-        "entity_event_actions": evt_actions,
-        "entity_event_sources": evt_sources,
-        "entity_half_extents":  half_ext,
-        "entity_rel":           rel,
-        "entity_vel":           vel,
-        "entity_path":          path,
-        "entity_path_dist":     path_dist,
-        "entity_eta":           eta,
-        "entity_recency":       recency,
-        "entity_facing":        facing,
-        "entity_team":          team,
-        "entity_score":         score,
-        "entity_amount":        amount,
-        "entity_regen":         regen,
-        "entity_state":         state,
-        "entity_count":         np.array(n, dtype=np.uint8),
-    }, pos
+    return pos
 
 
 def unpack_obs_buffer_native(raw: bytes) -> dict[str, np.ndarray]:
@@ -370,4 +393,95 @@ def unpack_obs_buffer_native(raw: bytes) -> dict[str, np.ndarray]:
     out.update(_unpack_native_spatial(raw))
     entities, _ = _unpack_native_entity_stream(raw, NATIVE_ENTITY_STREAM_OFFSET)
     out.update(entities)
+    return out
+
+
+# Batched-drain entity field specs: name → (dtype, per-token tail shape,
+# pad fill). entity_types pads with -1 (empty-slot sentinel the model's
+# mask reads); everything else zero-fills — mirrors vec_env.pad_entities.
+_ENTITY_BATCH_FIELDS: tuple = (
+    ("entity_types",         np.int8,    (),                   -1),
+    ("entity_subject_id",    np.uint8,   (),                    0),
+    ("entity_modality_id",   np.uint8,   (),                    0),
+    ("entity_player_id",     np.uint8,   (),                    0),
+    ("entity_event_count",   np.uint8,   (),                    0),
+    ("entity_event_actions", np.uint8,   (MAX_ENTITY_EVENTS,),  0),
+    ("entity_event_sources", np.uint8,   (MAX_ENTITY_EVENTS,),  0),
+    ("entity_half_extents",  np.uint8,   (3,),                  0),
+    ("entity_rel",           np.int16,   (3,),                  0),
+    ("entity_vel",           np.int16,   (3,),                  0),
+    ("entity_path",          np.int16,   (3,),                  0),
+    ("entity_path_dist",     np.uint16,  (),                    0),
+    ("entity_eta",           np.float16, (),                    0),
+    ("entity_recency",       np.float16, (),                    0),
+    ("entity_facing",        np.uint8,   (),                    0),
+    ("entity_team",          np.uint8,   (),                    0),
+    ("entity_score",         np.uint8,   (),                    0),
+    ("entity_amount",        np.uint8,   (),                    0),
+    ("entity_regen",         np.float16, (),                    0),
+    ("entity_state",         np.uint8,   (),                    0),
+)
+
+
+def unpack_obs_buffer_native_batch(raws: np.ndarray) -> dict[str, np.ndarray]:
+    """Unpack B stacked obs buffers into batched per-field arrays.
+
+    ``raws``: (B, OBS_BUFFER_SIZE) uint8. Self/spatial fields come out
+    vectorized across lanes (column slice → dtype view); entity fields
+    come out PADDED to ``MAX_TOKEN_OBJECTS`` (fill semantics identical to
+    ``vec_env.pad_entities``), the walk writing straight into per-lane
+    row views. Field set, dtypes and values match per-lane
+    ``unpack_obs_buffer_native`` + padding exactly (tested).
+    """
+    B = int(raws.shape[0])
+    out: dict[str, np.ndarray] = {}
+
+    def col(off: int, nbytes: int, dtype, tail: tuple = ()) -> np.ndarray:
+        block = np.ascontiguousarray(raws[:, off:off + nbytes]).view(dtype)
+        return block.reshape((B, *tail)) if tail else block.reshape(B)
+
+    o = NATIVE_SELF_OFFSET
+    out["health"]           = col(o + 0,  1, np.uint8)
+    out["effective_armor"]  = col(o + 1,  1, np.uint8)
+    out["ammo_shells"]      = col(o + 2,  1, np.uint8)
+    out["ammo_nails"]       = col(o + 3,  1, np.uint8)
+    out["ammo_rockets"]     = col(o + 4,  1, np.uint8)
+    out["ammo_cells"]       = col(o + 5,  1, np.uint8)
+    out["vel"]              = col(o + 6,  6, np.int16, (3,))
+    out["attack_finished"]  = col(o + 12, 2, np.float16)
+    out["self_weapon_id"]   = col(o + 14, 1, np.uint8)
+    out["self_movement_id"] = col(o + 15, 1, np.uint8)
+    out["self_items"]       = col(o + 16, 4, np.int32)
+    out["view_pitch"]       = col(o + 20, 1, np.int8)
+    out["look_delta"]       = col(o + 21, 6, np.float16, (3,))
+
+    p = NATIVE_SPATIAL_OFFSET
+    S = SPATIAL_TOKEN_COUNT
+    out["spatial_dir"]          = col(p, S * 3, np.int8, (S, 3)); p += S * 3
+    out["spatial_nearest_dist"] = col(p, S * 2, np.uint16, (S,)); p += S * 2
+    out["spatial_mean_dist"]    = col(p, S * 2, np.uint16, (S,)); p += S * 2
+    for _name in ("spatial_openness", "spatial_clearance",
+                  "spatial_traversable", "spatial_dropoff",
+                  "spatial_solid_frac", "spatial_water_frac",
+                  "spatial_slime_frac", "spatial_lava_frac"):
+        out[_name] = col(p, S, np.uint8, (S,)); p += S
+
+    M = MAX_TOKEN_OBJECTS
+    for name, dtype, tail, fill in _ENTITY_BATCH_FIELDS:
+        arr = np.full((B, M, *tail), fill, dtype=dtype) if fill else \
+            np.zeros((B, M, *tail), dtype=dtype)
+        out[name] = arr
+    counts = np.zeros((B,), dtype=np.uint8)
+    for lane in range(B):
+        raw = raws[lane].tobytes()
+        pos = NATIVE_ENTITY_STREAM_OFFSET
+        n = min(raw[pos], M); pos += 1  # row views are M long; engine caps at M
+        counts[lane] = n
+        if n == 0:
+            continue
+        _walk_entity_stream(
+            raw, pos, n,
+            *(out[name][lane] for name, _, _, _ in _ENTITY_BATCH_FIELDS),
+        )
+    out["entity_count"] = counts
     return out

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.27.0
+
+### Added
+
+- Native single-process PPO training replaces the Sample Factory backend,
+  with asynchronous vector collection, recurrent minibatch resets, bounded
+  host-staged rollout pipelining, and adapter-driven action distributions
+  that are independent of model-head structure.
+- Optional grouped arena training for multiple isolated combat matches and
+  policies in one engine, including the arena bridge, generated grid maps,
+  benchmark tooling, and retained throughput campaign records.
+
+### Changed
+
+- Native PPO collection now overlaps BF16 CPU inference with BF16 ROCm
+  learning through depth-two host-staged buffers. Batched decode RNG, direct
+  worker action writes, cached observation dequantization, fixed-width CPU
+  compilation, recurrent reset segmentation, and persistent compiler caches
+  support the promoted training path.
+
 ## 0.26.0
 
 ### Added

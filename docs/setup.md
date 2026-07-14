@@ -19,7 +19,7 @@ docker compose -f docker/compose.yaml run --rm trainer bash
 ```
 
 The container provides `fteqcc` (QuakeC compiler), `build-essential`, PyTorch,
-Sample Factory, and all Python dependencies. Key environment variables are set
+and all Python dependencies. Key environment variables are set
 in `compose.yaml`:
 
 | Variable | Purpose |
@@ -263,8 +263,8 @@ the server.
 
 ### Microbenchmark
 
-Per-process ppo_worker throughput ceiling (bare pipe IPC, no SF, no
-inference) — useful when investigating SF orchestration overhead:
+Per-process `ppo_worker` throughput ceiling (bare pipe IPC, no policy or
+learner) — useful when isolating engine and transport overhead:
 
 ```bash
 python scripts/bench_ppo_worker.py --steps 5000 --warmup 500

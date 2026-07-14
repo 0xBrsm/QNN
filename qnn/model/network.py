@@ -542,6 +542,7 @@ class Network(nn.Module):
         obs: Dict[str, torch.Tensor],
         hidden: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
+        reset_ts: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         seq_shape, flat_obs = _flatten_obs(obs)
         sample = flat_obs.get("vel")
@@ -558,6 +559,7 @@ class Network(nn.Module):
                 hidden=hidden,
                 reset_mask=reset_mask,
                 seq_shape=seq_shape,
+                reset_ts=reset_ts,
             ))
             gru_flat = temporal_out.flat_out
             next_hidden = temporal_out.next_hidden

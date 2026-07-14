@@ -28,6 +28,11 @@
 
 #define QNN_TRAIN_DEATH_FLAG_GIB 0x0001
 
+#define QNN_SVC_TRAINING 35
+#define QNN_TRAIN_NETWORK_VERSION 1
+#define QNN_TRAIN_NETWORK_ROUND_RESET 0x01
+#define QNN_TRAIN_NETWORK_ARENA_READY 0x02
+
 #define IT_AXE              4096.0f
 #define IT_SHOTGUN          1.0f
 #define IT_SUPER_SHOTGUN    2.0f
@@ -122,6 +127,9 @@ typedef struct
 } qnn_record_state_t;
 
 static qnn_record_state_t qnn_record_state;
+static qboolean qnn_network_round_reset;
+static qboolean qnn_network_arena_ready;
+static int qnn_network_reset_mask;
 
 /* ── Reward computation (moved from Python for performance) ────── */
 
@@ -366,12 +374,15 @@ static void QNN_ClearTick(void)
 	qnn_record_state.spawn_count = 0;
 	memset(qnn_record_state.shot_counts, 0, sizeof(qnn_record_state.shot_counts));
 	memset(qnn_record_state.last_shot_weapon_id, 0, sizeof(qnn_record_state.last_shot_weapon_id));
+	qnn_network_round_reset = false;
 }
 
 void QNN_TrainingResetEpisode(void)
 {
 	memset(&qnn_record_state, 0, sizeof(qnn_record_state));
 	qnn_reward_state.prev_ehp = 100.0f;
+	qnn_network_round_reset = false;
+	qnn_network_arena_ready = false;
 }
 
 void QNN_TrainingResetTick(void)
@@ -395,6 +406,8 @@ static void QNN_DetectPlayerSpawns(qboolean reset_flag)
 {
 	int client_idx;
 
+	if (!sv.active)
+		return;
 	for (client_idx = 0; client_idx < svs.maxclients; ++client_idx)
 	{
 		edict_t *player;
@@ -518,6 +531,230 @@ void PF_qnn_checkextension(void)
 	G_FLOAT(OFS_RETURN) = 0;
 }
 
+static int QNN_TrainingEntityMatchId(edict_t *entity)
+{
+	static int field_offset = -2;
+
+	if (entity == NULL || entity == sv.edicts || entity->free || progs == NULL)
+		return -1;
+	if (field_offset == -2)
+	{
+		extern ddef_t *ED_FindField(char *name);
+		ddef_t *def = ED_FindField((char *)"qnn_match_id");
+		field_offset = def ? (int)def->ofs : -1;
+	}
+	if (field_offset < 0)
+		return -1;
+	return (int)((eval_t *)((char *)&entity->v + field_offset * 4))->_float;
+}
+
+static qboolean QNN_TrainingDeathMatches(
+	const qnn_death_record_t *record, int self_entity_num, int match_id)
+{
+	if (record->victim_entity_num == self_entity_num
+		|| record->attacker_entity_num == self_entity_num)
+		return true;
+	if (match_id < 0 || record->victim_entity_num <= 0
+		|| record->victim_entity_num >= sv.num_edicts)
+		return false;
+	return QNN_TrainingEntityMatchId(EDICT_NUM(record->victim_entity_num)) == match_id;
+}
+
+void QNN_TrainingSetNetworkResetMask(int match_mask)
+{
+	qnn_network_reset_mask = match_mask;
+}
+
+void QNN_TrainingWriteNetwork(sizebuf_t *msg, edict_t *perspective, qboolean arena_ready)
+{
+	int self_entity_num;
+	int match_id;
+	int damage_count;
+	int item_count;
+	int death_count;
+	int idx;
+	int flags;
+
+	if (msg == NULL || perspective == NULL)
+		return;
+	self_entity_num = NUM_FOR_EDICT(perspective);
+	match_id = QNN_TrainingEntityMatchId(perspective);
+	damage_count = 0;
+	item_count = 0;
+	death_count = 0;
+	flags = arena_ready ? QNN_TRAIN_NETWORK_ARENA_READY : 0;
+	if (match_id >= 0 && match_id < 8
+		&& (qnn_network_reset_mask & (1 << match_id)))
+		flags |= QNN_TRAIN_NETWORK_ROUND_RESET;
+	for (idx = 0; idx < qnn_record_state.damage_count; ++idx)
+	{
+		qnn_damage_record_t *record = &qnn_record_state.damage[idx];
+		if (record->attacker_entity_num == self_entity_num
+			|| record->target_entity_num == self_entity_num)
+			damage_count += 1;
+	}
+	for (idx = 0; idx < qnn_record_state.item_count; ++idx)
+	{
+		if (qnn_record_state.items[idx].actor_entity_num == self_entity_num)
+			item_count += 1;
+	}
+	for (idx = 0; idx < qnn_record_state.death_count; ++idx)
+	{
+		if (QNN_TrainingDeathMatches(
+			&qnn_record_state.deaths[idx], self_entity_num, match_id))
+		{
+			death_count += 1;
+			flags |= QNN_TRAIN_NETWORK_ROUND_RESET;
+		}
+	}
+
+	/* A normal 1v1 tick is ~20 bytes; combat ticks remain well under the
+	   stock 1024-byte datagram because records are filtered to this seat. */
+	MSG_WriteByte(msg, QNN_SVC_TRAINING);
+	MSG_WriteByte(msg, QNN_TRAIN_NETWORK_VERSION);
+	MSG_WriteByte(msg, flags);
+	MSG_WriteByte(msg, qnn_record_state.shot_counts[self_entity_num]);
+	MSG_WriteByte(msg, qnn_record_state.last_shot_weapon_id[self_entity_num]);
+	MSG_WriteByte(msg, damage_count);
+	MSG_WriteByte(msg, item_count);
+	MSG_WriteByte(msg, death_count);
+
+	for (idx = 0; idx < qnn_record_state.damage_count; ++idx)
+	{
+		qnn_damage_record_t *record = &qnn_record_state.damage[idx];
+		if (record->attacker_entity_num != self_entity_num
+			&& record->target_entity_num != self_entity_num)
+			continue;
+		MSG_WriteShort(msg, record->attacker_entity_num);
+		MSG_WriteShort(msg, record->target_entity_num);
+		MSG_WriteByte(msg, record->weapon_id);
+		MSG_WriteByte(msg, record->flags);
+		MSG_WriteFloat(msg, record->health_before);
+		MSG_WriteFloat(msg, record->health_after);
+		MSG_WriteFloat(msg, record->armor_before);
+		MSG_WriteFloat(msg, record->armor_after);
+		MSG_WriteFloat(msg, record->armor_type_before);
+		MSG_WriteFloat(msg, record->armor_type_after);
+		MSG_WriteFloat(msg, record->damage_health);
+		MSG_WriteFloat(msg, record->damage_armor);
+	}
+	for (idx = 0; idx < qnn_record_state.item_count; ++idx)
+	{
+		qnn_item_record_t *record = &qnn_record_state.items[idx];
+		if (record->actor_entity_num != self_entity_num)
+			continue;
+		MSG_WriteShort(msg, record->actor_entity_num);
+		MSG_WriteShort(msg, record->item_entity_num);
+		MSG_WriteByte(msg, record->event_kind);
+		MSG_WriteByte(msg, record->category);
+		MSG_WriteByte(msg, record->weapon_id);
+		MSG_WriteByte(msg, record->flags);
+		MSG_WriteFloat(msg, record->amount);
+		MSG_WriteFloat(msg, record->origin[0]);
+		MSG_WriteFloat(msg, record->origin[1]);
+		MSG_WriteFloat(msg, record->origin[2]);
+	}
+	for (idx = 0; idx < qnn_record_state.death_count; ++idx)
+	{
+		qnn_death_record_t *record = &qnn_record_state.deaths[idx];
+		if (!QNN_TrainingDeathMatches(record, self_entity_num, match_id))
+			continue;
+		MSG_WriteShort(msg, record->victim_entity_num);
+		MSG_WriteShort(msg, record->attacker_entity_num);
+		MSG_WriteByte(msg, record->weapon_id);
+		MSG_WriteByte(msg, record->flags);
+	}
+}
+
+void QNN_TrainingReadNetwork(void)
+{
+	int version;
+	int flags;
+	int shot_count;
+	int shot_weapon;
+	int damage_count;
+	int item_count;
+	int death_count;
+	int self_entity_num;
+	int idx;
+
+	version = MSG_ReadByte();
+	if (version != QNN_TRAIN_NETWORK_VERSION)
+		Host_Error("Unsupported QNN training network version %d", version);
+	flags = MSG_ReadByte();
+	shot_count = MSG_ReadByte();
+	shot_weapon = MSG_ReadByte();
+	damage_count = MSG_ReadByte();
+	item_count = MSG_ReadByte();
+	death_count = MSG_ReadByte();
+	self_entity_num = cl.viewentity;
+	qnn_network_round_reset = (flags & QNN_TRAIN_NETWORK_ROUND_RESET) ? true : false;
+	qnn_network_arena_ready = (flags & QNN_TRAIN_NETWORK_ARENA_READY) ? true : false;
+	if (self_entity_num > 0 && self_entity_num < MAX_EDICTS)
+	{
+		qnn_record_state.shot_counts[self_entity_num] = shot_count;
+		qnn_record_state.last_shot_weapon_id[self_entity_num] = shot_weapon;
+	}
+
+	for (idx = 0; idx < damage_count; ++idx)
+	{
+		qnn_damage_record_t *record;
+		if (qnn_record_state.damage_count >= QNN_MAX_TRAIN_DAMAGE)
+			Host_Error("QNN network damage record overflow");
+		record = &qnn_record_state.damage[qnn_record_state.damage_count++];
+		record->attacker_entity_num = MSG_ReadShort();
+		record->target_entity_num = MSG_ReadShort();
+		record->weapon_id = MSG_ReadByte();
+		record->flags = MSG_ReadByte();
+		record->health_before = MSG_ReadFloat();
+		record->health_after = MSG_ReadFloat();
+		record->armor_before = MSG_ReadFloat();
+		record->armor_after = MSG_ReadFloat();
+		record->armor_type_before = MSG_ReadFloat();
+		record->armor_type_after = MSG_ReadFloat();
+		record->damage_health = MSG_ReadFloat();
+		record->damage_armor = MSG_ReadFloat();
+	}
+	for (idx = 0; idx < item_count; ++idx)
+	{
+		qnn_item_record_t *record;
+		if (qnn_record_state.item_count >= QNN_MAX_TRAIN_ITEMS)
+			Host_Error("QNN network item record overflow");
+		record = &qnn_record_state.items[qnn_record_state.item_count++];
+		record->actor_entity_num = MSG_ReadShort();
+		record->item_entity_num = MSG_ReadShort();
+		record->event_kind = MSG_ReadByte();
+		record->category = MSG_ReadByte();
+		record->weapon_id = MSG_ReadByte();
+		record->flags = MSG_ReadByte();
+		record->amount = MSG_ReadFloat();
+		record->origin[0] = MSG_ReadFloat();
+		record->origin[1] = MSG_ReadFloat();
+		record->origin[2] = MSG_ReadFloat();
+	}
+	for (idx = 0; idx < death_count; ++idx)
+	{
+		qnn_death_record_t *record;
+		if (qnn_record_state.death_count >= QNN_MAX_TRAIN_DEATHS)
+			Host_Error("QNN network death record overflow");
+		record = &qnn_record_state.deaths[qnn_record_state.death_count++];
+		record->victim_entity_num = MSG_ReadShort();
+		record->attacker_entity_num = MSG_ReadShort();
+		record->weapon_id = MSG_ReadByte();
+		record->flags = MSG_ReadByte();
+	}
+}
+
+qboolean QNN_TrainingNetworkRoundReset(void)
+{
+	return qnn_network_round_reset;
+}
+
+qboolean QNN_TrainingNetworkArenaReady(void)
+{
+	return qnn_network_arena_ready;
+}
+
 void QNN_FillMetricsFromRecords(qnn_metrics_t *out, const qnn_snapshot_t *snapshot)
 {
 	int self_entity_num = cl.viewentity;
@@ -572,8 +809,11 @@ void QNN_FillMetricsFromRecords(qnn_metrics_t *out, const qnn_snapshot_t *snapsh
 
 	/* Frags */
 	current_frags = 0;
-	if (self_entity_num > 0 && self_entity_num < sv.num_edicts)
+	if (sv.active && self_entity_num > 0 && self_entity_num < sv.num_edicts)
 		current_frags = (int)EDICT_NUM(self_entity_num)->v.frags;
+	else if (cl.scores != NULL && self_entity_num > 0
+		&& self_entity_num <= cl.maxclients)
+		current_frags = cl.scores[self_entity_num - 1].frags;
 	if (qnn_record_state.prev_self_valid
 		&& qnn_record_state.prev_self_entity_num == self_entity_num)
 	{
@@ -642,8 +882,11 @@ void QNN_WriteTrainingExtrasBinary(FILE *out, const qnn_snapshot_t *snapshot, in
 	armor_after = (float)snapshot->armor;
 	armor_type_after = snapshot->armor_type;
 	current_frags = 0;
-	if (self_entity_num > 0 && self_entity_num < sv.num_edicts)
+	if (sv.active && self_entity_num > 0 && self_entity_num < sv.num_edicts)
 		current_frags = (int)EDICT_NUM(self_entity_num)->v.frags;
+	else if (cl.scores != NULL && self_entity_num > 0
+		&& self_entity_num <= cl.maxclients)
+		current_frags = cl.scores[self_entity_num - 1].frags;
 
 	if (!qnn_record_state.prev_self_valid || qnn_record_state.prev_self_entity_num != self_entity_num)
 	{

@@ -11,13 +11,13 @@ inside that run directory.
 
 - `run.json` is the single entry point.
 - Every config path in `run.json.config` is required — and no more.
-- BC runs only declare `train`, `machine`, and `model`. PPO / PBT / Optuna add
+- BC runs only declare `train`, `machine`, and `model`. PPO / Optuna add
   `scenario`, `reward`, and `eval`.
 - `run.json.resume` is the only resume switch.
 - No code-level defaults fill in missing training keys.
-- Public run modes are `bc`, `ppo`, `pbt`, `eval`, and `optuna`.
-- `run.json.output.checkpoints` is the real PPO checkpoint root. Sample Factory
-  writes only its internal `checkpoint_p*` subdirs under it.
+- Public run modes are `bc`, `ppo`, `eval`, and `optuna`; `pbt` is retired.
+- `run.json.output.checkpoints` is the PPO checkpoint root. Native PPO keeps
+  one atomic `ppo_state_<run_id>.pt` resume state plus deployable best models.
 - Generated Optuna trial wrappers live under `runs/optuna/<name>/trials/`.
   Each wrapper keeps `params.json`, `reward.json`, and `diagnostics.json`,
   and the child PPO run lives under `ppo/`. They are runtime output, not
@@ -40,7 +40,7 @@ runs/bc/<name>/
   logs/
 ```
 
-PPO / PBT / Optuna:
+PPO / Optuna:
 
 ```text
 runs/<mode>/<name>/
@@ -65,7 +65,7 @@ from `run.json.run_id`, never from directory names.
 | File | Purpose |
 |------|---------|
 | `checkpoints/ckpt_e<epoch>_<run_id>.pt` | rolling resume checkpoint (model + optimizer). Exactly one per run: each epoch's atomic write (tmp + fsync + rename) supersedes and deletes the previous epoch's file |
-| `checkpoints/best_<run_id>.pth` (+ `.json` sidecar) | best model by selection score; the deploy/eval artifact. PPO mirrors its newest SF best to `best/best_<run_id>.pth` |
+| `checkpoints/best_<run_id>.pth` (+ `.json` sidecar) | best model by selection score; the deploy/eval artifact. Native PPO writes its deployable best under `checkpoints/best/` |
 | `checkpoints/snapshot.pt` | mid-epoch resume state, removed at each clean epoch boundary |
 
 There is no per-epoch checkpoint archive. At end of run, BC pushes
@@ -80,10 +80,10 @@ loaders discover both.
 | File | Owns |
 |------|------|
 | `machine.json` | device, asset root, binaries, worker geometry, batch sizing |
-| `scenario.json` | map surface, native args, match options, scenario ladder (PPO/PBT/Optuna) |
+| `scenario.json` | map surface, native args, match options, scenario ladder (PPO/Optuna) |
 | `model.json` | policy architecture |
 | `train.json` | trainer and eval knobs for the run mode |
-| `reward.json` | reward weights (PPO/PBT/Optuna) |
+| `reward.json` | reward weights (PPO/Optuna) |
 | `run.json` | run metadata, mode, resume behavior, checkpoint path, output roots |
 
 ## run.json
@@ -93,11 +93,11 @@ loaders discover both.
 | `name` | run name (human label — never an identity key) |
 | `run_id` | immutable run identity, `YYYYMMDD-xxxxxx` (qnn.utils.artifacts); stamped into checkpoint names/meta, bc_summary, eval summaries, the trainer ledger, and ONNX metadata |
 | `parent_run_id` | lineage edge for derived runs (empty otherwise) |
-| `mode` | `bc`, `ppo`, `pbt`, `eval`, or `optuna` |
+| `mode` | `bc`, `ppo`, `eval`, or `optuna` |
 | `runtime_scale` | metadata label, usually `live` or `verify` |
 | `resume` | `true` resumes this run’s own outputs when they exist; `false` archives them and starts fresh |
 | `description` | human-readable run note |
-| `checkpoint_path` | BC seed for `ppo` / `pbt` / `optuna`, or explicit checkpoint for `eval` |
+| `checkpoint_path` | BC seed for `ppo` / `optuna`, or explicit checkpoint for `eval` |
 | `trial_count` | Optuna trial count template/default for `mode: "optuna"` |
 | `trial_budget_steps` | env-step budget per Optuna trial |
 | `study_name` | Optuna study name |
@@ -125,20 +125,35 @@ BC:
 | `prefetch` | batch prefetch toggle |
 | `snapshot_interval` | mid-epoch snapshot save interval (`snapshot.pt`, deterministic in-epoch resume) |
 
-PPO / PBT / Optuna trials:
+PPO / Optuna trials:
 
 | Path | Purpose |
 |------|---------|
-| `num_workers` | PPO rollout worker count |
-| `num_envs_per_worker` | env count per worker |
-| `worker_num_splits` | Sample Factory worker splits |
-| `policy_workers_per_policy` | centralized inference workers per policy |
-| `batched_sampling` | Sample Factory batched sampling toggle |
-| `worker_inference` | per-worker inference toggle (see [PPO worker inference](#ppo-worker-inference)) |
-| `worker_inference_device` | `cpu` (default) or `gpu` — device each rollout worker runs inference on when `worker_inference=true` |
-| `minibatch_size` | PPO minibatch size |
+| `num_lanes` | native engine subprocess count (`768` throughput default) |
+| `minibatch_lanes` | recurrent PPO minibatch width (`768` default); rows/update = `minibatch_lanes × rollout_steps` |
+| `collect_device` | action-inference device (`cpu` for the current small policy) |
+| `collector_num_threads` | CPU intra-op threads used by the collector (`16` for the promoted process topology; use an explicitly measured value for narrower batches) |
+| `env_backend` | `process` (promoted default) or optional grouped `arena_grid` |
+| `matches_per_server` | grouped-arena 1v1 matches per world (`1..8`) |
+| `seat_mode` | grouped-arena opponents: `bot` or shared-current-policy `self_play` |
+| `arena_server_binary` / `arena_client_binary` | grouped-arena engine executables |
+| `arena_map_id` / `arena_base_port` / `arena_bot_skill` | grouped-arena map, first server port, and FrikBot skill |
 | `eval_num_envs` | post-train eval env count |
 | `eval_num_episodes` | post-train eval episode count |
+
+`arena_grid` is an optional dense-match backend; `process` remains the promoted
+throughput default. Build its reproducible artifacts inside the trainer
+container before launch:
+
+```bash
+python scripts/install_training_gamedir.py --asset-root assets
+src/engine/build/build_ppo_arena_server.sh
+src/engine/build/build_ppo_arena_client.sh
+python scripts/build_arena_grid.py
+```
+
+Bot mode exposes one learner trajectory per match. `self_play` exposes both
+seats to the same current policy; frozen-opponent routing is not implemented.
 
 Eval:
 
@@ -149,7 +164,7 @@ Eval:
 
 ## scenario.json
 
-Present for PPO / PBT / Optuna runs only. BC runs do not carry a scenario.
+Present for PPO / Optuna runs only. BC runs do not carry a scenario.
 
 | Path | Purpose |
 |------|---------|
@@ -208,19 +223,23 @@ BC:
 | `step_report_interval_seconds` | per-step metrics log cadence |
 | `prometheus_pushgateway_url` | optional metrics export target |
 
-PPO / PBT / Optuna trials:
+PPO / Optuna trials:
 
 | Path | Purpose |
 |------|---------|
 | `mode` | env mode |
 | `native_workdir` | worker working directory |
 | `fixed_tick_hz`, `max_steps_per_episode`, `seed` | run timing and seed |
-| `rollout_steps`, `total_steps` | PPO horizon |
+| `rollout_steps`, `total_env_steps` | PPO horizon and total training budget |
 | `policy_lr`, `ppo_epochs`, `clip_ratio` | optimizer controls |
-| `entropy_coef`, `bc_kl_coef`, `initial_stddev` | exploration, KL shaping, continuous action sampling width |
-| `head_loss_weights` | per-head PPO loss weighting (same JSON schema as BC); weight 0 zeros that head's log-prob/entropy/KL so no gradient flows to its parameters |
+| `trainable` | `full` (default) trains the transformer, GRU, pointer, and enabled heads; `heads` freezes the trunk |
+| `learner_dtype`, `collector_dtype` | independent numeric precision; both default to `bf16` on the current APU |
+| `rl_head_weights` | per-head PPO loss weighting; weight 0 removes that head's log-prob, entropy, KL, and gradient |
+| `entropy_coef`, `rl_temperatures`, `sample_temperatures` | per-head exploration and distribution temperatures |
 | `gamma`, `gae_lambda`, `max_grad_norm`, `value_coef` | PPO objective weights |
-| `with_pbt`, `num_policies`, `pbt_*` | PBT controls |
+| `compile_learner`, `compile_collector` | independent compile switches; the measured default is eager learner plus compiled fixed-width collector |
+| `pipeline_depth` | `1` for synchronous parity mode or `2` for the bounded one-update-lag pipeline |
+| `pipeline_host_staging` | collect into CPU buffers and bulk-copy complete unrolls to the reusable GPU learner buffer |
 | `eval_seed` | post-train eval seed |
 | `eval_policy_modes`, `eval_start_mode` | post-train eval scheduling |
 | `eval_holdout_seed_offset`, `eval_sample_seed_offset` | eval RNG offsets |
@@ -239,33 +258,37 @@ Eval:
 | `map_features_path` or `eval_map_features_path` | eval map features path |
 | `parallel_policy_modes` or `eval_parallel_policy_modes` | eval execution controls |
 
-## PPO worker inference
+## PPO Topology
 
-Sample Factory's default rollout architecture sends every env's observation
-to a central inference worker that batches and forwards on GPU. For this
-project's small (~50k-param) policy on ROCm/WSL, the coordination tax of
-gathering 128 envs into one GPU batch dominates the GPU compute, and the
-`worker_inference=true` path (local inference inside each rollout worker)
-is substantially faster:
+One native PPO trainer owns all engine subprocesses, one CPU collection replica,
+and one GPU learner. The retained depth-two scheduler collects immutable
+behavior generation `k` while it learns generation `k-1`. It permits exactly
+one update of policy lag; there is no free-running actor queue or mid-unroll
+weight refresh. `pipeline_depth=1` remains the synchronous parity path.
 
-| Config | Aggregate FPS | vs baseline |
-|---|---|---|
-| Central GPU inference (default) | ~1,900 | 1.0× |
-| `worker_inference=true`, GPU | ~2,800 | 1.5× |
-| `worker_inference=true`, `worker_inference_device=cpu` | ~4,570 | 2.4× |
+| Setting | Current Value | Rationale |
+|---|---:|---|
+| `num_lanes` | `768` | confirmed pipeline knee; 832, 896, and 1,024 lanes regress |
+| `minibatch_lanes` | `768` | one full recurrent lane batch per PPO epoch |
+| `collect_device` | `cpu` | avoids ROCm launch overhead for the small action model |
+| `learner_dtype` / `collector_dtype` | `bf16` / `bf16` | measured win on both GPU learning and CPU collection |
+| `pipeline_depth` | `2` | overlaps complete immutable collection and learner windows |
+| `pipeline_host_staging` | `true` | avoids concurrent GPU rollout writes during learning |
 
-The CPU path wins because 32 rollout-worker processes get real per-core
-parallelism, while 32 processes all hitting one ROCm device serialize
-their kernel launches. The win flips back toward GPU once the policy
-grows (rebenchmark above a few hundred thousand params).
+The fixed-width CPU action model compiles as one `dynamic=False` graph.
+Variable-width truncation bootstraps bypass that graph through eager
+`model.forward`; compiling those widths causes late graph storms. Trainer
+containers persist Inductor and MIOpen caches across runs. The full learner is
+deliberately eager: its compile probe produced no first update after more than
+eleven minutes.
 
-With `worker_inference=true`, per-worker policy lag variance increases;
-`_record_summaries` in SF's learner is monkey-patched to guard against
-an empty minibatch.
+Pipeline metrics distinguish `fill`, `steady`, and `drain` phases. Compare
+throughput with aggregate steady frames divided by total `pipeline_cycle_s`;
+do not include fill/drain FPS or rank candidates by a single-window peak.
 
 ## Derived Values
 
-- PPO-family `num_envs = num_workers * num_envs_per_worker`
+- PPO-family `num_envs = num_lanes`
 - Runtime plans are copied from explicit frozen values; there is no auto-sizing
 
 ## Removed Hidden Defaults

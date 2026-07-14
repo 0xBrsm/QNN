@@ -14,7 +14,7 @@ round-trip (unknown keys raise, missing required keys raise).
 v1 scope notes:
 
 * Heads are the four engine heads (``move``/``look``/``attack``/
-  ``weapon``). The PPO critic is Sample Factory-owned, not a node.
+  ``weapon``). The native PPO trainer owns its critic; it is not a node.
 * Motor-head edges are ``readout`` (+ ``target.feat``); the v17
   ``look_bypass_gru`` layout is not expressible — those checkpoints
   keep loading through the legacy flat-``ModelConfig`` path.

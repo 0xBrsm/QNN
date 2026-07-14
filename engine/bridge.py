@@ -17,6 +17,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
+import numpy as np
+
 from qnn.actions import (
     ActionLabels,
 )
@@ -170,6 +172,7 @@ class NativeProcessBase:
     #   bit 7   = jump press
     _BINARY_OP_STEP = b"\x01"
     _ACTION_PACK_FORMAT = "<4B3f"  # 4 uint8 + 3 float32 = 16 bytes
+    _ACTION_PACKET_SIZE = 17
 
     @staticmethod
     def _pack_press_byte(labels: ActionLabels) -> int:
@@ -194,16 +197,105 @@ class NativeProcessBase:
             byte |= 0x80
         return byte
 
-    def _binary_step_request(self, action: Mapping[str, object]) -> bytes:
+    @classmethod
+    def pack_step_request(cls, action: Mapping[str, object]) -> bytes:
+        """Validate and pack one complete binary step request.
+
+        Vector drivers can do this once while assembling the action batch,
+        then use ``step_send_packed`` without reparsing ActionLabels in the
+        latency-sensitive pipe fan-out.
+        """
         labels = ActionLabels.from_dict(action)
-        return self._BINARY_OP_STEP + struct.pack(
-            self._ACTION_PACK_FORMAT,
-            self._pack_press_byte(labels),
+        return cls._BINARY_OP_STEP + struct.pack(
+            cls._ACTION_PACK_FORMAT,
+            cls._pack_press_byte(labels),
             int(labels.weapon),
             0,  # input_mask not transmitted from runtime
             0,  # _pad
             float(labels.look[0]), float(labels.look[1]), float(labels.look[2]),
         )
+
+    @classmethod
+    def pack_step_batch(
+        cls,
+        action_batch: Mapping[str, object],
+        *,
+        num_rows: int,
+        normalize_look: bool = False,
+    ) -> np.ndarray:
+        """Validate and pack a complete ``(B, 17)`` binary step matrix.
+
+        This is field-equivalent to calling :meth:`pack_step_request` for every
+        row, but avoids per-row dictionaries, ``ActionLabels`` instances, and
+        ``struct.pack`` calls. Batched look normalization can differ by one
+        float32 ULP because NumPy reduces the rows together; the engine's
+        direction mapping is scale-invariant. The returned uint8 matrix owns
+        contiguous packet rows that can be passed to ``os.write`` without a
+        copy.
+        """
+        rows = int(num_rows)
+        if rows < 1:
+            raise ValueError("num_rows must be >= 1")
+
+        def _vector(name: str) -> np.ndarray:
+            value = action_batch.get(name)
+            if value is None:
+                return np.zeros((rows, 3), dtype=np.float32)
+            array = np.asarray(value, dtype=np.float32)
+            if array.shape != (rows, 3):
+                raise ValueError(
+                    f"action {name!r} must have shape ({rows}, 3), got {array.shape}"
+                )
+            return array
+
+        def _scalar_int(name: str) -> np.ndarray:
+            value = action_batch.get(name)
+            if value is None:
+                return np.zeros(rows, dtype=np.int64)
+            array = np.asarray(value)
+            if array.shape != (rows,):
+                raise ValueError(
+                    f"action {name!r} must have shape ({rows},), got {array.shape}"
+                )
+            return array.astype(np.int64, copy=False)
+
+        move = np.clip(_vector("move"), -1.0, 1.0)
+        look = _vector("look")
+        if normalize_look:
+            norms = np.linalg.norm(look, axis=1, keepdims=True)
+            look = np.divide(
+                look,
+                norms,
+                out=look.copy(),
+                where=norms > np.float32(1e-6),
+            )
+        look = np.clip(look, -1.0, 1.0)
+        attack = _scalar_int("attack")
+        if np.any((attack < 0) | (attack >= 2)):
+            raise ValueError("attack out of range [0, 2)")
+        # Match ActionLabels.from_dict: engine weapon impulses clamp to 0..8.
+        weapon = np.clip(_scalar_int("weapon"), 0, 8)
+
+        press = attack.astype(np.uint8)
+        threshold = np.float32(0.1)
+        press |= ((move[:, 0] < -threshold).astype(np.uint8) << 1)
+        press |= ((move[:, 0] > threshold).astype(np.uint8) << 2)
+        press |= ((move[:, 1] < -threshold).astype(np.uint8) << 3)
+        press |= ((move[:, 1] > threshold).astype(np.uint8) << 4)
+        press |= ((move[:, 2] < -threshold).astype(np.uint8) << 5)
+        up = (move[:, 2] > threshold).astype(np.uint8)
+        press |= up << 6
+        press |= up << 7
+
+        packets = np.zeros((rows, cls._ACTION_PACKET_SIZE), dtype=np.uint8)
+        packets[:, 0] = cls._BINARY_OP_STEP[0]
+        packets[:, 1] = press
+        packets[:, 2] = weapon.astype(np.uint8)
+        packets[:, 5:].view("<f4").reshape(rows, 3)[:] = look
+        return packets
+
+    def _binary_step_request(self, action: Mapping[str, object]) -> bytes:
+        return self.pack_step_request(action)
 
     def _action_request(self, action: Mapping[str, object], op: str = "step") -> bytes:
         labels = ActionLabels.from_dict(action)
@@ -299,8 +391,6 @@ class NativeProcessBase:
 # NativeObsBufferProcess — direct-pack obs_buffer_v1 binary
 # ---------------------------------------------------------------------------
 
-import numpy as np
-
 # engine_norm phase 2: C side emits the native-width obs buffer per
 # qnn.engine_norm (see src/engine/common/qnn_io.{h,c}). The legacy f32
 # parser is dead; we use the native dict format end-to-end on this
@@ -316,8 +406,20 @@ class NativeObsBufferProcess(NativeProcessBase):
     _required_capability = "obs_buffer_v1"
     _last_obs: Dict[str, np.ndarray] | None = None
 
+    def _read_raw_obs_packet(self) -> bytes:
+        """Read one obs buffer, surfacing control-plane errors immediately."""
+        proc = self._ensure_running()
+        first = self._read_exact(1)
+        if first == b"{":
+            # Reset/round-reset failures are JSON on the otherwise-binary
+            # response channel. Reading a blind 4096 bytes here used to hang
+            # forever on a short error line.
+            self._decode_json_response(first + proc.stdout.readline())
+            raise NativeEngineError("Worker returned JSON where an observation was expected")
+        return first + self._read_exact(OBS_BUFFER_SIZE - 1)
+
     def _read_obs_packet(self) -> Dict[str, np.ndarray]:
-        raw = self._read_exact(OBS_BUFFER_SIZE)
+        raw = self._read_raw_obs_packet()
         obs = _unpack_obs_buffer(raw)
         self._last_obs = obs
         return obs
@@ -357,10 +459,52 @@ class NativeObsBufferProcess(NativeProcessBase):
     def step_with_training(
         self, action: Mapping[str, int]
     ) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
+        self.step_send(action)
+        return self.step_recv()
+
+    # Split-phase stepping for vectorized drivers: fan out step_send() to
+    # every worker first (each engine sims its tick concurrently), then
+    # drain with step_recv(). One in-flight step per process, caller-managed.
+    def step_send(self, action: Mapping[str, int]) -> None:
+        self.step_send_packed(self.pack_step_request(action))
+
+    def step_send_packed(self, payload: bytes | bytearray | memoryview | np.ndarray) -> None:
+        """Send a prevalidated 17-byte step packet with one direct syscall."""
         if self.proc is None:
             self.start()
-        obs = self._request_obs_packet(self._binary_step_request(action))
+        proc = self._ensure_running()
+        fd = proc.stdin.fileno()
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise NativeEngineError("Worker step pipe accepted no bytes")
+            view = view[written:]
+
+    def step_recv(self) -> tuple[Dict[str, np.ndarray], TrustedTrainingExtrasV1 | None]:
+        obs = self._read_obs_packet()
         return obs, self._maybe_read_training_binary()
+
+    def step_recv_raw(self) -> tuple[bytes, TrustedTrainingExtrasV1 | None]:
+        """Drain one step WITHOUT unpacking the obs buffer — the batched
+        drain (vec_env) unpacks all lanes at once via
+        ``qnn.wire.unpack_obs_buffer_native_batch``."""
+        raw = self._read_raw_obs_packet()
+        return raw, self._maybe_read_training_binary()
+
+    def round_reset_raw(self) -> tuple[bytes, TrustedTrainingExtrasV1 | None]:
+        """Reset only the local arena match and return its live spawn obs.
+
+        Unlike :meth:`reset_with_training`, this does not disconnect, reload
+        the map, repeat sign-on, or respawn unrelated matches.
+        """
+        if self.proc is None:
+            self.start()
+        proc = self._ensure_running()
+        proc.stdin.write(self._serialize_request({"op": "round_reset"}))
+        proc.stdin.flush()
+        raw = self._read_raw_obs_packet()
+        return raw, self._maybe_read_training_binary()
 
     # -- Navmesh queries (JSON protocol) ------------------------------------
 

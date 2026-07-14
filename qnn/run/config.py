@@ -36,6 +36,18 @@ def _require_list(mapping: Mapping[str, Any], key: str, context: str) -> list[An
     return list(value)
 
 
+def _valid_policy_modes(modes: list[str]) -> list[str]:
+    """Fail at config-build time, not after the training stage has already
+    run: the eval driver only knows these modes, and a bad name would
+    otherwise surface hours later at post-train eval."""
+    known = {"greedy", "sampled"}
+    bad = [m for m in modes if m not in known]
+    if bad:
+        raise RuntimeError(
+            f"train.json eval_policy_modes {bad} unsupported — use {sorted(known)}")
+    return modes
+
+
 def _require_string(mapping: Mapping[str, Any], key: str, context: str) -> str:
     value = _require_key(mapping, key, context)
     if not isinstance(value, str) or not value.strip():
@@ -169,8 +181,9 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
         raise RuntimeError("run.json.checkpoint_path must be a string")
     result["checkpoint_path"] = _resolve_optional_path(ckpt)
 
-    # eval requires a checkpoint; ppo/pbt/optuna may omit it for random init.
-    if mode == "eval" and not result["checkpoint_path"]:
+    # eval needs a model; native PPO is the FINE-TUNING stage and always
+    # starts from a BC/RL seed (random-init RL died with Sample Factory).
+    if mode in ("eval", "ppo") and not result["checkpoint_path"]:
         raise RuntimeError(f"run.json must define a non-empty checkpoint_path when mode is '{mode}'")
 
     result["output"] = _require_mapping(manifest, "output", "run.json")
@@ -275,31 +288,68 @@ def build_run_ppo_eval_config(
     ppo_cfg["output_dir"] = str(outputs["checkpoints"])
     ppo_cfg["reward_json_path"] = str(run_cfg["config_paths"]["reward"])
     ppo_cfg["device"] = requested_device
-    ppo_cfg["num_workers"] = int(_require_key(machine, "num_workers", "machine.json"))
-    ppo_cfg["num_envs_per_worker"] = int(_require_key(machine, "num_envs_per_worker", "machine.json"))
-    ppo_cfg["worker_num_splits"] = int(_require_key(machine, "worker_num_splits", "machine.json"))
-    ppo_cfg["minibatch_size"] = int(_require_key(machine, "minibatch_size", "machine.json"))
-    ppo_cfg["policy_workers_per_policy"] = int(_require_key(machine, "policy_workers_per_policy", "machine.json"))
-    ppo_cfg["batched_sampling"] = bool(_require_key(machine, "batched_sampling", "machine.json"))
-    ppo_cfg["worker_inference"] = bool(_require_key(machine, "worker_inference", "machine.json"))
-    ppo_cfg["worker_inference_device"] = str(_require_key(machine, "worker_inference_device", "machine.json")).lower()
-    ppo_cfg["num_envs"] = int(ppo_cfg["num_workers"]) * int(ppo_cfg["num_envs_per_worker"])
+    # Native single-process trainer topology: lanes are parallel engine
+    # subprocesses in ONE process; the recurrent minibatch unit is a lane
+    # subset over the full rollout window (see agents/plans/ppo-rebuild.md).
+    ppo_cfg["num_lanes"] = int(_require_key(machine, "num_lanes", "machine.json"))
+    ppo_cfg["minibatch_lanes"] = int(_require_key(machine, "minibatch_lanes", "machine.json"))
+    # Collect-time forward device. Default cpu: the d64 act forward is
+    # ~4× faster on CPU than ROCm eager (per-op launch overhead), the
+    # worker-inference lesson carried into the native trainer — one
+    # in-process replica, synced at each iteration boundary (exactly
+    # on-policy; collection is synchronous). "" = same device as learner.
+    ppo_cfg["collect_device"] = str(machine.get("collect_device", "cpu"))
+    ppo_cfg["collector_num_threads"] = int(
+        machine.get("collector_num_threads", 0)
+    )
+    if ppo_cfg["collector_num_threads"] < 0:
+        raise ValueError("machine.json: collector_num_threads must be >= 0")
+    env_backend = str(machine.get("env_backend", "process"))
+    if env_backend not in {"process", "arena_grid"}:
+        raise ValueError("machine.json: env_backend must be 'process' or 'arena_grid'")
+    ppo_cfg["env_backend"] = env_backend
+    ppo_cfg["matches_per_server"] = int(machine.get("matches_per_server", 8))
+    ppo_cfg["seat_mode"] = str(machine.get("seat_mode", "bot"))
+    ppo_cfg["arena_server_binary"] = str(
+        machine.get("arena_server_binary", "assets/bin/ppo_arena_server")
+    )
+    ppo_cfg["arena_client_binary"] = str(
+        machine.get("arena_client_binary", "assets/bin/ppo_arena_client")
+    )
+    ppo_cfg["arena_map_id"] = str(machine.get("arena_map_id", "qnn_arena8"))
+    ppo_cfg["arena_base_port"] = int(machine.get("arena_base_port", 28000))
+    ppo_cfg["arena_bot_skill"] = int(
+        machine.get("arena_bot_skill", surface["options"].get("skill", 3))
+    )
+    if env_backend == "arena_grid":
+        from qnn.ppo.arena import ArenaTopology
 
-    # Validate minibatch alignment
-    rollout_batch = int(ppo_cfg["num_envs"]) * int(ppo_cfg.get("rollout_steps", 0))
-    mb = int(ppo_cfg["minibatch_size"])
-    if rollout_batch > 0 and mb > 0 and rollout_batch % mb != 0:
+        # Build once during frozen-config validation so invalid client-slot or
+        # lane divisibility choices fail before any engine process launches.
+        topology = ArenaTopology.build(
+            num_lanes=int(ppo_cfg["num_lanes"]),
+            matches_per_server=int(ppo_cfg["matches_per_server"]),
+            seat_mode=str(ppo_cfg["seat_mode"]),
+        )
+        first_port = int(ppo_cfg["arena_base_port"])
+        last_port = first_port + topology.server_count - 1
+        if first_port < 1024 or last_port > 65535:
+            raise ValueError(
+                "machine.json: arena_base_port plus the arena server count "
+                "must remain in [1024, 65535]"
+            )
+        if not 0 <= int(ppo_cfg["arena_bot_skill"]) <= 3:
+            raise ValueError("machine.json: arena_bot_skill must be in [0, 3]")
+    ppo_cfg["num_envs"] = int(ppo_cfg["num_lanes"])  # legacy alias (reports/metrics)
+
+    lanes, mb_lanes = int(ppo_cfg["num_lanes"]), int(ppo_cfg["minibatch_lanes"])
+    if lanes > 0 and mb_lanes > 0 and lanes % mb_lanes != 0:
         import warnings
         warnings.warn(
-            f"Minibatch fragmentation: rollout_batch={rollout_batch} "
-            f"(num_envs={ppo_cfg['num_envs']} x rollout_steps={ppo_cfg.get('rollout_steps')}) "
-            f"is not evenly divisible by minibatch_size={mb}. "
-            f"Last minibatch will be undersized ({rollout_batch % mb} vs {mb}). "
-            f"Clean sizes for this config: "
-            + ", ".join(str(d) for d in sorted(set(
-                d for d in range(1, rollout_batch + 1)
-                if rollout_batch % d == 0 and 1024 <= d <= rollout_batch
-            ))[:8]),
+            f"Minibatch fragmentation: num_lanes={lanes} is not evenly "
+            f"divisible by minibatch_lanes={mb_lanes}; the last minibatch "
+            f"will be undersized ({lanes % mb_lanes} lanes). Clean values: "
+            + ", ".join(str(d) for d in range(1, lanes + 1) if lanes % d == 0),
             stacklevel=2,
         )
 
@@ -318,7 +368,8 @@ def build_run_ppo_eval_config(
         "num_episodes": int(_require_key(machine, "eval_num_episodes", "machine.json")),
         "num_envs": int(_require_key(machine, "eval_num_envs", "machine.json")),
         "max_steps_per_episode": int(_require_key(train, "max_steps_per_episode", "train.json")),
-        "policy_modes": [str(value) for value in _require_list(train, "eval_policy_modes", "train.json")],
+        "policy_modes": _valid_policy_modes(
+            [str(value) for value in _require_list(train, "eval_policy_modes", "train.json")]),
         "start_mode": _require_string(train, "eval_start_mode", "train.json"),
         "holdout_seed_offset": int(_require_key(train, "eval_holdout_seed_offset", "train.json")),
         "sample_seed_offset": int(_require_key(train, "eval_sample_seed_offset", "train.json")),
@@ -477,15 +528,16 @@ def build_run_plan_values(run_cfg: dict[str, Any]) -> dict[str, int]:
             "eval_episodes": 0,
         }
 
-    if mode in {"ppo", "pbt", "optuna"}:
-        num_workers = int(_require_key(machine, "num_workers", "machine.json"))
-        num_envs_per_worker = int(_require_key(machine, "num_envs_per_worker", "machine.json"))
+    if mode in {"ppo", "optuna"}:
+        num_lanes = int(_require_key(machine, "num_lanes", "machine.json"))
         return {
             "bc_batch_size": 0,
-            "num_envs": num_workers * num_envs_per_worker,
+            "num_envs": num_lanes,
             "rollout_steps": int(_require_key(train, "rollout_steps", "train.json")),
-            "total_steps": int(_require_key(train, "total_steps", "train.json")),
-            "minibatch_size": int(_require_key(machine, "minibatch_size", "machine.json")),
+            "total_steps": int(_require_key(train, "total_env_steps", "train.json")),
+            # Rows per PPO minibatch = lane subset × the full window.
+            "minibatch_size": int(_require_key(machine, "minibatch_lanes", "machine.json"))
+            * int(_require_key(train, "rollout_steps", "train.json")),
             "eval_episodes": int(_require_key(machine, "eval_num_episodes", "machine.json")),
         }
 

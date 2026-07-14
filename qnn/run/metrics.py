@@ -129,7 +129,7 @@ def build_episode_extra_stats(
     reward_tracking: float,
     tracking_cos_sum: float,
 ) -> Dict[str, float]:
-    """Build terminal episode stats in the shape Sample Factory expects."""
+    """Build the canonical terminal episode statistics."""
     max_deaths = max(deaths, 1)
     max_shots = max(shots_fired, 1)
     max_steps = max(steps, 1)

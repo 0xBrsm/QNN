@@ -12,6 +12,7 @@ services:
       - QNN_ARTIFACT_ROOT=/workspace/assets
       - ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-1}
       - TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=${TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL:-1}
+      - TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-/home/trainer/.cache/torch/inductor}
       - HSA_ENABLE_DXG_DETECTION=${HSA_ENABLE_DXG_DETECTION:-1}
       - HIP_VISIBLE_DEVICES
       - ROCR_VISIBLE_DEVICES
@@ -31,20 +32,20 @@ services:
       # Overlay flat-file data dirs from HOST_DATA. Defaults to
       # HOST_WORKSPACE so they live in the same place by default.
       - type: bind
-        source: ${HOST_DATA:-${HOST_WORKSPACE}}/assets
+        source: ${HOST_ASSETS:-${HOST_DATA:-${HOST_WORKSPACE}}/assets}
         target: /workspace/assets
       - type: bind
-        source: ${HOST_DATA:-${HOST_WORKSPACE}}/artifacts
+        source: ${HOST_ARTIFACTS:-${HOST_DATA:-${HOST_WORKSPACE}}/artifacts}
         target: /workspace/artifacts
       - type: bind
-        source: ${HOST_DATA:-${HOST_WORKSPACE}}/vendor
+        source: ${HOST_VENDOR:-${HOST_DATA:-${HOST_WORKSPACE}}/vendor}
         target: /workspace/vendor
       - type: bind
         source: ${WSL_LIBDXCORE_PATH:-/usr/lib/wsl/lib/libdxcore.so}
         target: /usr/lib/libdxcore.so
         read_only: true
       - type: bind
-        source: ${WSL_LIBROCDXG_PATH:-${HOST_DATA:-${HOST_WORKSPACE}}/vendor/rocdxg/librocdxg.so.1.2.0}
+        source: ${WSL_LIBROCDXG_PATH:-${HOST_VENDOR:-${HOST_DATA:-${HOST_WORKSPACE}}/vendor}/rocdxg/librocdxg.so.1.2.0}
         target: /usr/lib/librocdxg.so
         read_only: true
       - type: volume
@@ -53,6 +54,9 @@ services:
       - type: volume
         source: qnn-miopen-cache
         target: /home/trainer/.config/miopen
+      - type: volume
+        source: qnn-inductor-cache
+        target: /home/trainer/.cache/torch/inductor
     devices:
       - /dev/dxg:/dev/dxg
     cap_add:
@@ -72,3 +76,4 @@ services:
 volumes:
   qnn-pip-cache:
   qnn-miopen-cache:
+  qnn-inductor-cache:

@@ -1,0 +1,13 @@
+--- net_main.c
++++ net_main.c
+@@ -398,6 +398,10 @@
+ 		}
+ 	}
+ 
++	/* Grouped PPO clients always receive an explicit loopback address. */
++	if (host && COM_CheckParm("-qnn_direct_connect"))
++		goto JustDoIt;
++
+ 	slistSilent = host ? true : false;
+ 	NET_Slist_f ();
+ 

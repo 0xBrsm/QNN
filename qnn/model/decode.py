@@ -38,6 +38,7 @@ indexing, so anything reused by a traced graph stays ONNX-traceable.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -45,10 +46,61 @@ import torch.nn.functional as F
 
 
 # ── Sampling primitives ─────────────────────────────────────────────
-# Stateless readout draws shared by every head decode. ``row_generators`` (one
-# torch.Generator per row) lets the eval pipeline advance each episode's RNG
-# independently for reproducibility across batched envs; pass None for the
-# default global RNG.
+# Stateless readout draws shared by every head decode. ``row_generators`` may
+# be one torch.Generator per row (eval needs episode streams to stay invariant
+# to batching), or one BatchedRNG (PPO needs the same independent draws but can
+# generate the whole B×N block in one dispatcher call).
+
+
+@dataclass(slots=True)
+class BatchedRNG:
+    """One generator producing vectorized draws for a fixed-size batch.
+
+    PPO trajectories only need a deterministic stream for the fixed collector
+    topology; unlike eval, they do not require each row's stream to survive a
+    change in batching.  Keeping that distinction explicit avoids hundreds of
+    tiny ``torch.rand`` dispatcher calls per policy tick.
+    """
+
+    generator: torch.Generator
+    batch_size: int
+
+    @classmethod
+    def seeded(cls, seed: int, batch_size: int, device: torch.device | str) -> "BatchedRNG":
+        generator = torch.Generator(device=torch.device(device))
+        generator.manual_seed(int(seed))
+        return cls(generator=generator, batch_size=int(batch_size))
+
+def row_uniforms(row_generators: Any, n: int, device) -> torch.Tensor:
+    """(B, n) uniforms, row i drawn ONLY from row_generators[i].
+
+    The one per-row loop the sampling path keeps: a bare ``torch.rand``
+    per generator (~µs) instead of per-row multinomial machinery.
+    Per-lane streams stay independent and seed-reproducible; downstream
+    sampling is vectorized inverse-CDF over these uniforms.
+    """
+    if isinstance(row_generators, BatchedRNG):
+        gdev = getattr(row_generators.generator, "device", None) or torch.device("cpu")
+        return torch.rand(
+            (row_generators.batch_size, n),
+            generator=row_generators.generator,
+            device=gdev,
+        ).to(device)
+
+    gdev = getattr(row_generators[0], "device", None) or torch.device("cpu")
+    u = torch.empty(len(row_generators), n, device=gdev)
+    for i, gen in enumerate(row_generators):
+        torch.rand((n,), generator=gen, out=u[i])
+    return u.to(device)
+
+
+def inverse_cdf_sample(probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """Vectorized categorical draw: (B, K) probs × (B,) uniforms → (B,) idx."""
+    cdf = probs.cumsum(-1)
+    cdf = cdf / cdf[..., -1:].clamp_min(1e-12)
+    idx = torch.searchsorted(cdf, u.reshape(-1, 1).contiguous()).squeeze(-1)
+    return idx.clamp_(max=probs.shape[-1] - 1)
+
 
 def categorical_sample(
     probs: torch.Tensor,
@@ -56,17 +108,18 @@ def categorical_sample(
 ) -> torch.Tensor:
     """Sample one class index per row from probs (B, K).
 
-    When row_generators is None, uses default RNG. When provided, draws
-    one row at a time so each episode's RNG advances independently — the
-    eval pipeline relies on this for reproducibility across batched envs.
+    When row_generators is None, uses default RNG. When provided, each
+    row's draw consumes ONLY that row's generator (independent per-episode
+    streams, reproducible across batched envs) — one uniform per row, then
+    a batched inverse-CDF instead of per-row multinomial calls. Same law
+    and independence contract as the old per-row multinomial, but
+    different draw values for a given seed: sampled trajectories are not
+    comparable across this boundary (2026-07-11).
     """
     if row_generators is None:
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
-    out = torch.empty(probs.shape[0], dtype=torch.long, device=probs.device)
-    for idx, gen in enumerate(row_generators):
-        row_p = probs[idx:idx + 1]
-        out[idx] = torch.multinomial(row_p, num_samples=1, generator=gen).squeeze()
-    return out
+    u = row_uniforms(row_generators, 1, probs.device)[:, 0]
+    return inverse_cdf_sample(probs, u)
 
 
 def bernoulli_sample(
@@ -76,10 +129,8 @@ def bernoulli_sample(
     """Sample a 0/1 bit per row from a Bernoulli probability (B,)."""
     if row_generators is None:
         return torch.bernoulli(prob).long()
-    out = torch.empty(prob.shape[0], dtype=torch.long, device=prob.device)
-    for idx, gen in enumerate(row_generators):
-        out[idx] = torch.bernoulli(prob[idx:idx + 1], generator=gen).long()
-    return out
+    u = row_uniforms(row_generators, 1, prob.device)[:, 0]
+    return (u < prob).long()
 
 
 def gumbel_argmax(logits: torch.Tensor) -> torch.Tensor:
@@ -161,6 +212,9 @@ def decode_move_axes(
     flat_probs = move_probs.reshape(-1, n_classes)             # (n_rows*n_axes, n_classes)
     if row_generators is None:
         flat_classes = torch.multinomial(flat_probs, num_samples=1).squeeze(-1)
+    elif isinstance(row_generators, BatchedRNG):
+        uniforms = row_uniforms(row_generators, n_axes, flat_probs.device)
+        flat_classes = inverse_cdf_sample(flat_probs, uniforms.reshape(-1))
     else:
         flat_classes = torch.empty(
             flat_probs.shape[0], dtype=torch.long, device=flat_probs.device)

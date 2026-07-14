@@ -41,6 +41,7 @@ class NativeWorldEnv:
         self.reward_weights = reward_weights
         self.rng = np.random.default_rng(seed)
         self.options = dict(options)
+        self.match_round_reset = self.options.get("round_reset") == "match"
         self.options["reward_weights"] = {
             "frag_bonus": reward_weights.frag_bonus,
             "death_penalty": reward_weights.death_penalty,
@@ -148,11 +149,45 @@ class NativeWorldEnv:
         return obs
 
     def step(self, action: Mapping[str, int]) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, object]]:
+        self.step_send(action)
+        return self.step_recv()
+
+    # Split-phase stepping (VecQuakeEnv): send every lane's action first so
+    # all engines sim the tick concurrently, then drain the replies. One
+    # in-flight step per env; step() == step_send()+step_recv().
+    def step_send(self, action: Mapping[str, int]) -> None:
         if self._steps < 0:
             raise RuntimeError("Call reset() before step()")
+        self.adapter.process.step_send(action)
 
-        obs, training_extras = self.adapter.step_obs_with_training(action)
+    def pack_step_action(self, action: Mapping[str, object]) -> bytes:
+        return self.adapter.process.pack_step_request(action)
 
+    def step_send_packed(self, payload) -> None:
+        if self._steps < 0:
+            raise RuntimeError("Call reset() before step()")
+        self.adapter.process.step_send_packed(payload)
+
+    def step_recv(self) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, object]]:
+        obs, training_extras = self.adapter.process.step_recv()
+        return self._book_step(obs, training_extras)
+
+    def step_recv_raw(self) -> Tuple[bytes, float, bool, Dict[str, object]]:
+        """Drain with the obs left as raw wire bytes — the vectorized
+        driver batch-unpacks all lanes at once. Bookkeeping identical."""
+        raw, training_extras = self.adapter.process.step_recv_raw()
+        return self._book_step(raw, training_extras)
+
+    def round_reset_raw(self) -> bytes:
+        """Reset this seat's whole 1v1 match without reloading the world."""
+        if not self.match_round_reset:
+            raise RuntimeError("round_reset_raw requires options.round_reset='match'")
+        raw, training_extras = self.adapter.process.round_reset_raw()
+        self._steps = 0
+        self._frags = int(training_extras.frag_gain) if training_extras is not None else 0
+        return raw
+
+    def _book_step(self, obs, training_extras):
         te = training_extras
         self._steps += 1
         worker_done = te is not None and te.done
@@ -203,7 +238,7 @@ class NativeWorldEnv:
                 else:
                     damage_direct += delta
 
-        # Lean info dict: only what EpisodeStatAccumulator and SF need.
+        # Lean info dict: only what native PPO and episode statistics need.
         info: Dict[str, object] = {
             "done_reason": done_reason,
             # Prefer the eval's scenario spec id (options["scenario_id"]) when
@@ -239,6 +274,13 @@ class NativeWorldEnv:
             "blind_fire": 0,
             "stuck": False,
         }
+        # In match mode the worker already paired the terminal reward with a
+        # live post-respawn observation.  Start the Python timeout counter for
+        # the new bout immediately; VecQuakeEnv advances the episode id after
+        # it books this terminal transition.
+        if self.match_round_reset and te is not None and te.player_died:
+            self._steps = 0
+            self._frags = 0
         return obs, reward, done, info
 
     def close(self) -> None:

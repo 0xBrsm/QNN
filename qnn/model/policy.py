@@ -461,11 +461,13 @@ class QNNPolicy:
         return torch.as_tensor(value, dtype=dtype, device=self.device)
 
     def _autocast(self):
-        dtype_name = os.environ.get("QNN_AUTOCAST_DTYPE", "fp32").lower()
-        if dtype_name == "fp32" or self.device.type != "cuda":
+        dtype_name = str(getattr(
+            self, "autocast_dtype", os.environ.get("QNN_AUTOCAST_DTYPE", "fp32"),
+        )).lower()
+        if dtype_name == "fp32" or self.device.type not in {"cpu", "cuda"}:
             return torch.amp.autocast(device_type=self.device.type, enabled=False)
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(dtype_name)
-        if dtype is None:
+        if dtype is None or (self.device.type == "cpu" and dtype == torch.float16):
             return torch.amp.autocast(device_type=self.device.type, enabled=False)
         return torch.amp.autocast(device_type=self.device.type, dtype=dtype, enabled=True)
 
@@ -559,6 +561,10 @@ class QNNPolicy:
                      EntityDequantizer().eval())
             self._dequant_chain = chain
         self_dq, spatial_dq, entity_dq = chain
+        # The lookup tables must live where _tensor put the obs indices.
+        if next(entity_dq.buffers()).device != self.device:
+            for stage in chain:
+                stage.to(self.device)
         return entity_dq(spatial_dq(self_dq(obs)))
 
     def _obs_tensors_dequant(
@@ -593,6 +599,7 @@ class QNNPolicy:
         *,
         hidden: np.ndarray | torch.Tensor | None = None,
         masks: Mapping[str, np.ndarray | torch.Tensor] | np.ndarray | torch.Tensor | None = None,
+        eager_model: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(obs, dict):
             raise ValueError("Token policy expects dict observations")
@@ -617,9 +624,9 @@ class QNNPolicy:
                 self._pad_companion(hidden_tensor, pad_rows)
                 if self.use_gru else hidden_tensor
             )
-            features, logits, values, next_hidden, target_logits = self.model(
-                padded_obs,
-                padded_hidden,
+            model_call = self.model.forward if eager_model else self.model
+            features, logits, values, next_hidden, target_logits = model_call(
+                padded_obs, padded_hidden,
             )
             if pad_rows == 0:
                 return features, logits, values, next_hidden, target_logits
@@ -634,12 +641,18 @@ class QNNPolicy:
         if sample.ndim != 3:
             raise ValueError("obs must be rank-2 or rank-3")
         reset_mask_tensor = None
+        reset_ts = None
         if isinstance(masks, Mapping) and "reset_mask" in masks:
             reset_mask_tensor = self._tensor(masks["reset_mask"], dtype=torch.bool)
-        return self.model(
+            raw_reset_ts = masks.get("reset_ts")
+            if raw_reset_ts is not None:
+                reset_ts = tuple(int(t) for t in raw_reset_ts)
+        model_call = self.model.forward if eager_model else self.model
+        return model_call(
             obs_tensors,
             hidden_tensor,
             reset_mask=reset_mask_tensor,
+            reset_ts=reset_ts,
         )
 
     def _optimizer(self, name: str, params: Iterable[nn.Parameter], lr: float) -> torch.optim.Optimizer:
@@ -825,7 +838,8 @@ class QNNPolicy:
         move_jump_temp: float = 1.0,
         attack_state: np.ndarray | None = None,
         attack_rng: np.ndarray | None = None,
-    ) -> PolicyActionBatch:
+        rl_extras: bool = False,
+    ) -> "PolicyActionBatch | tuple[PolicyActionBatch, Dict[str, Any]]":
         """Emit engine actions from a forward pass.
 
         Output dict shape matches the engine's action contract (see
@@ -844,6 +858,10 @@ class QNNPolicy:
         When *diag_log_path* is set, append one JSONL record per call with
         target/look/move/fire internals — for distribution-shift debugging in
         live eval.
+
+        ``rl_extras=True`` returns ``(batch, extras)`` with the raw logits and
+        value-head features PPO needs without a second forward. Head-specific
+        sampling and engine encoding live in ``qnn.ppo.distributions``.
         """
         # Capture reset_mask BEFORE dropping masks — the stateful aim-degradation
         # decode (DOWN-half skill knob) resets its per-row buffers on episode
@@ -854,7 +872,10 @@ class QNNPolicy:
             _aim_reset_mask = self._tensor(masks["reset_mask"], dtype=torch.bool)
         del masks, generator
         with torch.inference_mode():
-            _, logits, _, next_hidden, target_logits = self._forward_tensors(obs, hidden=hidden)
+            obs_model = self._obs_tensors_dequant(obs)
+            features, logits, _, next_hidden, target_logits = self._forward_tensors(
+                obs_model, hidden=hidden,
+            )
 
         sample_mode = str(mode).lower()
         if sample_mode not in ("greedy", "sampled"):
@@ -969,7 +990,7 @@ class QNNPolicy:
             engaged = None
             if move_tau_engagement_gated:
                 from qnn.vocab import TOKEN_ACTOR
-                etypes = self._obs_tensors_dequant(obs)["entity_types"].long().reshape(n_rows, -1)
+                etypes = obs_model["entity_types"].long().reshape(n_rows, -1)
                 engaged = (etypes == TOKEN_ACTOR).any(dim=-1)
 
             # Gate B generalized projectile-dodge: force an fb/lr hold release when
@@ -981,8 +1002,7 @@ class QNNPolicy:
             if (self._regime_mod is not None
                     and hasattr(self._regime_mod, "projectile_release_mask")
                     and isinstance(obs, Mapping)):
-                projectile_release = self._regime_mod.projectile_release_mask(
-                    self._obs_tensors_dequant(obs))
+                projectile_release = self._regime_mod.projectile_release_mask(obs_model)
 
             # MOVE-ONLY decode: attack is decoded separately (its own path), never
             # coupled into the move decode.
@@ -1081,7 +1101,7 @@ class QNNPolicy:
                         build_model_weapon_scalars()).float().to(mag_logits.device)
                 # Re-run the (idempotent, cached) dequant: live obs carries
                 # native keys, not entity_scalars_raw.
-                dq = self._obs_tensors_dequant(obs)
+                dq = obs_model
                 esc = dq["entity_scalars_raw"].float()
                 esc = esc.reshape(mag_bin.shape[0], *esc.shape[-2:])         # (R, N, S)
                 etypes = dq["entity_types"].long().reshape(mag_bin.shape[0], -1)  # (R, N)
@@ -1142,8 +1162,9 @@ class QNNPolicy:
         if (self._regime_mod is not None
                 and hasattr(self._regime_mod, "preprocess_attack_logit")
                 and isinstance(obs, Mapping)):
-            _dq = self._obs_tensors_dequant(obs)
-            attack_logit = self._regime_mod.preprocess_attack_logit(_dq, attack_logit)
+            attack_logit = self._regime_mod.preprocess_attack_logit(
+                obs_model, attack_logit,
+            )
         fire_prob = torch.sigmoid(attack_logit + float(self.attack_bias))   # diag-log readout
         # SAMPLED attack decode — the SAME in-graph function the ONNX export bakes
         # (qnn.model.bench.a24.decode.attack_decode_step_graph): Bernoulli on
@@ -1227,13 +1248,20 @@ class QNNPolicy:
             "attack":   zero.clone(),
             "weapon": zero.clone(),
         }
-        return PolicyActionBatch(
+        batch = PolicyActionBatch(
             actions=actions,
             log_probs=zero.clone(),
             values=zero.clone(),
             entropies=entropies,
             next_hidden=next_hidden.detach(),
         )
+        if not rl_extras:
+            return batch
+        return batch, {
+            "logits": logits,
+            "features": features,
+            "target_logits": target_logits,
+        }
 
     @staticmethod
     def _append_act_diagnostics(

@@ -1,0 +1,12 @@
+--- sv_main.c
++++ sv_main.c
+@@ -739,6 +739,10 @@
+ 
+ 	SV_WriteEntitiesToClient (client->edict, &msg);
+ 
++// QNN grouped arena: perspective-filtered reward/death records share the
++// same unreliable tick datagram as the state they describe.
++	QNN_TrainingWriteNetwork (&msg, client->edict, Cvar_VariableValue("qnn_arena_ready") != 0);
++
+ // copy the server datagram if there is space
+ 	if (msg.cursize + sv.datagram.cursize < msg.maxsize)

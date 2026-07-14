@@ -1,0 +1,25 @@
+--- cl_parse.c
++++ cl_parse.c
+@@ -18,5 +18,7 @@
+ 
+ #include "quakedef.h"
+ 
++#define svc_qnn_training 35
++
+ char *svc_strings[] =
+ {
+@@ -62,4 +64,5 @@
+ 	"svc_cdtrack",
+ 	"svc_sellscreen",
+-	"svc_cutscene"
++	"svc_cutscene",
++	"svc_qnn_training"
+ };
+@@ -769,3 +772,7 @@
++		case svc_qnn_training:
++			QNN_TrainingReadNetwork();
++			break;
++
+ 		case svc_nop:
+ //			Con_Printf ("svc_nop\n");
+ 			break;

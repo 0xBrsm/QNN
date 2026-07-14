@@ -1,0 +1,12 @@
+--- host.c
++++ host.c
+@@ -617,6 +617,10 @@
+ 	if (!sv.paused && (svs.maxclients > 1 || key_dest == key_game) )
+ 		SV_Physics ();
+ 
++// Finish match-scoped paired respawns after physics but before the state and
++// terminal telemetry are sent to policy clients.
++	QNN_ArenaProcessPending ();
++
+ // send all messages to the clients
+ 	SV_SendClientMessages ();

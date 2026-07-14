@@ -1,7 +1,7 @@
 [project]
 name = "qnn"
 version = "0.3.0"
-description = "Transformer BC plus Sample Factory APPO pipeline for PvP Quake"
+description = "Transformer BC plus native PPO fine-tuning pipeline for PvP Quake"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -11,9 +11,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0"]
 train = [
-  "torch>=2.9.0",
-  "sample-factory>=2.0.0",
-  "gymnasium>=0.29.0"
+  "torch>=2.9.0"
 ]
 corpus = [
   "smbprotocol>=1.10.0",

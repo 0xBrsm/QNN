@@ -1,9 +1,8 @@
-"""Checkpoint conversion between QNNPolicy and PPO warm-start formats.
+"""Read archived Sample Factory checkpoints as native QNNPolicy models.
 
-Two conversion directions:
-  BC/PPO → SF   : ``bc_to_sf()``  — warm-start APPO from a BC checkpoint.
-  SF → BC/PPO   : ``sf_to_qnn()``  — convert SF checkpoint back to QNNPolicy
-                                    format for evaluation.py.
+The native PPO pipeline does not write or train Sample Factory checkpoints.
+This module retains the SF → QNN direction only so historical checkpoints can
+still be evaluated and used as seeds.
 
 SF 2.1.1 model state_dict layout:
 
@@ -29,6 +28,7 @@ import torch
 
 from qnn.actions import ACTION_HEADS, CONTINUOUS_ACTION_HEADS, HEAD_ORDER
 from qnn.schema import (
+    OBS_DIM,
     SELF_SCALAR_DIM,
     SPATIAL_SCALAR_DIM,
     SPATIAL_TOKEN_COUNT,
@@ -51,25 +51,6 @@ _SF_COMBINED_HEAD_KEY = "action_parameterization.distribution_linear"
 def _is_sf_checkpoint(payload: Dict[str, Any]) -> bool:
     """Return True if payload looks like an SF checkpoint dict."""
     return "model" in payload and ("train_step" in payload or "env_steps" in payload)
-
-
-def bc_to_sf(
-    bc_path: str | Path,
-    sf_model: torch.nn.Module,
-    *,
-    device: str,
-) -> Dict[str, Any]:
-    """Copy weights from a BC/PPO checkpoint into an SF model state dict."""
-    bc_policy = QNNPolicy.load(str(bc_path), device=device)
-    bc_state = bc_policy.model.state_dict()
-    sf_state = sf_model.state_dict()
-
-    _copy_encoder(bc_state, sf_state, device)
-    _copy_gru(bc_state, sf_state, device)
-    _copy_value_head(bc_state, sf_state, device)
-    _copy_bc_heads_to_sf_combined(bc_state, sf_state, device)
-
-    return sf_state
 
 
 def sf_to_qnn(
@@ -120,8 +101,8 @@ def sf_to_qnn(
     )
     bc_state = bc_policy.model.state_dict()
 
-    missed = _copy_encoder(sf_state, bc_state, device, reverse=True)
-    missed += _copy_gru(sf_state, bc_state, device, reverse=True)
+    missed = _copy_encoder(sf_state, bc_state, device)
+    missed += _copy_gru(sf_state, bc_state, device)
     if missed:
         raise RuntimeError(
             f"SF→QNN conversion left {len(missed)} trained weight(s) at random "
@@ -130,11 +111,11 @@ def sf_to_qnn(
             f"pre-rename SF checkpoint whose keys need the legacy migrations "
             f"(reverse conversion does not apply them). First missed: {missed[:4]}"
         )
-    _copy_value_head(sf_state, bc_state, device, reverse=True)
+    _copy_value_head(sf_state, bc_state, device)
     if "move_head.mlp.0.weight" in bc_state:
-        # Mirror of save_sf_format's forward warning: SF trains a single flat
-        # action linear; there is no projection back into bottleneck-MLP
-        # heads. The converted checkpoint carries the TRAINED encoder, GRU,
+        # SF trained a single flat action linear; there is no projection back
+        # into bottleneck-MLP heads. The converted checkpoint carries the
+        # TRAINED encoder, GRU,
         # and pointer — the action heads keep this policy's init and must be
         # re-fit (BC head-tune or distill) before the model is playable.
         print(
@@ -148,173 +129,6 @@ def sf_to_qnn(
     bc_policy.model.load_state_dict(bc_state)
     bc_policy.model.to(bc_policy.device)
     return bc_policy
-
-
-def save_sf_format(
-    bc_policy: QNNPolicy,
-    output_dir: str | Path,
-    train_step: int = 0,
-    env_steps: int = 0,
-) -> Path:
-    """Save an QNNPolicy as a minimal SF-compatible checkpoint."""
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    bc_state = bc_policy.model.state_dict()
-    sf_style: Dict[str, torch.Tensor] = {}
-
-    # ─── Encoder ──────────────────────────────────────────────────
-    # BC trunk lives under ``obs_embedding.*`` + ``encoder.*``; SF's
-    # actor-critic wraps both under its own ``encoder.*`` namespace.
-    # ``target_pointer.*`` is the MLP score module (``score.0.*`` /
-    # ``score.2.*``) — port its keys so the SF QuakeTransformerEncoder's
-    # owned TargetPointer warm-starts rather than orthogonal-initializing.
-    for bc_key, tensor in bc_state.items():
-        if bc_key.startswith("obs_embedding."):
-            sf_key = f"encoder.{bc_key}"
-            sf_style[sf_key] = tensor.cpu()
-        elif bc_key.startswith("encoder."):
-            sf_key = f"{_SF_ENCODER_PREFIX}.{bc_key[len('encoder.'):]}"
-            sf_style[sf_key] = tensor.cpu()
-        elif bc_key.startswith("target_pointer."):
-            sf_key = f"encoder.{bc_key}"
-            sf_style[sf_key] = tensor.cpu()
-        # Legacy attention-style pointer keys (query_proj.*,
-        # weapon_query_embed.*, idx_prior_scale) are silently dropped:
-        # the pre-MLP pointer doesn't load into the new MLP score module.
-        # Pre-promotion checkpoints are not compatible — see
-        # ModelConfig.d_target for the new pointer's sole knob.
-
-    # ─── GRU ───────────────────────────────────────────────────────
-    # Pre-temporal-wrap checkpoints emit ``gru.*``; modern checkpoints
-    # (post-migrate_wrap_gru_in_temporal) emit ``temporal.gru.*``. SF
-    # expects ``core.core.*``.
-    for gru_param in ("weight_ih_l0", "weight_hh_l0", "bias_ih_l0", "bias_hh_l0"):
-        for bc_prefix in ("temporal.gru.", "gru."):
-            bc_key = f"{bc_prefix}{gru_param}"
-            if bc_key in bc_state:
-                sf_style[f"{_SF_GRU_PREFIX}.{gru_param}"] = bc_state[bc_key].cpu()
-                break
-
-    # ─── Value head ────────────────────────────────────────────────
-    # Modern BC doesn't train a value head (combat-objective phase 1);
-    # leave SF's critic_linear at random init. Earlier checkpoints
-    # carried a ``value_head.*`` Linear → keep the old mapping for them.
-    for suffix in ("weight", "bias"):
-        bc_key = f"value_head.{suffix}"
-        if bc_key in bc_state:
-            sf_style[f"{_SF_VALUE_PREFIX}.{suffix}"] = bc_state[bc_key].cpu()
-
-    # ─── Action head ───────────────────────────────────────────────
-    # Modern BC heads (move/look/attack/weapon) are bottleneck MLPs
-    # (Linear → GELU → Linear) under ``{head}_head.mlp.*``, while SF
-    # expects a single combined Linear over all heads at
-    # ``action_parameterization.distribution_linear.*``. There is no
-    # bit-perfect projection, so when we detect the modern layout we
-    # skip the action head copy and let SF orthogonal-init it — the
-    # encoder + GRU + target_pointer warm-start is still useful for
-    # PPO. Older checkpoints with the flat ``policy_heads.*`` layout
-    # keep the legacy concat path.
-    # Modern heads are wired together — one canonical lookup catches
-    # all four. (move_head.mlp.0.weight is the move head's input
-    # projection; if it's present, the BC checkpoint was trained with
-    # bottleneck-MLP heads end to end.)
-    has_modern_heads = "move_head.mlp.0.weight" in bc_state
-    if has_modern_heads:
-        print(
-            "[bc_to_sf] BC checkpoint uses bottleneck-MLP heads "
-            "(move_head/look_head/attack_head/weapon_head); SF's flat "
-            "action_parameterization can't represent them — leaving the SF "
-            "action head and critic_linear at orthogonal init. Encoder + GRU + "
-            "target_pointer weights are warm-started."
-        )
-    else:
-        combined_w_parts = []
-        combined_b_parts = []
-        for head in _HEAD_ORDER:
-            weight_key = f"policy_heads.{head}.weight"
-            bias_key = f"policy_heads.{head}.bias"
-            if weight_key not in bc_state or bias_key not in bc_state:
-                continue
-            head_weight = bc_state[weight_key]
-            head_bias = bc_state[bias_key]
-            if head in CONTINUOUS_ACTION_HEADS:
-                log_std_key = f"continuous_log_std.{head}"
-                log_std = bc_state[log_std_key] if log_std_key in bc_state else torch.full_like(head_bias, -1.0)
-                combined_w_parts.extend([head_weight, torch.zeros_like(head_weight)])
-                combined_b_parts.extend([head_bias, log_std])
-            else:
-                combined_w_parts.append(head_weight)
-                combined_b_parts.append(head_bias)
-        if combined_w_parts:
-            sf_style[f"{_SF_COMBINED_HEAD_KEY}.weight"] = torch.cat(combined_w_parts, dim=0).cpu()
-        if combined_b_parts:
-            sf_style[f"{_SF_COMBINED_HEAD_KEY}.bias"] = torch.cat(combined_b_parts, dim=0).cpu()
-
-    # Seed returns_normalizer at identity (the actor-critic constructs this
-    # module regardless of cfg.normalize_input). We skip the obs_normalizer
-    # keys — `cfg.normalize_input=False` is the QNN default, so the model
-    # doesn't have an obs_normalizer module and these keys would be
-    # "Unexpected" on load.
-    sf_style["returns_normalizer.running_mean"] = torch.zeros([1], dtype=torch.float64)
-    sf_style["returns_normalizer.running_var"] = torch.ones([1], dtype=torch.float64)
-    sf_style["returns_normalizer.count"] = torch.ones([1], dtype=torch.float64)
-
-    # Build a minimal Adam optimizer state dict.  SF creates a single flat
-    # Adam over actor_critic.parameters(); load_state_dict validates that the
-    # saved param_groups[0]['params'] length matches.  Parameters are all
-    # non-normalizer tensors (normalizer buffers are registered_buffers, not
-    # parameters).
-    n_params = sum(
-        1 for k in sf_style
-        if not k.startswith("obs_normalizer.") and not k.startswith("returns_normalizer.")
-    )
-    payload_out = {
-        "train_step": train_step,
-        "env_steps": env_steps,
-        "best_performance": -1e9,
-        "model": sf_style,
-        "optimizer": {
-            "state": {},
-            "param_groups": [{
-                "lr": 0.00025,
-                "betas": (0.9, 0.999),
-                "eps": 1e-08,
-                "weight_decay": 0,
-                "amsgrad": False,
-                "maximize": False,
-                "foreach": None,
-                "capturable": False,
-                "differentiable": False,
-                "fused": None,
-                "params": list(range(n_params)),
-            }],
-        },
-    }
-    # Arch fields are sourced from the policy's ModelConfig (the
-    # canonical home is now ``bc_policy.config`` — a frozen
-    # ModelConfig dataclass; the older flat attributes are gone).
-    meta = {
-        "obs_dim": bc_policy.obs_dim,
-        "model": bc_policy.config.to_dict(),
-        "source": "bc_to_sf_converter",
-    }
-    ckpt_path = output / "checkpoint_000000000_0.pth"
-    torch.save(payload_out, ckpt_path)
-    (output / "checkpoint_000000000_0.json").write_text(
-        json.dumps(meta, indent=2), encoding="utf-8"
-    )
-    return ckpt_path
-
-
-# ------------------------------------------------------------------
-# SF normalizer buffers
-# ------------------------------------------------------------------
-
-# Observation space shapes — derived from the canonical schema.
-from qnn.schema import OBS_SCHEMA
-
-_OBS_SHAPES = OBS_SCHEMA
 
 
 def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -1012,22 +826,6 @@ def migrate_entity_embed(state: Dict[str, torch.Tensor], optimizer: Dict[str, An
     return migrated
 
 
-def _add_sf_normalizer_buffers(sf_state: Dict[str, torch.Tensor]) -> None:
-    """Add zero-initialized SF normalizer entries so load_state_dict(strict=True) works."""
-    # obs_normalizer.running_mean_std is a RunningMeanStdDictInPlace containing
-    # a nn.ModuleDict named running_mean_std (hence the double prefix).
-    for key, shape in _OBS_SHAPES.items():
-        prefix = f"obs_normalizer.running_mean_std.running_mean_std.{key}"
-        sf_state[f"{prefix}.running_mean"] = torch.zeros(shape, dtype=torch.float64)
-        sf_state[f"{prefix}.running_var"] = torch.ones(shape, dtype=torch.float64)
-        sf_state[f"{prefix}.count"] = torch.ones([1], dtype=torch.float64)
-
-    # returns_normalizer (SF default: normalize_returns=True)
-    sf_state["returns_normalizer.running_mean"] = torch.zeros([1], dtype=torch.float64)
-    sf_state["returns_normalizer.running_var"] = torch.ones([1], dtype=torch.float64)
-    sf_state["returns_normalizer.count"] = torch.ones([1], dtype=torch.float64)
-
-
 # ------------------------------------------------------------------
 # Low-level copy helpers
 # ------------------------------------------------------------------
@@ -1045,115 +843,62 @@ def _copy_weight(src: Dict[str, torch.Tensor], dst: Dict[str, torch.Tensor], src
 
 
 def _copy_encoder(
-    src: Dict, dst: Dict, device: str, reverse: bool = False,
+    src: Dict, dst: Dict, device: str,
 ) -> "list[str]":
-    """Copy encoder weights between BC and SF state dicts.
+    """Copy encoder weights from an SF state dict into a QNN state dict.
 
     BC keys split input embedding (``obs_embedding.*``) from transformer
     stack (``encoder.*``). SF wraps both under its actor-critic encoder:
     ``encoder.obs_embedding.*`` and ``encoder.encoder.*``.
 
-    In ``reverse`` mode returns the BC keys that found no matching SF
-    weight — a non-empty list means the converted policy would keep
+    Returns the QNN keys that found no matching SF weight. A non-empty
+    list means the converted policy would keep
     random-init weights where trained ones were expected (e.g. converting
     a graph-described run without its graph: every ``self_builders.*``
     key misses). Callers must fail loud on it.
     """
     pairs = (
         ("obs_embedding.", "encoder.obs_embedding."),
-        # SF owns the pointer inside its encoder (QuakeTransformerEncoder
-        # builds it; save_sf_format ports it there) — copy it back too,
-        # else converted full_5head policies keep a random-init pointer.
+        # SF owns the pointer inside its encoder; copy it back too, else
+        # converted full_5head policies keep a random-init pointer.
         ("target_pointer.", "encoder.target_pointer."),
         ("encoder.", f"{_SF_ENCODER_PREFIX}."),
     )
 
-    if reverse:
-        missed: list[str] = []
-        for bc_prefix, sf_prefix in pairs:
-            for dst_key in list(dst.keys()):
-                if not dst_key.startswith(bc_prefix):
-                    continue
-                sf_key = sf_prefix + dst_key[len(bc_prefix):]
-                if not _copy_weight(src, dst, sf_key, dst_key, device):
-                    missed.append(dst_key)
-        return missed
-    else:
-        for bc_prefix, sf_prefix in pairs:
-            for src_key in list(src.keys()):
-                if not src_key.startswith(bc_prefix):
-                    continue
-                sf_key = sf_prefix + src_key[len(bc_prefix):]
-                _copy_weight(src, dst, src_key, sf_key, device)
+    missed: list[str] = []
+    for qnn_prefix, sf_prefix in pairs:
+        for dst_key in list(dst.keys()):
+            if not dst_key.startswith(qnn_prefix):
+                continue
+            sf_key = sf_prefix + dst_key[len(qnn_prefix):]
+            if not _copy_weight(src, dst, sf_key, dst_key, device):
+                missed.append(dst_key)
+    return missed
 
 
-def _copy_gru(src: Dict, dst: Dict, device: str, reverse: bool = False) -> "list[str]":
+def _copy_gru(src: Dict, dst: Dict, device: str) -> "list[str]":
     """Copy GRU weights. Modern checkpoints key the recurrence
     ``temporal.gru.*`` (post-migrate_wrap_gru_in_temporal); pre-wrap ones
-    use bare ``gru.*``. In ``reverse`` mode returns the BC GRU keys that
-    received nothing (empty when the model has no temporal slot).
+    use bare ``gru.*``. Returns QNN GRU keys that received nothing (empty
+    when the model has no temporal slot).
     """
     missed: list[str] = []
     for gru_param in ("weight_ih_l0", "weight_hh_l0", "bias_ih_l0", "bias_hh_l0"):
         sf_key = f"{_SF_GRU_PREFIX}.{gru_param}"
-        if reverse:
-            bc_keys = [
-                k for k in (f"temporal.gru.{gru_param}", f"gru.{gru_param}") if k in dst
-            ]
-            for bc_key in bc_keys:
-                if not _copy_weight(src, dst, sf_key, bc_key, device):
-                    missed.append(bc_key)
-        else:
-            for bc_prefix in ("temporal.gru.", "gru."):
-                if f"{bc_prefix}{gru_param}" in src:
-                    _copy_weight(src, dst, f"{bc_prefix}{gru_param}", sf_key, device)
-                    break
+        qnn_keys = [
+            k for k in (f"temporal.gru.{gru_param}", f"gru.{gru_param}") if k in dst
+        ]
+        for qnn_key in qnn_keys:
+            if not _copy_weight(src, dst, sf_key, qnn_key, device):
+                missed.append(qnn_key)
     return missed
 
 
-def _copy_value_head(src: Dict, dst: Dict, device: str, reverse: bool = False) -> None:
+def _copy_value_head(src: Dict, dst: Dict, device: str) -> None:
     for suffix in ("weight", "bias"):
         bc_key = f"value_head.{suffix}"
         sf_key = f"{_SF_VALUE_PREFIX}.{suffix}"
-        if reverse:
-            _copy_weight(src, dst, sf_key, bc_key, device)
-        else:
-            _copy_weight(src, dst, bc_key, sf_key, device)
-
-
-def _copy_bc_heads_to_sf_combined(bc_state: Dict, sf_state: Dict, device: str) -> None:
-    """Concatenate BC heads into SF's single combined Linear."""
-    weights = []
-    biases = []
-    for head in _HEAD_ORDER:
-        weight_key = f"policy_heads.{head}.weight"
-        bias_key = f"policy_heads.{head}.bias"
-        if weight_key not in bc_state or bias_key not in bc_state:
-            continue
-        head_weight = bc_state[weight_key].to(device)
-        head_bias = bc_state[bias_key].to(device)
-        if head in CONTINUOUS_ACTION_HEADS:
-            log_std_key = f"continuous_log_std.{head}"
-            log_std = (
-                bc_state[log_std_key].to(device)
-                if log_std_key in bc_state
-                else torch.full_like(head_bias, -1.0)
-            )
-            weights.extend([head_weight, torch.zeros_like(head_weight)])
-            biases.extend([head_bias, log_std])
-        else:
-            weights.append(head_weight)
-            biases.append(head_bias)
-    if not weights:
-        return
-    combined_w = torch.cat(weights, dim=0)
-    combined_b = torch.cat(biases, dim=0)
-    sf_w_key = f"{_SF_COMBINED_HEAD_KEY}.weight"
-    sf_b_key = f"{_SF_COMBINED_HEAD_KEY}.bias"
-    if sf_w_key in sf_state and combined_w.shape == sf_state[sf_w_key].shape:
-        sf_state[sf_w_key].copy_(combined_w)
-    if sf_b_key in sf_state and combined_b.shape == sf_state[sf_b_key].shape:
-        sf_state[sf_b_key].copy_(combined_b)
+        _copy_weight(src, dst, sf_key, bc_key, device)
 
 
 def _copy_sf_combined_to_bc_heads(sf_state: Dict, bc_state: Dict, device: str) -> None:
@@ -1197,13 +942,10 @@ def _copy_sf_combined_to_bc_heads(sf_state: Dict, bc_state: Dict, device: str) -
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Convert BC/PPO checkpoints to/from SF format")
+    parser = argparse.ArgumentParser(
+        description="Convert archived Sample Factory checkpoints to QNN format",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
-
-    to_sf = sub.add_parser("bc-to-sf", help="Convert a BC/PPO checkpoint to SF warm-start format")
-    to_sf.add_argument("bc_path", help="Input BC/PPO checkpoint (.pth)")
-    to_sf.add_argument("output_dir", help="Directory to write SF checkpoint")
-    to_sf.add_argument("--device", default="cpu")
 
     to_qnn = sub.add_parser("sf-to-qnn", help="Convert an SF checkpoint to QNNPolicy format")
     to_qnn.add_argument("sf_path", help="Input SF checkpoint .pth")
@@ -1226,12 +968,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.cmd == "bc-to-sf":
-        policy = QNNPolicy.load(args.bc_path, device=args.device)
-        ckpt = save_sf_format(policy, args.output_dir)
-        print(f"Saved SF-format warm-start checkpoint: {ckpt}")
-
-    elif args.cmd == "sf-to-qnn":
+    if args.cmd == "sf-to-qnn":
         graph = None
         model_cfg = None
         if args.graph_json:

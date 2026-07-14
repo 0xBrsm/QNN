@@ -24,6 +24,8 @@ def find_tool(name: str) -> str | None:
 def compile_map(
     map_path: Path,
     output_dir: Path | None = None,
+    *,
+    run_vis: bool = False,
 ) -> Path:
     """Compile a .map to .bsp.
 
@@ -90,8 +92,13 @@ def compile_map(
             if "WARNING 19" in line:
                 print(f"  {line.strip()}", file=sys.stderr)
 
-    # 2. vis: optimize PVS — skipped for training maps.  vis is the most
-    #    CPU-intensive step and the agent doesn't benefit from PVS culling.
+    # 2. vis: optional for most training maps, but mandatory for grouped
+    #    arenas so they carry a valid visibility lump. The arena observation
+    #    path additionally enforces generated cell identity because a fully
+    #    sealed zero-portal BSP can otherwise fail open in stock PVS code.
+    if run_vis and prt_path.exists():
+        _run("vis", [tools["vis"], bsp_path.as_posix()])
+
     # 3. light: compute lightmaps — skipped for training maps.  The agent
     #    doesn't use visual rendering; fullbright is fine.
 

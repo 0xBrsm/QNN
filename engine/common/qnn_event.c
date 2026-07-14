@@ -539,6 +539,13 @@ static void QNN_EventProcessTick(const qnn_snapshot_t *snapshot)
 		qnn_event_record_t *ev = &event_records[i];
 		int owner = -1;  /* entity index that owns this event */
 
+		/* Stock NQ broadcasts sound datagrams globally.  In the grouped arena
+		 * that would leak every other match back into the token stream even
+		 * though geometry and combat are isolated. */
+		if (!strncmp(qnn_map_state.requested_map_id, "qnn_arena", 9)
+			&& !QNN_EntityInPvs(snapshot->player_origin, ev->origin))
+			continue;
+
 		/* ---- Side effects by event type ---- */
 
 		if (ev->is_respawn)

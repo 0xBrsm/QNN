@@ -28,6 +28,9 @@ class TemporalInput:
     hidden: torch.Tensor | None                   # (1, B, H) or (B, H), last hidden state
     reset_mask: torch.Tensor | None               # (T*B,) bool — episode boundaries
     seq_shape: tuple[int, int] | None             # (T, B) if sequence, None if flat
+    # Sorted host-known timesteps where any lane resets. The mask remains the
+    # source of truth for which lanes reset at each boundary.
+    reset_ts: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,14 +74,22 @@ class Temporal(nn.Module):
             reset_seq = inp.reset_mask.to(
                 device=pool_seq.device, dtype=torch.bool,
             ).reshape(seq_len, batch_size)
+            boundary_ts = (
+                [int(t) for t in inp.reset_ts]
+                if inp.reset_ts is not None
+                else reset_seq.any(dim=1).nonzero().flatten().tolist()
+            )
+            if not boundary_ts or boundary_ts[0] != 0:
+                boundary_ts = [0, *boundary_ts]
+            boundary_ts.append(seq_len)
             h = h0
             outs = []
-            for t in range(seq_len):
-                reset_t = reset_seq[t].view(1, batch_size, 1)
+            for start, end in zip(boundary_ts[:-1], boundary_ts[1:]):
+                reset_t = reset_seq[start].view(1, batch_size, 1)
                 h = h.masked_fill(reset_t, 0.0)
-                out_t, h = self.gru(pool_seq[t:t + 1], h)
-                outs.append(out_t)
-            out_seq = torch.cat(outs, dim=0)
+                out_segment, h = self.gru(pool_seq[start:end], h)
+                outs.append(out_segment)
+            out_seq = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
             h_final = h
         return TemporalOutput(
             flat_out=out_seq.reshape(seq_len * batch_size, self.hidden_dim),

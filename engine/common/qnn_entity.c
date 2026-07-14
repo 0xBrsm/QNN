@@ -607,6 +607,19 @@ qboolean QNN_EntityInPvs(const vec3_t viewer, const vec3_t target)
 	byte *vis;
 	int cluster;
 
+	/* qnn_arena8's generated geometry is a fixed 4x2 grid: 64-unit walls,
+	 * 512-unit interiors, and therefore a 576-unit cell pitch.  Match identity
+	 * is a stronger boundary than renderer PVS state (which can fail open for
+	 * zero-portal BSPs), and applies equally to actors, projectiles, and sounds. */
+	if (!strncmp(qnn_map_state.requested_map_id, "qnn_arena", 9))
+	{
+		int viewer_col = (int)floorf((viewer[0] - 64.0f) / 576.0f);
+		int viewer_row = (int)floorf((viewer[1] - 64.0f) / 576.0f);
+		int target_col = (int)floorf((target[0] - 64.0f) / 576.0f);
+		int target_row = (int)floorf((target[1] - 64.0f) / 576.0f);
+		return viewer_col == target_col && viewer_row == target_row;
+	}
+
 	if (cl.worldmodel == NULL)
 		return true; /* fail open */
 
@@ -636,16 +649,11 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 	int pvs_count = 0;
 	int entity_num;
 	float server_dt = (float)(cl.mtime[0] - cl.mtime[1]);
-	/* MVD recordings carry every map entity (no server PVS culling).
-	 * Apply a per-viewer geometric PVS overlay so the model sees only
-	 * what a normal client would see. QWD and NQ recordings are already
-	 * server-PVS-filtered, and QNN_SyncPacketEntities / CL_RelinkEntities
-	 * mirror that filter into cl_entities[].model — no extra gate needed. */
-#ifdef QNN_QW_BUILD
-	qboolean apply_pvs = cls.mvdplayback ? true : false;
-#else
-	qboolean apply_pvs = false;
-#endif
+	/* Apply the BSP PVS explicitly for every transport.  Stock NQ normally
+	 * mirrors the server filter by nulling cl_entities[].model, but player
+	 * baselines and state-only arena resets can legitimately keep a stale
+	 * model pointer.  Geometry is the authoritative visibility boundary. */
+	qboolean apply_pvs = true;
 	if (server_dt < 0.001f || server_dt > 0.5f)
 		server_dt = 1.0f / 20.0f; /* fallback if mtime is stale or bogus */
 
@@ -692,8 +700,7 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 		QNN_EntityAnchorFromModel(entity_num, entity->origin, anchor_origin, half_extents);
 		in_fov = QNN_InFov(snapshot->player_origin, snapshot->player_view_angles, anchor_origin);
 
-		/* QW MVD: cull entities outside the viewer's PVS. NQ demos
-		 * are already culled at record time, so this is a no-op for NQ. */
+		/* Cull entities outside the viewer's PVS. */
 		if (apply_pvs && !QNN_EntityInPvs(snapshot->player_origin, anchor_origin))
 			continue;
 

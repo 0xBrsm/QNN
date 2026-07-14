@@ -32,24 +32,8 @@ RUN apt-get update \
     && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}" \
     && chmod 0440 "/etc/sudoers.d/${USERNAME}" \
     && python3 -m pip install --no-cache-dir \
-        "numpy==1.26.4" \
         "pytest>=8.0.0" \
-        "sample-factory==2.1.1" --no-deps \
-    && find /opt/venv -path '*/sample_factory/algo/sampling/batched_sampling.py' \
-        -exec sed -i 's/# out_actions = list(zip(\*out_actions)) # transpose/out_actions = list(zip(*out_actions))  # transpose (patched)/' {} \; \
-    && python3 -m pip install --no-cache-dir \
-        "gymnasium==0.29.1" \
-        "colorlog" \
-        "huggingface-hub" \
-        "opencv-python==4.11.0.86" \
-        "psutil" \
-        "pyglet" \
-        "signal-slot-mp" \
-        "tensorboard" \
-        "tensorboardX" \
-        "threadpoolctl" \
         "smbprotocol" \
-        "wandb" \
         "optuna"
 
 WORKDIR /workspace

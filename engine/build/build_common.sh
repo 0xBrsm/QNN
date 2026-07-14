@@ -10,7 +10,8 @@ REPO_ROOT=$(cd "${SRC_DIR}/.." && pwd)
 
 UPSTREAM_URL=${QUAKE_UPSTREAM_URL:-"https://github.com/id-Software/Quake.git"}
 UPSTREAM_COMMIT=${QUAKE_UPSTREAM_COMMIT:-"bf4ac424ce754894ac8f1dae6a3981954bc9852d"}
-VENDOR_DIR="${REPO_ROOT}/vendor/recastnavigation"
+QNN_VENDOR_ROOT=${QNN_VENDOR_ROOT:-"${REPO_ROOT}/vendor"}
+VENDOR_DIR="${QNN_VENDOR_ROOT}/recastnavigation"
 
 # ── Shared upstream source list ────────────────────────────────────
 
@@ -167,10 +168,15 @@ prepare_upstream() {
   UPSTREAM_DIR="${build_root}/upstream"
   WORKTREE_DIR="${build_root}/WinQuake"
 
-  git init -q "${UPSTREAM_DIR}"
-  git -C "${UPSTREAM_DIR}" remote add origin "${UPSTREAM_URL}"
-  git -C "${UPSTREAM_DIR}" fetch -q --depth 1 origin "${UPSTREAM_COMMIT}"
-  git -C "${UPSTREAM_DIR}" checkout -q --detach FETCH_HEAD
+  if [[ -n "${QUAKE_UPSTREAM_DIR:-}" ]]; then
+    mkdir -p "${UPSTREAM_DIR}"
+    git -C "${QUAKE_UPSTREAM_DIR}" archive "${UPSTREAM_COMMIT}" | tar -x -C "${UPSTREAM_DIR}"
+  else
+    git init -q "${UPSTREAM_DIR}"
+    git -C "${UPSTREAM_DIR}" remote add origin "${UPSTREAM_URL}"
+    git -C "${UPSTREAM_DIR}" fetch -q --depth 1 origin "${UPSTREAM_COMMIT}"
+    git -C "${UPSTREAM_DIR}" checkout -q --detach FETCH_HEAD
+  fi
 
   cp -R "${UPSTREAM_DIR}/WinQuake" "${WORKTREE_DIR}"
 

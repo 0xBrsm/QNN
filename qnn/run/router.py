@@ -18,8 +18,10 @@ def get_runner(mode: str) -> Callable[[RunnerContext], dict[str, Any]]:
         from qnn.ppo.train import run
         return run
     if mode == "pbt":
-        from qnn.ppo.pbt import run
-        return run
+        raise RuntimeError(
+            "PBT was retired with the Sample Factory backend "
+            "(agents/plans/ppo-rebuild.md); use plain multi-run orchestration."
+        )
     if mode == "eval":
         from qnn.eval.run import run
         return run

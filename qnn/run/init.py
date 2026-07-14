@@ -183,6 +183,23 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 — transitional; recollect/backfill to enable
             print(f"  Weapon hazard pin skipped: {exc}")
 
+    # PPO carries the SEED's pinned look grid: the trainer installs
+    # config/look_grid.json before any forward (no code default), so a
+    # look-bearing seed without its grid would fail — or silently decode on
+    # the wrong grid after a resume. Resolve it from the seed's own run dir
+    # (checkpoints/ or seed/ layouts both sit one level under the run root).
+    if args.mode == "ppo" and manifest.get("checkpoint_source"):
+        seed_run_cfg = Path(manifest["checkpoint_source"]).resolve().parent.parent / "config"
+        seed_grid = seed_run_cfg / "look_grid.json"
+        if seed_grid.exists():
+            shutil.copy2(seed_grid, config_dir / "look_grid.json")
+            print(f"  Look grid pinned from seed run: {seed_grid}")
+        else:
+            parser.error(
+                f"Seed run has no pinned look grid ({seed_grid}). RL seeds "
+                "must be a25+ run-dir checkpoints carrying config/look_grid.json."
+            )
+
     # Write manifest
     with open(run_dir / "run.json", "w") as f:
         json.dump(manifest, f, indent=2)

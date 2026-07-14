@@ -1,0 +1,12 @@
+--- cl_main.c
++++ cl_main.c
+@@ -653,8 +653,7 @@
+ 	if (cl_shownet.value)
+ 		Con_Printf ("\n");
+ 
+-	CL_RelinkEntities ();
+-	CL_UpdateTEnts ();
++	QNN_ArenaRelinkEntities ();
+ 
+ //
+ // bring the links up to date
