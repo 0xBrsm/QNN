@@ -1,6 +1,7 @@
 #include "qnn.h"
 #include "qnn_metrics.h"
 #include "qnn_store.h"
+#include "qnn_context.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -32,6 +33,8 @@
 #define QNN_TRAIN_NETWORK_VERSION 1
 #define QNN_TRAIN_NETWORK_ROUND_RESET 0x01
 #define QNN_TRAIN_NETWORK_ARENA_READY 0x02
+
+qboolean qnn_training_client_context;
 
 #define IT_AXE              4096.0f
 #define IT_SHOTGUN          1.0f
@@ -154,6 +157,16 @@ typedef struct
 
 static qnn_reward_weights_t qnn_reward_weights;
 static qnn_reward_state_t qnn_reward_state;
+
+void QNN_TrainingRegisterContext(void)
+{
+	QNN_ContextRegister(&qnn_record_state, sizeof(qnn_record_state));
+	QNN_ContextRegister(&qnn_network_round_reset, sizeof(qnn_network_round_reset));
+	QNN_ContextRegister(&qnn_network_arena_ready, sizeof(qnn_network_arena_ready));
+	QNN_ContextRegister(&qnn_network_reset_mask, sizeof(qnn_network_reset_mask));
+	QNN_ContextRegister(&qnn_reward_weights, sizeof(qnn_reward_weights));
+	QNN_ContextRegister(&qnn_reward_state, sizeof(qnn_reward_state));
+}
 
 /* QNN_EffectiveHP is public in qnn_metrics.c */
 
@@ -406,7 +419,7 @@ static void QNN_DetectPlayerSpawns(qboolean reset_flag)
 {
 	int client_idx;
 
-	if (!sv.active)
+	if (!sv.active || qnn_training_client_context)
 		return;
 	for (client_idx = 0; client_idx < svs.maxclients; ++client_idx)
 	{
@@ -602,11 +615,16 @@ void QNN_TrainingWriteNetwork(sizebuf_t *msg, edict_t *perspective, qboolean are
 	{
 		if (QNN_TrainingDeathMatches(
 			&qnn_record_state.deaths[idx], self_entity_num, match_id))
-		{
 			death_count += 1;
-			flags |= QNN_TRAIN_NETWORK_ROUND_RESET;
-		}
 	}
+	/* Death does NOT end the round here, mirroring the single-worker trainer
+	   (qnn_trainer_main.c QNN_BuildSnapshot: "In deathmatch, death is part of
+	   the reward signal, not a terminal state. The player respawns and the
+	   episode continues until max_steps."). The player_died/death_records bits
+	   above still carry the event for reward/stat attribution; only the round-
+	   reset (done) flag changes. QNN_TRAIN_NETWORK_ROUND_RESET is now driven
+	   solely by qnn_network_reset_mask (explicit Python-requested resets, e.g.
+	   VecQuakeEnv reset_lanes) and QNN_ArenaResetMatch, not by every death. */
 
 	/* A normal 1v1 tick is ~20 bytes; combat ticks remain well under the
 	   stock 1024-byte datagram because records are filtered to this seat. */
@@ -809,7 +827,8 @@ void QNN_FillMetricsFromRecords(qnn_metrics_t *out, const qnn_snapshot_t *snapsh
 
 	/* Frags */
 	current_frags = 0;
-	if (sv.active && self_entity_num > 0 && self_entity_num < sv.num_edicts)
+	if (sv.active && !qnn_training_client_context
+		&& self_entity_num > 0 && self_entity_num < sv.num_edicts)
 		current_frags = (int)EDICT_NUM(self_entity_num)->v.frags;
 	else if (cl.scores != NULL && self_entity_num > 0
 		&& self_entity_num <= cl.maxclients)
@@ -882,7 +901,8 @@ void QNN_WriteTrainingExtrasBinary(FILE *out, const qnn_snapshot_t *snapshot, in
 	armor_after = (float)snapshot->armor;
 	armor_type_after = snapshot->armor_type;
 	current_frags = 0;
-	if (sv.active && self_entity_num > 0 && self_entity_num < sv.num_edicts)
+	if (sv.active && !qnn_training_client_context
+		&& self_entity_num > 0 && self_entity_num < sv.num_edicts)
 		current_frags = (int)EDICT_NUM(self_entity_num)->v.frags;
 	else if (cl.scores != NULL && self_entity_num > 0
 		&& self_entity_num <= cl.maxclients)

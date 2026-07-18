@@ -23,7 +23,7 @@ _V2_EXTENSION_SIZE = struct.calcsize(_V2_EXTENSION_FORMAT)
 # Version 3 appends 8 floats after the v2 extension: the nearest in-LOS actor's
 # view-frame rel pos (3, raw u), view-frame ABSOLUTE world velocity (3, raw u/s),
 # the currently-held weapon id, and a validity flag (1.0 when an actor was found).
-# Lead-aim geometry for the lead-referenced aim-coherence eval metric.
+# Lead-aim geometry for the lead-referenced intercept (discharge-alignment, hbw) eval metric.
 _V3_EXTENSION_FORMAT = "<8f"
 _V3_EXTENSION_SIZE = struct.calcsize(_V3_EXTENSION_FORMAT)
 

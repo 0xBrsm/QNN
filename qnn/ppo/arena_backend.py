@@ -84,7 +84,11 @@ class ArenaGridBackend:
         max_steps_per_episode: int,
         fixed_tick_hz: int,
         reward_weights: RewardWeights,
+        direct_actions: bool,
+        observer_mode: str = "external",
         scenario_id: str = "arena-grid-1v1",
+        scenario_ids: Sequence[str] | None = None,
+        weapon_config: Mapping[str, object] | None = None,
     ) -> None:
         if int(fixed_tick_hz) != 20:
             raise ValueError("arena_grid currently requires fixed_tick_hz=20")
@@ -99,6 +103,7 @@ class ArenaGridBackend:
         self._closed = False
         self._inflight: dict[int, Future[list[tuple[bytes, TrustedTrainingExtrasV1]]]] | None = None
         self._inflight_episode_ids: np.ndarray | None = None
+        self._latest_raws: np.ndarray | None = None
 
         reward_json = json.dumps(
             {"reward_weights": asdict(reward_weights)}, separators=(",", ":")
@@ -127,22 +132,37 @@ class ArenaGridBackend:
                 bot_skill=int(bot_skill),
                 self_play=seat_mode == "self_play",
                 reward_json=reward_json,
+                direct_actions=bool(direct_actions),
+                observer_mode=str(observer_mode),
                 env=process_env,
                 workdir=workdir,
+                weapon_config=weapon_config,
             ))
 
         self._executor = ThreadPoolExecutor(
             max_workers=self.topology.server_count,
             thread_name_prefix="qnn-arena-group",
         )
+        # Per-lane scenario ids let a single homogeneous arena bucket its lanes
+        # into distinct eval cells (the aim-grid packs one swept decode value per
+        # lane, all sharing one weapon/map). PPO leaves scenario_ids None and every
+        # lane shares the broadcast scenario_id.
+        if scenario_ids is None:
+            lane_scenario_ids = [str(scenario_id)] * self.num_lanes
+        else:
+            lane_scenario_ids = [str(sid) for sid in scenario_ids]
+            if len(lane_scenario_ids) != self.num_lanes:
+                raise ValueError(
+                    f"scenario_ids has {len(lane_scenario_ids)} entries but the "
+                    f"arena has {self.num_lanes} lanes")
         self._states = [
             _ArenaLaneState(
-                scenario_id=str(scenario_id),
+                scenario_id=lane_scenario_ids[lane],
                 max_steps=int(max_steps_per_episode),
                 map_id=str(map_id),
-                options={"scenario_id": str(scenario_id)},
+                options={"scenario_id": lane_scenario_ids[lane]},
             )
-            for _ in range(self.num_lanes)
+            for lane in range(self.num_lanes)
         ]
         self._episode_ids = np.full(self.num_lanes, -1, dtype=np.int64)
 
@@ -213,6 +233,7 @@ class ArenaGridBackend:
                 for server_id, group in enumerate(self._groups)
             }
             raws, _ = self._collect_group_transitions(futures)
+        self._latest_raws = raws.copy()
         for state in self._states:
             state.reset_episode()
             state.stats = EpisodeStatAccumulator()
@@ -221,6 +242,49 @@ class ArenaGridBackend:
         self._episode_ids += 1
         self._time_add("reset_s", started)
         return self._raw_batch(raws)
+
+    def reset_lanes(self, env_ids: Sequence[int]) -> dict[str, np.ndarray]:
+        """Reset the matches owning ``env_ids`` and return the dense live state.
+
+        This is primarily the evaluation adapter's episode-boundary primitive.
+        A self-play pair maps to one match bit and is reset atomically.
+        """
+        if not self._started or self._latest_raws is None:
+            raise RuntimeError("call reset() before reset_lanes()")
+        if self._inflight is not None:
+            raise RuntimeError("cannot reset lanes while an arena step is in flight")
+        masks: dict[int, int] = {}
+        selected_matches: set[tuple[int, int]] = set()
+        for raw_env_id in env_ids:
+            env_id = int(raw_env_id)
+            if not 0 <= env_id < self.num_lanes:
+                raise ValueError(f"arena env id out of range: {env_id}")
+            seat = self.topology.seat_for_env(env_id)
+            masks[seat.server_id] = masks.get(seat.server_id, 0) | (1 << seat.match_id)
+            selected_matches.add((seat.server_id, seat.match_id))
+        if not masks:
+            return self._raw_batch(self._latest_raws.copy())
+
+        futures = {
+            server_id: self._executor.submit(
+                self._groups[server_id].reset_matches, mask
+            )
+            for server_id, mask in masks.items()
+        }
+        for server_id, future in futures.items():
+            transitions = future.result()
+            for env_id, (raw, _training) in zip(
+                self._server_env_ids[server_id], transitions, strict=True
+            ):
+                self._latest_raws[int(env_id)] = np.frombuffer(raw, dtype=np.uint8)
+        for env_id, state in enumerate(self._states):
+            seat = self.topology.seat_for_env(env_id)
+            if (seat.server_id, seat.match_id) in selected_matches:
+                state.reset_episode()
+                state.stats = EpisodeStatAccumulator()
+                state.length = 0
+                state.return_value = 0.0
+        return self._raw_batch(self._latest_raws.copy())
 
     def submit(self, action_batch: Mapping[str, np.ndarray]) -> None:
         if not self._started:
@@ -237,13 +301,18 @@ class ArenaGridBackend:
         started = time.perf_counter()
         self._inflight = {
             server_id: self._executor.submit(
-                group.step,
+                group.step_many,
                 [packets[int(env_id)] for env_id in self._server_env_ids[server_id]],
             )
             for server_id, group in enumerate(self._groups)
         }
         self._inflight_episode_ids = self._episode_ids.copy()
         self._time_add("submit_s", started)
+
+    def step_many(self, action_batch: Mapping[str, np.ndarray]) -> EnvStepBatch:
+        """Synchronous grouped step for evaluation and simple rollout drivers."""
+        self.submit(action_batch)
+        return self.receive()
 
     def receive(self) -> EnvStepBatch:
         futures = self._inflight
@@ -299,6 +368,7 @@ class ArenaGridBackend:
 
         started = time.perf_counter()
         obs = self._raw_batch(raws)
+        self._latest_raws = raws.copy()
         final_obs_rows = [
             (env_id, unpack_obs_buffer_native(raw))
             for env_id, raw in final_raws.items()
@@ -341,6 +411,7 @@ class ArenaGridBackend:
             valid=np.ones(self.num_lanes, dtype=bool),
             final_obs_rows=final_obs_rows,
             episodes=episodes,
+            infos=infos,
         )
 
     def close(self) -> None:

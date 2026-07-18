@@ -12,24 +12,20 @@ generation's policy/export has needed them in the same form:
     "sample don't argmax" readout (argmax greedy / categorical-sample sampled).
 
 What does NOT live here:
-  * The gen-SPECIFIC decode — the polar-look hybrid, the sticky-weapon gate, the
-    aim-prior blend — lives in :mod:`qnn.model.bench.a24.decode`. Those are a24-lineage
-    CHOICES, not cross-gen invariants; a future generation replaces that module.
-  * The a24-recent move LAYERS on top of the basic axis decode — sticky
-    hysteresis, the semi-Markov hazard supplement, switch-back watermarking,
-    stop-onset suppression — stay INLINE in :meth:`qnn.model.policy.QNNPolicy.act`.
-    They are deeply entangled with per-episode instance state (held-class
-    threading, row generators, caller-owned watermark buffers) and are a24-recent,
-    not part of the cross-gen base.
+  * The gen-SPECIFIC decode — the polar-look hybrid, the aim-prior blend, the
+    a25 move commitment + attack_with joint decode — lives in the generation's
+    OWN facade (:mod:`qnn.model.bench.a25.decode`). Those are generation CHOICES,
+    not cross-gen invariants; a future generation replaces that module. (The a24
+    sticky/hazard/switch-back stack and its facade were retired with the a24 arch.)
   * The polar GEOMETRY (``tangent_expmap`` / ``MAG_CENTERS`` / ``DIR_CENTERS``)
     lives in :mod:`qnn.model.look_bins`; the lead/aim primitives in
-    :mod:`qnn.model.bench.a24.lead_aim`. This module imports neither — it is pure readout.
+    :mod:`qnn.model.bench.a25.lead_aim`. This module imports neither — it is pure readout.
 
-EXPORT note: ``ExportWrapper`` (tools/export_onnx.py) DEFERS the move-axis and
-attack-bit decode to the C engine (it emits raw fb/lr logits + gumbel-perturbed
-jump, and the attack LOGIT), so :func:`decode_attack_bit` / :func:`decode_move_axes`
-are called by ``QNNPolicy.act`` only. Base membership is about cross-gen
-STABILITY, not about being called by both surfaces.
+EXPORT note: the export path decodes in-graph via the a25 facade;
+:func:`decode_attack_bit` / :func:`decode_move_axes` are called by
+``QNNPolicy.act`` only (the split-head fallback and the non-commitment move
+readout). Base membership is about cross-gen STABILITY, not about being called
+by both surfaces.
 
 TRACE-SAFETY: keep this module dependency-light (torch only) and free of
 ``.item()``, data-dependent Python control flow, and advanced/boolean tensor
@@ -165,11 +161,9 @@ def decode_attack_bit(
     ``threshold`` is the fire operating point (default 0.5). It enters BOTH paths
     as the equivalent logit bias ``logit(threshold) = ln(θ/(1−θ))`` so greedy and
     sampled share one operating point; θ=0.5 → bias 0, identical to the historical
-    decode. It is fit offline (``qnn.bc.decode_fit.fit_attack``) and stamped as
-    ``decode.attack_threshold`` for the engine, which runs the same greedy cut.
-
-    EXPORT defers this to the C engine (it emits the attack LOGIT and C runs the
-    sigmoid threshold), so this is the policy path's readout only.
+    decode. (The offline threshold FIT and its engine stamp were retired with the
+    a24 arch — the a25 attack decode is the 9-way attack_with joint head; this
+    readout remains for split-head models in tests/diagnostics.)
     """
     flat = attack_logit.reshape(-1)
     thr = min(max(float(threshold), 1e-6), 1.0 - 1e-6)
@@ -195,11 +189,9 @@ def decode_move_axes(
     sampled = per-axis categorical draw (the calibrated "sample don't argmax"
     readout). ``move_logits`` is (n_rows, n_axes, n_classes).
 
-    This is the BASIC axis readout only. The a24-recent layers built on top of
-    it — sticky hysteresis, the semi-Markov hazard supplement, switch-back
-    watermarking, stop-onset suppression — stay inline in QNNPolicy.act (they
-    thread per-episode instance state and are not cross-gen base). EXPORT defers
-    the move decode to the C engine entirely.
+    This is the BASIC axis readout only — and, with the a24 sticky/hazard stack
+    retired, the ONLY non-commitment move decode: QNNPolicy.act runs either the
+    a25 commitment decode (move_seg models) or this plain per-axis readout.
     """
     n_rows = int(move_logits.shape[0])
     n_axes = int(move_logits.shape[1])

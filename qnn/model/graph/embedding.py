@@ -8,8 +8,8 @@ entity / spatial / shared-embedding plumbing is inherited from
 ``ObsEmbedding`` unchanged.
 
 Field order inside a token is fixed (scalars → kind_tag → vocab →
-readiness → vocab_sum) so the parameter layout is deterministic for a
-given spec. State-dict names are keyed by token name
+readiness → ammo_pools → vocab_sum) so the parameter layout is
+deterministic for a given spec. State-dict names are keyed by token name
 (``self_builders.<token>.projs.<i>...``), so renaming a token in the
 spec renames its parameters — legacy checkpoints map in through the
 loader migrations, not by accident of naming.
@@ -25,7 +25,8 @@ from qnn.model.graph.spec import (
 )
 from qnn.model.tokens.obs_accessor import ObsAccessor
 from qnn.model.tokens.obs_fields import (
-    KIND_SELF, KindTag, ScalarGroup, VocabEmbed, VocabSum, WeaponReadiness,
+    KIND_SELF, AmmoPools, KindTag, ScalarGroup, VocabEmbed, VocabSum,
+    WeaponReadiness,
 )
 from qnn.model.tokens.token_builder import TokenBuilder
 from qnn.model.transformer import ObsEmbedding
@@ -41,6 +42,8 @@ def token_fields(token: TokenSpec) -> tuple:
     fields.extend(VocabEmbed(n) for n in token.vocab)
     if token.readiness:
         fields.append(WeaponReadiness())
+    if token.ammo_pools:
+        fields.append(AmmoPools())
     fields.extend(VocabSum(n) for n in token.vocab_sum)
     return tuple(fields)
 

@@ -242,6 +242,62 @@ def _load_split(split_dir: Path) -> list[_EpisodeView]:
     return episodes
 
 
+# ── matched-corpus per-episode 20 Hz strides ──────────────────────────────────
+
+def matched_episode_strides(
+    slim_split_dir: Path,
+    default_stride: int,
+) -> np.ndarray | None:
+    """Per-episode 20 Hz window strides for a matched-collect slim split.
+
+    Demos record at their native client rate (77 Hz and 60 Hz are both
+    common), so a single global ``round(native_hz / 20)`` stride puts half a
+    mixed corpus in the wrong duration units.  The matched collect's qobs
+    twin carries ``native_index`` per 20 Hz frame — its per-episode median
+    delta IS that episode's native-frames-per-model-frame.
+
+    Joins slim episodes to qobs episodes via the manifests' ``demo_idxs``
+    and returns an ``(E,)`` int64 array aligned with ``_load_split`` /
+    ``materialize_split`` episode order.  Returns None when there is no
+    paired qobs split (plain labeler corpora); demos missing from the qobs
+    manifest fall back to ``default_stride``.
+    """
+    slim_split_dir = Path(slim_split_dir)
+    if slim_split_dir.parent.name != "slim":
+        return None
+    qobs_split = slim_split_dir.parent.parent / "qobs" / slim_split_dir.name
+    slim_manifest = slim_split_dir / "manifest.json"
+    qobs_manifest = qobs_split / "manifest.json"
+    if not (slim_manifest.exists() and qobs_manifest.exists()):
+        return None
+
+    # demo_idx -> per-episode median native_index deltas across qobs episodes
+    per_demo: dict[int, list[float]] = {}
+    qman = json.loads(qobs_manifest.read_text())
+    for shard in qman["shards"]:
+        ni_rel = (shard.get("obs") or {}).get("native_index")
+        if ni_rel is None:
+            return None
+        ni = np.load(qobs_split / ni_rel, mmap_mode="r")
+        start = 0
+        for length, demo_idx in zip(shard["episode_lengths"], shard["demo_idxs"]):
+            stop = start + int(length)
+            d = np.diff(ni[start:stop].astype(np.int64))
+            d = d[d > 0]
+            if d.size:
+                per_demo.setdefault(int(demo_idx), []).append(float(np.median(d)))
+            start = stop
+
+    sman = json.loads(slim_manifest.read_text())
+    strides: list[int] = []
+    for shard in sman["shards"]:
+        for demo_idx in shard["demo_idxs"]:
+            eps = per_demo.get(int(demo_idx))
+            s = float(np.median(eps)) if eps else float(default_stride)
+            strides.append(max(1, int(round(s))))
+    return np.asarray(strides, dtype=np.int64)
+
+
 # ── op_input keep-mask ─────────────────────────────────────────────────────────
 
 def op_input_keep_mask(decoded: np.ndarray, op_input: np.ndarray | None,

@@ -10,6 +10,7 @@
 #include "qnn_store.h"
 #include "qnn_object.h"
 #include "qnn_map.h"
+#include "qnn_context.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -789,4 +790,106 @@ void QNN_StoreDumpSounds(FILE *out, int tick, const qnn_snapshot_t *snapshot)
 			tick, s->entity_num, s->name,
 			s->origin[0], s->origin[1], s->origin[2]);
 	}
+}
+
+/* ── Mover occlusion cache (shared by QNN_TraceLine, both engines) ─────
+ *
+ * Solid brush-submodel movers (func_door / func_plat / func_train /
+ * func_button — model name "*N") are excluded from world hull 0, so the
+ * world-only PM_/SV_RecursiveHullCheck that QNN_TraceLine runs sees
+ * straight through them.  That makes the bot's spatial rays and enemy
+ * LOS X-ray through closed doors / moving platforms.
+ *
+ * QNN_TraceLine now clips against each solid mover at its live origin.
+ * To keep that off the per-ray hot path, the mover set is enumerated
+ * ONCE per observation frame here (keyed on cl.time — movers only move
+ * as cl.time advances) and reused by every ray of that frame.  The
+ * per-variant qnn_sys.c pulls the cached model+origin and runs the
+ * engine's own hull-clip against each.
+ *
+ * Enumeration mirrors QNN_BuildMoverRefs (qnn_collect_helpers.c) but
+ * lives here because qnn_store.c is linked into every worker — including
+ * nq_client, which does NOT link qnn_collect_helpers.c. */
+#define QNN_TRACE_MAX_MOVERS QNN_MAX_PHYS_MOVERS
+
+static double   qnn_trace_mover_time = -1.0;
+static int      qnn_trace_mover_valid = 0;
+static int      qnn_trace_mover_count = 0;
+static model_t *qnn_trace_mover_models[QNN_TRACE_MAX_MOVERS];
+static vec3_t   qnn_trace_mover_origins[QNN_TRACE_MAX_MOVERS];
+
+void QNN_StoreRegisterContext(void)
+{
+	QNN_ContextRegister(qnn_store, sizeof(qnn_store));
+	QNN_ContextRegister(&qnn_store_overflow_count, sizeof(qnn_store_overflow_count));
+	QNN_ContextRegister(qnn_ephemeral_present, sizeof(qnn_ephemeral_present));
+	QNN_ContextRegister(qnn_player_present, sizeof(qnn_player_present));
+	QNN_ContextRegister(&qnn_trace_mover_time, sizeof(qnn_trace_mover_time));
+	QNN_ContextRegister(&qnn_trace_mover_valid, sizeof(qnn_trace_mover_valid));
+	QNN_ContextRegister(&qnn_trace_mover_count, sizeof(qnn_trace_mover_count));
+	QNN_ContextRegister(qnn_trace_mover_models, sizeof(qnn_trace_mover_models));
+	QNN_ContextRegister(qnn_trace_mover_origins, sizeof(qnn_trace_mover_origins));
+}
+
+static void QNN_TraceGatherMovers(void)
+{
+	int i;
+
+	qnn_trace_mover_count = 0;
+	for (i = 1; i < MAX_EDICTS && qnn_trace_mover_count < QNN_TRACE_MAX_MOVERS; i++)
+	{
+		entity_t *ent;
+		model_t *m;
+
+		/* Only entities the store has classified as solid movers.  This
+		 * excludes non-occluding brush models (func_illusionary) and
+		 * trigger fields, matching QNN_BuildMoverRefs. */
+		if (qnn_store[i].type != QNN_ENT_MOVER)
+			continue;
+		ent = &cl_entities[i];
+		m = ent->model;
+		if (m == NULL || m->name[0] != '*')
+			continue;
+		/* Needs a usable clip tree for the recursive hull check. */
+		if (m->hulls[0].firstclipnode > m->hulls[0].lastclipnode)
+			continue;
+		qnn_trace_mover_models[qnn_trace_mover_count] = m;
+		VectorCopy(ent->origin, qnn_trace_mover_origins[qnn_trace_mover_count]);
+		qnn_trace_mover_count++;
+	}
+}
+
+/* Refresh the per-frame mover cache and return the current count.  Called
+ * at the top of each QNN_TraceLine; rebuilds at most once per cl.time. */
+int QNN_TraceMoverCacheRefresh(void)
+{
+	if (cl.worldmodel == NULL)
+	{
+		qnn_trace_mover_count = 0;
+		qnn_trace_mover_valid = 0;
+		qnn_trace_mover_time = -1.0;
+		return 0;
+	}
+	if (!qnn_trace_mover_valid || (double)cl.time != qnn_trace_mover_time)
+	{
+		QNN_TraceGatherMovers();
+		qnn_trace_mover_time = (double)cl.time;
+		qnn_trace_mover_valid = 1;
+	}
+	return qnn_trace_mover_count;
+}
+
+model_t *QNN_TraceMoverModel(int index)
+{
+	if (index < 0 || index >= qnn_trace_mover_count)
+		return NULL;
+	return qnn_trace_mover_models[index];
+}
+
+float *QNN_TraceMoverOrigin(int index)
+{
+	static vec3_t zero = {0.0f, 0.0f, 0.0f};
+	if (index < 0 || index >= qnn_trace_mover_count)
+		return zero;
+	return qnn_trace_mover_origins[index];
 }

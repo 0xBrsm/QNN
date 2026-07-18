@@ -14,6 +14,7 @@ PATCHES=(
 )
 
 CUSTOM_SOURCES=(
+  "${ENGINE_DIR}/common/qnn_context.c"
   "${ENGINE_DIR}/nq/qnn_sys.c"
   "${ENGINE_DIR}/common/qnn_sys_common.c"
   "${ENGINE_DIR}/nq/qnn_collect_main.c"

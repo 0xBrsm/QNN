@@ -24,6 +24,42 @@ import torch
 
 from qnn import filter_dsl
 from qnn.vocab import MAX_TOKEN_OBJECTS, TOKEN_ACTOR
+
+
+def compile_bc_hot_path(model: "QNNPolicy", log: Callable[[str], None] = print) -> None:
+    """torch.compile the BC training hot path (kill switch: QNN_BC_NO_COMPILE=1).
+
+    An early whole-model attempt measured net-negative, but that was under the
+    old sync-bound step (28 blocking device syncs per step) where kernel fusion
+    couldn't help. With the step sync-free (2026-07-11) this region measured
+    63.9k → 94.8k RPS on the offline harness and 50.6k → 76.0k on the real
+    corpus.
+
+    Scope is DELIBERATELY embed+encoder only. Extending to the head modules +
+    the loss method was measured and LOST (92.4k → 62.7k RPS harness): the
+    loss method fragments into many small guarded graphs whose call overhead
+    exceeds the fused-kernel savings, and one label-prep scan trips an
+    Inductor codegen bug (see derive_segment_targets). The temporal (MIOpen
+    GRU) stays eager: reset segmentation varies per batch, and the fused RNN
+    kernel would not fuse further anyway.
+
+    ``Module.compile()`` wraps forward in place, so state_dict keys and the
+    checkpoint layout are untouched.
+    """
+    if os.environ.get("QNN_BC_NO_COMPILE", "").strip() == "1":
+        return
+    try:
+        # Compilation is lazy (first forward), so a backend failure would
+        # surface mid-training where no try/except here can catch it. With
+        # suppress_errors any graph that fails to compile falls back to eager
+        # for that graph only — compile is a perf feature and must never kill
+        # a run. Quality is still guarded by the epoch-1 sanity gate.
+        torch._dynamo.config.suppress_errors = True
+        model.model.obs_embedding.compile(dynamic=False)
+        model.model.encoder.compile(dynamic=False)
+        log("torch.compile: obs_embedding + encoder (dynamic=False)")
+    except Exception as exc:  # pragma: no cover - backend-dependent
+        log(f"torch.compile unavailable, staying eager: {exc}")
 from qnn.bc.class_weights import attack_class_weights
 from qnn.schema import OBS_DIM
 from qnn.model.network import ModelConfig
@@ -65,7 +101,7 @@ class BCConfig:
     tbptt_limit: int  # max ticks before detaching gradient graph (0 = no limit)
     fixed_tick_hz: int
     device: str
-    head_loss_weights: str  # JSON string, e.g. '{"move":1.5,"weapon":0.0}'
+    head_loss_weights: str  # JSON string, e.g. '{"move":1.5,"weapon":0.0}'; per-axis move keys "move_fb"/"move_lr"/"move_ud" scale one CE term inside the move loss
     regression_threshold: float
     regression_patience: int
     lr_min: float
@@ -136,6 +172,13 @@ class BCConfig:
     # Expected collection identity (qnn.collection_fingerprint). Empty =
     # log-only mode.
     collection_fingerprint: str
+    # Opt-in resident recurrent layout: gather the shuffled lane-packed epoch
+    # once, then train from views. Costs roughly one additional corpus copy
+    # while active; retained off until a real-corpus A/B wins.
+    resident_epoch_pack: bool = False
+    # Opt-in recurrent lane layout: length-sorted waves align episode resets
+    # across lanes, trading modest padding for far fewer segmented GRU calls.
+    reset_aligned_lanes: bool = False
     # Per-frame engagement EMA decay rate (see
     # qnn.bc.supervised_loop._compute_engagement_ema). α=0.5 was picked by
     # the MI analysis in scripts/attack_prior_methodical.py and is the
@@ -195,9 +238,71 @@ class BCConfig:
     # (independent of autostop_patience) since divergence should stop even runs that
     # left the normal autostop off. 0.5 is well above normal epoch-to-epoch noise.
     autostop_catastrophic_margin: float = 0.5
+    # Epoch-1 sanity gate: hard-abort a run whose FIRST completed epoch already
+    # carries a broken val metric — a non-finite (NaN/inf) or wildly out-of-band
+    # per-head skill — instead of burning the full schedule (broken-from-epoch-1
+    # stays broken). Legit early skills sit in ~[-1, 1] (an untrained head can be
+    # mildly negative, e.g. the -0.37 attack-marginal warmup dip), so a skill
+    # below floor / above ceil / non-finite is unambiguously broken. Fires
+    # independent of autostop_patience; non-finite is checked EVERY epoch, the
+    # band only at the first completed epoch of a fresh run. Default on for all
+    # runs — a production run broken at epoch 1 is also a resource sink. See
+    # agents/conventions.md "validate every run after epoch 1".
+    epoch1_sanity_abort: bool = True
+    epoch1_sanity_skill_floor: float = -50.0
+    epoch1_sanity_skill_ceil: float = 1000.0
+    # Epoch-checkpoint retention: keep ckpt_e<N> files whose (1-based) epoch is
+    # a multiple of this, instead of letting the rolling resume checkpoint
+    # supersede them. 0 (default) = pure rolling — one checkpoint, clean
+    # archived runs (the deliberate post-6/12 behavior). Candidate/validation
+    # runs set e.g. 5 so closed-loop metric-vs-epoch curves are measurable
+    # (the 7/07 TOT-vs-epoch question was unanswerable from best+final).
+    checkpoint_keep_every: int = 0
+    # --- Convergence-tuning knobs (opt-in; every default preserves TODAY's
+    # behavior bit-for-bit, so existing runs stay comparable). Rationale +
+    # Phase-0 measurements: agents/plans/bc-optimizer-convergence-tuning.md.
+    #
+    # Per-STEP linear LR warmup: ramp lr_min → lr over the first N *global*
+    # optimizer steps, then hand off to the (unchanged) per-epoch cosine. When
+    # >0 this OVERRIDES warmup_epochs. When 0 and warmup_epochs > 0, the step
+    # count is DERIVED as warmup_epochs × (estimated steps/epoch) — the same
+    # ramp shape the conv sweep blessed, sized corpus-relatively (user call,
+    # 2026-07-10). The legacy FLAT-epoch + hard-jump warmup is REMOVED: it was
+    # measured to transiently crater the attack marginal (val_attack_skill
+    # 0.19 → −0.37 at ep1) and nothing blessed uses it.
+    warmup_steps: int = 0
+    # Gradient-clip mode. "fixed" (default) = constant `max_grad_norm` every
+    # step — current behavior. "adaptive" = clip to
+    # min(grad_clip_ema_k · EMA(pre-clip norm), grad_clip_hard_max): genuine
+    # spikes stay capped while ordinary large-but-honest steps pass through
+    # (a global fixed clip fires every step here — mean norm 34–545 ≫ clip 1.0).
+    grad_clip_mode: str = "fixed"
+    # Adaptive-clip multiplier and EMA decay (only consulted when
+    # grad_clip_mode == "adaptive"). Threshold = ema_k × EMA; the EMA tracks the
+    # observed pre-clip norm with this decay.
+    grad_clip_ema_k: float = 1.5
+    grad_clip_ema_beta: float = 0.99
+    # Absolute ceiling (grad L2-norm units) on the adaptive threshold, so a
+    # cold-start / transiently-low EMA can't admit a genuine spike (the ep1
+    # ~3000 spike is real). 0 = no ceiling — NOT recommended with adaptive; a
+    # warning is logged. Ignored when grad_clip_mode == "fixed".
+    grad_clip_hard_max: float = 0.0
+    # Clip scope. "global" (default) = one L2 norm over ALL params — a single
+    # spiking component then rescales every component's step. "per_group" =
+    # clip each top-level component (obs_embedding / encoder / temporal /
+    # pointer / <each head>) independently. Phase-0 confirmed one component
+    # owns 75–86% of the global norm and which one flips (weapon_head early →
+    # obs_embedding late), so no single global scale fits.
+    grad_clip_scope: str = "global"
+    # >0 switches the BC optimizer Adam → AdamW with this decoupled weight
+    # decay. 0 = plain Adam (current). Low priority (best ≈ final ⇒ no overfit),
+    # exposed for the sweep's stretch arm.
+    weight_decay: float = 0.0
 
 
 from qnn.bc.loop import (
+    GradClipper as _GradClipper,
+    GradClipSpec as _GradClipSpec,
     MidEpochState as _MidEpochState,
     make_resident_source_from_cache as _make_resident_source_from_cache,
     run_epoch as _run_epoch,
@@ -236,6 +341,12 @@ def _selection_score(metrics: Mapping[str, float]) -> float:
         + head_error("target", loss_key="loss_target")
         + head_error("attack", loss_key="loss_attack")
         + head_error("weapon", loss_key="loss_weapon")
+        # movearch heads (full_movearch promotion, 2026-07-10). Absent-head
+        # neutrality keeps every older run's selection identical; runs that
+        # emit these skills fold them in. move_seg_ud_skill is deliberately
+        # EXCLUDED — a 1.6k-event metric must not gate checkpoint selection.
+        + head_error("move_seg", loss_key="loss_move_seg")
+        + head_error("jump", loss_key="loss_jump")
     )
 
 
@@ -279,6 +390,34 @@ def _train_eval_schedule(
             reasons.append("val_regressed_train_improved")
 
     return train_proxy_sum, proxy_gap, reasons
+
+
+def _epoch1_sanity_check(
+    val_metrics: Mapping[str, float],
+    skill_keys: "tuple[str, ...]",
+    *,
+    enabled: bool,
+    floor: float,
+    ceil: float,
+    is_first_epoch: bool,
+) -> "tuple[bool, str]":
+    """Return (abort, reason) if a val skill is broken. Non-finite (NaN/inf) is
+    fatal any epoch; the [floor, ceil] band is judged only at the first completed
+    epoch of a fresh run. Legit early skills sit in ~[-1, 1], so the wide default
+    band never trips a slow-starting head — only genuinely broken runs (e.g. the
+    -37M weapon-skill CE detonation) do. Pure function → unit-testable."""
+    import math as _m
+    if not enabled:
+        return False, ""
+    for k in skill_keys:
+        if k not in val_metrics:
+            continue
+        v = float(val_metrics[k])
+        if not _m.isfinite(v):
+            return True, f"{k}={v} (non-finite)"
+        if is_first_epoch and (v < floor or v > ceil):
+            return True, f"{k}={v:.3g} outside [{floor:g}, {ceil:g}] at epoch 1"
+    return False, ""
 
 
 def _autostop_decision(
@@ -1176,6 +1315,10 @@ def run_behavior_cloning(
     # the attack-head LOSS reads actions["attack_shifted"] (built by the
     # source above) and val metrics keep using the original attack label.
     model.attack_label_shift = bool(config.attack_label_shift)
+    # BC weight decay is a training-time optimizer knob (no arch/checkpoint
+    # impact). >0 makes QNNPolicy._optimizer build AdamW instead of Adam.
+    # Set before the first optimizer construction (lazy, on first step).
+    model.bc_weight_decay = float(config.weight_decay)
 
     if source_bundle is None:
         source_bundle = build_behavior_cloning_sources(config, head_loss_weights=head_loss_weights)
@@ -1314,10 +1457,7 @@ def run_behavior_cloning(
             _log(f"Mid-epoch state load failed: {exc}")
             mid_epoch_path.unlink(missing_ok=True)
 
-    # torch.compile: tested but net negative for this model size (189K params).
-    # The fused kernels don't help when individual ops are already microseconds,
-    # and the compile wrapper adds overhead (val: 100s → 120s per epoch).
-    # Revisit if model size increases significantly.
+    compile_bc_hot_path(model, log=_log)
 
     # Per-step reporting: aggregate every ~1024 samples, then wall-clock gate
     # actual logging/flushes so perf runs do not spend most of their time
@@ -1368,6 +1508,46 @@ def run_behavior_cloning(
 
     _prev_epoch_weights: Dict[str, torch.Tensor] | None = None
 
+    # Gradient clipper — one instance for the whole run so the adaptive EMA
+    # persists across epochs. Default spec (fixed/global) reproduces the
+    # historical constant clip exactly.
+    _clip_mode = str(getattr(config, "grad_clip_mode", "fixed"))
+    _clip_scope = str(getattr(config, "grad_clip_scope", "global"))
+    _clip_hard_max = float(getattr(config, "grad_clip_hard_max", 0.0))
+    if _clip_mode == "adaptive" and _clip_hard_max <= 0:
+        _log("WARN: grad_clip_mode=adaptive with grad_clip_hard_max=0 — no "
+             "ceiling on the adaptive threshold; a cold-start EMA can admit a "
+             "genuine spike. Set grad_clip_hard_max > 0.")
+    _clipper = _GradClipper(_GradClipSpec(
+        max_norm=float(config.max_grad_norm),
+        mode=_clip_mode,
+        scope=_clip_scope,
+        ema_k=float(getattr(config, "grad_clip_ema_k", 1.5)),
+        ema_beta=float(getattr(config, "grad_clip_ema_beta", 0.99)),
+        hard_max=_clip_hard_max,
+    ))
+    # Per-step warmup: ramp lr_min → lr over the first `warmup_steps` GLOBAL
+    # optimizer steps, overriding the per-epoch `warmup_epochs` ramp. Track the
+    # global step count across epochs; on a resume into epoch > 0 the warmup is
+    # already done, so seed the counter past it (its only effect is in epoch 0).
+    _warmup_steps = int(getattr(config, "warmup_steps", 0))
+    if _warmup_steps > 0:
+        _log(f"Per-step LR warmup: {_warmup_steps} global steps "
+             f"(explicit; overrides warmup_epochs={config.warmup_epochs})")
+    elif int(config.warmup_epochs) > 0:
+        # warmup_epochs = corpus-relative sugar for the SAME per-step ramp:
+        # derive the step count from the epoch size (rows / (batch × tbptt)).
+        # Exactness is immaterial (the blessed 700 vs the true ~716 never
+        # mattered); the shape is what the sweep validated.
+        _rows_per_epoch = int(source_bundle.train_source.n_total_rows)
+        _steps_per_epoch = max(1, round(_rows_per_epoch / max(
+            1, int(config.batch_size) * max(1, int(config.tbptt_limit)))))
+        _warmup_steps = int(config.warmup_epochs) * _steps_per_epoch
+        _log(f"Per-step LR warmup: {_warmup_steps} global steps "
+             f"(derived: warmup_epochs={config.warmup_epochs} × "
+             f"~{_steps_per_epoch} steps/epoch)")
+    _global_opt_steps = _warmup_steps if (_warmup_steps > 0 and start_epoch > 0) else 0
+
     for epoch in range(start_epoch, config.epochs):
         # Reclaim Python + CUDA allocator pool at each epoch boundary.
         _gc.collect()
@@ -1399,13 +1579,12 @@ def run_behavior_cloning(
             except Exception as exc:
                 _log(f"lr_override.json parse error: {exc}")
 
-        # LR schedule: optional linear warmup then optional cosine decay.
-        _warmup = config.warmup_epochs
-        if _warmup > 0 and epoch < _warmup:
-            # Linear warmup from lr_min (or near-zero) to lr.
-            _base = _lr_min if _lr_min > 0 else _lr * 0.01
-            _active_lr = _base + (_lr - _base) * (epoch / _warmup)
-        elif _lr_min > 0:
+        # LR schedule: per-step warmup ramp (always, when any warmup is
+        # configured — the flat-epoch scheme is gone) + per-epoch cosine from
+        # epoch 0. The ramp is applied inside run_epoch over global steps.
+        _warmup = 0
+        _warmup_base_lr = _lr_min if _lr_min > 0 else _lr * 0.01
+        if _lr_min > 0:
             # Cosine decay from lr to lr_min over post-warmup epochs.
             _post_warmup = epoch - _warmup
             _post_total = max(config.epochs - 1 - _warmup, 1)
@@ -1428,6 +1607,10 @@ def run_behavior_cloning(
             lr=_active_lr,
             rng=rng,
             max_grad_norm=config.max_grad_norm,
+            clipper=_clipper,
+            warmup_steps=_warmup_steps,
+            warmup_base_lr=_warmup_base_lr,
+            warmup_global_offset=_global_opt_steps,
             head_loss_weights=hlw,
             step_callback=_on_step,
             report_every=_report_every,
@@ -1436,8 +1619,11 @@ def run_behavior_cloning(
             snapshot_interval=_MID_EPOCH_SAVE_INTERVAL,
             resume_state=_mid_epoch_resume,
             cancel_event=cancel_event,
+            resident_epoch_pack=bool(config.resident_epoch_pack),
+            reset_aligned_lanes=bool(config.reset_aligned_lanes),
         )
         _mid_epoch_resume = None
+        _global_opt_steps += int(train_metrics.get("opt_steps", 0))
         _t_train_end = _time.monotonic()
 
         # Immediate (mid-epoch) cancel: train_on_batches broke out and the
@@ -1462,6 +1648,8 @@ def run_behavior_cloning(
             sequence_length=config.sequence_length,
             tbptt_limit=config.tbptt_limit,
             head_loss_weights=hlw,
+            resident_epoch_pack=bool(config.resident_epoch_pack),
+            reset_aligned_lanes=bool(config.reset_aligned_lanes),
         )
         _t_val_only_end = _time.monotonic()
         train_proxy_sum, train_proxy_gap, train_eval_reasons = _train_eval_schedule(
@@ -1492,6 +1680,8 @@ def run_behavior_cloning(
                 sequence_length=config.sequence_length,
                 tbptt_limit=config.tbptt_limit,
                 head_loss_weights=hlw,
+                resident_epoch_pack=bool(config.resident_epoch_pack),
+                reset_aligned_lanes=bool(config.reset_aligned_lanes),
                 )
             _train_eval_secs = _time.monotonic() - _t_train_eval_start
             train_eval_sum = _selection_score(train_eval_metrics)
@@ -1520,6 +1710,7 @@ def run_behavior_cloning(
         # stay in bc_history.json for analysis. See research/head-metrics.md.
         _headline_keys = (
             "move_skill", "look_skill", "target_skill", "attack_skill", "weapon_skill",
+            "move_seg_skill", "jump_skill",
         )
         skill_str = "  ".join(
             f"{k}={float(val_metrics[k]):.4f}"
@@ -1530,6 +1721,16 @@ def run_behavior_cloning(
         val_selection_score = _selection_score(val_metrics)
         selection_metric = val_selection_score
         improved = selection_metric < best_selection_score
+
+        # Epoch-1 sanity gate: kill a run already broken (non-finite or wildly
+        # out-of-band per-head skill) rather than burn the schedule. See BCConfig.
+        _epoch1_abort, _epoch1_reason = _epoch1_sanity_check(
+            val_metrics, _headline_keys,
+            enabled=bool(getattr(config, "epoch1_sanity_abort", True)),
+            floor=float(getattr(config, "epoch1_sanity_skill_floor", -50.0)),
+            ceil=float(getattr(config, "epoch1_sanity_skill_ceil", 1000.0)),
+            is_first_epoch=(epoch == 0),
+        )
 
         # Weight drift: L2 of (weights now) - (weights at epoch start).
         # Non-zero drift in a plateau = model still reorganizing; zero = stuck.
@@ -1703,7 +1904,14 @@ def run_behavior_cloning(
         checkpoint_path = output / _artifacts.ckpt_name(epoch, run_id)
         _artifacts.atomic_torch_save(ckpt_data, checkpoint_path)
         if prev_checkpoint_path is not None and prev_checkpoint_path != checkpoint_path:
-            prev_checkpoint_path.unlink(missing_ok=True)
+            _keep = False
+            if config.checkpoint_keep_every > 0:
+                _parsed_prev = _artifacts.parse_ckpt_name(prev_checkpoint_path.name)
+                if _parsed_prev is not None:
+                    # 1-based epoch stamp: keep e005, e010, ... at keep_every=5.
+                    _keep = (_parsed_prev[0] + 1) % config.checkpoint_keep_every == 0
+            if not _keep:
+                prev_checkpoint_path.unlink(missing_ok=True)
         # Epoch completed cleanly — remove the rolling mid-epoch state.
         mid_epoch_path.unlink(missing_ok=True)
 
@@ -1720,6 +1928,12 @@ def run_behavior_cloning(
 
         if _autostop_now:
             _log(f"Autostop: {_autostop_reason}. Best epoch: {best_epoch + 1}")
+            break
+
+        if _epoch1_abort:
+            _log(f"EPOCH-1 SANITY ABORT: {_epoch1_reason}. Run is broken from the "
+                 f"start — killing after epoch {epoch + 1} instead of running the "
+                 f"full schedule. (agents/conventions.md: validate after epoch 1)")
             break
 
     if best_epoch < 0:
@@ -1767,6 +1981,8 @@ def run_behavior_cloning(
             sequence_length=config.sequence_length,
             tbptt_limit=config.tbptt_limit,
             head_loss_weights=hlw,
+            resident_epoch_pack=bool(config.resident_epoch_pack),
+            reset_aligned_lanes=bool(config.reset_aligned_lanes),
         )
     else:
         final_val_metrics = {"loss": 0.0}

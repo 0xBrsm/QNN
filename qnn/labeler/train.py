@@ -44,7 +44,14 @@ from qnn.actions import (
 from .data import (
     _EpisodeView,
     _load_split,
+    matched_episode_strides,
     op_input_keep_mask,
+)
+from .seg_stats import (
+    downsample_axis,
+    segment_parity,
+    window_all_true,
+    window_ids,
 )
 from .model import (
     CORE_FEAT_DIM,
@@ -134,6 +141,10 @@ class TrainConfig:
     # by `seed` and accumulated until the cap (cap-first, so smaller caps nest in
     # larger ones) — for data-scaling / learning-curve sweeps.
     max_train_frames: int = 0
+    # Native collect rate; the val segment-parity gate downsamples pred/truth
+    # to 20 Hz (stride = round(native_hz / 20)) before computing move_seg
+    # onset/duration parity, matching the GBT relabel-quality table.
+    native_hz: int = 77
 
 
 # Episode loading (_EpisodeView, _load_split) lives in qnn.labeler.data and is
@@ -432,6 +443,27 @@ def train(cfg: TrainConfig) -> None:
     skip    = cfg.feat_spec.use_baseline_skip
     with_ud = cfg.predict_ud
 
+    # ── val segment-parity setup (fb/lr — what the a25 move_seg head trains
+    # on).  Truth streams come from the dataset's precomputed per-episode
+    # targets (post smooth/sanitize, i.e. exactly what CE supervises); -100
+    # frames break segments via the valid mask.  Preds are gathered chunk by
+    # chunk during validation — the val loader is shuffle=False, so chunk
+    # order follows val_ds.index and reconstructs episodes exactly.
+    val_ep_starts = np.zeros(len(val_eps) + 1, dtype=np.int64)
+    val_ep_starts[1:] = np.cumsum([ep.n_frames for ep in val_eps])
+    n_val_frames = int(val_ep_starts[-1])
+    truth_streams = {
+        "fb": np.concatenate(val_ds._fb) if val_ds._fb else np.zeros(0, np.int8),
+        "lr": np.concatenate(val_ds._lr) if val_ds._lr else np.zeros(0, np.int8),
+    }
+    seg_stride: "int | np.ndarray" = max(1, round(cfg.native_hz / 20))
+    ep_strides = matched_episode_strides(cfg.data_dir / "precomputed_val",
+                                         int(seg_stride))
+    if ep_strides is not None and ep_strides.shape[0] == len(val_eps):
+        seg_stride = ep_strides       # matched corpus: real per-episode rates
+    val_win_id, val_n_windows, val_win_starts = window_ids(val_ep_starts,
+                                                           seg_stride)
+
     def _unpack(batch):
         # Layouts: (feats, fb, lr) | (feats, fb, lr, baseline)
         #          (feats, fb, lr, ud) | (feats, fb, lr, ud, baseline)
@@ -556,6 +588,9 @@ def train(cfg: TrainConfig) -> None:
         cm_fb = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
         cm_lr = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
         cm_ud = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
+        pred_streams = {"fb": np.zeros(n_val_frames, dtype=np.int8),
+                        "lr": np.zeros(n_val_frames, dtype=np.int8)}
+        chunk_ptr = 0
         with torch.no_grad():
             for batch in val_loader:
                 feats, fb, lr, ud, baseline = _unpack(batch)
@@ -569,6 +604,27 @@ def train(cfg: TrainConfig) -> None:
                 if with_ud:
                     pred_ud = out["ud"].argmax(-1)
                     _accumulate_cm(cm_ud, ud, pred_ud)
+                # scatter preds back into flat episode streams for the
+                # segment-parity gate (chunk order == val_ds.index order)
+                pf = pred_fb.cpu().numpy()
+                pl = pred_lr.cpu().numpy()
+                for b in range(pf.shape[0]):
+                    ep_idx, start, vlen = val_ds.index[chunk_ptr + b]
+                    off = int(val_ep_starts[ep_idx]) + start
+                    pred_streams["fb"][off:off + vlen] = pf[b, :vlen]
+                    pred_streams["lr"][off:off + vlen] = pl[b, :vlen]
+                chunk_ptr += pf.shape[0]
+
+        # ── 20 Hz segment parity (onset rate + duration-bucket law) ──
+        seg20 = {}
+        for axis in ("fb", "lr"):
+            truth = truth_streams[axis].astype(np.int64)
+            valid = truth != -100
+            p20 = downsample_axis(pred_streams[axis].astype(np.int64),
+                                  val_win_id, val_n_windows)
+            t20 = downsample_axis(truth, val_win_id, val_n_windows)
+            v20 = window_all_true(valid, val_win_id, val_n_windows)
+            seg20[axis] = segment_parity(p20, t20, val_win_starts, valid=v20)
 
         acc_fb, f1_fb = _acc_and_macro_f1(cm_fb)
         acc_lr, f1_lr = _acc_and_macro_f1(cm_lr)
@@ -588,6 +644,13 @@ def train(cfg: TrainConfig) -> None:
         msg += (f"avg-acc={avg_acc:.2f}  avg-F1={avg_f1:.3f}  "
                 f"{time.time() - t0:.1f}s")
         print(msg, flush=True)
+        seg_bits = []
+        for axis in ("fb", "lr"):
+            s = seg20[axis]
+            ratio = (f"x{s['onset_ratio']:.2f}" if s["onset_ratio"] is not None
+                     else "n/a")
+            seg_bits.append(f"{axis} onset {ratio} durTV {s['dur_tv']:.3f}")
+        print(f"  seg20: {'  |  '.join(seg_bits)}", flush=True)
 
         ckpt = {
             "epoch": epoch,
@@ -600,6 +663,7 @@ def train(cfg: TrainConfig) -> None:
             "val_ud": acc_ud,
             "f1_fb": f1_fb, "f1_lr": f1_lr, "f1_ud": f1_ud,
             "val_avg_f1": avg_f1,
+            "seg20": seg20,
             "best_avg_f1": max(best_avg, avg_f1),
             "channels": cfg.channels,
             "n_layers": cfg.n_layers,
@@ -706,6 +770,10 @@ def main() -> None:
                     help="Cap training to at most N frames (whole episodes, "
                          "shuffled by --seed, cap-first). 0 = all. For "
                          "data-scaling / learning-curve sweeps.")
+    ap.add_argument("--native-hz", type=int, default=77,
+                    help="Native collect rate; the val segment-parity gate "
+                         "downsamples to 20 Hz with stride = round(native_hz/20) "
+                         "(default 77 → stride 4), matching the GBT report.")
     args = ap.parse_args()
 
     spec = FeatureSpec(
@@ -739,6 +807,7 @@ def main() -> None:
         predict_ud =args.predict_ud,
         sanitize_targets=args.sanitize_targets,
         max_train_frames=args.max_train_frames,
+        native_hz  =args.native_hz,
     )
     train(cfg)
 

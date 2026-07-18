@@ -46,11 +46,12 @@ def _select_action(
     hidden: np.ndarray,
     mode: str,
     diag_log_path: str | Path | None = None,
+    act_state: Mapping[str, np.ndarray] | None = None,
 ) -> tuple[dict[str, object], np.ndarray]:
     """Run one forward pass and convert the output into the action dict the
     bridge expects.  Mirrors the per-row extraction in qnn.eval.run."""
     action_batch = model.act(_add_batch_dim(obs), mode=mode, hidden=hidden,
-                             diag_log_path=diag_log_path)
+                             diag_log_path=diag_log_path, **(act_state or {}))
     action: dict[str, object] = {
         "move": action_batch.actions["move"][0].astype(np.float32, copy=False).tolist(),
         "look": action_batch.actions["look"][0].astype(np.float32, copy=False).tolist(),
@@ -126,6 +127,9 @@ def play_live(
 
     model = QNNPolicy.load(checkpoint, device=device)
     hidden = model.zero_hidden(1).astype(np.float32, copy=False)
+    # act() state-threading contract (movearch commitment lanes) — same (1,D)
+    # array each step = in-place carry across the bridge session.
+    act_state = model.prepare_act_state(1)
 
     env = {"QUAKE_BASEDIR": str(asset_root)} if asset_root else None
     extra_args: list[str] = []
@@ -150,6 +154,7 @@ def play_live(
             action, hidden = _select_action(
                 model, obs, hidden, mode,
                 diag_log_path=str(model_diag_log_path) if model_diag_log_path else None,
+                act_state=act_state,
             )
             if tick_fp is not None:
                 _write_tick_record(tick_fp, tick, obs, action)

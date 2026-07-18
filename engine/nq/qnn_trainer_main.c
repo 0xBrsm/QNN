@@ -101,6 +101,13 @@ static cvar_t qnn_inv_selected_cvar   = {"qnn_inv_selected",   "0", false, false
    bot is forced to hold this weapon, fixing its engagement range. Mirrors the
    model-set "selected_weapon" surface. */
 static cvar_t qnn_bot_weapon_pin_cvar = {"qnn_bot_weapon_pin", "0", false, false};
+/* QNN acquisition instrument: yaw offset (deg) added to the MODEL player's
+   spawn-spot yaw so it spawns facing AWAY from the opponent (toward a wall) and
+   must ACQUIRE — the target-free -> target flicks the Fitts-throughput
+   (acquisition) axis needs. 0 (default) = normal spawn. Read by QuakeC
+   PutClientInServer; set per-scenario via the "spawn_face_away" reset option so
+   only the acquisition sweep enables it (training/other evals are unchanged). */
+static cvar_t qnn_spawn_face_away_cvar = {"qnn_spawn_face_away", "0", false, false};
 static cvar_t qnn_arena_selfplay_cvar = {"qnn_arena_selfplay", "0", false, false};
 
 /* pr_edict.c exports this without a header prototype. */
@@ -288,6 +295,10 @@ static void QNN_ParseResetOptions(const char *line, qnn_reset_options_t *options
 		else
 			QNN_CvarSetInt("qnn_bot_weapon_pin", 0);
 	}
+	/* QNN acquisition instrument: model spawn-yaw offset (deg). Absent => 0 (off),
+	   so every non-acquisition scenario spawns normally. */
+	QNN_CvarSetInt("qnn_spawn_face_away",
+		QNN_JsonExtractInt(line, "\"spawn_face_away\"", 0));
 	QNN_JsonExtractString(line, "\"pre_map_commands\"", options->pre_map_commands, sizeof(options->pre_map_commands));
 	QNN_JsonExtractString(line, "\"post_map_commands\"", options->post_map_commands, sizeof(options->post_map_commands));
 
@@ -1050,6 +1061,7 @@ int main(int argc, char **argv)
 	Cvar_RegisterVariable(&qnn_inv_powerups_cvar);
 	Cvar_RegisterVariable(&qnn_inv_selected_cvar);
 	Cvar_RegisterVariable(&qnn_bot_weapon_pin_cvar);
+	Cvar_RegisterVariable(&qnn_spawn_face_away_cvar);
 	Cvar_RegisterVariable(&qnn_arena_selfplay_cvar);
 	cls.demonum = -1;
 

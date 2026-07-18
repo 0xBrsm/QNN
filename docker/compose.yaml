@@ -73,6 +73,46 @@ services:
     stdin_open: true
     tty: true
 
+  # CPU work-horse: collects, aimgrid/arena evals, decode-fit campaigns, band
+  # scoring — anything wide/long that would otherwise slam the devcontainer's
+  # 16 GiB cgroup or contend with the trainer. Launch detached like eval runs:
+  #   docker compose -f src/docker/compose.yaml run -d cpu \
+  #       python3 scripts/analysis/aim_grid_closedloop.py ...
+  # Budgets (cpus/mem_limit) are deliberately below host capacity so the
+  # devcontainer stays responsive and the trainer keeps its headroom.
+  cpu:
+    image: ${CPU_IMAGE_TAG:-qnn-cpu:local}
+    build:
+      context: ../..
+      dockerfile: src/docker/Dockerfile.cpu
+    working_dir: /workspace
+    environment:
+      - PYTHONUNBUFFERED=1
+      - QUAKE_BASEDIR=/workspace/assets
+      - QNN_DEVICE=cpu
+      - QNN_ARTIFACT_ROOT=/workspace/assets
+    volumes:
+      - type: bind
+        source: ${HOST_CODE:-${HOST_WORKSPACE:?Set HOST_WORKSPACE to the host repo path}}
+        target: /workspace
+      - type: bind
+        source: ${HOST_DATA:-${HOST_WORKSPACE}}/assets
+        target: /workspace/assets
+      - type: bind
+        source: ${HOST_DATA:-${HOST_WORKSPACE}}/artifacts
+        target: /workspace/artifacts
+      - type: bind
+        source: ${HOST_DATA:-${HOST_WORKSPACE}}/vendor
+        target: /workspace/vendor
+      - type: volume
+        source: qnn-pip-cache
+        target: /home/worker/.cache/pip
+    cpus: ${CPU_WORKER_CPUS:-30}
+    mem_limit: ${CPU_WORKER_MEM:-48g}
+    shm_size: ${CPU_WORKER_SHM_SIZE:-2gb}
+    stdin_open: true
+    tty: true
+
 volumes:
   qnn-pip-cache:
   qnn-miopen-cache:

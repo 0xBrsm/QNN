@@ -7,6 +7,8 @@ Kept as a stable import path; the implementation lives in
 from __future__ import annotations
 
 from qnn.bc.supervised_loop import (
+    GradClipper,
+    GradClipSpec,
     MidEpochState,
     PrecomputedEpisode,
     ResidentSource,
@@ -19,6 +21,8 @@ from qnn.bc.supervised_loop import (
 )
 
 __all__ = [
+    "GradClipper",
+    "GradClipSpec",
     "MidEpochState",
     "PrecomputedEpisode",
     "ResidentSource",

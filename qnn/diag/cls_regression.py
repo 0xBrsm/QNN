@@ -33,6 +33,41 @@ def _ridge_r2(
     return float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
 
 
+def _mlp_r2(
+    X_train: np.ndarray, y_train: np.ndarray,
+    X_val: np.ndarray, y_val: np.ndarray,
+    *, hidden: int = 64, epochs: int = 300, lr: float = 1e-2,
+) -> float:
+    """Nonlinear-probe R²: a small MLP (head-sized, GELU) readout → scalar.
+
+    The gap between this and ``_ridge_r2`` is what a head's own MLP could
+    extract beyond a linear read — i.e. whether the residual the linear probe
+    misses is *present but nonlinear* (MLP recovers it) or *absent* from the
+    readout (MLP stuck near ridge). Features standardized with train stats;
+    seeded for reproducibility.
+    """
+    torch.manual_seed(0)
+    mu = X_train.mean(0); sd = X_train.std(0) + 1e-6
+    Xtr = torch.tensor((X_train - mu) / sd, dtype=torch.float32)
+    Xva = torch.tensor((X_val - mu) / sd, dtype=torch.float32)
+    ytr = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+    net = torch.nn.Sequential(
+        torch.nn.Linear(X_train.shape[1], hidden), torch.nn.GELU(),
+        torch.nn.Linear(hidden, 1),
+    )
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = ((net(Xtr) - ytr) ** 2).mean()
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        pred = net(Xva).squeeze(1).numpy()
+    ss_res = float(np.sum((y_val - pred) ** 2))
+    ss_tot = float(np.sum((y_val - y_val.mean()) ** 2))
+    return (1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+
 def _inject_view_pitch(obs_ep: dict) -> dict:
     """Backfill view_pitch from spatial_dir for legacy shards (no-op if present)."""
     if "view_pitch" in obs_ep or "spatial_dir" not in obs_ep:
@@ -174,10 +209,15 @@ def extract_cls_gru_and_scalars(
             enc_out = policy.model.encoder(policy.model.obs_embedding(obs_t))
             cls_out = enc_out.self_readout                         # (T, d_model)
 
-            # GRU: sequence-first, batch=1, h₀=zeros
-            gru_in = cls_out.unsqueeze(1)                          # (T, 1, d_model)
-            gru_out, _ = policy.model.gru(gru_in)                  # (T, 1, d_gru)
-            gru_out = gru_out.squeeze(1)                           # (T, d_gru)
+            # GRU: sequence-first, batch=1, h₀=zeros. Route through the graph's
+            # temporal node (post-refactor: Network has no bare ``.gru`` attr;
+            # the GRU lives behind Temporal(TemporalInput)).
+            from qnn.model.temporal import TemporalInput
+            temporal_out = policy.model.temporal(TemporalInput(
+                flat_pool=cls_out, hidden=None, reset_mask=None,
+                seq_shape=(cls_out.shape[0], 1),
+            ))
+            gru_out = temporal_out.flat_out                        # (T, d_gru)
 
             cls_list.append(cls_out.cpu().float().numpy())
             gru_list.append(gru_out.cpu().float().numpy())
@@ -205,8 +245,16 @@ def compare_cls_gru_report(
     *,
     max_train_frames: int = 50_000,
     max_val_frames: int = 20_000,
+    include_mlp: bool = False,
 ) -> dict[str, dict[str, float]]:
-    """Fit Ridge for both CLS and GRU h_t; return {scalar: {cls: R², gru: R²}}."""
+    """Fit Ridge (and optionally a head-sized MLP) for CLS and GRU h_t.
+
+    Returns ``{scalar: {cls, gru}}``; with ``include_mlp`` also ``cls_mlp,
+    gru_mlp`` — the nonlinear recoverability from each readout. The MLP-vs-ridge
+    gap on a scalar says whether the readout's linearly-missed variance is
+    present-but-nonlinear (MLP recovers) or genuinely absent (MLP stuck near
+    ridge → a raw obs edge would add real information the head can't reconstruct).
+    """
     train_cls, train_gru, train_sc = extract_cls_gru_and_scalars(
         policy, train_episodes, max_frames=max_train_frames,
     )
@@ -217,10 +265,14 @@ def compare_cls_gru_report(
     out: dict[str, dict[str, float]] = {}
     for name in _SCALAR_NAMES:
         try:
-            out[name] = {
+            entry = {
                 "cls": _ridge_r2(train_cls, train_sc[name], val_cls, val_sc[name]),
                 "gru": _ridge_r2(train_gru, train_sc[name], val_gru, val_sc[name]),
             }
+            if include_mlp:
+                entry["cls_mlp"] = _mlp_r2(train_cls, train_sc[name], val_cls, val_sc[name])
+                entry["gru_mlp"] = _mlp_r2(train_gru, train_sc[name], val_gru, val_sc[name])
+            out[name] = entry
         except Exception as e:  # noqa: BLE001
             out[name] = {"cls": float("nan"), "gru": float("nan"), "_error": str(e)}
     return out

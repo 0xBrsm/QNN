@@ -1059,7 +1059,21 @@ def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
                                       as input_mask. Passed through; load
                                       time unpackers in qnn.bc.train rebuild
                                       the per-axis class streams.
-      look          float32[T, 3]  → float16[T, 3].
+      look          float32[T, 3]  → float16[T, 2] tangent (``look_tan``)
+                                      + float16[T, 3] unit vector (``look``,
+                                      transitional). The tangent z = θ·d̂ is
+                                      the canonical form since the 7/06 fp16
+                                      root cause (research/look-head.md): a
+                                      cast unit vector's x-component destroys
+                                      all angular resolution below ~1.27°
+                                      (arccos near-1 trap), while ‖z‖ = θ is
+                                      linear over [0, π] — fp16 tangent keeps
+                                      ~0.05% relative angle precision
+                                      everywhere, well under the demo angle16
+                                      floor. The 3-vec stays one format rev
+                                      for legacy consumers (look_delta obs
+                                      synthesis, baseline.py); drop it once
+                                      the loader reads look_tan natively.
       weapon        uint8[T]       — raw engine weapon byte (0..8): 0 = no
                                       weapon held, 1..8 = Quake weapon id
                                       (axe..thunderbolt). No-weapon frames
@@ -1091,8 +1105,14 @@ def _compact_action_arrays(act_arrays: dict[str, np.ndarray]) -> None:
         )
 
     look = act_arrays.get("look")
-    if look is not None and look.dtype != np.float16:
-        act_arrays["look"] = np.ascontiguousarray(look, dtype=np.float16)
+    if look is not None:
+        # Canonical compact form FIRST, from the full-precision wire values —
+        # never from the already-cast fp16 3-vec (that would re-inherit the
+        # x-channel comb this format exists to eliminate).
+        from qnn.bc.cache_look_tan import look_to_tangent
+        act_arrays["look_tan"] = look_to_tangent(np.asarray(look, dtype=np.float64))
+        if look.dtype != np.float16:
+            act_arrays["look"] = np.ascontiguousarray(look, dtype=np.float16)
 
     weapon = act_arrays.get("weapon")
     if weapon is not None:
@@ -2114,42 +2134,18 @@ def run_collect(
     if extra_metadata:
         metadata.update(extra_metadata)
 
-    # Record the data-driven look turn-delta grid (sufficient-stat histogram +
-    # fitted Lloyd-Max magnitude centers + hold fraction). This is the "observe"
-    # half: every collect computes a candidate grid + drift stats; a *run* pins a
-    # chosen grid into its own config. Best-effort — never fail a collect over it
-    # (e.g. a collect with no look labels). torch-free (qnn.model.look_grid).
-    try:
-        from qnn.model import look_grid
-        look_grid_block = look_grid.compute_from_collect(output)
-        look_grid_block["tick_hz"] = tick_hz
-        metadata["look_grid"] = look_grid_block
-    except Exception as exc:  # noqa: BLE001 — diagnostic only, must not abort collect
-        print(f"  [collect] look_grid skipped: {exc}")
-
-    # Record the data-driven move-axis dwell-hazard release table beside the look
-    # grid (same observe-then-pin contract): tick-aware bucket edges + fb/lr
-    # release probabilities tabulated from this corpus. A *run* pins it into its
-    # config/move_hazard.json. Best-effort — never fail a collect over it.
-    # torch-free (qnn.model.move_hazard).
-    try:
-        from qnn.model import move_hazard
-        metadata["move_hazard"] = move_hazard.compute_hazard_from_collect(output, tick_hz=tick_hz)
-    except Exception as exc:  # noqa: BLE001 — diagnostic only, must not abort collect
-        print(f"  [collect] move_hazard skipped: {exc}")
-
-    # Record the data-driven weapon WHEN-hazard table beside move_hazard (same
-    # observe-then-pin contract): the combat-frame P(intent-switch | held weapon,
-    # dwell-age, n_owned) the weapon decode gates on. A *run* pins it into its
-    # config/weapon_hazard.json. Best-effort — never fail a collect over it.
-    # torch-free (qnn.model.weapon_hazard).
-    try:
-        from qnn.model import weapon_hazard
-        metadata["weapon_hazard"] = weapon_hazard.compute_hazard_from_collect(output, tick_hz=tick_hz)
-    except Exception as exc:  # noqa: BLE001 — diagnostic only, must not abort collect
-        print(f"  [collect] weapon_hazard skipped: {exc}")
-
     (output / "collect_metadata.json").write_text(json.dumps(metadata, indent=2))
+
+    # Post-collect: record the corpus-derived decode TABLES (look_grid / move_hazard /
+    # weapon_hazard) as top-level collect_metadata.json blocks — the "observe" half of
+    # the observe-then-pin contract (a *run* pins a chosen table into its own config;
+    # run.init reads these keys). qnn.human is the self-contained, torch-free producer
+    # of every corpus human baseline: it reads back the metadata just written, computes
+    # the tables (best-effort per table — a label-less corpus is skipped, never aborts),
+    # and rewrites. The heavier corpus-walk baselines stay compute-on-demand (decode-fit
+    # stage-0 / `python -m qnn.human`), so collect cost is unchanged.
+    from qnn.human import ensure_collect_tables
+    ensure_collect_tables(output)
 
     # Deterministic identity fingerprint of every input that influenced
     # what's on disk (filter, manifest, done log, worker, code).  The

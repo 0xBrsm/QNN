@@ -171,6 +171,25 @@ class WeaponReadiness:
     """Per-weapon readiness × entity_embed einsum (bw,wd->bd)."""
 
 
+# Ammo pools, in the fixed order the dequant emits ``self_ammo_pools`` (B, 4).
+# The four ammo TYPES, not weapons: shells feed SG/SSG, nails NG/SNG, rockets
+# GL/RL, cells LG. Order fixes the AmmoPools embedding-table row layout, so it
+# lives here (never in probe.json), same discipline as ScalarGroup field order.
+AMMO_POOL_NAMES = ("shells", "nails", "rockets", "cells")
+NUM_AMMO_POOLS = len(AMMO_POOL_NAMES)
+
+
+@dataclass(frozen=True, slots=True)
+class AmmoPools:
+    """Per-ammo-pool fraction × learned ammo-type embed einsum (bp,pd->bd).
+
+    The post-masking arsenal signal (P2): 4 ammo-type embeddings each scaled by
+    that pool's normalized ammo fraction. Weapon identity/ownership are owned by
+    the feasibility mask, so this input carries only the graded ammo level. The
+    embedding table is a NEW parameter owned by the TokenBuilder (not tied to the
+    entity vocab — ammo types are not entities)."""
+
+
 @dataclass(frozen=True, slots=True)
 class KindTag:
     """Add the encoder's token-kind embedding row (self/entity/spatial)."""
@@ -178,7 +197,7 @@ class KindTag:
 
 
 # A token is an ordered tuple of these.
-FieldSource = "ScalarGroup | VocabEmbed | VocabSum | WeaponReadiness | KindTag"
+FieldSource = "ScalarGroup | VocabEmbed | VocabSum | WeaponReadiness | AmmoPools | KindTag"
 
 
 def canonical_self_fields(include_weapon_id: bool) -> tuple:

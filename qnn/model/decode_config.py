@@ -34,22 +34,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # Entry points a guard adapter MUST expose — the bit-for-bit eval/export contract.
 _GUARD_REQUIRED = ("guard_attack_logit_for_export", "policy_decode_action_postprocess")
 
-# Legacy --decode-regime / eval regime names → their bundled decode-config JSON.
-# The rc-module chain folded into one param-gated guard; regime selection is now
-# picking a decode config. Shared by tools/export_onnx + qnn.eval.run.
+# Eval regime names → their bundled decode-config JSON. a24 is a RETIRED arch:
+# its entries were pruned with its decode modules (a24 template JSONs remain on
+# disk as history only — they name modules that no longer exist and will fail
+# resolve_decode_config). Regime selection is picking a decode config; unknown
+# names error (config_path_for). Shared by tools/export_onnx + qnn.eval.run.
 _TEMPLATES = _REPO_ROOT / "src/qnn/model/bench/templates"
 REGIME_CONFIGS: dict[str, Path] = {
-    "a24rc1": _TEMPLATES / "decode.a24rc1.json",   # correctness baseline: anti-broken floor, all aim assist neutralized
-    "a24rc1m": _TEMPLATES / "decode.a24rc1m.json", # first tuned operating point (gain 0.03 + snap + weapon_ban)
-    "a24rc1n": _TEMPLATES / "decode.a24rc1n.json", # rc1m heads + rc3 hazard table & "any" dodge (20Hz)
-    "a24rc1o": _TEMPLATES / "decode.a24rc1o.json", # rc1n + non-combat baseline hazard + engagement-gated tau + gain 0.02 (20Hz)
-    "a24rc1p": _TEMPLATES / "decode.a24rc1p.json", # rc1o + log-normal non-combat hazard (tau 0.75/0.91) + skilled lock-on look schedule (gain 0.015, gentle_all) (20Hz)
-    "a24rc2": _TEMPLATES / "decode.a24rc2.json",   # a24rc2a operating point (10Hz)
-    "a24rc3": _TEMPLATES / "decode.a24rc3.json",   # newest 20Hz (rc2-lineage @ 20Hz)
-    "a24rc1q": _TEMPLATES / "decode.a24rc1q.json", # FINAL skill-system decode: dampener turn_mag_scale=0.7 + aim p90 (gain 0.20) + all-humans pins + rc1 SG-ban + rc2/3 guards; rc2/3 non-guard decode superseded
-    "a24rc1r": _TEMPLATES / "decode.a24rc1r.json", # rc1q + VALIDATED RL splash feet-aiming (look.weapon_pitch_gain RL=0.3; closed-loop A/B PASS) + wire.11 in-graph decided ATTACK
-    "a24rc1s": _TEMPLATES / "decode.a24rc1s.json", # rc1r + sampled jump; PATCHED in-place with RL feet-aim pitch bias 3.5° (look.weapon_pitch_bias) — bugfix for RL firing ~1.5° high / landing behind
-    "a24rc4": _TEMPLATES / "decode.a24rc4.json",   # de-scripted-label baseline (weapon-head.md §13): per-model pins (weapon gate 0.65/0.0, attack thr 0.46), p99 aim (= rc1v), argmax jump/fire, NO SG ban (rc1-era label-defect compensation retired)
+    "a25rc1": _TEMPLATES / "decode.a25rc1.json",   # a25-owned template (seg-commitment move + 9-way attack-with): names a25 decode/guard modules so a25 decode-fit + export emit a25 refs
+    "a25base": _TEMPLATES / "decode.a25base.json",  # a25-native BASE template (decode-fit emit base): a25 module pointers + only LIVE param keys, neutral placeholder values
 }
 
 
@@ -62,6 +55,76 @@ def config_path_for(name_or_path: str | Path) -> Path:
         return p
     raise ValueError(f"unknown decode regime / config path: {name_or_path!r}")
 
+# ── FAIL-LOUD required-key manifest ──────────────────────────────────────────
+# Decode params whose ABSENCE silently changes closed-loop behavior via a code-side
+# default (the run-config philosophy: no defaults in code — a config missing a
+# required value must FAIL LOUD, not fall back). This is the SINGLE source of truth
+# validated inside resolve_decode_config, so BOTH consumers (qnn.eval.run and
+# tools/export_onnx) get the check and cannot drift apart.
+#
+# The manifest is PER-DECODE-MODULE, not one global tuple: some silent-default
+# keys are concepts a specific decode arch owns (e.g. the a25 segment-commitment
+# move decode), and requiring them of an arch whose decode law never consumes them
+# would break that arch's configs for no reason. So the required set = a shared
+# BASE (the look.* aim-geometry family every look-decode arch carries) UNION the
+# extras registered for the config's own ``decode_module``.
+#
+# BASE (2026-07-13): the look.* aim-geometry family — six knobs every a25 decode-fit
+# emits. Each silently flips behavior when omitted: the hazard-discounted lead caps
+# default to None=OFF (a25 silently lost the a24 4/5 caps → RL over-leads and rockets
+# land behind), and look.turn_mag_scale defaults to 1.0=OFF (a25 silently ran the
+# a24 0.7 dampener fit on another model).
+REQUIRED_PARAM_KEYS: tuple[str, ...] = (
+    "look.aim_prior_gain",
+    "look.aim_ffwd_gain",
+    "look.aim_mag_gain",
+    "look.turn_mag_scale",
+    "look.lead_hold_cap_frames",
+    "look.lead_hold_cap_radial_frames",
+)
+
+# PER-MODULE extras: keys required ONLY when the config names this decode_module,
+# so promoting an arch-owned silent default does not force pre-a25 arches
+# (qnn.model.decode) or the retired a24 line to carry keys their decode law never
+# reads. a24's modules are deleted, so its configs fail at import before this check.
+#
+#   move.commitment       absent → the a25 segment-commitment move decode silently
+#                          reverts to per-axis sampling (HIGH risk; both live a25
+#                          templates intend true).
+#   look.hold_passthrough absent → engaged head-commanded holds (θ==0) are silently
+#                          α-blended into micro-corrections instead of passed
+#                          through (a25base set true, a25rc1 had OMITTED it → a live
+#                          inconsistency this promotion closes).
+MODULE_REQUIRED_PARAM_KEYS: dict[str, tuple[str, ...]] = {
+    "qnn.model.bench.a25.decode": (
+        "move.commitment",
+        "look.hold_passthrough",
+    ),
+}
+# attack.* / guard.* siblings are NOT yet promoted — see
+# src/docs/decode-config-defaults.md for the full catalog and the deferred set.
+
+
+def _required_param_keys(decode_module: str) -> tuple[str, ...]:
+    """Shared BASE keys plus any registered for this config's decode_module."""
+    return REQUIRED_PARAM_KEYS + MODULE_REQUIRED_PARAM_KEYS.get(decode_module, ())
+
+
+def _validate_required_params(
+    path: Path, params: dict[str, Any], decode_module: str) -> None:
+    """FAIL LOUD when a resolved decode config omits a required param key (the
+    shared BASE plus the extras registered for its decode_module). No code-side
+    default is substituted — the caller must fix the config."""
+    missing = [k for k in _required_param_keys(decode_module) if k not in params]
+    if missing:
+        raise ValueError(
+            f"{path}: decode config (decode_module {decode_module!r}) missing "
+            f"required param key(s) {missing}. These have no code-side default "
+            f"(fail-loud policy — see REQUIRED_PARAM_KEYS / "
+            f"MODULE_REQUIRED_PARAM_KEYS / src/docs/decode-config-defaults.md); add "
+            f"them to the config with an explicit value (OFF is 0.0, not omission).")
+
+
 # decode-config param key -> ExportWrapper / policy kwarg. guard.* keys are not
 # here: they are consumed by the guard module and stamped for provenance.
 # move.stop_onset (bool) and the move_hazard table (a file ref) are handled
@@ -69,15 +132,30 @@ def config_path_for(name_or_path: str | Path) -> Path:
 PARAM_TO_KWARG: dict[str, str] = {
     "look.aim_prior_gain": "look_aim_prior_gain",
     "look.aim_ffwd_gain": "look_aim_ffwd",
-    "weapon.sticky_confidence": "weapon_switch_confidence",
-    "weapon.sticky_margin": "weapon_switch_margin",
-    "move.sticky_tau_fb": "move_sticky_tau_fb",
-    "move.sticky_tau_lr": "move_sticky_tau_lr",
-    "move.switchback_eps": "move_switchback_eps",
-    # attack.threshold RETIRED at wire.11: attack is decoded IN-GRAPH (decided
-    # bit), so there is no engine-side sigmoid>threshold to configure. attack.bias
-    # stays — it is applied inside the in-graph attack decode.
-    "attack.bias": "attack_bias",
+    # a24-only keys (weapon.sticky_*, move.sticky_tau_*, move.switchback_eps,
+    # attack.threshold) were RETIRED with the a24 arch — their decode laws no
+    # longer exist; a config carrying them simply has those keys ignored here
+    # (and flagged by the export's provenance path if load-bearing).
+    "move.commitment": "move_commitment",  # a25 segment-head commitment decode
+    "move.commit_dur_tilt": "move_commit_dur_tilt",  # duration censoring-bias tilt
+    "move.commit_interrupt": "move_commit_interrupt",  # Gate B interrupt opt-out
+    # Sustained per-tick re-decision prob while an incoming projectile is
+    # present (the human-shaped reactivity assist; trim target hazard 1.143)
+    "move.threat_break_hazard": "move_threat_break_hazard",
+    "attack.bias": "attack_bias",  # applied inside the a25 attack_with decode (class-0 offset)
+    # a25 9-way attack-with per-weapon operating point (research/attack-head.md
+    # §11): attack.bias_vec = (8,) per-weapon attack bias applied POST-argmax;
+    # attack.stick_bias = scalar selection hysteresis toward the held weapon.
+    "attack.bias_vec": "attack_bias_vec",
+    "attack.stick_bias": "attack_stick_bias",
+    # a25 discharge-quality gate ("crest-firing"): attack.crest_theta_vec =
+    # (8,) per-weapon alignment threshold θ_w in hbw units (≤0 = OFF for that
+    # weapon); attack.crest_hold_ticks = shared max hold H in ticks (0 = OFF
+    # globally). Both OFF = bit-identical; the countdown latch rides the
+    # existing attack_state wire slot (no wire bump). See
+    # qnn.model.bench.a25.decode.attack_crest_gate_step.
+    "attack.crest_theta_vec": "attack_crest_theta_vec",
+    "attack.crest_hold_ticks": "attack_crest_hold_ticks",
 }
 
 
@@ -146,6 +224,7 @@ def resolve_decode_config(
     cfg = load_decode_config(p)
     decode_mod = importlib.import_module(cfg["decode_module"])
     params = dict(cfg.get("params", {}))
+    _validate_required_params(p, params, cfg["decode_module"])
     guard_name = cfg["guard_module"]
     guard_mod = None
     if guard_name and guard_name != "none":

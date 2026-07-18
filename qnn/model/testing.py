@@ -88,6 +88,7 @@ def make_obs_dict(batch: int, *, seed: int = 0) -> dict[str, torch.Tensor]:
         "self_motion_scalars":  torch.randn(batch, SELF_MOTION_SCALAR_DIM,  generator=gen),
         "self_weapon_id": torch.full((batch, 1), ENTITY_IDS["NAILGUN"], dtype=torch.long),
         "self_weapon_readiness": torch.rand(batch, WEAPON_HEAD_SIZE, generator=gen),
+        "self_ammo_pools": torch.rand(batch, 4, generator=gen),
         "self_armor_type_id": torch.zeros(batch, 1, dtype=torch.long),
         "self_movement_id": torch.zeros(batch, 1, dtype=torch.long),
         "self_powerup_ids":         torch.zeros(batch, 5, dtype=torch.long),

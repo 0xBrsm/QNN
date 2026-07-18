@@ -17,6 +17,7 @@
 #include "qnn_store.h"
 #include "qnn_io.h"
 #include "qnn_demo_sounds.h"
+#include "qnn_context.h"
 
 /* Defined in common/qnn_sound.c */
 extern FILE *qnn_sound_dump;
@@ -373,6 +374,12 @@ int QNN_EventClassifySounds(const qnn_snapshot_t *snapshot, qnn_event_record_t *
 
 qnn_semantic_event_atom_t qnn_semantic_events[QNN_MAX_EVENT_ATOMS];
 int qnn_event_head[QNN_EVENT_HEAD_CAPACITY];
+
+void QNN_EventRegisterContext(void)
+{
+	QNN_ContextRegister(qnn_semantic_events, sizeof(qnn_semantic_events));
+	QNN_ContextRegister(qnn_event_head, sizeof(qnn_event_head));
+}
 
 static void QNN_AppendEvent(int owner_index, int action_id, int source_id)
 {

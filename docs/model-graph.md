@@ -205,7 +205,7 @@ Cache format is frozen (disk budget). A code audit proposed in-process levers; e
 | Cache training-view fingerprint | Negligible | Manifest-level hashing, startup milliseconds; the resident daemon amortizes startup anyway. |
 | Per-step grad-norm `.item()` sync | Already done | Grad norms accumulate as tensors, flushed at epoch end. |
 | bf16 autocast | Already done | `dtype: "bf16"` is the template default (`QNN_AUTOCAST_DTYPE`). |
-| `torch.compile` | Ruled out (measured) | Net-negative at this model size (~189K params); documented in `bc/train.py`. |
+| `torch.compile` | Promoted, narrow scope | Compiling `obs_embedding` + `encoder` after the sync-free rewrite raised the retained real-corpus path from 50.6k to 76.0k RPS. Whole-model/loss compilation and compiled autograd remain net-negative; see `bc/train.py`. |
 | Native PPO collection | Separate campaign | See `research/performance-tuning.md`; the bounded BF16 host-staged pipeline and confirmed 768-lane knee are the retained defaults. |
 
 The real, already-built levers remain the resident ablation daemon (~2.5× vs streaming) and parallel ablation containers (4× sweet spot, 5× practical limit). Further single-job BC throughput means changing the training itself (lane count / model size), not the harness.

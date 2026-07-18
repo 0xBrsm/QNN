@@ -6,5 +6,7 @@
   "pin_memory": true,
   "prefetch": 2,
   "snapshot_interval": 60,
-  "streaming": false
+  "streaming": false,
+  "resident_epoch_pack": false,
+  "reset_aligned_lanes": false
 }

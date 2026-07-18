@@ -9,7 +9,7 @@ recurrent and frame-shuffled batches otherwise, and feeds both to
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Dict, Protocol
@@ -70,6 +70,39 @@ def _drop_dequant_inputs(
     return obs
 
 
+def _compact_resident_event_slots(
+    obs: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Trim resident event tensors to the corpus-wide used slot count.
+
+    The wire contract reserves four event slots per entity, but collected BC
+    corpora commonly use only the first slot. Keeping all four after resident
+    preload makes every training forward embed the unused zero slots and also
+    retains both event tables at their full width in device memory. Inference
+    and streaming inputs keep the wire width; this only compacts a fully-known
+    resident corpus and preserves at least one slot for all-zero corpora.
+    """
+    actions = obs.get("entity_event_actions")
+    sources = obs.get("entity_event_sources")
+    counts = obs.get("entity_event_counts")
+    if actions is None or sources is None or counts is None:
+        return obs
+    if actions.ndim < 1 or sources.shape[-1] != actions.shape[-1]:
+        return obs
+
+    available = int(actions.shape[-1])
+    if available <= 1:
+        return obs
+    # One preload-time sync replaces dense work in every subsequent step.
+    used = max(1, min(available, int(counts.max().item())))
+    if used == available:
+        return obs
+
+    obs["entity_event_actions"] = actions[..., :used].contiguous()
+    obs["entity_event_sources"] = sources[..., :used].contiguous()
+    return obs
+
+
 def _compute_engagement_ema(
     attack: np.ndarray, op: np.ndarray, alpha: float = _ENGAGEMENT_EMA_ALPHA,
 ) -> np.ndarray:
@@ -122,6 +155,8 @@ _RAW_SUM_METRIC_PREFIXES = (
     "looksum_",  # tangent-space look-metric sufficient stats (see qnn.bc.look_metrics)
     "lookdist_",  # binned-head distributional (human-likeness) sufficient stats
     "movedist_",  # move-head distributional (human-likeness) sufficient stats
+    "movesegdist_",  # move_seg_skill sufficient stats (see research/head-metrics.md)
+    "jumpdist_",  # jump_skill sufficient stats (see research/head-metrics.md)
     "weapondist_",  # weapon_skill sufficient stats (see research/head-metrics.md)
     "attackdist_",  # attack_skill sufficient stats (see research/head-metrics.md)
     "targetdist_",  # target_skill sufficient stats (see research/head-metrics.md)
@@ -595,9 +630,65 @@ def _target_skill_from_sums(result: Dict[str, float]) -> None:
     _skill_from_nll(result, "target", nll, h_marg)
 
 
+def _jump_skill_from_sums(result: Dict[str, float]) -> None:
+    """jump_dll / jump_skill from the clean BCE sum + the jump base rate on
+    ground-jump-feasible frames (binary marginal entropy) — the exact
+    attack_skill construction on the jump population."""
+    import numpy as _np
+    if "jumpdist_n" not in result:
+        return
+    n = max(_f(result.pop("jumpdist_n")), 1.0)
+    nll = _f(result.pop("jumpdist_ce_sum")) / n
+    base = min(max(_f(result.pop("jumpdist_pos")) / n, 1e-12), 1.0 - 1e-12)
+    h_marg = float(-(base * _np.log(base) + (1.0 - base) * _np.log(1.0 - base)))
+    _skill_from_nll(result, "jump", nll, h_marg)
+
+
+def _move_seg_skill_from_sums(result: Dict[str, float]) -> None:
+    """move_seg_dll / move_seg_skill from per-axis onset CE sums + joint-class
+    histograms. Mirrors move_skill's convention: dll = mean per-axis
+    (H_marg − NLL), skill = dll / mean per-axis H_marg — the common head ruler
+    (research/head-metrics.md), here over the onset-frame 30-way joint
+    (class × duration-bucket) distribution per fb/lr axis."""
+    if "movesegdist_n_fb" not in result:
+        return
+    axes = ("fb", "lr")
+    dll_axes: list[float] = []
+    h_marg_axes: list[float] = []
+    for axis in axes:
+        n = max(_f(result.pop(f"movesegdist_n_{axis}")), 1.0)
+        nll = _f(result.pop(f"movesegdist_ce_sum_{axis}")) / n
+        h_keys = sorted(
+            (k for k in result if k.startswith(f"movesegdist_h_{axis}_")),
+            key=lambda s: int(s.rsplit("_", 1)[1]),
+        )
+        h_marg = _entropy_from_hist([_f(result.pop(k)) for k in h_keys])
+        dll_axes.append(h_marg - nll)
+        h_marg_axes.append(h_marg)
+    mean_dll = sum(dll_axes) / len(axes)
+    mean_h_marg = sum(h_marg_axes) / len(axes)
+    result["move_seg_dll"] = mean_dll
+    result["move_seg_skill"] = mean_dll / mean_h_marg if mean_h_marg > 1e-12 else 0.0
+    # Water-ud (swim) axis: derived SEPARATELY — 2.9%-of-frames axis, its
+    # noisy estimate must not gate the fb/lr skill or selection.
+    if "movesegdist_n_ud" in result:
+        n_ud = max(_f(result.pop("movesegdist_n_ud")), 1.0)
+        nll_ud = _f(result.pop("movesegdist_ce_sum_ud")) / n_ud
+        h_keys_ud = sorted(
+            (k for k in result if k.startswith("movesegdist_h_ud_")),
+            key=lambda s2: int(s2.rsplit("_", 1)[1]),
+        )
+        h_marg_ud = _entropy_from_hist([_f(result.pop(k)) for k in h_keys_ud])
+        result["move_seg_ud_dll"] = h_marg_ud - nll_ud
+        result["move_seg_ud_skill"] = ((h_marg_ud - nll_ud) / h_marg_ud
+                                       if h_marg_ud > 1e-12 else 0.0)
+
+
 def _apply_stable_epoch_metrics(result: Dict[str, float]) -> None:
     if "tp_attack" in result and "fp_attack" in result and "fn_attack" in result:
         _stable_binary_metrics_from_counts(result, prefix="attack")
+    if "tp_jump" in result and "fp_jump" in result and "fn_jump" in result:
+        _stable_binary_metrics_from_counts(result, prefix="jump")
     _stable_target_metrics_from_counts(result)
     _stable_weapon_metrics_from_counts(result)
     _stable_look_metrics_from_sums(result)
@@ -606,6 +697,8 @@ def _apply_stable_epoch_metrics(result: Dict[str, float]) -> None:
     _weapon_skill_from_sums(result)
     _attack_skill_from_sums(result)
     _target_skill_from_sums(result)
+    _move_seg_skill_from_sums(result)
+    _jump_skill_from_sums(result)
 
 
 def _apply_global_length_bucketing(
@@ -664,10 +757,19 @@ class _PackedChunkPlan:
     active_lanes: int
     dst_indices: np.ndarray
     reset_indices: np.ndarray
+    # Host-known reset timesteps (sorted, deduped across lanes). Passed to the
+    # temporal component via masks["reset_ts"] so GRU segmentation never reads
+    # the reset mask back from the device (a synchronizing copy per batch).
+    reset_ts: tuple[int, ...] | None = None
     # Device-staged views, filled in once at plan-build time so per-batch
     # gather isn't paying a fresh H→D transfer for these tensors.
+    src_indices_d: torch.Tensor | None = None
     dst_indices_d: torch.Tensor | None = None
     reset_indices_d: torch.Tensor | None = None
+    packed_src_indices_d: torch.Tensor | None = None
+    invalid_indices_d: torch.Tensor | None = None
+    valid_mask_d: torch.Tensor | None = None
+    reset_mask_d: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -746,6 +848,18 @@ class ResidentSource:
             {k: v.index_select(0, indices) for k, v in self.obs.items()},
             {k: v.index_select(0, indices) for k, v in self.actions.items()},
         )
+
+    def gather_into(
+        self,
+        indices: torch.Tensor,
+        obs_out: dict[str, torch.Tensor],
+        actions_out: dict[str, torch.Tensor],
+    ) -> None:
+        """Gather resident rows into reusable, shape-stable batch buffers."""
+        for key, value in self.obs.items():
+            torch.index_select(value, 0, indices, out=obs_out[key])
+        for key, value in self.actions.items():
+            torch.index_select(value, 0, indices, out=actions_out[key])
 
     def attack_pos_neg_counts(self, *, op_only: bool = False) -> tuple[int, int]:
         """Return (pos, neg) attack-frame counts.
@@ -984,6 +1098,8 @@ def make_resident_source(
                 )
             )
         gpu_obs = _drop_dequant_inputs(gpu_obs, enabled=compact_dequantized)
+
+    gpu_obs = _compact_resident_event_slots(gpu_obs)
 
     # Precompute per-frame distance-to-nearest-positive WITHIN each
     # episode for the binary action streams that drive distance-
@@ -1607,8 +1723,9 @@ def make_resident_source_from_cache(
             last_report = now
 
     streaming.release_device_tensors()
+    obs_out = _compact_resident_event_slots(obs_out or {})
     return ResidentSource(
-        obs=obs_out or {},
+        obs=obs_out,
         actions=act_out or {},
         episodes=list(streaming.episodes),
         episode_offsets=streaming.episode_offsets.copy(),
@@ -1676,6 +1793,107 @@ def parallel_prefetch_iter(
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+@dataclass
+class GradClipSpec:
+    """Gradient-clip policy for a run. Defaults reproduce the historical
+    fixed / global clip exactly. See BCConfig.grad_clip_* and
+    agents/plans/bc-optimizer-convergence-tuning.md."""
+
+    max_norm: float                 # base clip (BCConfig.max_grad_norm)
+    mode: str = "fixed"             # "fixed" | "adaptive"
+    scope: str = "global"           # "global" | "per_group"
+    ema_k: float = 1.5              # adaptive: threshold = ema_k × EMA(norm)
+    ema_beta: float = 0.99          # adaptive: EMA decay of the pre-clip norm
+    hard_max: float = 0.0           # adaptive: absolute ceiling (0 = none)
+
+
+def _grad_clip_groups(model: nn.Module) -> "OrderedDict[str, list[nn.Parameter]]":
+    """Group parameters WITH gradients by top-level component (the first
+    dotted segment of the parameter name: ``obs_embedding`` / ``encoder`` /
+    ``temporal`` / ``pointer`` / ``<head>``). Matches the component split the
+    Phase-0 per-component grad-norm diagnostics use (``diag.gradients``)."""
+    groups: "OrderedDict[str, list[nn.Parameter]]" = OrderedDict()
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        key = name.split(".", 1)[0]
+        groups.setdefault(key, []).append(p)
+    return groups
+
+
+class GradClipper:
+    """Gradient clipper with optional adaptive threshold and per-group scope.
+
+    Stateful across the WHOLE run: the adaptive EMA (per scope-group) persists
+    between epochs, so the threshold is not cold-started every epoch. Instance
+    is constructed once by the run loop and passed into each training epoch.
+
+    Adaptive threshold uses the PRIOR EMA (history), then folds this step's
+    observed pre-clip norm into the EMA — so the current step is bounded by
+    what recent steps looked like, not by itself. The first step (no EMA yet)
+    clips to ``hard_max`` if set, else ``max_norm`` (never wide open).
+
+    Default spec (mode="fixed", scope="global") is byte-identical to a bare
+    ``torch.nn.utils.clip_grad_norm_(params, max_norm)``.
+    """
+
+    def __init__(self, spec: GradClipSpec) -> None:
+        self.spec = spec
+        self._ema: Dict[str, float] = {}
+
+    @property
+    def active(self) -> bool:
+        return self.spec.max_norm > 0
+
+    def _adaptive_threshold(self, key: str) -> float:
+        s = self.spec
+        prev = self._ema.get(key)
+        if prev is None:
+            # Cold start: never wide open. Prefer the hard ceiling; else the
+            # fixed base clip.
+            return s.hard_max if s.hard_max > 0 else s.max_norm
+        thr = s.ema_k * prev
+        if s.hard_max > 0:
+            thr = min(thr, s.hard_max)
+        return thr
+
+    def _update_ema(self, key: str, observed: float) -> None:
+        s = self.spec
+        prev = self._ema.get(key)
+        self._ema[key] = (
+            observed if prev is None
+            else s.ema_beta * prev + (1.0 - s.ema_beta) * observed
+        )
+
+    def _clip_one(self, key: str, params) -> torch.Tensor:
+        """Clip one scope-group; return its observed pre-clip L2 norm (tensor).
+
+        Fixed mode keeps the norm as a device tensor so the caller can defer
+        the host sync (byte-identical to the historical path). Adaptive mode
+        must read the scalar to update the EMA, so it syncs — opt-in only.
+        """
+        s = self.spec
+        if s.mode != "adaptive":
+            return torch.nn.utils.clip_grad_norm_(params, s.max_norm).detach()
+        gn = torch.nn.utils.clip_grad_norm_(params, self._adaptive_threshold(key)).detach()
+        self._update_ema(key, float(gn))
+        return gn
+
+    def clip(self, model: nn.Module) -> "torch.Tensor | None":
+        """Clip gradients in place; return the observed pre-clip GLOBAL norm
+        (√Σ per-group² under per_group scope) as a device tensor for
+        deferred logging, or None when clipping is disabled / no grads."""
+        if not self.active:
+            return None
+        if self.spec.scope == "per_group":
+            norms = [self._clip_one(k, ps) for k, ps in _grad_clip_groups(model).items()]
+            if not norms:
+                return None
+            stacked = torch.stack(norms)
+            return torch.sqrt((stacked * stacked).sum())
+        return self._clip_one("__global__", model.parameters())
+
+
 def train_on_batches(
     model: "QNNPolicy",
     batches: Iterable[Batch],
@@ -1684,6 +1902,10 @@ def train_on_batches(
     class_weights: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     lr: float | None = None,
     max_grad_norm: float = 1.0,
+    clipper: "GradClipper | None" = None,
+    warmup_steps: int = 0,
+    warmup_base_lr: float = 0.0,
+    warmup_global_offset: int = 0,
     head_loss_weights: Mapping[str, float] | None = None,
     accum_target: float = 1.0,
     initial: Mapping[str, Any] | None = None,
@@ -1696,6 +1918,13 @@ def train_on_batches(
     clip, optimizer step (with optional accumulation), and metric
     aggregation. ``initial`` may seed ``total_rows``/``total_loss``/
     ``opt_steps`` for mid-epoch resume.
+
+    ``clipper`` (when given) owns the grad-clip policy and its cross-epoch
+    adaptive state; it supersedes ``max_grad_norm``. ``warmup_steps`` > 0
+    linearly ramps the LR ``warmup_base_lr`` → ``lr`` over the first
+    ``warmup_steps`` GLOBAL optimizer steps (``warmup_global_offset`` = steps
+    already taken before this epoch); after that the passed-in ``lr`` is used
+    unchanged. All default to today's behavior (fixed global clip, no ramp).
     """
     import time as _time
 
@@ -1721,9 +1950,19 @@ def train_on_batches(
 
     for b in batches:
         if training:
+            # Per-step LR warmup: ramp warmup_base_lr → lr over the first
+            # `warmup_steps` GLOBAL optimizer steps. opt_steps is the index of
+            # the step this micro-batch accumulates toward, so every micro-
+            # batch in one accumulation window sees the same ramped LR.
+            step_lr = lr
+            if warmup_steps > 0 and lr is not None:
+                gstep = warmup_global_offset + opt_steps
+                if gstep < warmup_steps:
+                    frac = (gstep + 1) / warmup_steps
+                    step_lr = warmup_base_lr + (lr - warmup_base_lr) * frac
             metrics = model.supervised_step(
                 b.obs, b.actions, class_weights,
-                lr=lr, accumulate_only=True,
+                lr=step_lr, accumulate_only=True,
                 head_loss_weights=head_loss_weights,
                 loss_scale=b.loss_scale,
                 hidden=b.hidden, masks=b.masks,
@@ -1732,10 +1971,15 @@ def train_on_batches(
             accum_count += b.loss_scale
             stepped = accum_count >= accum_target
             if stepped:
-                if max_grad_norm > 0:
-                    _gn = torch.nn.utils.clip_grad_norm_(
-                        model.model.parameters(), max_grad_norm
-                    ).detach()
+                _gn = (
+                    clipper.clip(model.model) if clipper is not None
+                    else (
+                        torch.nn.utils.clip_grad_norm_(
+                            model.model.parameters(), max_grad_norm
+                        ).detach() if max_grad_norm > 0 else None
+                    )
+                )
+                if _gn is not None:
                     if grad_norm_sum_t is None:
                         grad_norm_sum_t = torch.zeros_like(_gn)
                         grad_norm_max_t = torch.zeros_like(_gn)
@@ -1796,7 +2040,9 @@ def train_on_batches(
 
     # Final partial-accumulation flush.
     if training and accum_count > 0 and not cancelled:
-        if max_grad_norm > 0:
+        if clipper is not None:
+            clipper.clip(model.model)
+        elif max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_grad_norm)
         model.bc_step()
         model.bc_zero_grad()
@@ -1839,24 +2085,54 @@ def build_packed_plans(
     ordered_items: Sequence[tuple[int, PrecomputedEpisode]],
     chunk_size: int,
     n_lanes: int,
+    *,
+    align_resets: bool = False,
 ) -> list[_PackedChunkPlan]:
-    """Bin-pack episodes into ``n_lanes`` lanes (shortest-lane heap),
-    then slice each lane into chunks of ``chunk_size`` rows.
-    """
-    lane_lengths = [0] * n_lanes
-    lane_items: list[list[_LaneItem]] = [[] for _ in range(n_lanes)]
-    lane_heap = [(0, idx) for idx in range(n_lanes)]
-    heapq.heapify(lane_heap)
-    for ep_idx, episode in ordered_items:
-        if episode.n_samples <= 0:
-            continue
-        lane_length, lane = heapq.heappop(lane_heap)
-        item = _LaneItem(ep_idx=ep_idx, episode=episode, lane=lane, lane_start=lane_length)
-        lane_items[lane].append(item)
-        lane_lengths[lane] = lane_length + episode.n_samples
-        heapq.heappush(lane_heap, (lane_lengths[lane], lane))
+    """Lay episodes into ``n_lanes`` lanes, then slice them into chunks.
 
-    total_length = max(lane_lengths, default=0)
+    The default shortest-lane packing minimizes padding. ``align_resets``
+    instead starts a length-sorted wave of up to ``n_lanes`` episodes at the
+    same lane timestep. That adds padding at the end of each wave, but makes
+    episode reset timesteps common across lanes so :class:`Temporal` can run
+    far fewer fused GRU segments.
+    """
+    lane_items: list[list[_LaneItem]] = [[] for _ in range(n_lanes)]
+    positive_items = [
+        (ep_idx, episode)
+        for ep_idx, episode in ordered_items
+        if episode.n_samples > 0
+    ]
+    if align_resets:
+        total_length = 0
+        for wave_start in range(0, len(positive_items), n_lanes):
+            wave = positive_items[wave_start:wave_start + n_lanes]
+            for lane, (ep_idx, episode) in enumerate(wave):
+                lane_items[lane].append(_LaneItem(
+                    ep_idx=ep_idx,
+                    episode=episode,
+                    lane=lane,
+                    lane_start=total_length,
+                ))
+            total_length += max(
+                (episode.n_samples for _ep_idx, episode in wave),
+                default=0,
+            )
+    else:
+        lane_lengths = [0] * n_lanes
+        lane_heap = [(0, idx) for idx in range(n_lanes)]
+        heapq.heapify(lane_heap)
+        for ep_idx, episode in positive_items:
+            lane_length, lane = heapq.heappop(lane_heap)
+            item = _LaneItem(
+                ep_idx=ep_idx,
+                episode=episode,
+                lane=lane,
+                lane_start=lane_length,
+            )
+            lane_items[lane].append(item)
+            lane_lengths[lane] = lane_length + episode.n_samples
+            heapq.heappush(lane_heap, (lane_lengths[lane], lane))
+        total_length = max(lane_lengths, default=0)
     n_chunks = (total_length + chunk_size - 1) // chunk_size
     chunk_slices: list[list[_PackedSlice]] = [[] for _ in range(n_chunks)]
     chunk_rows = [0] * n_chunks
@@ -1928,9 +2204,36 @@ def frame_shuffled_batches(
     else:
         indices = torch.arange(n_frames, device=source.device)
     bs = max(1, int(batch_size))
+    resident = isinstance(source, ResidentSource)
+    resident_obs_buffers: dict[str, torch.Tensor] | None = None
+    resident_action_buffers: dict[str, torch.Tensor] | None = None
+    if resident:
+        resident_obs_buffers = {
+            key: torch.empty((bs, *value.shape[1:]), dtype=value.dtype, device=source.device)
+            for key, value in source.obs.items()
+        }
+        resident_action_buffers = {
+            key: torch.empty((bs, *value.shape[1:]), dtype=value.dtype, device=source.device)
+            for key, value in source.actions.items()
+        }
 
     def _prep(idx: torch.Tensor) -> Batch:
-        obs, actions = source.gather(idx)
+        if resident:
+            assert isinstance(source, ResidentSource)
+            assert resident_obs_buffers is not None
+            assert resident_action_buffers is not None
+            n_rows = int(idx.shape[0])
+            obs = {
+                key: value[:n_rows]
+                for key, value in resident_obs_buffers.items()
+            }
+            actions = {
+                key: value[:n_rows]
+                for key, value in resident_action_buffers.items()
+            }
+            source.gather_into(idx, obs, actions)
+        else:
+            obs, actions = source.gather(idx)
         return Batch(obs=obs, actions=actions, rows=int(idx.shape[0]))
 
     for start in range(0, n_frames, bs):
@@ -1953,6 +2256,8 @@ def lane_packed_batches(
     report_interval_seconds: float = 0.0,
     resume_state: "MidEpochState | None" = None,
     cancel_event: Any = None,
+    resident_epoch_pack: bool = False,
+    reset_aligned_lanes: bool = False,
 ) -> tuple[Iterable[Batch], "Mapping[str, Any] | None", float, int]:
     """Yield lane-packed sequence batches with per-batch hidden propagation.
 
@@ -1983,11 +2288,55 @@ def lane_packed_batches(
         ep_order = _apply_global_length_bucketing(ep_order, episodes)
 
     ordered_items = [(idx, episodes[idx]) for idx in ep_order]
-    plans = build_packed_plans(ordered_items, chunk_size, n_lanes)
+    plans = build_packed_plans(
+        ordered_items,
+        chunk_size,
+        n_lanes,
+        align_resets=reset_aligned_lanes,
+    )
+    offsets = source.episode_offsets
+    resident = isinstance(source, ResidentSource)
     for p in plans:
-        p.dst_indices_d = torch.from_numpy(p.dst_indices).to(device)
-        if p.reset_indices.size:
-            p.reset_indices_d = torch.from_numpy(p.reset_indices).to(device)
+        # reset_indices are flat (T*B) row-major indices → timestep = idx // B.
+        p.reset_ts = tuple(
+            int(t) for t in np.unique(p.reset_indices // p.batch_size)
+        )
+        flat_src = np.empty((p.valid_rows,), dtype=np.int64)
+        cursor = 0
+        for sl in p.slices:
+            base = int(offsets[sl.item.ep_idx]) + sl.src_start
+            flat_src[cursor:cursor + sl.length] = np.arange(
+                base, base + sl.length, dtype=np.int64,
+            )
+            cursor += sl.length
+
+        if resident:
+            # Resident tensors can gather straight into their final (T*B, ...)
+            # layout. Padding rows point at source row zero for the gather and
+            # are zeroed immediately afterwards. All plan indices and masks are
+            # staged once here instead of rebuilt/transferred every microbatch.
+            TB = p.length * p.batch_size
+            packed_src = np.zeros((TB,), dtype=np.int64)
+            packed_src[p.dst_indices] = flat_src
+            valid_mask = np.zeros((TB,), dtype=np.bool_)
+            valid_mask[p.dst_indices] = True
+            invalid = np.flatnonzero(~valid_mask).astype(np.int64, copy=False)
+            reset_mask = np.zeros((TB,), dtype=np.bool_)
+            reset_mask[p.reset_indices] = True
+            p.packed_src_indices_d = torch.from_numpy(packed_src).to(device)
+            p.valid_mask_d = torch.from_numpy(valid_mask).to(device).reshape(
+                p.length, p.batch_size,
+            )
+            p.reset_mask_d = torch.from_numpy(reset_mask).to(device).reshape(
+                p.length, p.batch_size,
+            )
+            if invalid.size:
+                p.invalid_indices_d = torch.from_numpy(invalid).to(device)
+        else:
+            p.src_indices_d = torch.from_numpy(flat_src).to(device)
+            p.dst_indices_d = torch.from_numpy(p.dst_indices).to(device)
+            if p.reset_indices.size:
+                p.reset_indices_d = torch.from_numpy(p.reset_indices).to(device)
 
     next_plan = 0
     initial: Mapping[str, Any] | None = None
@@ -2008,50 +2357,165 @@ def lane_packed_batches(
             if 0 <= lane_idx < n_lanes and ch is not None:
                 lane_hidden[lane_idx].copy_(ch.to(device))
 
-    offsets = source.episode_offsets
+    resident_obs_buffers: dict[str, torch.Tensor] | None = None
+    resident_action_buffers: dict[str, torch.Tensor] | None = None
+    if resident and not resident_epoch_pack:
+        TB = chunk_size * n_lanes
+        resident_obs_buffers = {
+            key: torch.empty((TB, *value.shape[1:]), dtype=value.dtype, device=device)
+            for key, value in source.obs.items()
+        }
+        resident_action_buffers = {
+            key: torch.empty((TB, *value.shape[1:]), dtype=value.dtype, device=device)
+            for key, value in source.actions.items()
+        }
+    epoch_obs: dict[str, torch.Tensor] | None = None
+    epoch_actions: dict[str, torch.Tensor] | None = None
+
+    def _ensure_epoch_packed() -> None:
+        """Materialize this epoch's lane order once instead of per step.
+
+        Construction is lazy so its cost remains inside the reported epoch
+        throughput rather than disappearing into batch-plan setup.
+        """
+        nonlocal epoch_obs, epoch_actions
+        if epoch_obs is not None:
+            return
+        assert isinstance(source, ResidentSource)
+        if not plans:
+            epoch_obs, epoch_actions = {}, {}
+            return
+        TB = chunk_size * n_lanes
+        all_indices = torch.cat([
+            p.packed_src_indices_d for p in plans
+            if p.packed_src_indices_d is not None
+        ])
+        invalid_parts = [
+            p.invalid_indices_d + plan_idx * TB
+            for plan_idx, p in enumerate(plans)
+            if p.invalid_indices_d is not None
+        ]
+        all_invalid = torch.cat(invalid_parts) if invalid_parts else None
+
+        packed_rows = int(all_indices.numel())
+        packed_bytes = sum(
+            packed_rows * value[0].numel() * value.element_size()
+            for fields in (source.obs, source.actions)
+            for value in fields.values()
+        )
+        print(
+            f"  [bc/epoch-pack] materializing {packed_rows:,} rows "
+            f"({packed_bytes / (1024 ** 3):.2f} GiB)",
+            flush=True,
+        )
+
+        def _pack(fields: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            packed: dict[str, torch.Tensor] = {}
+            for key, value in fields.items():
+                out = value.index_select(0, all_indices)
+                if all_invalid is not None:
+                    out.index_fill_(0, all_invalid, 0)
+                packed[key] = out
+            return packed
+
+        epoch_obs = _pack(source.obs)
+        epoch_actions = _pack(source.actions)
+        if device.type == "cuda":
+            print(
+                "  [bc/epoch-pack] ready: "
+                f"allocated={torch.cuda.memory_allocated(device) / (1024 ** 3):.2f} GiB  "
+                f"reserved={torch.cuda.memory_reserved(device) / (1024 ** 3):.2f} GiB  "
+                f"peak={torch.cuda.max_memory_allocated(device) / (1024 ** 3):.2f} GiB",
+                flush=True,
+            )
     _last_save_time = _time.monotonic()
     _last_report_time = _time.monotonic() - max(float(report_interval_seconds), 0.0)
     _report: Dict[str, Any] = {
         "rows": 0, "metric_rows": 0, "loss_t": None, "avg": {}, "raw": {},
     }
 
-    def _gather_plan(plan: _PackedChunkPlan):
-        flat_src = np.empty((plan.valid_rows,), dtype=np.int64)
-        cursor = 0
-        for sl in plan.slices:
-            base = int(offsets[sl.item.ep_idx]) + sl.src_start
-            flat_src[cursor:cursor + sl.length] = np.arange(base, base + sl.length, dtype=np.int64)
-            cursor += sl.length
-        src_idx = torch.from_numpy(flat_src).to(device)
-        dst_idx = plan.dst_indices_d  # pre-staged on device at plan-build time
+    def _gather_plan(plan: _PackedChunkPlan, plan_idx: int):
         T = plan.length
         B = plan.batch_size
         TB = T * B
 
-        gathered_obs, gathered_acts = source.gather(src_idx)
+        if resident:
+            assert isinstance(source, ResidentSource)
+            if resident_epoch_pack:
+                _ensure_epoch_packed()
+                assert epoch_obs is not None
+                assert epoch_actions is not None
+                start = plan_idx * TB
+                stop = start + TB
+                obs_batch = {
+                    key: value[start:stop].reshape(T, B, *value.shape[1:])
+                    for key, value in epoch_obs.items()
+                }
+                act_batch = {
+                    key: value[start:stop].reshape(T, B, *value.shape[1:])
+                    for key, value in epoch_actions.items()
+                }
+                return obs_batch, act_batch, {
+                    "valid_mask": plan.valid_mask_d,
+                    "reset_mask": plan.reset_mask_d,
+                    "reset_ts": plan.reset_ts,
+                }
+            assert resident_obs_buffers is not None
+            assert resident_action_buffers is not None
+            assert plan.packed_src_indices_d is not None
+            assert plan.valid_mask_d is not None
+            assert plan.reset_mask_d is not None
+            source.gather_into(
+                plan.packed_src_indices_d,
+                resident_obs_buffers,
+                resident_action_buffers,
+            )
+            if plan.invalid_indices_d is not None:
+                for buffer in resident_obs_buffers.values():
+                    buffer.index_fill_(0, plan.invalid_indices_d, 0)
+                for buffer in resident_action_buffers.values():
+                    buffer.index_fill_(0, plan.invalid_indices_d, 0)
+            obs_batch = {
+                key: value.reshape(T, B, *value.shape[1:])
+                for key, value in resident_obs_buffers.items()
+            }
+            act_batch = {
+                key: value.reshape(T, B, *value.shape[1:])
+                for key, value in resident_action_buffers.items()
+            }
+            return obs_batch, act_batch, {
+                "valid_mask": plan.valid_mask_d,
+                "reset_mask": plan.reset_mask_d,
+                "reset_ts": plan.reset_ts,
+            }
+
+        assert plan.src_indices_d is not None
+        assert plan.dst_indices_d is not None
+        gathered_obs, gathered_acts = source.gather(plan.src_indices_d)
         obs_batch: dict[str, torch.Tensor] = {}
         for k, v in gathered_obs.items():
             buf = torch.zeros((TB, *v.shape[1:]), dtype=v.dtype, device=device)
-            buf.index_copy_(0, dst_idx, v)
+            buf.index_copy_(0, plan.dst_indices_d, v)
             obs_batch[k] = buf.reshape(T, B, *v.shape[1:])
         act_batch: dict[str, torch.Tensor] = {}
         for k, v in gathered_acts.items():
             buf = torch.zeros((TB, *v.shape[1:]), dtype=v.dtype, device=device)
-            buf.index_copy_(0, dst_idx, v)
+            buf.index_copy_(0, plan.dst_indices_d, v)
             act_batch[k] = buf.reshape(T, B, *v.shape[1:])
 
         valid_flat = torch.zeros(TB, dtype=torch.bool, device=device)
-        valid_flat.index_fill_(0, dst_idx, True)
+        valid_flat.index_fill_(0, plan.dst_indices_d, True)
         reset_flat = torch.zeros(TB, dtype=torch.bool, device=device)
         if plan.reset_indices_d is not None:
             reset_flat.index_fill_(0, plan.reset_indices_d, True)
         return obs_batch, act_batch, {
             "valid_mask": valid_flat.reshape(T, B),
             "reset_mask": reset_flat.reshape(T, B),
+            "reset_ts": plan.reset_ts,
         }
 
     def _make_batch(plan: _PackedChunkPlan, plan_idx: int) -> Batch:
-        obs_b, act_b, masks = _gather_plan(plan)
+        obs_b, act_b, masks = _gather_plan(plan, plan_idx)
         if training:
             sample = (report_interval_seconds <= 0) or (
                 _time.monotonic() - _last_report_time >= report_interval_seconds
@@ -2167,6 +2631,10 @@ def run_epoch(
     lr: float | None = None,
     rng: np.random.Generator | None = None,
     max_grad_norm: float = 1.0,
+    clipper: "GradClipper | None" = None,
+    warmup_steps: int = 0,
+    warmup_base_lr: float = 0.0,
+    warmup_global_offset: int = 0,
     head_loss_weights: Mapping[str, float] | None = None,
     save_state_callback: Any = None,
     snapshot_interval: int = 0,
@@ -2175,6 +2643,8 @@ def run_epoch(
     report_interval_seconds: float = 0.0,
     resume_state: "MidEpochState | None" = None,
     cancel_event: Any = None,
+    resident_epoch_pack: bool = False,
+    reset_aligned_lanes: bool = False,
 ) -> Dict[str, float]:
     """Single supervised-epoch entry point.
 
@@ -2184,6 +2654,16 @@ def run_epoch(
     """
     if source.n_total_rows == 0:
         return {"loss": 0.0, "accuracy": 0.0, "n_rows": 0.0}
+
+    # Also catches a source retained by the daemon across a code reload. New
+    # resident sources are compacted during preload; an already-resident source
+    # gets the same one-time compaction before batch buffers are allocated.
+    # Use the resident source's structural ``obs`` marker rather than an
+    # ``isinstance`` check. A daemon hot-reload deliberately keeps the old
+    # source object while rebinding this module's ResidentSource class.
+    resident_obs = getattr(source, "obs", None)
+    if isinstance(resident_obs, dict):
+        _compact_resident_event_slots(resident_obs)
 
     training = class_weights is not None and lr is not None
     accum_target: float = 1.0
@@ -2209,6 +2689,8 @@ def run_epoch(
             report_interval_seconds=report_interval_seconds,
             resume_state=resume_state,
             cancel_event=cancel_event,
+            resident_epoch_pack=resident_epoch_pack,
+            reset_aligned_lanes=reset_aligned_lanes,
         )
     else:
         batches = frame_shuffled_batches(
@@ -2229,6 +2711,10 @@ def run_epoch(
         training=training,
         class_weights=class_weights, lr=lr,
         max_grad_norm=max_grad_norm,
+        clipper=clipper,
+        warmup_steps=warmup_steps,
+        warmup_base_lr=warmup_base_lr,
+        warmup_global_offset=warmup_global_offset,
         head_loss_weights=head_loss_weights,
         accum_target=accum_target,
         initial=initial,

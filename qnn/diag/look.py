@@ -1006,6 +1006,7 @@ def look_ground_spin(
         install_polar_grid(
             torch.tensor(_lg["mag_centers_rad"], dtype=torch.float32),
             torch.tensor(_lg["dir_centers_rad"], dtype=torch.float32),
+            deadzone_rad=_lg.get("deadzone_rad"),
         )
 
     import qnn.model.look_bins as _lb_live
@@ -1422,7 +1423,7 @@ def look_aim_prior_decode(
         ACTOR_REL_OFFSET, ACTOR_VEL_OFFSET, ACTOR_TEAM_OFFSET,
         TEAM_TEAMMATE_VALUE, build_model_weapon_scalars,
     )
-    from qnn.model.bench.a24.lead_aim import (
+    from qnn.model.bench.a25.lead_aim import (
         compute_lead_aim, held_weapon_trajectory, pooled_aim_vec,
     )
     from qnn.model.look_bins import install_polar_grid
@@ -1436,6 +1437,7 @@ def look_aim_prior_decode(
         install_polar_grid(
             torch.tensor(_lg["mag_centers_rad"], dtype=torch.float32),
             torch.tensor(_lg["dir_centers_rad"], dtype=torch.float32),
+            deadzone_rad=_lg.get("deadzone_rad"),
         )
 
     import qnn.model.look_bins as _lb_live

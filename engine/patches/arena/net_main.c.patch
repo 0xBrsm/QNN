@@ -11,3 +11,12 @@
  	slistSilent = host ? true : false;
  	NET_Slist_f ();
  
+@@ -833,6 +837,8 @@
+ 	}
+ 
+ 	net_numsockets = svs.maxclientslimit;
++	if (COM_CheckParm("-qnn_virtual_clients"))
++		net_numsockets = svs.maxclientslimit * 2 + 1;
+ 	if (cls.state != ca_dedicated)
+ 		net_numsockets++;
+ 

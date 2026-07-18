@@ -1,0 +1,648 @@
+{
+  "schema": "skill_curve_v1",
+  "axis": "mechanical_aim",
+  "scope": "AIM-only mechanical knob; tactical/strategic axes DEFERRED",
+  "skill_index": "leave-one-out within-weapon coh percentile (behavioral)",
+  "substrate": {
+    "look.turn_mag_scale": 0.7,
+    "look.hold_drift_eps": 0.0,
+    "fit_order": "dampener-before-aim"
+  },
+  "piecewise": {
+    "down": {
+      "range": "s < p21",
+      "knob": "look.aim_degrade_lag_frames",
+      "anchors": [
+        {
+          "pct": 21.1,
+          "lag_frames": 0.0
+        },
+        {
+          "pct": 27.106569505598333,
+          "lag_frames": 12.0
+        },
+        {
+          "pct": 30.07149732693325,
+          "lag_frames": 5.0
+        },
+        {
+          "pct": 31.30312957202521,
+          "lag_frames": 8.0
+        },
+        {
+          "pct": 38.13314953133781,
+          "lag_frames": 3.0
+        },
+        {
+          "pct": 49.32163335713828,
+          "lag_frames": 2.0
+        },
+        {
+          "pct": 50.3974552430199,
+          "lag_frames": 1.0
+        },
+        {
+          "pct": 59.86498833713872,
+          "lag_frames": 0.5
+        }
+      ]
+    },
+    "up": {
+      "range": "p21 \u2264 s \u2264 p68",
+      "knob": "look.aim_prior_gain",
+      "anchors": [
+        {
+          "pct": 21.1,
+          "gain": 0.0
+        },
+        {
+          "pct": 44.1,
+          "gain": 0.1
+        },
+        {
+          "pct": 50.9,
+          "gain": 0.13
+        },
+        {
+          "pct": 51.3,
+          "gain": 0.16
+        },
+        {
+          "pct": 67.5,
+          "gain": 0.2
+        }
+      ]
+    },
+    "super": {
+      "range": "s > p68",
+      "knob": "look.aim_mag_gain (\u03b1), gain pinned at knee 0.2",
+      "anchors": [
+        {
+          "pct": 67.5,
+          "alpha": 0.0
+        },
+        {
+          "pct": 67.8,
+          "alpha": 0.05
+        },
+        {
+          "pct": 74.0,
+          "alpha": 0.1
+        },
+        {
+          "pct": 83.0,
+          "alpha": 0.3
+        },
+        {
+          "pct": 91.4,
+          "alpha": 0.5
+        }
+      ]
+    }
+  },
+  "per_weapon_gain_table": {
+    "shotgun": [
+      {
+        "pct": 10,
+        "coh_human": 0.0882,
+        "coh_source": "per_weapon",
+        "gain": 0.03,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.1216,
+        "coh_source": "per_weapon",
+        "gain": 0.03,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.1539,
+        "coh_source": "per_weapon",
+        "gain": 0.03,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.1939,
+        "coh_source": "per_weapon",
+        "gain": 0.0828906035728243,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.2353,
+        "coh_source": "per_weapon",
+        "gain": 0.31842346471127403,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.2688,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.3678,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "lightning": [
+      {
+        "pct": 10,
+        "coh_human": 0.1381,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.1893,
+        "coh_source": "per_weapon",
+        "gain": 0.05479028697571744,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.2588,
+        "coh_source": "per_weapon",
+        "gain": 0.3415487443208872,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.3402,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.4108,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.4462,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.5393,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "nailgun": [
+      {
+        "pct": 10,
+        "coh_human": 0.0165,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.0335,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.0566,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.088,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.1342,
+        "coh_source": "per_weapon",
+        "gain": 0.15831533477321816,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.1668,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.2478,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "rocket_launcher": [
+      {
+        "pct": 10,
+        "coh_human": 0.0378,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.0462,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.0572,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.0696,
+        "coh_source": "per_weapon",
+        "gain": 0.03990163934426228,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.0856,
+        "coh_source": "per_weapon",
+        "gain": 0.09747503566333808,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.0958,
+        "coh_source": "per_weapon",
+        "gain": 0.13375241779497096,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.1247,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "grenade_launcher": [
+      {
+        "pct": 10,
+        "coh_human": 0.0092,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.0172,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.0325,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.0551,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.0827,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.1064,
+        "coh_source": "per_weapon",
+        "gain": 0.02372688477951635,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.2142,
+        "coh_source": "per_weapon",
+        "gain": 0.35,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "super_shotgun": [
+      {
+        "pct": 10,
+        "coh_human": 0.0603,
+        "coh_source": "per_weapon",
+        "gain": 0.03,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.0935,
+        "coh_source": "per_weapon",
+        "gain": 0.03,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.1352,
+        "coh_source": "per_weapon",
+        "gain": 0.03,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.181,
+        "coh_source": "per_weapon",
+        "gain": 0.06295029926052224,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.2311,
+        "coh_source": "per_weapon",
+        "gain": 0.3030247479376718,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.2859,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.378,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "super_nailgun": [
+      {
+        "pct": 10,
+        "coh_human": 0.0196,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.0433,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.0629,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.0889,
+        "coh_source": "per_weapon",
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.1164,
+        "coh_source": "per_weapon",
+        "gain": 0.06381950655830056,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.1393,
+        "coh_source": "per_weapon",
+        "gain": 0.18034557235421161,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.2095,
+        "coh_source": "per_weapon",
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ]
+  },
+  "all_humans_pins": {
+    "look.turn_mag_scale": 0.7,
+    "look.aim_ffwd_gain": 0.0,
+    "move.commitment": true,
+    "move.commit_interrupt": false,
+    "move.commit_dur_tilt": [
+      0.1614,
+      0.1968
+    ],
+    "weapon_ban": []
+  },
+  "move_hazard": "RETIRED \u2014 move_seg commitment decode (dur_tilt=[0.1614, 0.1968], interrupt=False); no sticky/lognorm stack",
+  "guards": {},
+  "non_lever_verdicts": {
+    "MOVE": "commitment decode (semi-Markov segment head) \u2014 per-checkpoint fitted dur_tilt=[0.1614, 0.1968], interrupt off; sticky_tau + corpus lognorm hazard RETIRED",
+    "LOOK_style": null,
+    "WEAPON_select": "human target RETRACTED (coh artifact); gate diag only, DEFERRED",
+    "ATTACK": "all-humans pin \u2014 attack.bias calibration, cone low/off, sampled"
+  },
+  "model_verification": {
+    "per_weapon_coh": {
+      "SG": {
+        "model_coh_5deg": 0.1872,
+        "n": 6788,
+        "low_n": false,
+        "human_floor_percentile": 70.9,
+        "human_p50": 0.1545,
+        "human_p90": 0.2337
+      },
+      "SSG": {
+        "model_coh_5deg": 0.1493,
+        "n": 864,
+        "low_n": true,
+        "human_floor_percentile": 57.3,
+        "human_p50": 0.1374,
+        "human_p90": 0.2214
+      },
+      "NG": {
+        "model_coh_5deg": 0.0853,
+        "n": 375,
+        "low_n": true,
+        "human_floor_percentile": 72.3,
+        "human_p50": 0.0602,
+        "human_p90": 0.115
+      },
+      "SNG": {
+        "model_coh_5deg": 0.0395,
+        "n": 456,
+        "low_n": true,
+        "human_floor_percentile": 17.7,
+        "human_p50": 0.0655,
+        "human_p90": 0.1136
+      },
+      "LG": {
+        "model_coh_5deg": 0.3127,
+        "n": 1033,
+        "low_n": true,
+        "human_floor_percentile": 65.5,
+        "human_p50": 0.2621,
+        "human_p90": 0.4103
+      },
+      "NAILS(pooled)": {
+        "model_coh_5deg": 0.0602,
+        "n": 831,
+        "low_n": true,
+        "human_floor_percentile": 50.0,
+        "note": "NG+SNG pooled (kinematics-identical)"
+      }
+    },
+    "look_style": null,
+    "native_floor_percentile_mean": 70.9,
+    "vertical_feet_gap": {
+      "note": "run scripts/analysis/rl_aim_vertical_residual.py to measure"
+    }
+  },
+  "provenance": {
+    "checkpoint": "runs/bc/bench/head_probe_move_seg_a1p_seed17/checkpoints/best_20260705-7n1zex.pth",
+    "model_id": "head_probe_move_seg_a1p_seed17",
+    "corpus_dir": "/workspaces/dev-qnn/artifacts/collect/qwd",
+    "corpus_fingerprint": "sha256:44a4730af660577e4138e9d3dd5c2088eb376d54ba7881bc9dc97ba02f71720a",
+    "look_grid": "runs/bc/bench/head_probe_move_seg_a1p_seed17/config/look_grid.json",
+    "look_grid_sha256": "2f4ea33e88e990d694182efb5676d793414cdf9e3617d481843ed2fca304e34b",
+    "git_commit": "d9a9e76a"
+  },
+  "aim_artifact_commits": {
+    "psegment": "e1979ad233f0c85f112f7025990cb10ec4f52240",
+    "frontier": "e1979ad233f0c85f112f7025990cb10ec4f52240"
+  }
+}

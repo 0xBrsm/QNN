@@ -8,6 +8,7 @@
 
 #include "qnn_object.h"
 #include "qnn_map.h"
+#include "qnn_context.h"
 
 /* ── Team detection (NQ): pants color is the engine's own team field ────
  *   Matches engine logic: ent->v.team = (colors & 15) + 1  (host_cmd.c).
@@ -22,6 +23,13 @@
 static int qnn_cached_pants[QNN_MAX_CACHED_PLAYERS];
 static int qnn_cached_pants_count = 0;
 static int qnn_self_pants_cached = -1;
+
+void QNN_PlayersRegisterContext(void)
+{
+	QNN_ContextRegister(qnn_cached_pants, sizeof(qnn_cached_pants));
+	QNN_ContextRegister(&qnn_cached_pants_count, sizeof(qnn_cached_pants_count));
+	QNN_ContextRegister(&qnn_self_pants_cached, sizeof(qnn_self_pants_cached));
+}
 
 static void QNN_LatchTeamColors(void)
 {

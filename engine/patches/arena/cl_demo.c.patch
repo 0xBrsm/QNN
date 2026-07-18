@@ -1,0 +1,11 @@
+--- cl_demo.c
++++ cl_demo.c
+@@ -94,6 +94,9 @@
+ 	int		r, i;
+ 	float	f;
+ 	
++	if (QNN_ArenaVirtualMirrorActive())
++		return QNN_ArenaVirtualGetMessage();
++
+ 	if	(cls.demoplayback)
+ 	{

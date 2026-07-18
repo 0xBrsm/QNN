@@ -243,9 +243,15 @@ const char *QNN_ProgString(string_t value)
 }
 
 /* QNN_TraceLine (NQ) — forwards to upstream's SV_RecursiveHullCheck from
- * world.c.  Shared declaration in qnn_object.h. */
+ * world.c, then clips the same segment against every solid mover brush
+ * submodel at its live origin so movers occlude like static geometry
+ * (spatial rays shorten at a door face; an enemy behind a closed door
+ * drops from SIGHT).  Shared declaration in qnn_object.h. */
 void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
 {
+	int mover_count;
+	int i;
+
 	if (trace == NULL)
 		return;
 	if (cl.worldmodel == NULL)
@@ -265,4 +271,38 @@ void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
 	trace->fraction = 1.0f;
 	SV_RecursiveHullCheck(cl.worldmodel->hulls, 0, 0, 1,
 		(float *)start, (float *)end, trace);
+
+	/* Clip against solid movers at their live origins.  The mover set is
+	 * cached once per observation frame (QNN_TraceMoverCacheRefresh), so
+	 * this loop adds no re-scan per ray.  When no mover intersects nearer
+	 * than the world trace, `trace` is left exactly as world.c produced
+	 * it — bit-identical to the static-only path. */
+	mover_count = QNN_TraceMoverCacheRefresh();
+	for (i = 0; i < mover_count; i++)
+	{
+		model_t *m = QNN_TraceMoverModel(i);
+		float *origin = QNN_TraceMoverOrigin(i);
+		hull_t *hull;
+		trace_t mt;
+		vec3_t start_l, end_l;
+
+		if (m == NULL)
+			continue;
+		hull = &m->hulls[0];
+		VectorSubtract(start, origin, start_l);
+		VectorSubtract(end, origin, end_l);
+		memset(&mt, 0, sizeof(mt));
+		mt.fraction = 1.0f;
+		SV_RecursiveHullCheck(hull, hull->firstclipnode, 0, 1,
+			start_l, end_l, &mt);
+		if (mt.fraction < trace->fraction)
+		{
+			vec3_t delta;
+			trace->fraction = mt.fraction;
+			trace->allsolid = mt.allsolid;
+			trace->startsolid = mt.startsolid;
+			VectorSubtract(end, start, delta);
+			VectorMA(start, mt.fraction, delta, trace->endpos);
+		}
+	}
 }

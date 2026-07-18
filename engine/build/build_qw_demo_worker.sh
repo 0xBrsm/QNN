@@ -96,6 +96,7 @@ QW_UPSTREAM_SOURCES=(
 # Shared qnn_* files are in src/engine/common/.
 
 QW_CUSTOM_SOURCES=(
+  "${ENGINE_DIR}/common/qnn_context.c"
   "${ENGINE_DIR}/qw/qnn_sys.c"
   "${ENGINE_DIR}/common/qnn_sys_common.c"
   "${ENGINE_DIR}/qw/qnn_collect_main.c"

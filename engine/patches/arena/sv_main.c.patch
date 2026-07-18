@@ -1,6 +1,14 @@
 --- sv_main.c
 +++ sv_main.c
-@@ -739,6 +739,10 @@
+@@ -291,6 +291,7 @@
+ 			client->spawn_parms[i] = (&pr_global_struct->parm1)[i];
+ 	}
+ 
++	QNN_ArenaVirtualAttach (client);
+ 	SV_SendServerinfo (client);
+ }
+ 
+@@ -739,11 +740,16 @@
  
  	SV_WriteEntitiesToClient (client->edict, &msg);
  
@@ -10,3 +18,26 @@
 +
  // copy the server datagram if there is space
  	if (msg.cursize + sv.datagram.cursize < msg.maxsize)
+ 		SZ_Write (&msg, sv.datagram.data, sv.datagram.cursize);
+ 
+ // send the datagram
++	QNN_ArenaVirtualMirrorMessage (client, &msg, 2);
+ 	if (NET_SendUnreliableMessage (client->netconnection, &msg) == -1)
+ 	{
+ 		SV_DropClient (true);// if the message couldn't send, kick off
+@@ -806,6 +812,7 @@
+ 	msg.cursize = 0;
+ 
+ 	MSG_WriteChar (&msg, svc_nop);
++	QNN_ArenaVirtualMirrorMessage (client, &msg, 2);
+ 
+ 	if (NET_SendUnreliableMessage (client->netconnection, &msg) == -1)
+ 		SV_DropClient (true);	// if the message couldn't send, kick off
+@@ -873,6 +880,7 @@
+ 				SV_DropClient (false);	// went to another level
+ 			else
+ 			{
++				QNN_ArenaVirtualMirrorMessage (host_client, &host_client->message, 1);
+ 				if (NET_SendMessage (host_client->netconnection
+ 					, &host_client->message) == -1)
+ 					SV_DropClient (true);	// if the message couldn't send, kick off

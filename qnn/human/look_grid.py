@@ -37,8 +37,21 @@ DEFAULT_N_MAG: int = 12
 DEFAULT_FOVEA_POWER: float = 2.5
 THETA_MAX: float = float(np.pi)          # turn angle ≤ π
 
+# Label deadzone = the source resolution floor (QW angle16: 360/65536 deg).
+# Since the 7/06 point-mass-hold scheme (research/look-head.md): hold is the
+# TRUE stillness point mass (~19% exact zeros — zero mouse counts in a tick),
+# not a small-angle region; below this floor a "turn" is physically
+# meaningless in the recording format. Decoupled from grid geometry — the
+# legacy rung1/2 rule deleted real drift as a side-effect of rung placement.
+SOURCE_FLOOR_RAD: float = float(2.0 * np.pi / 65536.0)   # ≈ 9.59e-5 rad = 0.0055°
+
 # θ histogram (sufficient stat) resolution. Uniform over [0, π].
-HIST_NBINS: int = 720                    # 0.25° per bin
+# 7200 (0.025°/bin) since the 7/06 fp16 root-cause fix: the honest corpus has
+# ~20% of its nonzero mass below 1° and the Lloyd-Max fovea rung lands at
+# ~0.9° — 0.25° bins cannot place it. Metadata blocks written at 720 bins
+# remain readable (theta_hist.nbins is stored); drift EMD comparisons require
+# matching nbins on both sides.
+HIST_NBINS: int = 7200                   # 0.025° per bin
 HIST_EDGES: np.ndarray = np.linspace(0.0, THETA_MAX, HIST_NBINS + 1)
 _HIST_CENTERS: np.ndarray = (HIST_EDGES[:-1] + HIST_EDGES[1:]) / 2.0
 
@@ -103,9 +116,16 @@ def code_default_grid(
 
 
 def theta_from_look(look: np.ndarray) -> np.ndarray:
-    """(N, 3) unit look vectors → (N,) turn angle θ in radians. forward=(1,0,0)."""
-    x = np.clip(look[:, 0].astype(np.float64), -1.0, 1.0)
-    return np.arccos(x)
+    """(N, 3) unit look vectors → (N,) turn angle θ in radians. forward=(1,0,0).
+
+    ``atan2(|yz|, x)``, NOT ``arccos(x)`` — on fp16-cached vectors the arccos
+    form combs θ onto √n·1.79° and zeroes every turn below ~1.27° (the 7/06
+    root cause, research/look-head.md); the transverse components carry the
+    magnitude linearly and survive the cast.
+    """
+    x = look[:, 0].astype(np.float64)
+    n = np.linalg.norm(look[:, 1:3].astype(np.float64), axis=1)
+    return np.arctan2(n, x)
 
 
 def histogram_theta(theta: np.ndarray) -> np.ndarray:
@@ -206,7 +226,7 @@ def pinned_grid_from_collect(
     if not lg or "fit" not in lg:
         raise ValueError(
             f"{collect_dir}/collect_metadata.json has no look_grid.fit — recollect "
-            "(or backfill via qnn.model.look_grid.compute_from_collect) first.")
+            "(or backfill via qnn.human.look_grid.compute_from_collect) first.")
     n_mag = int(lg["n_mag"])
     mag_full = [0.0] + list(lg["fit"]["mag_centers_rad"])  # hold-prefix → N_MAG+1
     if len(mag_full) != n_mag + 1:
@@ -222,6 +242,9 @@ def pinned_grid_from_collect(
         "n_mag": n_mag,
         "n_dir": int(n_dir),
         "hold_max_rad": float(lg["hold_max_rad"]),
+        # Explicit label deadzone (point-mass hold, 7/06). Present → honored by
+        # install_polar_grid; absent (legacy metadata) → derived rung1/2 rule.
+        **({"deadzone_rad": float(lg["deadzone_rad"])} if "deadzone_rad" in lg else {}),
         "hold_frac": lg.get("hold_frac"),
         "mag_centers_rad": mag_full,
         "dir_centers_rad": default_dir_centers(n_dir).tolist(),
@@ -236,6 +259,7 @@ def compute_from_collect(
     n_mag: int = DEFAULT_N_MAG,
     fovea_power: float = DEFAULT_FOVEA_POWER,
     seed: int = 0,
+    tick_hz: int | float | None = None,
 ) -> dict:
     """Walk a collect's train-split look labels and build the ``look_grid``
     metadata block: θ histogram (sufficient stat), exact hold fraction, the
@@ -243,12 +267,15 @@ def compute_from_collect(
 
     Hold threshold is the legacy default's — behavioral, not fit. Fits only the
     magnitude center positions; ``n_mag`` is held fixed (changing it is an arch
-    change, not a grid refit)."""
+    change, not a grid refit). ``tick_hz`` is stamped into the block; when None it
+    is read from the collect's metadata (the orchestrator passes it to skip that read)."""
     collect_dir = Path(collect_dir)
     files = sorted(glob.glob(str(collect_dir / "precomputed_train" / "shard*_act_look.npy")))
     if not files:
         raise FileNotFoundError(f"no act_look shards under {collect_dir}/precomputed_train")
-    hold_max = hold_max_from_centers(default_mag_centers(n_mag, fovea_power))
+    # Point-mass hold: exclude only the true-stillness mass below the source
+    # floor from the fit; every real drift is fittable mass (7/06 scheme).
+    hold_max = SOURCE_FLOOR_RAD
     counts = np.zeros(HIST_NBINS, dtype=np.int64)
     n_frames = 0
     hold_n = 0
@@ -259,10 +286,10 @@ def compute_from_collect(
         hold_n += int((theta < hold_max).sum())
     fitted = fit_mag_centers(counts, hold_max, n_mag=n_mag, seed=seed)
     default = default_mag_centers(n_mag, fovea_power)
-    tick_hz = None
-    meta_path = collect_dir / "collect_metadata.json"
-    if meta_path.exists():
-        tick_hz = json.loads(meta_path.read_text()).get("tick_hz")
+    if tick_hz is None:
+        meta_path = collect_dir / "collect_metadata.json"
+        if meta_path.exists():
+            tick_hz = json.loads(meta_path.read_text()).get("tick_hz")
     return {
         "schema": "look_grid_v1",
         "tick_hz": tick_hz,
@@ -270,6 +297,7 @@ def compute_from_collect(
         "n_mag": int(n_mag),
         "seed": int(seed),
         "hold_max_rad": float(hold_max),
+        "deadzone_rad": float(SOURCE_FLOOR_RAD),
         "hold_frac": float(hold_n / n_frames) if n_frames else 0.0,
         "theta_hist": {"nbins": HIST_NBINS, "max_deg": float(np.degrees(THETA_MAX)),
                        "counts": counts.tolist()},

@@ -30,6 +30,49 @@ from qnn.model import look_bins as _look_bins
 from qnn.model.policy import QNNPolicy
 
 
+def resolve_decode_module(run_dir: Path, policy: QNNPolicy | None = None):
+    """EXPLICITLY resolve (and optionally inject) a run's generation decode facade.
+
+    ``QNNPolicy._decode()`` has NO default decode module — the module is explicit
+    state, normally injected from a resolved decode config. Bare-policy entry
+    points (analysis scripts that ``load_policy`` a run dir and then ``act()``)
+    call this helper instead: it reads the run's OWN ``config/probe.json`` head
+    set and resolves the arch from it —
+
+      * ``move_seg`` head and/or ``weapon.type == "attack_with"``
+        → ``qnn.model.bench.a25.decode``
+
+    and RAISES when the arch cannot be determined (a24 is retired; there is no
+    fallback). When ``policy`` is given the module is injected into
+    ``policy._decode_mod``. Returns the resolved module.
+    """
+    import importlib
+
+    run_dir = Path(run_dir)
+    probe_path = run_dir / "config" / "probe.json"
+    heads: dict = {}
+    if probe_path.exists():
+        try:
+            probe = json.loads(probe_path.read_text())
+            heads = (probe.get("overrides") or {}).get("heads") or {}
+        except (ValueError, OSError):
+            heads = {}
+    is_a25 = bool(heads.get("move_seg")) or (
+        (heads.get("weapon") or {}).get("type") == "attack_with")
+    if not is_a25:
+        raise RuntimeError(
+            f"{run_dir}: cannot determine the run's decode arch from "
+            f"config/probe.json (no move_seg head and no attack_with weapon head). "
+            "a24 is retired — only a25-arch runs resolve here. Pass the run's "
+            "resolved decode config instead (resolve_decode_config → "
+            "resolved.decode_module → policy._decode_mod)."
+        )
+    mod = importlib.import_module("qnn.model.bench.a25.decode")
+    if policy is not None:
+        policy._decode_mod = mod
+    return mod
+
+
 def load_policy(
     run_dir: Path,
     device: str | None = None,

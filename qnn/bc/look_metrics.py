@@ -2,14 +2,14 @@
 
 The ``look`` label is a *view-relative turn-delta unit vector*: "no turn this
 tick" is the fixed vector ``(1,0,0)`` and the per-tick turn magnitude is
-``arccos(look[0])``. Because most ticks are small turns, look vectors cluster
+``atan2(|look[1:3]|, look[0])``. Because most ticks are small turns, look vectors cluster
 near ``(1,0,0)`` and ``cos_sim_look`` saturates near 1.0 — a copy-previous-frame
 predictor scores ~0.99. That metric can't separate models.
 
 Tangent / log-map representation fixes this. Map each unit vector to the 2D
 rotation vector at ``(1,0,0)``::
 
-    theta = arccos(u[0])                       # turn magnitude (rad)
+    theta = atan2(||(u[1], u[2])||, u[0])      # turn magnitude (rad)
     z     = theta * (u[1], u[2]) / ||(u[1], u[2])||   in R^2,  ||z|| = theta
 
 ``z`` has magnitude equal to the turn angle and direction equal to the turn
@@ -63,13 +63,14 @@ class LookSums:
 def tangent_logmap_np(u: np.ndarray) -> np.ndarray:
     """Log-map unit vectors ``(...,3)`` to tangent rotation vectors ``(...,2)``.
 
-    ``||result|| == arccos(u[...,0])`` (the turn angle); no-turn maps to 0.
+    ``||result|| == atan2(|yz|, x)`` (the turn angle); no-turn maps to 0.
+    atan2, NOT arccos(x) — the fp16 near-1 cosine trap (research/look-head.md
+    7/06 root cause); mirrors ``qnn.model.look_bins.tangent_logmap``.
     """
     u = np.asarray(u, dtype=np.float64)
-    u0 = np.clip(u[..., 0], -1.0, 1.0)
-    theta = np.arccos(u0)                              # (...,)
     yz = u[..., 1:3]                                   # (...,2)
     yz_norm = np.linalg.norm(yz, axis=-1)              # (...,)
+    theta = np.arctan2(yz_norm, u[..., 0])             # (...,)
     scale = np.where(yz_norm > _EPS, theta / np.maximum(yz_norm, _EPS), 0.0)
     return yz * scale[..., None]
 

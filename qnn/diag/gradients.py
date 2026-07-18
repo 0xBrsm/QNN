@@ -52,10 +52,9 @@ def per_parameter_grad_norms(
         target_logits=target_logits,
         obs=obs_t,
     )
-    real = [l for l, r in zip(losses, loss_is_real) if r]
-    if not real:
+    if not losses:
         return []
-    loss = torch.stack(real).mean()
+    loss = policy._mean_real_losses(losses, loss_is_real)
     loss.backward()
 
     rows: list[dict] = []

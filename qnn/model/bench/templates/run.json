@@ -8,8 +8,7 @@
   "config": {
     "train": "config/train.json",
     "machine": "config/machine.json",
-    "probe": "config/probe.json",
-    "decode": "config/decode.json"
+    "probe": "config/probe.json"
   },
   "output": {
     "checkpoints": "checkpoints/",

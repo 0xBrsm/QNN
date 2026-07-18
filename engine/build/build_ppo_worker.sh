@@ -10,6 +10,7 @@ OUTPUT_PATH=${1:-"${REPO_ROOT}/assets/bin/ppo_worker"}
 PATCHES=("${COMMON_PATCHES[@]}" "${ENGINE_DIR}/patches/host.c.patch")
 
 CUSTOM_SOURCES=(
+  "${ENGINE_DIR}/common/qnn_context.c"
   "${ENGINE_DIR}/nq/qnn_sys.c"
   "${ENGINE_DIR}/common/qnn_sys_common.c"
   "${ENGINE_DIR}/nq/qnn_trainer_main.c"
@@ -25,7 +26,7 @@ CUSTOM_SOURCES=(
   "${ENGINE_DIR}/common/qnn_spatial.c"
   "${ENGINE_DIR}/nq/qnn_self.c"
   "${ENGINE_DIR}/common/qnn_self_common.c"
-  "${ENGINE_DIR}/nq/qnn_progs_stub.c"
+  "${ENGINE_DIR}/nq/qnn_progs_server.c"
   "${ENGINE_DIR}/common/qnn_io.c"
   "${ENGINE_DIR}/common/qnn_metrics.c"
   "${ENGINE_DIR}/common/qnn_fault.c"

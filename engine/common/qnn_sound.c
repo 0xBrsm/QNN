@@ -20,6 +20,7 @@
  */
 
 #include "qnn.h"
+#include "qnn_context.h"
 
 #include <string.h>
 
@@ -38,6 +39,12 @@ int qnn_sound_count = 0;
 /* Optional debug dump file — set by NQ's collect/trainer main when
  * QNN_SOUND_DUMP env var is set.  QW currently leaves it NULL. */
 FILE *qnn_sound_dump = NULL;
+
+void QNN_SoundRegisterContext(void)
+{
+	QNN_ContextRegister(qnn_sound_buffer, sizeof(qnn_sound_buffer));
+	QNN_ContextRegister(&qnn_sound_count, sizeof(qnn_sound_count));
+}
 
 void QNN_DrainSounds(qnn_snapshot_t *snapshot)
 {
@@ -135,6 +142,14 @@ void S_StopSound(int entnum, int entchannel)
 sfx_t *S_PrecacheSound(char *sample)
 {
 	sfx_t *sfx;
+	int index;
+
+	/* In-process arena observers share immutable sound definitions.  Reuse
+	 * the first parser's entry so sixteen client contexts do not consume the
+	 * fixed precache table sixteen times. */
+	for (index = 0; index < qnn_snd_precache_count; ++index)
+		if (!strcmp(qnn_snd_precache_names[index], sample))
+			return &qnn_snd_precache_sfx[index];
 
 	if (qnn_snd_precache_count >= QNN_SND_MAX_PRECACHE)
 		return NULL;

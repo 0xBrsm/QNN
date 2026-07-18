@@ -223,20 +223,30 @@ class NativeWorldEnv:
                     player_suicide = d.attacker_entity_num == self_ent
                     break
 
-        # Split damage by type from per-record flags.
+        # Split damage by type + SOURCE from per-record attacker/target. Dealt
+        # (attacker==self, target!=self): direct vs splash. Taken (target==self):
+        # self-inflicted (own splash / environment-via-self, attacker==self) vs
+        # opponent (attacker!=self) — so "reckless self-splash" is separable from
+        # "aggressive, taking opponent fire" (see the P1 A/B damage caveat).
         _FLAG_SPLASH = 0x0004
         damage_direct = 0.0
         damage_splash = 0.0
+        damage_taken_self = 0.0
+        damage_taken_other = 0.0
         if te is not None:
             self_ent = te.self_entity_num
             for rec in te.damage_records:
-                if rec.attacker_entity_num != self_ent or rec.target_entity_num == self_ent:
-                    continue
                 delta = rec.damage_health + rec.damage_armor
-                if rec.flags & _FLAG_SPLASH:
-                    damage_splash += delta
-                else:
-                    damage_direct += delta
+                if rec.target_entity_num == self_ent:
+                    if rec.attacker_entity_num == self_ent:
+                        damage_taken_self += delta
+                    else:
+                        damage_taken_other += delta
+                elif rec.attacker_entity_num == self_ent:
+                    if rec.flags & _FLAG_SPLASH:
+                        damage_splash += delta
+                    else:
+                        damage_direct += delta
 
         # Lean info dict: only what native PPO and episode statistics need.
         info: Dict[str, object] = {
@@ -256,6 +266,8 @@ class NativeWorldEnv:
             "damage_direct": float(damage_direct),
             "damage_splash": float(damage_splash),
             "damage_taken": float(te.damage_taken) if te is not None else 0.0,
+            "damage_taken_self": float(damage_taken_self),
+            "damage_taken_other": float(damage_taken_other),
             "hit_count": float(te.hit_count) if te is not None else 0.0,
             "shots_fired": float(te.shots_fired) if te is not None else 0.0,
             "health_gain": float(te.pickup_health) if te is not None else 0.0,
@@ -271,7 +283,6 @@ class NativeWorldEnv:
             "lead_vel": tuple(te.lead_vel) if te is not None else (0.0, 0.0, 0.0),
             "lead_weapon_id": int(te.lead_weapon_id) if te is not None else 0,
             "lead_valid": bool(te.lead_valid) if te is not None else False,
-            "blind_fire": 0,
             "stuck": False,
         }
         # In match mode the worker already paired the terminal reward with a

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.28.0
+
+### Added
+
+- `qnn.decode_fit`: per-model aim-calibration pipeline — per-discharge likelihood fits with achievable-frontier refusal semantics, a per-impulse tremor model, per-corpus placement anchors, per-weapon attack trim at the deployable operating point, and seeded deterministic replicates; emits a gated, run-pinned decode config with fit report and provenance
+- Crest-firing discharge-quality gate: commanded discharges hold to the alignment crest, applied in `policy.act` and baked into the exported ONNX decode; opt-in per-discharge alignment windows in eval (`QNN_EVAL_INTERCEPT_WINDOW`)
+- `qnn.human`: per-collect human-baseline creators (intercept, acquisition, aim-range, operative-attack) behind a single orchestrator (`python -m qnn.human <collect>`)
+
+### Changed
+
+- Decode configs are fail-loud: per-module required-key manifests reject missing `params.*` keys instead of falling back to code-side defaults (`src/docs/decode-config-defaults.md`)
+- Decode-fit skill operating points report on the human sustained-band coordinate (per-demo-median anchored pXX)
+
+### Fixed
+
+- QW demo-worker build: forward-declare `struct client_s` in common `qnn.h`
+
 ## 0.27.0
 
 ### Added
@@ -23,6 +40,8 @@
 ## 0.26.0
 
 ### Added
+
+- BC convergence-tuning knobs (opt-in; defaults reproduce prior behavior bit-for-bit): `warmup_steps` (per-step LR ramp overriding the blunt per-epoch `warmup_epochs` jump), `grad_clip_mode` (`fixed`|`adaptive` — clip to `min(k·EMA(norm), hard_max)`), `grad_clip_scope` (`global`|`per_group` — AGC-style per-component clip), `grad_clip_ema_k`/`grad_clip_ema_beta`/`grad_clip_hard_max`, and `weight_decay` (Adam→AdamW). Stateful `GradClipper` persists the adaptive EMA across epochs. Phase 1 of `agents/plans/bc-optimizer-convergence-tuning.md` (faster convergence / shorter ablation schedules)
 
 - De-scripted `act.weapon` labeling in the collector: per-demo fire-script fingerprinting suppresses press/release select churn; deliberate-intent carry-forward with forced re-baseline on held-changes-without-select, death masking, and min-dwell debounce
 - MVD inference path for weapon labels: `act.weapon` reconstruction from spectated `.mvd` streams at parity with the QWD path; synthetic-label collect for the MVD scale-up program

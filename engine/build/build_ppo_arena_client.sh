@@ -16,7 +16,9 @@ PATCHES=(
 CUSTOM_SOURCES=(
   "${ENGINE_DIR}/nq/qnn_sys.c"
   "${ENGINE_DIR}/common/qnn_sys_common.c"
+  "${ENGINE_DIR}/common/qnn_context.c"
   "${ENGINE_DIR}/nq/qnn_arena_client_main.c"
+  "${ENGINE_DIR}/nq/qnn_arena_observer.c"
   "${ENGINE_DIR}/nq/qnn_client_runtime_stub.c"
   "${ENGINE_DIR}/nq/qnn_input.c"
   "${ENGINE_DIR}/nq/qnn_predict.c"

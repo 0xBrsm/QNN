@@ -1,0 +1,478 @@
+{
+  "schema": "skill_curve_v2",
+  "axis": "mechanical_aim",
+  "scope": "AIM-only mechanical knob; tactical/strategic axes DEFERRED",
+  "skill_index": "within-weapon INTERCEPT (hbw) percentile \u2014 POOLED population events, INVERTED (lower alignment error = higher skill)",
+  "substrate": {
+    "look.turn_mag_scale": 1.419,
+    "look.hold_drift_eps": 0.0,
+    "turn_mag_scale_axis": "acquisition (motor/view-motion signature)",
+    "fit_order": "dampener-before-aim"
+  },
+  "down": {
+    "range": "s < p28",
+    "knob": "look.aim_degrade_tremor_mag (hold-gated OU; universal \u2014 lag retired 7/10)",
+    "tremor_tau_frames": 8.0,
+    "anchors": [
+      {
+        "pct": 23.95585857557019,
+        "tremor_mag": 0.08
+      },
+      {
+        "pct": 28.133333333333336,
+        "tremor_mag": 0.0
+      }
+    ]
+  },
+  "per_weapon": {
+    "SG": {
+      "impulse": 2,
+      "native_pct": 23.0,
+      "up_top_pct": 50.0,
+      "knee_gain": 0.04,
+      "up": {
+        "knob": "look.aim_prior_gain",
+        "anchors": [
+          {
+            "pct": 23.0,
+            "gain": 0.0
+          },
+          {
+            "pct": 25.0,
+            "gain": 0.0081
+          },
+          {
+            "pct": 50.0,
+            "gain": 0.443
+          }
+        ]
+      },
+      "super": {
+        "knob": "look.aim_mag_gain (\u03b1), gain pinned at the per-weapon knee",
+        "anchors": [
+          {
+            "pct": 50.0,
+            "alpha": 0.0
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.05
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.1
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.2
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.3
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.5
+          }
+        ]
+      }
+    },
+    "SSG": {
+      "impulse": 3,
+      "native_pct": 18.5,
+      "up_top_pct": 25.0,
+      "knee_gain": 0.04,
+      "up": {
+        "knob": "look.aim_prior_gain",
+        "anchors": [
+          {
+            "pct": 18.5,
+            "gain": 0.0
+          },
+          {
+            "pct": 25.0,
+            "gain": 0.0239
+          }
+        ]
+      },
+      "super": {
+        "knob": "look.aim_mag_gain (\u03b1), gain pinned at the per-weapon knee",
+        "anchors": [
+          {
+            "pct": 25.0,
+            "alpha": 0.0
+          }
+        ]
+      }
+    },
+    "NG": {
+      "impulse": 4,
+      "native_pct": 37.9,
+      "up_top_pct": 50.0,
+      "knee_gain": 0.015,
+      "up": {
+        "knob": "look.aim_prior_gain",
+        "anchors": [
+          {
+            "pct": 25.0,
+            "gain": 0.0093
+          },
+          {
+            "pct": 37.9,
+            "gain": 0.0
+          },
+          {
+            "pct": 50.0,
+            "gain": 0.284
+          }
+        ]
+      },
+      "super": {
+        "knob": "look.aim_mag_gain (\u03b1), gain pinned at the per-weapon knee",
+        "anchors": [
+          {
+            "pct": 50.0,
+            "alpha": 0.0
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.05
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.1
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.2
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.3
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.5
+          }
+        ]
+      }
+    },
+    "SNG": {
+      "impulse": 5,
+      "native_pct": 37.0,
+      "up_top_pct": 50.0,
+      "knee_gain": 0.015,
+      "up": {
+        "knob": "look.aim_prior_gain",
+        "anchors": [
+          {
+            "pct": 25.0,
+            "gain": 0.0141
+          },
+          {
+            "pct": 37.0,
+            "gain": 0.0
+          },
+          {
+            "pct": 50.0,
+            "gain": 0.2883
+          }
+        ]
+      },
+      "super": {
+        "knob": "look.aim_mag_gain (\u03b1), gain pinned at the per-weapon knee",
+        "anchors": [
+          {
+            "pct": 50.0,
+            "alpha": 0.0
+          }
+        ]
+      }
+    },
+    "LG": {
+      "impulse": 8,
+      "native_pct": 22.9,
+      "up_top_pct": 25.0,
+      "knee_gain": 0.015,
+      "up": {
+        "knob": "look.aim_prior_gain",
+        "anchors": [
+          {
+            "pct": 22.9,
+            "gain": 0.0
+          },
+          {
+            "pct": 25.0,
+            "gain": 0.0308
+          }
+        ]
+      },
+      "super": {
+        "knob": "look.aim_mag_gain (\u03b1), gain pinned at the per-weapon knee",
+        "anchors": [
+          {
+            "pct": 25.0,
+            "alpha": 0.0
+          },
+          {
+            "pct": 25.1,
+            "alpha": 0.05
+          },
+          {
+            "pct": 25.1,
+            "alpha": 0.1
+          },
+          {
+            "pct": 25.1,
+            "alpha": 0.2
+          },
+          {
+            "pct": 26.8,
+            "alpha": 0.5
+          },
+          {
+            "pct": 27.6,
+            "alpha": 0.3
+          }
+        ]
+      }
+    },
+    "RL": {
+      "impulse": 7,
+      "native_pct": 29.5,
+      "up_top_pct": 50.0,
+      "knee_gain": 0.04,
+      "up": {
+        "knob": "look.aim_prior_gain",
+        "anchors": [
+          {
+            "pct": 29.5,
+            "gain": 0.0
+          },
+          {
+            "pct": 50.0,
+            "gain": 0.2944
+          }
+        ]
+      },
+      "super": {
+        "knob": "look.aim_mag_gain (\u03b1), gain pinned at the per-weapon knee",
+        "anchors": [
+          {
+            "pct": 50.0,
+            "alpha": 0.0
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.05
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.1
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.2
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.3
+          },
+          {
+            "pct": 50.1,
+            "alpha": 0.5
+          }
+        ]
+      }
+    }
+  },
+  "sources": {
+    "gain_grid": "runs/head_probe/_aim_grid_lead_head_probe_p3d_jumpv2_tlfix_nc_seed43.json",
+    "gain_grid_commit": "32d2fdd66cb9f718e9ef679481176b3e9da94d18",
+    "alpha_grid": "runs/head_probe/_aim_alpha_grid_head_probe_p3d_jumpv2_tlfix_nc_seed43.json",
+    "intercept_skill": "artifacts/collect/qwd/human_baseline/_aim_intercept_skill.json",
+    "gain_fit": "live (perweapon_gain_fit_live: intercept ladder \u00d7 model transfer)",
+    "degrade_sweep": "runs/head_probe/_aim_degrade_sweep.json",
+    "range_hist": "artifacts/collect/qwd/human_baseline/_aim_range_byweapon.json",
+    "range_weighted": true
+  },
+  "all_humans_pins": {
+    "look.turn_mag_scale": 1.0,
+    "look.aim_ffwd_gain": 0.0,
+    "look.hold_passthrough": true,
+    "weapon_ban": [],
+    "attack.bias_vec": [
+      4.3107,
+      0.786,
+      3.3869,
+      1.8106,
+      1.6476,
+      1.3385,
+      1.1914,
+      1.7229
+    ],
+    "attack.stick_bias": 0.445,
+    "move.commitment": true,
+    "move.commit_interrupt": false,
+    "move.commit_dur_tilt": [
+      0.1259,
+      0.1721
+    ]
+  },
+  "move_hazard": "RETIRED \u2014 move_seg commitment decode (dur_tilt=[0.1259, 0.1721], interrupt=False); no sticky/lognorm stack",
+  "guards": {
+    "guard.projectile_release": true,
+    "guard.projectile_release_mode": "rocket"
+  },
+  "non_lever_verdicts": {
+    "MOVE": "commitment decode (semi-Markov segment head) \u2014 per-checkpoint fitted dur_tilt=[0.1259, 0.1721], interrupt off; sticky_tau + corpus lognorm hazard RETIRED",
+    "LOOK_style": null,
+    "WEAPON_select": "human target RETRACTED (decode-unreachable); gate diag only, DEFERRED",
+    "ATTACK": "all-humans pin \u2014 attack.bias calibration, cone low/off, sampled",
+    "ACQUISITION": "LOOK yardstick \u2014 target-free Fitts-throughput human BAND + model placement (motor/view-motion skill); the look.turn_mag_scale dampener is an acquisition fitting element. NOT the gain lever (intercept is the lever, \u00a713/\u00a714)"
+  },
+  "acquisition_axis": {
+    "status": "human_band_only",
+    "role": "LOOK ACQUISITION yardstick \u2014 target-free Fitts-THROUGHPUT human band + model placement (motor/view-motion skill), symmetric to the per-weapon INTERCEPT band. GLOBAL (weapon-invariant motor signature; acquisition\u2260pursuit, \u00a79/\u00a712). The look.turn_mag_scale DAMPENER is an ACQUISITION fitting element (turn magnitude is part of the motor signature) and the model is measured on the DAMPENED turn stream. NOT the aim gain lever (intercept is the lever, \u00a713/\u00a714).",
+    "scope": "global",
+    "metric": "throughput_bits_per_s",
+    "human_band": {
+      "band_pct": [
+        10.0,
+        90.0
+      ],
+      "band_bits_per_s": [
+        2.9652,
+        12.3628
+      ],
+      "median_bits_per_s": 6.1236,
+      "ladder": {
+        "10.0": 2.6425,
+        "25.0": 3.7919,
+        "50.0": 6.1127,
+        "75.0": 9.9973,
+        "90.0": 16.5941,
+        "99.0": 50.831
+      },
+      "split_half_reliability": 0.3272,
+      "n_players": 1927,
+      "artifact": "/workspaces/dev-qnn/artifacts/collect/qwd/human_baseline/_acq_submovement.json"
+    },
+    "model_placement": null,
+    "tms_fit": {
+      "turn_mag_scale": 1.419,
+      "target_pct": 50.0,
+      "target_throughput_bits_per_s": 6.1127,
+      "achieved_throughput_bits_per_s": 6.112,
+      "achieved_acq_percentile": 50.0,
+      "in_band": true,
+      "sweep_floor_bound": false,
+      "sweep_ceil_bound": false,
+      "swept_tms_range": [
+        0.5,
+        2.0
+      ],
+      "curve": [
+        {
+          "turn_mag_scale": 0.5,
+          "throughput_bits_per_s": 5.2332
+        },
+        {
+          "turn_mag_scale": 0.75,
+          "throughput_bits_per_s": 5.1483
+        },
+        {
+          "turn_mag_scale": 1.0,
+          "throughput_bits_per_s": 5.2013
+        },
+        {
+          "turn_mag_scale": 1.25,
+          "throughput_bits_per_s": 5.4546
+        },
+        {
+          "turn_mag_scale": 1.5,
+          "throughput_bits_per_s": 6.427
+        },
+        {
+          "turn_mag_scale": 1.75,
+          "throughput_bits_per_s": 7.2107
+        },
+        {
+          "turn_mag_scale": 2.0,
+          "throughput_bits_per_s": 8.0161
+        }
+      ],
+      "method": "fit to human Fitts-throughput band (\u00a714.2 dampener-before-aim; over-turn-ratio + [0.5,1.0] clamp retired)"
+    },
+    "note": "model acquisition not measured on a free-play rollout \u2014 the tms_fit above IS the acquisition operating point (from the turn_mag_scale sweep). Run scripts/analysis/acq_submovement.py on a MODEL-ROLLOUT collect of the DAMPENED decode with --out runs/head_probe/_acq_submovement_model_head_probe_p3d_jumpv2_tlfix_nc_seed43.json for an independent deployed-decode placement."
+  },
+  "model_verification": {
+    "per_weapon_intercept": {
+      "SG": {
+        "model_intercept_hbw": 3.5601,
+        "n": 6083,
+        "low_n": false,
+        "human_skill_percentile": 36.8,
+        "human_p50_hbw": 2.47,
+        "human_p90_hbw": 0.82
+      },
+      "SSG": {
+        "model_intercept_hbw": 2.568,
+        "n": 488,
+        "low_n": true,
+        "human_skill_percentile": 44.4,
+        "human_p50_hbw": 2.22,
+        "human_p90_hbw": 0.77
+      },
+      "NG": {
+        "model_intercept_hbw": 3.0134,
+        "n": 226,
+        "low_n": true,
+        "human_skill_percentile": 59.0,
+        "human_p50_hbw": 3.57,
+        "human_p90_hbw": 1.17
+      },
+      "SNG": {
+        "model_intercept_hbw": 3.5409,
+        "n": 533,
+        "low_n": true,
+        "human_skill_percentile": 50.0,
+        "human_p50_hbw": 3.54,
+        "human_p90_hbw": 1.19
+      },
+      "LG": {
+        "model_intercept_hbw": 2.5741,
+        "n": 1117,
+        "low_n": true,
+        "human_skill_percentile": 47.1,
+        "human_p50_hbw": 2.4,
+        "human_p90_hbw": 0.83
+      },
+      "NAILS(pooled)": {
+        "model_intercept_hbw": 3.3838,
+        "n": 759,
+        "low_n": true,
+        "human_skill_percentile": 53.0,
+        "note": "NG+SNG pooled (kinematics-identical)"
+      }
+    },
+    "look_style": null,
+    "native_floor_percentile_mean": 36.8,
+    "vertical_feet_gap": {
+      "note": "run scripts/analysis/rl_aim_vertical_residual.py to measure"
+    }
+  },
+  "provenance": {
+    "checkpoint": "runs/head_probe/head_probe_p3d_jumpv2_tlfix_nc_seed43/checkpoints/best_20260711-jmzqf7.pth",
+    "model_id": "head_probe_p3d_jumpv2_tlfix_nc_seed43",
+    "corpus_dir": "/workspaces/dev-qnn/artifacts/collect/qwd",
+    "corpus_fingerprint": "sha256:3b41540abb03a64a98e9b16a6f409cd6c82afc17d0b91a8bb12a3c063d765424",
+    "look_grid": "runs/head_probe/head_probe_p3d_jumpv2_tlfix_nc_seed43/config/look_grid.json",
+    "look_grid_sha256": "2da66d851f83685647efffef1c3adc1c36eb7f9c94b1b41d705d66d7039c7d47",
+    "git_commit": "3cd68758"
+  },
+  "aim_artifact_commits": {
+    "gain_grid": "32d2fdd66cb9f718e9ef679481176b3e9da94d18",
+    "degrade": ""
+  }
+}

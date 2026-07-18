@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from qnn.model.tokens.obs_accessor import ObsAccessor
 from qnn.model.tokens.obs_fields import (
-    VOCAB_FIELDS, WEAPON_SUBJECT_IDS,
-    ScalarGroup, VocabEmbed, VocabSum, WeaponReadiness, KindTag,
+    NUM_AMMO_POOLS, VOCAB_FIELDS, WEAPON_SUBJECT_IDS,
+    AmmoPools, ScalarGroup, VocabEmbed, VocabSum, WeaponReadiness, KindTag,
 )
 
 
@@ -54,11 +55,14 @@ class TokenBuilder(nn.Module):
         # the parameter layout is deterministic w.r.t. the spec order.
         self.projs = nn.ModuleDict()
         needs_readiness = False
+        n_ammo_pools = 0
         for i, src in enumerate(self.fields):
             if isinstance(src, ScalarGroup):
                 self.projs[str(i)] = nn.Linear(src.width, self.d_model)
             elif isinstance(src, WeaponReadiness):
                 needs_readiness = True
+            elif isinstance(src, AmmoPools):
+                n_ammo_pools += 1
             elif isinstance(src, KindTag) and self.kind_embed is None:
                 raise ValueError("KindTag field needs a kind_embed table")
 
@@ -68,6 +72,13 @@ class TokenBuilder(nn.Module):
                 torch.tensor(WEAPON_SUBJECT_IDS, dtype=torch.long),
                 persistent=False,
             )
+        # Ammo-type embeds are a NEW owned table (ammo types are not entities,
+        # so nothing to tie). One table per token; at most one AmmoPools field.
+        if n_ammo_pools > 1:
+            raise ValueError("a token may declare at most one AmmoPools field")
+        self.ammo_embed = (
+            nn.Embedding(NUM_AMMO_POOLS, self.d_model) if n_ammo_pools else None
+        )
 
     def _table(self, selector: str) -> nn.Embedding:
         return self.entity_embed if selector == "entity" else self.movement_embed
@@ -94,9 +105,18 @@ class TokenBuilder(nn.Module):
         readiness = acc.readiness().to(weapon_embeds.dtype)          # (B*, 8)
         return torch.einsum("bw,wd->bd", readiness, weapon_embeds)
 
+    def _ammo_pools(self, acc: ObsAccessor) -> torch.Tensor:
+        ammo_embeds = self.ammo_embed.weight                        # (4, d_model)
+        pools = acc.ammo_pools().to(ammo_embeds.dtype)              # (B*, 4)
+        return torch.einsum("bp,pd->bd", pools, ammo_embeds)
+
     def _kind_tag(self, acc: ObsAccessor, kind: int) -> torch.Tensor:
-        idx = torch.full((acc.batch,), kind, dtype=torch.long, device=acc.device)
-        return self.kind_embed(idx)
+        # The tag is constant for the whole token. Broadcasting the table row
+        # avoids allocating an index tensor and launching an embedding lookup.
+        # Backward sums over the expanded dim instead of scatter-adding B rows
+        # — same gradient, different accumulation order, so training runs are
+        # not trajectory-comparable across this change (adopted 2026-07-11).
+        return self.kind_embed.weight[kind].unsqueeze(0).expand(acc.batch, -1)
 
     def forward(self, acc: ObsAccessor, dtype: torch.dtype | None = None) -> torch.Tensor:
         parts: list[torch.Tensor] = []
@@ -111,6 +131,8 @@ class TokenBuilder(nn.Module):
                 parts.append(self._vocab_sum(acc, src.name))
             elif isinstance(src, WeaponReadiness):
                 parts.append(self._weapon_readiness(acc))
+            elif isinstance(src, AmmoPools):
+                parts.append(self._ammo_pools(acc))
             elif isinstance(src, KindTag):
                 parts.append(self._kind_tag(acc, src.kind))
             else:  # pragma: no cover - guards spec typos

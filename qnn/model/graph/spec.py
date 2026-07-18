@@ -66,6 +66,16 @@ _WEAPON_EDGES = tuple(WEAPON_EDGE_TO_SOURCE)
 # checked at GraphSpec level where the token list is known.
 EDGE_TOKEN_PREFIX = "token."
 
+# A head may also read a raw obs SCALAR field straight into its input cat via a
+# ``scalar.<name>`` edge (e.g. ``scalar.attack_finished``) — the dequantized,
+# normalized value (``SCALAR_FIELDS[name]``), NOT its embedded/attended token.
+# This is a privileged short path for a scalar the head depends on directly
+# (cooldown → attack cadence), bypassing embed → attention → readout. Only
+# slice-based scalar fields are eligible; computed fields (accessor-owned) are
+# not, since the selector cat reads the field straight off the flattened obs.
+# The build maps it to a ``scalar:<name>`` weapon source.
+EDGE_SCALAR_PREFIX = "scalar."
+
 
 def _is_token_edge(edge: str) -> bool:
     return edge.startswith(EDGE_TOKEN_PREFIX)
@@ -74,13 +84,21 @@ def _is_token_edge(edge: str) -> bool:
 def _token_edge_name(edge: str) -> str:
     return edge[len(EDGE_TOKEN_PREFIX):]
 
+
+def _is_scalar_edge(edge: str) -> bool:
+    return edge.startswith(EDGE_SCALAR_PREFIX)
+
+
+def _scalar_edge_name(edge: str) -> str:
+    return edge[len(EDGE_SCALAR_PREFIX):]
+
 # ``move_hazard`` (a25) is a motor head: it reads the shared motor feature
 # vector (readout [+ target.feat]) like move/look/attack. Its additional
 # semi-Markov inputs (held_class / dwell_age) are NOT graph edges — they are
 # decode-state obs fields the Network passes straight through ``flat_obs`` (see
 # qnn.model.bench.a25.move_hazard_head and network.py), so the edge contract
 # here is unchanged.
-_HEAD_NAMES = ("move", "look", "attack", "weapon", "move_hazard")
+_HEAD_NAMES = ("move", "look", "attack", "weapon", "move_hazard", "move_seg", "jump")
 _MOTOR_HEADS = ("move", "look", "attack", "move_hazard")
 _ACTIVATIONS = ("none", "gelu", "relu")
 
@@ -120,7 +138,8 @@ class TokenSpec:
     reserved kinds (``cls``, ``spatial``, ``entities``) are constructed
     by the embedding outside the field catalog. Field order inside a
     token is fixed by the spec layout (scalars → kind_tag → vocab →
-    readiness → vocab_sum) so the parameter layout is deterministic.
+    readiness → ammo_pools → vocab_sum) so the parameter layout is
+    deterministic.
     """
     name: str
     kind: str = TOKEN_KIND_FIELDS
@@ -128,12 +147,17 @@ class TokenSpec:
     vocab: tuple[str, ...] = ()
     vocab_sum: tuple[str, ...] = ()
     readiness: bool = False
+    ammo_pools: bool = False
     kind_tag: bool = False
 
     @classmethod
     def from_dict(cls, name: str, raw: Mapping[str, Any]) -> "TokenSpec":
         ctx = f"tokens[{name!r}]"
-        _reject_unknown(raw, ("kind", "scalars", "vocab", "vocab_sum", "readiness", "kind_tag"), ctx)
+        _reject_unknown(
+            raw,
+            ("kind", "scalars", "vocab", "vocab_sum", "readiness", "ammo_pools", "kind_tag"),
+            ctx,
+        )
         kind = str(raw.get("kind", TOKEN_KIND_FIELDS))
         if kind not in _TOKEN_KINDS:
             raise GraphSpecError(f"{ctx}: unknown kind {kind!r}; allowed: {list(_TOKEN_KINDS)}")
@@ -144,6 +168,7 @@ class TokenSpec:
             vocab=_str_tuple(raw.get("vocab", ()), ctx),
             vocab_sum=_str_tuple(raw.get("vocab_sum", ()), ctx),
             readiness=bool(raw.get("readiness", False)),
+            ammo_pools=bool(raw.get("ammo_pools", False)),
             kind_tag=bool(raw.get("kind_tag", False)),
         )
         spec._validate()
@@ -152,10 +177,12 @@ class TokenSpec:
     def _validate(self) -> None:
         ctx = f"tokens[{self.name!r}]"
         if self.kind != TOKEN_KIND_FIELDS:
-            if self.scalars or self.vocab or self.vocab_sum or self.readiness or self.kind_tag:
+            if (self.scalars or self.vocab or self.vocab_sum
+                    or self.readiness or self.ammo_pools or self.kind_tag):
                 raise GraphSpecError(f"{ctx}: kind={self.kind!r} tokens carry no fields")
             return
-        if not (self.scalars or self.vocab or self.vocab_sum or self.readiness or self.kind_tag):
+        if not (self.scalars or self.vocab or self.vocab_sum
+                or self.readiness or self.ammo_pools or self.kind_tag):
             raise GraphSpecError(f"{ctx}: fields token declares no fields")
         for n in self.scalars:
             if n not in SCALAR_FIELDS:
@@ -179,6 +206,8 @@ class TokenSpec:
             out["vocab_sum"] = list(self.vocab_sum)
         if self.readiness:
             out["readiness"] = True
+        if self.ammo_pools:
+            out["ammo_pools"] = True
         if self.kind_tag:
             out["kind_tag"] = True
         return out
@@ -306,6 +335,13 @@ class HeadNodeSpec:
     d_hidden: int = 0
     activation: str = "gelu"
     context_from_obs: bool = True            # weapon only
+    # weapon only — P1 feasibility-masking + rare-positive loss shaping
+    # (agents/plans/attack-finished-masking-refactor.md). All default-off ⇒
+    # graphs without these keys build byte-identically to before.
+    feasibility_mask: bool = False
+    focal_gamma: float = 0.0
+    pos_weight: float = 0.0
+    water_ud: bool = False
     # Stored as sorted (key, value) pairs — hashable and immutable like the
     # rest of the spec. Construct with a plain dict; __post_init__ normalizes
     # either form so direct construction compares equal to a from_dict
@@ -323,7 +359,12 @@ class HeadNodeSpec:
         ctx = f"heads[{name!r}]"
         allowed = ("type", "inputs", "d_hidden", "activation")
         if name == "weapon":
-            allowed += ("context_from_obs", "decode")
+            allowed += ("context_from_obs", "decode",
+                        "feasibility_mask", "focal_gamma", "pos_weight")
+        if name == "jump":
+            allowed += ("pos_weight",)
+        if name == "move_seg":
+            allowed += ("water_ud",)
         _reject_unknown(raw, allowed, ctx)
         decode_raw = raw.get("decode", {})
         if not isinstance(decode_raw, Mapping):
@@ -336,6 +377,10 @@ class HeadNodeSpec:
             d_hidden=int(raw.get("d_hidden", 0)),
             activation=str(raw.get("activation", "gelu")),
             context_from_obs=bool(raw.get("context_from_obs", True)),
+            feasibility_mask=bool(raw.get("feasibility_mask", False)),
+            focal_gamma=float(raw.get("focal_gamma", 0.0)),
+            pos_weight=float(raw.get("pos_weight", 0.0)),
+            water_ud=bool(raw.get("water_ud", False)),
             decode=dict(decode_raw),
         )
         spec._validate()
@@ -352,11 +397,14 @@ class HeadNodeSpec:
         if len(set(self.inputs)) != len(self.inputs):
             raise GraphSpecError(f"{ctx}: duplicate input edge")
         if self.name == "weapon":
-            # weapon may also read a single token as its readout (token.<name>);
-            # the token's existence is checked at GraphSpec level.
+            # weapon may also read a single token as its readout (token.<name>)
+            # and/or a raw scalar obs field (scalar.<name>) straight into its
+            # input cat; existence/eligibility is checked at GraphSpec level.
             bad = [e for e in self.inputs
-                   if e not in _WEAPON_EDGES and not _is_token_edge(e)]
-            allowed_edges = list(_WEAPON_EDGES) + [f"{EDGE_TOKEN_PREFIX}<name>"]
+                   if e not in _WEAPON_EDGES
+                   and not _is_token_edge(e) and not _is_scalar_edge(e)]
+            allowed_edges = (list(_WEAPON_EDGES)
+                             + [f"{EDGE_TOKEN_PREFIX}<name>", f"{EDGE_SCALAR_PREFIX}<name>"])
         else:
             allowed_edges = _MOTOR_EDGES
             bad = [e for e in self.inputs if e not in allowed_edges]
@@ -380,8 +428,21 @@ class HeadNodeSpec:
         }
         if self.name == "weapon":
             out["context_from_obs"] = self.context_from_obs
+            if self.feasibility_mask:
+                out["feasibility_mask"] = self.feasibility_mask
+            if self.focal_gamma:
+                out["focal_gamma"] = self.focal_gamma
+            if self.pos_weight:
+                out["pos_weight"] = self.pos_weight
             if self.decode:
                 out["decode"] = {k: v for k, v in self.decode}
+        if self.name == "jump" and self.pos_weight:
+            out["pos_weight"] = self.pos_weight
+        if self.name == "move_seg" and self.water_ud:
+            # Shape-bearing: a water_ud head is 3×JOINT wide. Dropping this
+            # on serialization made checkpoints unloadable (p3/p3b reload
+            # crash — 90-wide checkpoint vs 60-wide rebuilt head).
+            out["water_ud"] = self.water_ud
         return out
 
 
@@ -497,6 +558,20 @@ class GraphSpec:
                         f"{_token_edge_name(e)!r}; declared self-tokens: "
                         f"{sorted(self_token_names)}"
                     )
+                if _is_scalar_edge(e):
+                    fname = _scalar_edge_name(e)
+                    spec = SCALAR_FIELDS.get(fname)
+                    if spec is None:
+                        raise GraphSpecError(
+                            f"{hctx}: scalar edge {e!r} → unknown scalar field "
+                            f"{fname!r}; known: {sorted(SCALAR_FIELDS)}"
+                        )
+                    if spec.slice_key is None:
+                        raise GraphSpecError(
+                            f"{hctx}: scalar edge {e!r} → computed field {fname!r} "
+                            "is not eligible; only slice-based scalar fields can be "
+                            "fed straight into a head input cat"
+                        )
         # Network feeds ONE motor feature vector to all motor heads.
         motor = [h for h in self.heads if h.name in _MOTOR_HEADS]
         if motor and len({h.inputs for h in motor}) != 1:

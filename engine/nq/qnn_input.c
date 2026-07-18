@@ -17,6 +17,30 @@ static void QNN_PressButton(kbutton_t *button)
 	button->state |= 1 + 2;
 }
 
+void QNN_ApplyActionLook(const qnn_action_t *action, vec3_t viewangles)
+{
+	float fwd, yaw_comp, pitch_comp, yaw_deg, pitch_deg;
+
+	fwd = QNN_Clamp(action->look[0], -1.0f, 1.0f);
+	yaw_comp = QNN_Clamp(action->look[1], -1.0f, 1.0f);
+	pitch_comp = QNN_Clamp(-action->look[2], -1.0f, 1.0f);
+
+	yaw_deg = atan2f(yaw_comp, fwd) * (180.0f / (float)M_PI);
+	pitch_deg = atan2f(pitch_comp, fwd) * (180.0f / (float)M_PI);
+
+	if (yaw_deg != 0.0f)
+		viewangles[YAW] = anglemod(viewangles[YAW] - yaw_deg);
+
+	if (pitch_deg != 0.0f)
+	{
+		viewangles[PITCH] += pitch_deg;
+		if (viewangles[PITCH] > 80.0f)
+			viewangles[PITCH] = 80.0f;
+		if (viewangles[PITCH] < -70.0f)
+			viewangles[PITCH] = -70.0f;
+	}
+}
+
 void IN_Init(void)
 {
 }
@@ -50,28 +74,7 @@ void IN_Move(usercmd_t *cmd)
 	   here would under-turn by ~3.3x.  Revisit when PPO needs human-
 	   like mouse dynamics — the curve may be reintroduced as a learned
 	   or tuned post-processing step at that point. */
-	{
-		float fwd, yaw_comp, pitch_comp, yaw_deg, pitch_deg;
-
-		fwd = QNN_Clamp(qnn_pending_action.look[0], -1.0f, 1.0f);
-		yaw_comp = QNN_Clamp(qnn_pending_action.look[1], -1.0f, 1.0f);
-		pitch_comp = QNN_Clamp(-qnn_pending_action.look[2], -1.0f, 1.0f);
-
-		yaw_deg = atan2f(yaw_comp, fwd) * (180.0f / (float)M_PI);
-		pitch_deg = atan2f(pitch_comp, fwd) * (180.0f / (float)M_PI);
-
-		if (yaw_deg != 0.0f)
-			cl.viewangles[YAW] = anglemod(cl.viewangles[YAW] - yaw_deg);
-
-		if (pitch_deg != 0.0f)
-		{
-			cl.viewangles[PITCH] += pitch_deg;
-			if (cl.viewangles[PITCH] > 80.0f)
-				cl.viewangles[PITCH] = 80.0f;
-			if (cl.viewangles[PITCH] < -70.0f)
-				cl.viewangles[PITCH] = -70.0f;
-		}
-	}
+	QNN_ApplyActionLook(&qnn_pending_action, cl.viewangles);
 
 	/* Self-state prediction: record the cmd exactly as it leaves — move
 	 * values plus the post-turn yaw the message will carry. */
@@ -117,4 +120,22 @@ void IN_Move(usercmd_t *cmd)
 	if (qnn_pending_action.weapon > 0
 		&& qnn_pending_action.weapon != QNN_WeaponId())
 		in_impulse = qnn_pending_action.weapon;
+}
+
+void QNN_ArenaApplyLocalAction(const qnn_action_t *action)
+{
+	usercmd_t cmd;
+
+	qnn_pending_action = *action;
+	CL_BaseMove(&cmd);
+	IN_Move(&cmd);
+	cl.cmd = cmd;
+
+	/* Match CL_SendMove's local edge/impulse consumption without emitting a
+	   client-to-server datagram.  The arena server receives this action in the
+	   grouped stdin batch instead. */
+	in_attack.state &= ~2;
+	in_jump.state &= ~2;
+	in_impulse = 0;
+	QNN_ClearAction(&qnn_pending_action);
 }

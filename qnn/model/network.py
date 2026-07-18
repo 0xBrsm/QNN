@@ -34,6 +34,7 @@ from qnn.model.look_head import LookHead, LookHeadInput
 from qnn.model.move_head import MoveHead, MoveHeadInput
 from qnn.model.target import TargetPointer, TargetPointerInput
 from qnn.model.temporal import Temporal, TemporalInput
+from qnn.model.tokens.obs_fields import SCALAR_FIELDS
 from qnn.model.transformer import ObsEmbedding, TransformerEncoder
 from qnn.model.weapon_head import WeaponHead, WeaponHeadInput
 from qnn.vocab import TOKEN_ACTOR
@@ -159,6 +160,8 @@ LOOK_HEAD = "look"
 ATTACK_HEAD = "attack"
 WEAPON_HEAD = "weapon"
 MOVE_HAZARD_HEAD = "move_hazard"  # a25 WHEN/termination head (opt-in)
+MOVE_SEG_HEAD = "move_seg"        # a25 segment (class x duration) head (opt-in)
+JUMP_HEAD = "jump"                # a25 2-class land-jump head (opt-in)
 
 # Output sizes, exported for callers that build padded buffers or
 # downstream layers against these sizes. Heads define their own
@@ -260,6 +263,10 @@ def _weapon_source_dim(
     if source in ("self_readout", "target_feat") or source.startswith("token:"):
         # a token:<name> source reads one encoder self-token output (d_model wide)
         return int(d_model)
+    if source.startswith("scalar:"):
+        # a scalar:<name> source concatenates the raw obs scalar field straight
+        # into the selector cat (its dequantized width, e.g. attack_finished → 1).
+        return int(SCALAR_FIELDS[source[len("scalar:"):]].width)
     raise ValueError(f"unknown weapon source {source!r}")
 
 
@@ -359,6 +366,8 @@ class Network(nn.Module):
         attack_head: "nn.Module | Off | None" = None,
         weapon_head: "nn.Module | Off | None" = None,
         move_hazard_head: "nn.Module | Off | None" = Off,
+        move_seg_head: "nn.Module | Off | None" = Off,
+        jump_head: "nn.Module | Off | None" = Off,
     ) -> None:
         super().__init__()
         if obs_embedding is Off:
@@ -403,12 +412,13 @@ class Network(nn.Module):
         _valid_sources = {"gru", "self_readout", "target_feat"}
         _bad = [
             s for s in self.weapon_sources
-            if s not in _valid_sources and not s.startswith("token:")
+            if s not in _valid_sources
+            and not s.startswith("token:") and not s.startswith("scalar:")
         ]
         if _bad:
             raise ValueError(
-                f"weapon_sources contains unknown source(s) {_bad}; "
-                f"valid sources are {sorted(_valid_sources)} or 'token:<name>'"
+                f"weapon_sources contains unknown source(s) {_bad}; valid sources are "
+                f"{sorted(_valid_sources)} or 'token:<name>' / 'scalar:<name>'"
             )
         for s in self.weapon_sources:
             if s.startswith("token:") and s[len("token:"):] not in self._self_token_index:
@@ -416,6 +426,14 @@ class Network(nn.Module):
                     f"weapon source {s!r} → unknown self-token; obs embedding has "
                     f"{list(self._self_token_index)}"
                 )
+        # A scalar:<name> source reads the dequantized obs scalar field straight
+        # into the selector cat — precompute (obs_key, start, stop) slices so the
+        # per-step forward stays a dict lookup, not a catalog resolve.
+        self._weapon_scalar_slices: dict[str, tuple[str, int, int]] = {}
+        for s in self.weapon_sources:
+            if s.startswith("scalar:"):
+                spec = SCALAR_FIELDS[s[len("scalar:"):]]
+                self._weapon_scalar_slices[s] = (spec.slice_key, spec.start, spec.stop)
         if not ({"gru", "self_readout"} & set(self.weapon_sources)) and not any(
             s.startswith("token:") for s in self.weapon_sources
         ):
@@ -446,6 +464,8 @@ class Network(nn.Module):
         # build_network passed a real module — default Off keeps every existing
         # Network construction (which never passes it) hazard-free.
         self._has_move_hazard_head = isinstance(move_hazard_head, nn.Module)
+        self._has_move_seg_head = isinstance(move_seg_head, nn.Module)
+        self._has_jump_head = isinstance(jump_head, nn.Module)
 
         # Build the upstream slots (temporal, target pointer) FIRST so the
         # downstream dim contract reads their declared out_dim rather than a
@@ -515,6 +535,12 @@ class Network(nn.Module):
                 if attack_head is None else attack_head
             )
 
+        if self._has_move_seg_head:
+            self.move_seg_head = move_seg_head
+        if self._has_jump_head:
+            # a25 land-jump head: opt-in only, same passenger contract as
+            # move_seg (reads the shared motor feature vector).
+            self.jump_head = jump_head
         if self._has_move_hazard_head:
             # No canonical fallback — always an override built by build_network.
             self.move_hazard_head = move_hazard_head
@@ -536,6 +562,23 @@ class Network(nn.Module):
         if weapon_context is None:
             return features
         return torch.cat([features, weapon_context], dim=-1)
+
+    # P1 feasibility mask (agents/plans/attack-finished-masking-refactor.md):
+    # owned+ammo (readiness > 0.1; the 0.1 floor marks owned-but-empty) AND the
+    # refire cooldown elapsed (af == remaining-cooldown/TIME_SCALE ≈ 0 ⇒ ready).
+    # Both sources are dequant OUTPUTS that survive resident compaction, so the
+    # mask builds identically at train, serve, and ONNX-export time.
+    _FEAS_OWNED_AMMO = 0.1 + 1e-4
+    _FEAS_AF_READY = 1e-4
+
+    @staticmethod
+    def _weapon_feasibility_mask(flat_obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        readiness = flat_obs["self_weapon_readiness"]        # (B*, 8) axe..LG
+        af = flat_obs["self_arsenal_scalars"][..., 0:1]      # (B*, 1) remaining cooldown /TIME_SCALE
+        feas8 = (readiness > Network._FEAS_OWNED_AMMO) & (af <= Network._FEAS_AF_READY)
+        neg = torch.where(feas8, af.new_zeros(()), af.new_full((), -1e9))  # (B*, 8)
+        # class 0 (no_attack) is always feasible → never masked.
+        return torch.cat([torch.zeros_like(af), neg], dim=-1)             # (B*, 9)
 
     def forward(
         self,
@@ -626,13 +669,28 @@ class Network(nn.Module):
                     _ws_available[_src] = enc_out.self_block[
                         :, self._self_token_index[_src[len("token:"):]], :
                     ]
+                elif _src.startswith("scalar:"):
+                    _key, _start, _stop = self._weapon_scalar_slices[_src]
+                    if _key not in flat_obs:
+                        raise ValueError(
+                            f"weapon source {_src!r} needs dequantized obs field "
+                            f"{_key!r}, absent from obs — the model must run on "
+                            "dequantized obs (compact_dequantized resident source)"
+                        )
+                    _ws_available[_src] = flat_obs[_key][..., _start:_stop]
             weapon_selector_flat = torch.cat(
                 [_ws_available[src] for src in self.weapon_sources if src in _ws_available],
                 dim=-1,
             )
+            _feas_mask = (
+                self._weapon_feasibility_mask(flat_obs)
+                if getattr(self.weapon_head, "wants_feasibility_mask", False)
+                else None
+            )
             weapon_out = self.weapon_head(WeaponHeadInput(
                 selector=weapon_selector_flat,
                 obs_weapon_id=flat_obs["self_weapon_id"] if self.weapon_context_from_obs else None,
+                feasibility_mask=_feas_mask,
             ))
         weapon_context = weapon_out.context if weapon_out is not None else None
 
@@ -644,6 +702,18 @@ class Network(nn.Module):
         # which arrive as flat_obs fields (train: precomputed act_move columns;
         # deploy: threaded from the engine's move-decode state). Local import
         # keeps the canonical Network module free of a top-level bench dependency.
+        move_seg_out = None
+        if self._has_move_seg_head:
+            # a25 segment head (passenger): reads the SAME motor feature vector
+            # as the move head; the module prefix-slices to its declared inputs.
+            move_seg_out = self.move_seg_head(move_features_flat)
+
+        jump_out = None
+        if self._has_jump_head:
+            # a25 land-jump head (passenger): same motor feature vector; the
+            # module prefix-slices to its declared inputs.
+            jump_out = self.jump_head(move_features_flat)
+
         move_hazard_out = None
         # The move-hazard (a25 WHEN-law) head is a TRAINING auxiliary: it consumes
         # move_held_class / move_dwell_age, which the BC loader derives from
@@ -704,6 +774,10 @@ class Network(nn.Module):
         logits_flat: Dict[str, torch.Tensor] = {}
         if move_out is not None:
             logits_flat[MOVE_HEAD] = move_out.logits
+        if move_seg_out is not None:
+            logits_flat[MOVE_SEG_HEAD] = move_seg_out
+        if jump_out is not None:
+            logits_flat[JUMP_HEAD] = jump_out
         if move_hazard_out is not None:
             # Per-axis release-hazard logits — consumed by the loss (phase 3) and
             # the move WHEN-decode; not an argmax-sampled action vector.

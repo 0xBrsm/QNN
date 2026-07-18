@@ -248,6 +248,16 @@ void QNN_EventTick(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag
  * with at minimum fraction (1.0 = no obstruction) and endpos. */
 void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace);
 
+/* Mover occlusion cache (qnn_store.c) — solid brush-submodel movers at
+ * their live origins, enumerated once per observation frame.  The
+ * per-engine QNN_TraceLine refreshes the cache and clips each ray/LOS
+ * segment against these so movers occlude like static world geometry.
+ * Refresh returns the current mover count; Model/Origin index into the
+ * cache (valid until the next refresh). */
+int      QNN_TraceMoverCacheRefresh(void);
+model_t *QNN_TraceMoverModel(int index);
+float   *QNN_TraceMoverOrigin(int index);
+
 /* Model view-cone aperture (total degrees, [0,360]); read by QNN_InFov,
  * registered via QNN_RegisterPerceptionCvars. See qnn_entity.c. */
 extern cvar_t qnn_fov;

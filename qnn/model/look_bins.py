@@ -37,10 +37,20 @@ CENTERS = _build_centers()        # (N_BINS,) CPU; callers .to(device)
 
 
 def tangent_logmap(u: torch.Tensor) -> torch.Tensor:
-    """3D unit vectors (..., 3) → 2D tangent (..., 2); ||result|| = turn angle."""
-    theta = torch.arccos(u[..., 0].clamp(-1.0, 1.0))
+    """3D unit vectors (..., 3) → 2D tangent (..., 2); ||result|| = turn angle.
+
+    Magnitude from ``atan2(|yz|, x)``, NOT ``arccos(x)``: for small turns the
+    signal in x is quadratically small (1 − cosθ ≈ θ²/2) and arccos amplifies
+    x-error by 1/√(1−x²) — on fp16-cached look vectors that combination
+    quantizes θ onto √n·1.79° and manufactures exact-zero holds for every
+    turn below ~1.27° (research/look-head.md, 2026-07-06 root cause). The
+    transverse |yz| ≈ sinθ carries the same rotation linearly near zero where
+    the float grid is dense; atan2 is well-conditioned over the whole range
+    and tolerant of slightly non-unit inputs.
+    """
     yz = u[..., 1:3]
     n = torch.linalg.vector_norm(yz, dim=-1)
+    theta = torch.atan2(n, u[..., 0])
     scale = torch.where(n > _EPS, theta / n.clamp(min=_EPS), torch.zeros_like(theta))
     return yz * scale[..., None]
 
@@ -101,7 +111,7 @@ N_DIR = 16                        # uniform direction bins over [0, 2π)
 # (rate-dependent) and pinned per-run in config/look_grid.json; every job MUST call
 # install_polar_grid() at startup (runner/eval/export/decode_fit all do). Old models
 # trained before data-driven grids get the historical grid materialized into their
-# run dir via `qnn.model.look_grid --export-default` (source "code_default") and go
+# run dir via `qnn.human.look_grid --export-default` (source "code_default") and go
 # through the same install path — there is no runtime fallback to snap to.
 MAG_CENTERS: torch.Tensor | None = None               # (N_MAG+1,); [0]=0 (hold)
 DIR_CENTERS: torch.Tensor | None = None               # (N_DIR,) bin-center angles
@@ -127,13 +137,29 @@ _POLAR_MEDGE = None
 POLAR_LOG_CELL_AREA: torch.Tensor | None = None       # (N_MAG+1,)
 
 
+# Per-device copies of the installed grid. `.to(device)` from pageable host
+# memory is a SYNCHRONIZING copy; polar_targets/polar_to_tangent run on every
+# training forward, so re-uploading the centers per call stalled the GPU
+# pipeline (profiled). Cleared on install_polar_grid.
+_DEVICE_GRID_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _grid_on(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (device.type, device.index)
+    hit = _DEVICE_GRID_CACHE.get(key)
+    if hit is None:
+        hit = (MAG_CENTERS.to(device), DIR_CENTERS.to(device))
+        _DEVICE_GRID_CACHE[key] = hit
+    return hit
+
+
 def _require_polar_grid() -> None:
     """Raise a clear error if no polar grid has been installed (no default)."""
     if MAG_CENTERS is None or DIR_CENTERS is None:
         raise RuntimeError(
             "look polar grid not installed — call look_bins.install_polar_grid() at "
             "job start from the run's config/look_grid.json. There is NO code default; "
-            "old runs get one via `python -m qnn.model.look_grid --export-default <run>`.")
+            "old runs get one via `python -m qnn.human.look_grid --export-default <run>`.")
 
 
 def polar_targets(z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -141,10 +167,9 @@ def polar_targets(z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     _require_polar_grid()
     theta = torch.linalg.vector_norm(z, dim=-1)                       # (...,)
     phi = torch.atan2(z[..., 1], z[..., 0]) % (2.0 * torch.pi)        # (...,)
-    mc = MAG_CENTERS.to(z.device)
+    mc, dc = _grid_on(z.device)
     mag_bin = (theta[..., None] - mc[1:]).abs().argmin(dim=-1) + 1     # nearest non-hold center
     mag_bin = torch.where(theta < _HOLD_MAX, torch.zeros_like(mag_bin), mag_bin)
-    dc = DIR_CENTERS.to(z.device)
     ang = torch.atan2(torch.sin(phi[..., None] - dc), torch.cos(phi[..., None] - dc)).abs()
     dir_bin = ang.argmin(dim=-1)                                      # nearest direction (circular)
     return mag_bin, dir_bin
@@ -153,8 +178,9 @@ def polar_targets(z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def polar_to_tangent(mag_bin: torch.Tensor, dir_bin: torch.Tensor) -> torch.Tensor:
     """(mag_bin, dir_bin) long → 2D tangent z (..., 2). hold → 0."""
     _require_polar_grid()
-    theta = MAG_CENTERS.to(mag_bin.device)[mag_bin]
-    phi = DIR_CENTERS.to(dir_bin.device)[dir_bin]
+    mc, dc = _grid_on(mag_bin.device)
+    theta = mc[mag_bin]
+    phi = dc[dir_bin]
     return torch.stack([theta * torch.cos(phi), theta * torch.sin(phi)], dim=-1)
 
 
@@ -183,7 +209,8 @@ def polar_log_prob(
     return lpm + (mag_bin > 0).to(lpm.dtype) * lpd
 
 
-def install_polar_grid(mag_centers_rad, dir_centers_rad=None) -> None:
+def install_polar_grid(mag_centers_rad, dir_centers_rad=None,
+                       deadzone_rad=None) -> None:
     """Rebind the module's polar grid to a pinned, data-fit grid.
 
     The look head's loss target (``polar_targets``), the offline decode
@@ -195,15 +222,25 @@ def install_polar_grid(mag_centers_rad, dir_centers_rad=None) -> None:
 
     The grid is process-global: call **once per job at startup**, before the
     model is built/used, from the run's pinned ``config/look_grid.json`` (see
-    ``qnn.model.look_grid`` + ``run.init``). There is NO implicit default — a run
+    ``qnn.human.look_grid`` + ``run.init``). There is NO implicit default — a run
     must pin its grid. Do not run parallel jobs with different grids in one
     process (the daemon runs jobs sequentially; each installs its own grid).
 
     Only the magnitude (and optionally direction) center *positions* move;
     ``N_MAG``/``N_DIR`` are fixed (no shape/arch change). ``mag_centers_rad`` must
     have ``N_MAG+1`` entries (leading hold center 0), matching ``MAG_CENTERS``.
+
+    ``deadzone_rad`` (grid json ``deadzone_rad``, 7/06 point-mass-hold scheme)
+    decouples the LABEL deadzone from the grid geometry: hold is the true
+    stillness point mass, bounded only by the source resolution floor (demo
+    angle16), and no drift is deleted at labeling regardless of rung
+    positions. When absent (every pre-7/06 grid json), the legacy derived
+    ``rung1/2`` rule applies — bit-identical for existing runs. NOTE: legacy
+    jsons carry a ``hold_max_rad`` field that records the FIT exclusion, not
+    the effective threshold — it is intentionally NOT honored here.
     """
     global MAG_CENTERS, DIR_CENTERS, _HOLD_MAX, _MC64, _POLAR_MEDGE, POLAR_LOG_CELL_AREA
+    _DEVICE_GRID_CACHE.clear()
     mag = torch.as_tensor(mag_centers_rad, dtype=torch.float32).flatten()
     if mag.numel() != N_MAG + 1:
         raise ValueError(
@@ -217,7 +254,8 @@ def install_polar_grid(mag_centers_rad, dir_centers_rad=None) -> None:
         DIR_CENTERS = d
     # Recompute the hold threshold + polar cell log-areas from the new centers
     # (mirror of the import-time block above).
-    _HOLD_MAX = float(MAG_CENTERS[1]) * 0.5
+    _HOLD_MAX = (float(deadzone_rad) if deadzone_rad is not None
+                 else float(MAG_CENTERS[1]) * 0.5)
     _MC64 = MAG_CENTERS.numpy().astype("float64")
     _POLAR_MEDGE = _np_lb.concatenate(
         [[_HOLD_MAX], (_MC64[1:-1] + _MC64[2:]) / 2, [_np_lb.pi]])

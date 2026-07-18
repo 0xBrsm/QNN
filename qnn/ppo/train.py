@@ -257,6 +257,8 @@ def run_native_ppo(
             max_steps_per_episode=int(ppo_cfg["max_steps_per_episode"]),
             fixed_tick_hz=int(ppo_cfg["fixed_tick_hz"]),
             reward_weights=reward_weights,
+            direct_actions=True,
+            observer_mode="virtual",
             scenario_id=f"arena-grid-{ppo_cfg['seat_mode']}",
         )
     else:

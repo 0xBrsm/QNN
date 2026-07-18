@@ -98,13 +98,38 @@ def _build_head_probe_bc_config(
 
     model_config, model_factory, graph = _resolve_probe_model(dict(probe))
 
+    seed_checkpoint = str(run_cfg.get("checkpoint_path", "") or "")
+    if seed_checkpoint:
+        # Warm-start (e.g. tail-extension probes): QNNPolicy.load rebuilds
+        # the architecture from the checkpoint's embedded meta.model_graph,
+        # and run_behavior_cloning forbids passing a graph alongside a seed.
+        # Verify the probe's declared graph MATCHES the checkpoint's so the
+        # run dir cannot lie about what actually trained, then defer to the
+        # load path (graph=None). Shared here so BOTH the standalone runner
+        # and the ablation daemon (_build_job) get the same behavior.
+        import torch as _torch
+        _payload = _torch.load(seed_checkpoint, map_location="cpu", weights_only=False)
+        _ckpt_graph = (_payload.get("meta") or {}).get("model_graph")
+        del _payload
+        if _ckpt_graph is None:
+            raise RuntimeError(
+                f"{seed_checkpoint} has no embedded model_graph — head_probe "
+                "warm-start requires a graph checkpoint")
+        if graph is not None and _ckpt_graph != graph.to_dict():
+            raise RuntimeError(
+                "probe.json resolves to a different graph than the seed "
+                "checkpoint's embedded model_graph — align probe.json with "
+                "the seed run before warm-starting")
+        model_factory = None
+        graph = None
+
     # Pin the look turn-delta grid this run trains/decodes with. The grid lives
     # in the run dir (config/look_grid.json) — written by run.init from the
     # corpus's data-fit grid (or the materialized code-default for retained
     # models). No implicit default: a head_probe run-dir must carry its grid.
     # Installing here (once, before the model factory runs) keeps the loss
     # target and the offline decode on the SAME centers. See
-    # qnn.model.look_bins.install_polar_grid + qnn.model.look_grid.
+    # qnn.model.look_bins.install_polar_grid + qnn.human.look_grid.
     import json as _json
     from qnn.model import look_bins as _look_bins
     run_dir = Path(run_output_dirs(run_cfg)["checkpoints"]).parent
@@ -114,7 +139,8 @@ def _build_head_probe_bc_config(
             f"{grid_path} is absent — every run must pin its look grid "
             "(run.init writes it from the corpus fit; no implicit default).")
     _grid = _json.loads(grid_path.read_text())
-    _look_bins.install_polar_grid(_grid["mag_centers_rad"], _grid.get("dir_centers_rad"))
+    _look_bins.install_polar_grid(_grid["mag_centers_rad"], _grid.get("dir_centers_rad"),
+                                  deadzone_rad=_grid.get("deadzone_rad"))
     print(f"  [head_probe] look grid pinned: source={_grid.get('source','?')} "
           f"hold_max={_grid['hold_max_rad']:.5f} rad "
           f"(fit rms {_grid.get('fit_rms_deg', '?')} vs default {_grid.get('default_rms_deg', '?')})")
@@ -135,6 +161,8 @@ def _build_head_probe_bc_config(
     bc_cfg["prefetch"] = int(_require_key(machine, "prefetch", "machine.json"))
     bc_cfg["snapshot_interval"] = int(_require_key(machine, "snapshot_interval", "machine.json"))
     bc_cfg["streaming"] = bool(_require_key(machine, "streaming", "machine.json"))
+    bc_cfg["resident_epoch_pack"] = bool(machine.get("resident_epoch_pack", False))
+    bc_cfg["reset_aligned_lanes"] = bool(machine.get("reset_aligned_lanes", False))
     # Optional per-run knob: engagement EMA decay rate. Defaults to 0.5
     # to preserve historical behavior for run-dirs that don't set it.
     bc_cfg["engagement_ema_alpha"] = float(probe.get("engagement_ema_alpha", 0.5))

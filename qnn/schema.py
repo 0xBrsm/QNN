@@ -29,6 +29,13 @@ SPATIAL_SCALAR_DIM = 13
 
 SELF_SCALAR_DIM = 17  # legacy flat layout, kept for ablation heads / probes (+ attack_finished at idx 16)
 
+# Version of the flat gate-stream schema in move_streams_*.npz (the band /
+# rc_humanlikeness subject format written by qnn.eval.run and read by
+# qnn.eval.humanlikeness). 2 = band-v5 fields (discharge / weapon_imp /
+# engaged). Bump on ANY field change: eval caches (e.g. decode-fit freeplay
+# waves) key on it so stale-schema npz are re-produced, not silently reused.
+GATE_STREAM_SCHEMA_VERSION = 2
+
 # Self-subtoken widths consumed by the three ObsEmbedding projections
 # (self_proj_state / self_proj_arsenal / self_proj_motion).
 SELF_STATE_SCALAR_DIM   = 2  # health, effective_armor

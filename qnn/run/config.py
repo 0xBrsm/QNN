@@ -261,6 +261,8 @@ def build_run_bc_config(
     bc_cfg["prefetch"] = int(_require_key(machine, "prefetch", "machine.json"))
     bc_cfg["snapshot_interval"] = int(_require_key(machine, "snapshot_interval", "machine.json"))
     bc_cfg["streaming"] = bool(_require_key(machine, "streaming", "machine.json"))
+    bc_cfg["resident_epoch_pack"] = bool(machine.get("resident_epoch_pack", False))
+    bc_cfg["reset_aligned_lanes"] = bool(machine.get("reset_aligned_lanes", False))
     bc_cfg["dtype"] = str(_require_string(train, "dtype", "train.json"))
     bc_cfg["collection_fingerprint"] = _require_string(
         train, "collection_fingerprint", "train.json"
@@ -379,6 +381,13 @@ def build_run_ppo_eval_config(
         "reward_json_path": str(run_cfg["config_paths"]["reward"]),
         "parallel_policy_modes": bool(_require_key(train, "eval_parallel_policy_modes", "train.json")),
         "device": requested_device,
+        "env_backend": str(machine.get("eval_env_backend", "process")),
+        "arena_server_binary": str(machine.get("arena_server_binary", "assets/bin/ppo_arena_server")),
+        "arena_client_binary": str(machine.get("arena_client_binary", "assets/bin/ppo_arena_client")),
+        "arena_map_id": str(machine.get("arena_map_id", "qnn_arena8")),
+        "arena_base_port": int(machine.get("eval_arena_base_port", 28900)),
+        "arena_bot_skill": int(machine.get("arena_bot_skill", 3)),
+        "arena_matches_per_server": int(machine.get("matches_per_server", 8)),
     }
     return ppo_cfg, eval_cfg
 
@@ -400,6 +409,33 @@ def _parse_weapon_ban(raw: Any) -> tuple[int, ...]:
         if not 1 <= imp <= 8:
             raise ValueError(f"eval_weapon_ban: impulse {imp} out of range 1..8")
     return ban
+
+
+def _parse_per_env_decode_overrides(
+    raw: Any,
+) -> tuple[dict[str, float], ...] | None:
+    """Normalize an ``eval_per_env_decode_overrides`` value into the tuple of
+    per-lane decode dicts ``EvalConfig.per_env_decode_overrides`` expects.
+
+    On disk this is a JSON list (one entry per ENV SLOT, aligned with the
+    scenario order in scenario.json), each a mapping of a supported decode-config
+    key (qnn.model.policy._PER_ROW_DECODE_KEYS) to that lane's scalar. It is the
+    serialized form of the aim-grid batched widener: many (swept-value, scenario)
+    cells packed into one ≤64-lane batched eval. None/absent → the scalar path
+    (back-compat). Values are coerced to float so JSON ints ride through.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            "eval_per_env_decode_overrides must be a list of {key: value} dicts")
+    out: list[dict[str, float]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                f"eval_per_env_decode_overrides[{i}] must be a dict, got {type(item)}")
+        out.append({str(k): float(v) for k, v in item.items()})
+    return tuple(out)
 
 
 def build_run_eval_config(
@@ -449,6 +485,13 @@ def build_run_eval_config(
         "reward_json_path": str(run_cfg["config_paths"]["reward"]),
         "parallel_policy_modes": bool(_t("parallel_policy_modes")),
         "device": requested_device,
+        "env_backend": str(machine.get("eval_env_backend", "process")),
+        "arena_server_binary": str(machine.get("arena_server_binary", "assets/bin/ppo_arena_server")),
+        "arena_client_binary": str(machine.get("arena_client_binary", "assets/bin/ppo_arena_client")),
+        "arena_map_id": str(machine.get("arena_map_id", "qnn_arena8")),
+        "arena_base_port": int(machine.get("eval_arena_base_port", 28900)),
+        "arena_bot_skill": int(machine.get("arena_bot_skill", 3)),
+        "arena_matches_per_server": int(machine.get("matches_per_server", 8)),
         # Optional: aim-prior gain override (0.0 = control arm). Absent →
         # None → the model's baked decode-contract default.
         "look_aim_prior_gain": (
@@ -459,40 +502,16 @@ def build_run_eval_config(
         # ONNX export path applies, so eval predicts deployed behavior. Accepts
         # a csv string ("2,3") or a list ([2, 3]); absent → () → no ban.
         "weapon_ban": _parse_weapon_ban(train.get("eval_weapon_ban")),
-        # Optional: engine-parity sticky move decode (set both for live
-        # parity; absent → legacy per-frame sampling).
-        "move_sticky_tau_fb": (
-            float(train["eval_move_sticky_tau_fb"])
-            if "eval_move_sticky_tau_fb" in train else None
-        ),
-        "move_sticky_tau_lr": (
-            float(train["eval_move_sticky_tau_lr"])
-            if "eval_move_sticky_tau_lr" in train else None
-        ),
         # Optional: dump per-episode decoded move streams (diagnostics).
+        # NOTE: the a24 sticky-move eval keys (eval_move_sticky_tau_*,
+        # eval_move_hazard, eval_move_switchback_eps, eval_move_stop_onset,
+        # eval_move_tau_engagement_gated) were RETIRED with the a24 arch; old
+        # train.json files still carrying them are simply not read here.
         "log_action_streams": bool(train.get("eval_log_action_streams", False)),
-        # Optional: semi-Markov dwell hazard (dict with a "lognorm" block of
-        # per-axis fb/lr (mu,sigma); the decode evaluates h(t) per dwell-age,
-        # no bucketed table). Requires the sticky taus.
-        "move_hazard": (
-            dict(train["eval_move_hazard"])
-            if isinstance(train.get("eval_move_hazard"), Mapping) else None
-        ),
-        # Optional: latency-agnostic switch-back suppression (watermark on the
-        # abandoned class's softmax prob; see research/move-head.md). Requires
-        # the sticky taus.
-        "move_switchback_eps": (
-            float(train["eval_move_switchback_eps"])
-            if "eval_move_switchback_eps" in train else None
-        ),
-        # Optional: stop-onset hazard symmetry — from a true stop (both held
-        # fb/lr = none) gate presses are suppressed; onsets come from the
-        # none-row hazard. Requires eval_move_hazard fb+lr tables.
-        "move_stop_onset": bool(train.get("eval_move_stop_onset", False)),
-        # Optional: engagement-gated sticky tau — tau=1 (table-only switching) on
-        # disengaged (no-target) frames, sticky_tau on engaged frames. Pairs with a
-        # non-combat baseline eval_move_hazard table (rc1o move scheme).
-        "move_tau_engagement_gated": bool(train.get("eval_move_tau_engagement_gated", False)),
+        # Optional: dump per-episode raw entity obs streams for the ACQUISITION
+        # (Fitts-throughput) axis (acq_streams_<mode>.npz). See
+        # EvalConfig.log_acq_streams.
+        "log_acq_streams": bool(train.get("eval_log_acq_streams", False)),
         # Optional: emulate the live client's obs latency — the policy sees
         # obs from N ticks ago while actions land in real time. 0 = bridge
         # semantics (every eval before 2026-06-11).
@@ -507,8 +526,16 @@ def build_run_eval_config(
         # one model.act(B=N) per macro-step so the CPU saturates instead of
         # idling in the per-env ping-pong. NOT bit-identical to the default B=1
         # path; only for evals robust to float-level batching differences (e.g.
-        # the aim grid's coh_5deg). See EvalConfig.batched_forward.
+        # the aim grid's intercept-hbw). See EvalConfig.batched_forward.
         "batched_forward": bool(train.get("eval_batched_forward", False)),
+        # Optional: PER-LANE decode overrides — one {key: value} dict per env
+        # slot (aligned with scenario order), so a single ≤64-lane batched eval
+        # runs many (swept-value, scenario) cells instead of one cold subprocess
+        # per swept value (the aim-grid widener). Requires batched_forward.
+        # Absent → None → the model/decode scalar for every lane. See
+        # EvalConfig.per_env_decode_overrides.
+        "per_env_decode_overrides": _parse_per_env_decode_overrides(
+            train.get("eval_per_env_decode_overrides")),
     }
 
 

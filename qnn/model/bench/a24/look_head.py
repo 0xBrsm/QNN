@@ -66,22 +66,40 @@ class PurePolarLookHead(nn.Module):
         frames (the look-loss hook contract).
 
         `logits` carries this head's forwarded outputs; `look_label` is the
-        normalized unit turn-delta on the valid frames. The label is mapped to
-        the tangent log-map and discretized into (mag_bin, dir_bin); the loss is
-        CE over the (N_MAG+1) magnitude bins plus — only on the non-hold rows —
-        CE over the N_DIR direction bins (direction is undefined for hold). See
+        normalized unit turn-delta for EVERY row (invalid rows are filled with
+        the no-turn vector by the caller) and `valid` selects the scored rows.
+        The loss folds `valid` into per-row weights instead of subset-indexing:
+        boolean indexing calls nonzero(), whose device→host sync was the
+        profiled training bottleneck. The label is mapped to the tangent
+        log-map and discretized into (mag_bin, dir_bin); the loss is CE over
+        the (N_MAG+1) magnitude bins plus — only on the non-hold rows — CE
+        over the N_DIR direction bins (direction is undefined for hold). See
         qnn.model.look_bins.
         """
-        mag = logits["_look_mag_logits"].reshape(-1, N_MAG + 1)[valid]
-        dirl = logits["_look_dir_logits"].reshape(-1, N_DIR)[valid]
+        mag = logits["_look_mag_logits"].reshape(-1, N_MAG + 1)
+        dirl = logits["_look_dir_logits"].reshape(-1, N_DIR)
         z = tangent_logmap(look_label)
         mb, db = polar_targets(z)
-        loss = F.cross_entropy(mag, mb)
-        turn = mb > 0
-        if bool(turn.any()):
-            loss = loss + F.cross_entropy(dirl[turn], db[turn])
+        valid_f = valid.to(mag.dtype)
+        n_valid = valid_f.sum().clamp(min=1.0)
+        ce_mag = F.cross_entropy(mag, mb, reduction="none")
+        loss = (ce_mag * valid_f).sum() / n_valid
+        turn_f = (mb > 0).to(mag.dtype) * valid_f
+        # Weighted-sum CE over zero rows is exactly zero. This keeps hold-only
+        # batches on device instead of synchronizing `turn.any()` to Python.
+        ce_dir = F.cross_entropy(dirl, db, reduction="none")
+        loss = loss + (ce_dir * turn_f).sum() / turn_f.sum().clamp(min=1.0)
         metrics = {}
         if compute_metrics:
+            # Metrics run on the sampled reporting step only — the subset
+            # indexing (and its sync) is off the hot path, and the sums must
+            # cover exactly the valid rows as before.
+            mag = mag[valid]
+            dirl = dirl[valid]
+            z = z[valid]
+            mb = mb[valid]
+            db = db[valid]
+            turn = mb > 0
             metrics["loss_look"] = loss.detach()
             # Distributional sufficient stats (additive raw sums, prefix lookdist_).
             # Polar emits model tangent log-density + the same per-axis binned tangent

@@ -25,6 +25,7 @@ PATCHES=(
 # (qnn_phys).  Everything that touches sv.* lives in those files; the
 # obs/action path that remains is pure cl.* state.
 CUSTOM_SOURCES=(
+  "${ENGINE_DIR}/common/qnn_context.c"
   "${ENGINE_DIR}/nq/qnn_sys.c"
   "${ENGINE_DIR}/nq/qnn_client_console.c"
   "${ENGINE_DIR}/common/qnn_sys_common.c"

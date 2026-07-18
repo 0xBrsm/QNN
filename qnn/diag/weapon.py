@@ -77,11 +77,36 @@ import torch
 from qnn.bc.supervised_loop import make_resident_source_from_cache
 from qnn.bc.decode_fit import (
     _committed_stream,  # canonical — one copy, imported here and re-exported
-    _forward_weapon_logits,
     _to_np,
 )
 from qnn.diag.loader import load_policy
+from qnn.schema import WEAPON_HEAD_SIZE
 from qnn.vocab import self_weapon_id_to_impulse
+
+
+@torch.inference_mode()
+def _forward_weapon_logits(policy, source) -> torch.Tensor:
+    """Per-frame 8-way weapon logits (N, 8) — the split-weapon-head forward.
+
+    CANONICAL HOME (moved from qnn.bc.decode_fit when the a24 fits were retired;
+    the 8-way head is an a24-era analysis subject, but this diag surface still
+    reads retained runs). Forward each episode as a (1, T) sequence through the
+    plain network — NO bench side-channel, matching the live act() path."""
+    import numpy as _np
+    from qnn.model.network import WEAPON_HEAD as _WH
+    offsets = _np.asarray(source.episode_offsets, dtype=_np.int64)
+    out = torch.empty((int(offsets[-1]), WEAPON_HEAD_SIZE), dtype=torch.float32)
+    for i in range(len(offsets) - 1):
+        s, e = int(offsets[i]), int(offsets[i + 1])
+        if e <= s:
+            continue
+        T = e - s
+        idx = torch.arange(s, e, dtype=torch.int64, device=policy.device)
+        obs_seq = {k: v.index_select(0, idx).reshape((1, T) + tuple(v.shape[1:]))
+                   for k, v in source.obs.items()}
+        _f, logits, _v, _nh, _tl = policy.model(obs_seq, hidden=None, reset_mask=None)
+        out[s:e] = logits[_WH].reshape(T, WEAPON_HEAD_SIZE).float().cpu()
+    return out
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -602,10 +627,7 @@ def gate_sweep(
     confs, margins:
         Grid values.  Defaults to a standard sweep.
     """
-    import sys
-    import os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../scripts/analysis"))
-    import _weapon_metrics as wm  # canonical switch/dwell definitions
+    from qnn.diag import weapon_metrics as wm  # canonical switch/dwell definitions
 
     if confs is None:
         confs = [0.0, 0.3, 0.4, 0.5, 0.6, 0.65, 0.7, 0.8]
@@ -672,10 +694,7 @@ def switch_gated(
 
     Returns structured dict.  Prints nothing — the thin wrapper handles printing.
     """
-    import sys
-    import os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../scripts/analysis"))
-    import _weapon_metrics as wm
+    from qnn.diag import weapon_metrics as wm
 
     probs, label = collect_frames(policy, source)
     tok = _tok_impulse(source)

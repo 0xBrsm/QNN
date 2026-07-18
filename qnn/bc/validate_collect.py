@@ -293,7 +293,7 @@ def validate_collect(
     if drift_ref is not None and drift_ref.resolve() != data_dir.resolve():
         import json as _json
         try:
-            from qnn.model import look_grid as _lg
+            from qnn.human import look_grid as _lg
             this_lg = _json.loads((data_dir / "collect_metadata.json").read_text()).get("look_grid")
             ref_lg = _json.loads((drift_ref / "collect_metadata.json").read_text()).get("look_grid")
             if this_lg and ref_lg:

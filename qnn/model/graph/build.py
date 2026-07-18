@@ -26,6 +26,7 @@ from qnn.model.graph.spec import (
     EDGE_READOUT, EDGE_TARGET_FEAT,
     WEAPON_EDGE_TO_SOURCE, WEAPON_SOURCE_TO_EDGE,
     _is_token_edge, _token_edge_name,
+    _is_scalar_edge, _scalar_edge_name,
     GraphSpec, GraphSpecError, HeadNodeSpec, TokenSpec,
     TOKEN_KIND_ENTITIES, TOKEN_KIND_SPATIAL,
     EncoderSpec, PointerSpec, TemporalSpec,
@@ -48,11 +49,16 @@ import qnn.model.bench.a24.move_head     # noqa: F401  move "cls"
 import qnn.model.bench.a24.look_head     # noqa: F401  look "polar"
 import qnn.model.bench.a24.attack_head   # noqa: F401  attack "cls"
 import qnn.model.bench.a24.weapon_head   # noqa: F401  weapon "cls" / "cls_prior"
+import qnn.model.bench.a25.move_hazard_head  # noqa: F401  move_hazard "canonical"
+import qnn.model.bench.a25.move_seg_head     # noqa: F401  move_seg "canonical"
+import qnn.model.bench.a25.jump_head         # noqa: F401  jump "canonical"
+import qnn.model.bench.a25.attack_with_head  # noqa: F401  weapon "attack_with"
 import qnn.model.bench.inputs.preattn_encoder    # noqa: F401  encoder "passthrough"
 import qnn.model.bench.inputs.gt_target_pointer  # noqa: F401  pointer "gt"
 # Base-graph compositions — each generation registers its own (arch lives with
 # the generation, not here). base_graph_dict resolves names from the registry.
 import qnn.model.bench.a24.graphs  # noqa: F401  full_4head / full_5head
+import qnn.model.bench.a25.graphs  # noqa: F401  full_6head
 
 
 def _build_head(head: HeadNodeSpec, dims: dict[str, int], d_model: int) -> nn.Module:
@@ -84,9 +90,12 @@ def _weapon_sources(spec: GraphSpec) -> tuple[str, ...]:
 
     def _edge_to_source(edge: str) -> str:
         # token.<name> → token:<name> (read that self-token as the readout);
+        # scalar.<name> → scalar:<name> (raw obs scalar straight into the cat);
         # otherwise the fixed gru/self_readout/target_feat mapping.
         if _is_token_edge(edge):
             return "token:" + _token_edge_name(edge)
+        if _is_scalar_edge(edge):
+            return "scalar:" + _scalar_edge_name(edge)
         return WEAPON_EDGE_TO_SOURCE[edge]
 
     return tuple(_edge_to_source(e) for e in weapon.inputs)
@@ -189,6 +198,8 @@ def build_network(obs_dim: int, spec: GraphSpec) -> Network:
         attack_head=head_or_off("attack"),
         weapon_head=head_or_off("weapon"),
         move_hazard_head=head_or_off("move_hazard"),
+        move_seg_head=head_or_off("move_seg"),
+        jump_head=head_or_off("jump"),
     )
 
 

@@ -305,6 +305,15 @@ class SelfDequantizer(nn.Module):
             have_suit, torch.full_like(zero, _SUBJECT_SUIT), zero,
         ).unsqueeze(-1)                                                # (B, 1)
 
+        # Per-ammo-pool normalized fractions [shells, nails, rockets, cells],
+        # unmasked by ownership — the graded ammo signal (P2 arsenal token;
+        # agents/plans/attack-finished-masking-refactor.md). A dequant OUTPUT,
+        # so it survives resident compaction identically to self_weapon_readiness
+        # and is available at train / serve / ONNX. Ownership/identity are the
+        # feasibility mask's job, not this input's.
+        out["self_ammo_pools"] = torch.stack(
+            [ammo_sh_f, ammo_na_f, ammo_rk_f, ammo_ce_f], dim=1,
+        )                                                              # (B, 4)
         out["self_scalars"]         = scalars
         out["self_weapon_readiness"] = readiness
         out["self_weapon_id"]       = obs["self_weapon_id"].to(torch.int64).unsqueeze(-1)

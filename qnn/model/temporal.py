@@ -28,8 +28,10 @@ class TemporalInput:
     hidden: torch.Tensor | None                   # (1, B, H) or (B, H), last hidden state
     reset_mask: torch.Tensor | None               # (T*B,) bool — episode boundaries
     seq_shape: tuple[int, int] | None             # (T, B) if sequence, None if flat
-    # Sorted host-known timesteps where any lane resets. The mask remains the
-    # source of truth for which lanes reset at each boundary.
+    # Host-known timesteps where any lane resets (sorted). When provided, the
+    # recurrence segments at these without reading reset_mask back from the
+    # device (a synchronizing copy). Purely an optimization: reset_mask stays
+    # the source of truth for WHICH lanes reset at each boundary.
     reset_ts: tuple[int, ...] | None = None
 
 
@@ -74,21 +76,30 @@ class Temporal(nn.Module):
             reset_seq = inp.reset_mask.to(
                 device=pool_seq.device, dtype=torch.bool,
             ).reshape(seq_len, batch_size)
-            boundary_ts = (
-                [int(t) for t in inp.reset_ts]
-                if inp.reset_ts is not None
-                else reset_seq.any(dim=1).nonzero().flatten().tolist()
-            )
+            # Episode resets are sparse (a handful of lanes per TBPTT window),
+            # so segment the sequence at the timesteps where ANY lane resets
+            # and run one fused multi-step GRU kernel per segment, zeroing the
+            # affected lanes' hidden state at each boundary. Per-row math is
+            # identical to the old per-timestep loop (within a segment no lane
+            # resets, so masked_fill at the boundary covers every reset the
+            # loop would have applied) at ~T× fewer kernel launches. The
+            # boundary list normally arrives host-side via reset_ts (the
+            # trainer's packing plan knows it); the nonzero() fallback for
+            # callers that don't plumb it costs one device sync per batch.
+            if inp.reset_ts is not None:
+                boundary_ts = [int(t) for t in inp.reset_ts]
+            else:
+                boundary_ts = reset_seq.any(dim=1).nonzero().flatten().tolist()
             if not boundary_ts or boundary_ts[0] != 0:
                 boundary_ts = [0, *boundary_ts]
             boundary_ts.append(seq_len)
             h = h0
             outs = []
-            for start, end in zip(boundary_ts[:-1], boundary_ts[1:]):
-                reset_t = reset_seq[start].view(1, batch_size, 1)
+            for t0, t1 in zip(boundary_ts[:-1], boundary_ts[1:]):
+                reset_t = reset_seq[t0].view(1, batch_size, 1)
                 h = h.masked_fill(reset_t, 0.0)
-                out_segment, h = self.gru(pool_seq[start:end], h)
-                outs.append(out_segment)
+                out_seg, h = self.gru(pool_seq[t0:t1], h)
+                outs.append(out_seg)
             out_seq = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
             h_final = h
         return TemporalOutput(

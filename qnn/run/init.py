@@ -70,7 +70,11 @@ def main() -> None:
     parser.add_argument("--machine", help="Path to machine.json (overrides template)")
     parser.add_argument("--model", help="Path to model.json (overrides template)")
     parser.add_argument("--probe", help="Path to probe.json (overrides template; head_probe mode)")
-    parser.add_argument("--decode", help="Path to decode.json (overrides template; e.g. a versioned templates/decode.*.json)")
+    # decode.json is NOT stamped by default any more (the a24rc4 silent-default
+    # stamping is retired): a run's decode config arrives via the decode-fit
+    # pipeline after training. --decode remains available for an EXPLICIT pin.
+    parser.add_argument("--decode", help="Path to decode.json to pin EXPLICITLY at "
+                        "config/decode.json (optional; decode-fit is the normal source)")
     args = parser.parse_args()
 
     template_dir = _template_dir_for_mode(args.mode)
@@ -116,6 +120,12 @@ def main() -> None:
                 config_files[key] = str(default)
             else:
                 parser.error(f"Template missing for config/{key}.json and no --{key} override provided")
+    # Explicit decode pin: --decode stamps config/decode.json even when the
+    # manifest template doesn't list it (bench runs no longer stamp a decode
+    # config at init — decode arrives via the decode-fit pipeline).
+    if getattr(args, "decode", None) and "decode" not in config_files:
+        config_files["decode"] = args.decode
+        manifest.setdefault("config", {})["decode"] = "config/decode.json"
 
     # Create run directory and freeze configs
     config_dir = run_dir / "config"
@@ -147,7 +157,7 @@ def main() -> None:
     # data-fit grid into config/look_grid.json so it lives with the model (no
     # implicit code default). The trainer installs it at job start.
     if args.mode in ("bc", "head_probe"):
-        from qnn.model import look_grid as _look_grid
+        from qnn.human import look_grid as _look_grid
         machine = json.loads((config_dir / "machine.json").read_text())
         bc_data_dir = machine.get("bc_data_dir")
         if not bc_data_dir:
@@ -161,7 +171,7 @@ def main() -> None:
 
         # Pin the move-axis dwell-hazard release table from the same corpus, beside
         # the look grid. The move decode reads edges/fb/lr from this pinned table.
-        from qnn.model import move_hazard as _move_hazard
+        from qnn.human import move_hazard as _move_hazard
         haz = _move_hazard.pinned_hazard_from_collect(bc_data_dir)
         haz["git_commit"] = manifest["git_commit"]
         haz["created"] = manifest["created"]
@@ -173,7 +183,7 @@ def main() -> None:
         # collected before weapon_hazard was added won't carry the block until
         # recollected/backfilled — don't fail run-init over it during the transition.
         try:
-            from qnn.model import weapon_hazard as _weapon_hazard
+            from qnn.human import weapon_hazard as _weapon_hazard
             whaz = _weapon_hazard.pinned_hazard_from_collect(bc_data_dir)
             whaz["git_commit"] = manifest["git_commit"]
             whaz["created"] = manifest["created"]

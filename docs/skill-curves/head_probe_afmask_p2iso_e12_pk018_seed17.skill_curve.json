@@ -1,0 +1,537 @@
+{
+  "schema": "skill_curve_v1",
+  "axis": "mechanical_aim",
+  "scope": "AIM-only mechanical knob; tactical/strategic axes DEFERRED",
+  "skill_index": "leave-one-out within-weapon coh percentile (behavioral)",
+  "substrate": {
+    "look.turn_mag_scale": 0.93,
+    "look.hold_drift_eps": 0.0,
+    "fit_order": "dampener-before-aim"
+  },
+  "piecewise": {
+    "down": {
+      "range": "s < p17",
+      "knob": "look.aim_degrade_tremor_mag (hold-gated OU; lag retired 7/10)",
+      "tremor_tau_frames": 8.0,
+      "anchors": [
+        {
+          "pct": 10.592447916666666,
+          "tremor_mag": 0.08
+        },
+        {
+          "pct": 16.166087962962962,
+          "tremor_mag": 0.04
+        },
+        {
+          "pct": 17.1,
+          "tremor_mag": 0.0
+        }
+      ]
+    },
+    "up": {
+      "range": "p17 \u2264 s \u2264 p45",
+      "knob": "look.aim_prior_gain",
+      "anchors": [
+        {
+          "pct": 17.1,
+          "gain": 0.0
+        },
+        {
+          "pct": 31.1,
+          "gain": 0.1
+        },
+        {
+          "pct": 38.8,
+          "gain": 0.13
+        },
+        {
+          "pct": 44.4,
+          "gain": 0.16
+        },
+        {
+          "pct": 44.8,
+          "gain": 0.2
+        }
+      ]
+    },
+    "super": {
+      "range": "s > p45",
+      "knob": "look.aim_mag_gain (\u03b1), gain pinned at knee 0.2",
+      "anchors": [
+        {
+          "pct": 44.8,
+          "alpha": 0.0
+        },
+        {
+          "pct": 54.6,
+          "alpha": 0.05
+        },
+        {
+          "pct": 66.7,
+          "alpha": 0.1
+        },
+        {
+          "pct": 82.6,
+          "alpha": 0.3
+        },
+        {
+          "pct": 90.9,
+          "alpha": 0.5
+        }
+      ]
+    }
+  },
+  "per_weapon_gain_table": {
+    "shotgun": [
+      {
+        "pct": 10,
+        "coh_human": 0.1187,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.1504,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.1905,
+        "gain": 0.07741499995125489,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.2376,
+        "gain": 0.3268560953253895,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.2901,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.3255,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.4444,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "super_shotgun": [
+      {
+        "pct": 10,
+        "coh_human": 0.0667,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.1087,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.1611,
+        "gain": 0.008210161662817527,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.2174,
+        "gain": 0.1572369582921467,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.2686,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.3333,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.4499,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "nailgun": [
+      {
+        "pct": 10,
+        "coh_human": 0.0,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.0312,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.0625,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.096,
+        "gain": 0.015,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.1512,
+        "gain": 0.29622641509433967,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.1896,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.2779,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "super_nailgun": [
+      {
+        "pct": 10,
+        "coh_human": 0.0213,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.0395,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.0674,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.0984,
+        "gain": 0.023052166815722974,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.1306,
+        "gain": 0.11883720930232551,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.1526,
+        "gain": 0.304848484848485,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.2124,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "lightning": [
+      {
+        "pct": 10,
+        "coh_human": 0.16,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.226,
+        "gain": 0.16489361702127656,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.3001,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.3839,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.4643,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.5117,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.576,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ],
+    "rocket_launcher": [
+      {
+        "pct": 10,
+        "coh_human": 0.4147,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 25,
+        "coh_human": 0.4548,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 50,
+        "coh_human": 0.5044,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 75,
+        "coh_human": 0.5582,
+        "gain": 0.0,
+        "reachable": false,
+        "below_band": true,
+        "above_band": false
+      },
+      {
+        "pct": 90,
+        "coh_human": 0.6091,
+        "gain": 0.06156080281734316,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 95,
+        "coh_human": 0.6376,
+        "gain": 0.1819452618965505,
+        "reachable": true,
+        "below_band": false,
+        "above_band": false
+      },
+      {
+        "pct": 99,
+        "coh_human": 0.6843,
+        "gain": 0.4,
+        "reachable": false,
+        "below_band": false,
+        "above_band": true
+      }
+    ]
+  },
+  "all_humans_pins": {
+    "look.turn_mag_scale": 1.0,
+    "look.aim_ffwd_gain": 0.0,
+    "look.hold_passthrough": true,
+    "weapon_ban": [],
+    "attack.bias_vec": [
+      4.8176,
+      0.6343,
+      1.8478,
+      1.4132,
+      1.4438,
+      1.5882,
+      1.0693,
+      0.958
+    ],
+    "attack.stick_bias": 0.539,
+    "move.commitment": true,
+    "move.commit_interrupt": false,
+    "move.commit_dur_tilt": [
+      0.1294,
+      0.1616
+    ]
+  },
+  "move_hazard": "RETIRED \u2014 move_seg commitment decode (dur_tilt=[0.1294, 0.1616], interrupt=False); no sticky/lognorm stack",
+  "guards": {
+    "guard.projectile_release": true,
+    "guard.projectile_release_mode": "rocket"
+  },
+  "non_lever_verdicts": {
+    "MOVE": "commitment decode (semi-Markov segment head) \u2014 per-checkpoint fitted dur_tilt=[0.1294, 0.1616], interrupt off; sticky_tau + corpus lognorm hazard RETIRED",
+    "LOOK_style": null,
+    "WEAPON_select": "human target RETRACTED (coh artifact); gate diag only, DEFERRED",
+    "ATTACK": "all-humans pin \u2014 attack.bias calibration, cone low/off, sampled"
+  },
+  "model_verification": {
+    "per_weapon_coh": {
+      "SG": {
+        "model_coh_5deg": 0.1925,
+        "n": 6788,
+        "low_n": false,
+        "human_floor_percentile": 74.2,
+        "human_p50": 0.1545,
+        "human_p90": 0.2337
+      },
+      "SSG": {
+        "model_coh_5deg": 0.162,
+        "n": 864,
+        "low_n": true,
+        "human_floor_percentile": 65.0,
+        "human_p50": 0.1374,
+        "human_p90": 0.2214
+      },
+      "NG": {
+        "model_coh_5deg": 0.0907,
+        "n": 375,
+        "low_n": true,
+        "human_floor_percentile": 76.3,
+        "human_p50": 0.0602,
+        "human_p90": 0.115
+      },
+      "SNG": {
+        "model_coh_5deg": 0.0417,
+        "n": 456,
+        "low_n": true,
+        "human_floor_percentile": 20.0,
+        "human_p50": 0.0655,
+        "human_p90": 0.1136
+      },
+      "LG": {
+        "model_coh_5deg": 0.3224,
+        "n": 1033,
+        "low_n": true,
+        "human_floor_percentile": 68.5,
+        "human_p50": 0.2621,
+        "human_p90": 0.4103
+      },
+      "NAILS(pooled)": {
+        "model_coh_5deg": 0.0638,
+        "n": 831,
+        "low_n": true,
+        "human_floor_percentile": 53.2,
+        "note": "NG+SNG pooled (kinematics-identical)"
+      }
+    },
+    "look_style": null,
+    "native_floor_percentile_mean": 74.2,
+    "vertical_feet_gap": {
+      "note": "run scripts/analysis/rl_aim_vertical_residual.py to measure"
+    }
+  },
+  "provenance": {
+    "checkpoint": "runs/head_probe/head_probe_afmask_p2iso_e12_pk018_seed17/checkpoints/best_20260709-j7ct55.pth",
+    "model_id": "head_probe_afmask_p2iso_e12_pk018_seed17",
+    "corpus_dir": "/workspaces/dev-qnn/artifacts/collect/qwd",
+    "corpus_fingerprint": "sha256:44a4730af660577e4138e9d3dd5c2088eb376d54ba7881bc9dc97ba02f71720a",
+    "look_grid": "runs/head_probe/head_probe_afmask_p2iso_e12_pk018_seed17/config/look_grid.json",
+    "look_grid_sha256": "272cd7f6b4ecc69c3221ae30aedf14004308e2f9634f8856a6629fc9af481ed8",
+    "git_commit": "fce4687b"
+  },
+  "aim_artifact_commits": {
+    "psegment": "d712d4cb16ec7ac68281ff963bcfe881e1c6feda",
+    "frontier": "d712d4cb16ec7ac68281ff963bcfe881e1c6feda"
+  }
+}

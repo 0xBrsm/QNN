@@ -16,6 +16,8 @@ typedef struct qnn_route_runtime_s qnn_route_runtime_t;
 #endif
 
 #define QNN_OBS_BUFFER_SIZE 4096
+
+extern qboolean qnn_training_client_context;
 #define QNN_MAX_PROPERTY_KEY 64
 #define QNN_MAX_PROPERTY_VALUE 256
 #define QNN_MAX_CLASSNAME 64
@@ -614,11 +616,30 @@ void QNN_TrainingSetNetworkResetMask(int match_mask);
 void QNN_TrainingReadNetwork(void);
 qboolean QNN_TrainingNetworkRoundReset(void);
 qboolean QNN_TrainingNetworkArenaReady(void);
+void QNN_ApplyActionLook(const qnn_action_t *action, vec3_t viewangles);
+void QNN_ArenaApplyLocalAction(const qnn_action_t *action);
 void QNN_ArenaProcessPending(void);
 qboolean QNN_ArenaResetMatch(int match_id);
 qboolean QNN_ArenaAddBot(float skill);
 int QNN_ArenaAssignNamedSeats(void);
+void QNN_ArenaConfigureActionSeats(qboolean selfplay);
+qboolean QNN_ArenaStageActions(const qnn_action_t *actions, int action_count);
+/* Forward tag: client_t = struct client_s (server type). Builds that
+ * exclude server headers (QW/NQ demo workers) still compile this header. */
+struct client_s;
+void QNN_ArenaApplyStagedClient(struct client_s *client);
+int QNN_ArenaPendingActionCount(void);
 void QNN_ArenaRelinkEntities(void);
+void QNN_ArenaNewMap(void);
+void QNN_ArenaNewTranslation(int slot);
+
+/* Mutable observer-state registration for in-process arena client contexts. */
+void QNN_StoreRegisterContext(void);
+void QNN_EventRegisterContext(void);
+void QNN_SoundRegisterContext(void);
+void QNN_PlayersRegisterContext(void);
+void QNN_PredictRegisterContext(void);
+void QNN_TrainingRegisterContext(void);
 /* ── Engine physics constants (shared by collector, physics, inference) ── */
 
 #define QNN_SV_MAXSPEED      320.0f

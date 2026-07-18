@@ -31,6 +31,7 @@ from qnn.model.network import (
     ATTACK_HEAD_SIZE,
     LOOK_HEAD,
     LOOK_HEAD_SIZE,
+    JUMP_HEAD,
     MOVE_HEAD,
     MOVE_HEAD_SIZE,
     MOVE_HAZARD_HEAD,
@@ -51,12 +52,6 @@ HEAD_LOSS_WEIGHTS: Dict[str, float] = {
     "look": 1.0,
     "attack": 1.0,
 }
-
-# Stop-onset decode (move_stop_onset): minimum both-none dwell (ticks) before
-# gate presses are suppressed. ~0.3 s = the Quake friction time-to-zero from
-# run speed; younger both-none blips are combat strafe reversals that never
-# reach the stand animation. Mirrored in qnn_onnx.c (QNN_STOP_ONSET_MIN_AGE).
-STOP_ONSET_MIN_AGE: int = 6
 
 WEAPON_HEAD_CLASS_NAMES: Tuple[Tuple[int, str], ...] = (
     (0, "axe"),
@@ -91,11 +86,30 @@ def _null_side_channel_scope(*_args, **_kwargs):
     return contextlib.nullcontext()
 
 
-# Default generation decode facade when a policy isn't given an explicit one
-# (``_decode_mod``). The decode config's ``decode_module`` overrides it per run;
-# this is the only generation-decode literal in the core (the act path resolves
-# everything else through ``QNNPolicy._decode()``).
-_DEFAULT_DECODE_MODULE = "qnn.model.bench.a24.decode"
+# There is NO default generation decode facade. The decode module is EXPLICIT
+# state: eval/export orchestration injects it from the run's resolved decode
+# config (``resolved.decode_module`` → ``policy._decode_mod``), and bare-policy
+# entry points (analysis scripts) resolve it per run via
+# ``qnn.diag.loader.resolve_decode_module``. ``QNNPolicy._decode()`` raises when
+# nothing was injected — explicit-or-fail, never an arch guess.
+
+
+# PER-ROW (per-lane) DECODE OVERRIDES — the aim-grid closed-loop enabler.
+# ``act(per_row_decode=...)`` lets a SINGLE batched forward decode each row with
+# a DIFFERENT operating point on these look levers, so many (gain/α/tremor,
+# scenario) cells run in one B=N forward instead of one cold eval per swept
+# value. The keys below are the four the aim grid sweeps (decode-config dotted
+# names, matching a decode.json ``params`` block); each maps to the instance
+# attribute the canonical (scalar/vector) decode path reads. A per-row array of
+# length B overrides ONLY that lever, ONLY for this call — the forward is
+# unchanged and every unlisted lever keeps its instance value. Absent the kwarg
+# the instance scalars broadcast to all rows exactly as before (full back-compat).
+_PER_ROW_DECODE_KEYS: dict[str, str] = {
+    "look.aim_prior_gain": "look_aim_prior_gain",         # rotation-steering gain
+    "look.aim_mag_gain": "look_aim_mag_gain",             # α (magnitude blend)
+    "look.turn_mag_scale": "look_turn_mag_scale",         # native-θ dampener
+    "look.aim_degrade_tremor_mag": "look_aim_degrade_tremor_mag",  # OU tremor mag
+}
 
 
 class QNNPolicy:
@@ -165,8 +179,6 @@ class QNNPolicy:
         self.d_gru = int(model.d_gru) if self.use_gru else 0
         self.use_weapon_head = bool(model.use_weapon_head)
         self.look_bypass_gru = bool(model.look_bypass_gru and self.use_gru)
-        self.weapon_switch_confidence = float(model.weapon_switch_confidence)
-        self.weapon_switch_margin = float(model.weapon_switch_margin)
         self.weapon_context_from_obs = bool(model.weapon_context_from_obs)
         self.d_target = int(model.d_target)
         self.d_move = int(model.d_move)
@@ -270,15 +282,10 @@ class QNNPolicy:
         # Lazily-built (9,7) weapon-trajectory table for the look aim-prior
         # decode (emit_actions sampled branch, pointer-bearing models).
         self._aim_prior_weapon_static: torch.Tensor | None = None
-        # Aim-prior gain override. None → qnn.model.bench.a24.lead_aim.AIM_PRIOR_GAIN
+        # Aim-prior gain override. None → the decode facade's AIM_PRIOR_GAIN
         # (the baked decode contract); 0.0 → prior off (control arm in A/B
         # evals — set from the run config's eval_look_aim_prior_gain).
         self.look_aim_prior_gain: float | None = None
-        # Attack fire operating point (sigmoid > threshold). Default 0.5 = the
-        # historical calibrated cut; fit offline via qnn.bc.decode_fit.fit_attack
-        # and applied from the decode config (attack.threshold). The deployed
-        # engine runs the same greedy cut from decode.attack_threshold.
-        self.attack_threshold: float = 0.5
         # Global attack-propensity bias — the SAMPLED-mode skill knob. Attack is
         # decoded SAMPLED (temp-bernoulli on sigmoid(logit)), like look/move, so the
         # greedy threshold is inert; this additive logit bias shifts P(attack)=
@@ -286,14 +293,44 @@ class QNNPolicy:
         # conditioned attack_align gate is a SEPARATE bias (the all-humans cone fix).
         # Set from the decode config (attack.bias). See research/skill-curves.md §5.
         self.attack_bias: float = 0.0
-        # Deterministic fire threshold (attack.threshold): None = SAMPLED
-        # (Bernoulli, default); a float τ = greedy fire iff sigmoid(logit+bias) ≥ τ,
-        # which commits on confident ticks so attack co-occurs with jump+aim
-        # (restores coordinated actions like the rocket-jump). τ calibrated to human
-        # fire frequency.
-        self.attack_threshold: "float | None" = None
+        # a25 9-way attack-with per-weapon operating point (research/attack-head.md
+        # §11). attack_bias_vec: (8,) per-weapon attack bias applied POST-argmax in
+        # attack_with_decode_step (tunes each weapon's attack rate to its human
+        # cadence; None = no per-weapon knob). attack_stick_bias: scalar selection
+        # hysteresis toward the held weapon (0.0 = plain argmax).
+        self.attack_bias_vec: "list | None" = None
+        self.attack_stick_bias: float = 0.0
+        # DISCHARGE-QUALITY gate ("crest-firing"): hold a commanded discharge up
+        # to H ticks until crosshair→lead alignment crosses the per-weapon θ_w,
+        # blind-fire at expiry (never cancel — the head's fire-rate invariant).
+        # attack_crest_theta_vec: (8,) θ per impulse-1, hbw units (≤0 = OFF for
+        # that weapon); attack_crest_hold_ticks: shared max hold H (0 = OFF
+        # globally). Both default OFF = bit-identical. The countdown latch rides
+        # the caller-threaded attack_state wire slot (lane 0; zeros = idle).
+        self.attack_crest_theta_vec: "list | None" = None
+        self.attack_crest_hold_ticks: int = 0
+        # a25 MOVE COMMITMENT decode (segment head → semi-Markov generative):
+        # opt-in via decode config param move.commitment. Requires a move_seg
+        # head in the graph + caller-threaded move_commit_state.
+        self.move_commitment: bool = False
+        # Duration censoring-bias correction (move.commit_dur_tilt): per-axis
+        # (fb, lr) bucket-index tilt applied inside move_commit_step; fit by
+        # _move_seg_dur_calibration.py. (0, 0) = off, bit-identical.
+        self.move_commit_dur_tilt: tuple[float, float] = (0.0, 0.0)
+        # Gate B projectile interrupt opt-out (move.commit_interrupt): the
+        # interrupt predates the seg head — with threat-conditioned durations
+        # (mean dwell ~7 ticks => ~175 ms to the next natural decision point)
+        # the forced resample may be redundant, and its both-axes k=0
+        # changepoint spike (+0.41 vs human +0.03) breaks the rhythm gate.
+        self.move_commit_interrupt: bool = True
+        # Threat-break hazard (move.threat_break_hazard): while an incoming
+        # projectile is present, per-tick RE-DECISION probability λ inside
+        # move_commit_step — the sustained human-shaped reactivity assist
+        # (human hazard ratio 1.143; the head's own conditioning is ~1.01 —
+        # research/move-head.md "Threat reactivity"). 0.0 = off, bit-identical.
+        self.move_threat_break_hazard: float = 0.0
         # Aim feed-forward override (rate term; kills the strafe trail).
-        # None → qnn.model.bench.a24.lead_aim.AIM_FFWD_GAIN; 0.0 → off.
+        # None → the decode facade's AIM_FFWD_GAIN; 0.0 → off.
         self.look_aim_ffwd: float | None = None
         # Aim-prior magnitude-blend gain (α): the kept turn magnitude blends from
         # |z|=θ (0 = pure rotation, the deployed default — direction-preserving, aim
@@ -314,6 +351,19 @@ class QNNPolicy:
         # via scripts/analysis/look_openloop_los_overturn.py (~0.78 → ~1.0× human,
         # open-loop). See look-aim-decode.md / look-head.md.
         self.look_turn_mag_scale: float = 1.0
+        # HOLD-DRIFT (radians; 0.0 = OFF = bit-identical): on hold frames with a
+        # live aim prior, emit eps toward the prior instead of a dead-zero turn.
+        # The hold bin is a collect-time quantization artifact (humans sub-
+        # hold_max drift ~30% of engaged ticks); a faithful hold rate + the
+        # pure-rotation blend's |z|=0 preservation freezes pursuit (2026-07-05
+        # lead-pointing investigation). Set from decode config
+        # (look.hold_drift_eps). eps < hold_max keeps measured hold rates human.
+        self.look_hold_drift_eps: float = 0.0
+        # Hold pass-through (look.hold_passthrough): head-commanded exact holds
+        # (θ==0) bypass the aim-prior magnitude blend, which otherwise converts
+        # every engaged hold into an α·|aim-error| micro-correction (zero-hold
+        # occupancy 0.000 vs human ~0.138). Default False = bit-identical.
+        self.look_hold_passthrough: bool = False
         # Per-weapon VERTICAL aim authority (RL-splash feet-aiming). A (9,) per-
         # IMPULSE blend weight β∈[0,1] (0..8; 0 = OFF) for the feet-aim BLEND that
         # lerps the decoded vertical toward the feet-anchored lead point — the
@@ -346,8 +396,8 @@ class QNNPolicy:
         # ──────────────────────────────────────────────────────────────────────
         # AIM DEGRADATION (the DOWN half of the mechanical-aim skill knob).
         # Decode-side, post-head, STATEFUL transforms on the look turn-delta that
-        # LOWER per-weapon tracking coherence (TOT/coh) into the sub-median human
-        # range — so the skill knob spans weak→elite. The UP half is the gain/α
+        # LOOSEN per-weapon discharge alignment (raise intercept hbw) into the
+        # sub-median human range — so the skill knob spans weak→elite. The UP half is the gain/α
         # lead-pursuit steering above; the bare-head floor already out-tracks a
         # median human, so playing DOWN needs ADDED mechanical error (human-like,
         # not robotic), NOT lower gain. All knobs default 0 = OFF = BIT-IDENTICAL
@@ -368,7 +418,7 @@ class QNNPolicy:
         self.look_aim_degrade_tremor_mag: float = 0.0
         self.look_aim_degrade_tremor_tau: float = 5.0
         #   jitter    — WHITE per-frame Gaussian angular noise on z. INCLUDED ONLY
-        #     as the baseline to REJECT (it lowers coh but breaks heading-hold — the
+        #     as the baseline to REJECT (it does loosen alignment/raise hbw but breaks heading-hold — the
         #     look "spin" lesson). _mag = per-frame SD in radians. 0 = OFF.
         self.look_aim_degrade_jitter_mag: float = 0.0
         # Per-row stateful buffers (lazily allocated when a mechanism is active;
@@ -377,28 +427,26 @@ class QNNPolicy:
         self._aim_degrade_lag_buf: torch.Tensor | None = None    # (R,L+1,2) ring
         self._aim_degrade_tremor_state: torch.Tensor | None = None  # (R,2) OU mem
         self._aim_degrade_rng: torch.Generator | None = None
-        # Per-model weapon BAN (decode contract) — the SAME spec the export
-        # path applies (csv impulses 1..8; see tools/export_onnx.ExportWrapper
-        # and the --weapon-ban CLI / decode.weapon_ban ONNX metadata). Set as
-        # an instance override by eval orchestration (qnn.eval.run, from the run
-        # config's eval_weapon_ban) so offline eval predicts what the deployed
-        # ONNX graph does. Empty () → no ban: act() runs the gate UNBANNED,
-        # bit-identical to the historical no-ban behavior. Banned-tensor build
-        # is the shared helper (qnn.model.bench.a24.decode.build_weapon_ban_tensors).
+        # ATTACK-WITH INTENT (7/08 operator ruling): the decode keys aim
+        # geometry + per-weapon knobs on the model's MOST RECENT intent weapon
+        # (the attack_with head's last committed nonzero choice), falling back
+        # to held — "pre-aim for the weapon you're bringing up". −1 = no
+        # intent yet (fresh row / episode boundary) → held.
+        self._intent_impulse_buf: torch.Tensor | None = None      # (R,) long
+        # Per-model weapon BAN (decode-config provenance; csv impulses 1..8).
+        # Set by eval orchestration from the config's weapon_ban param. The a25
+        # attack_with decode carries no ban gate — the a25 pins always emit
+        # weapon_ban=[] — so this attribute is config provenance only; there is
+        # no reachable decode consumer on the a25 shape.
         self.weapon_ban: tuple[int, ...] = ()
-        # Lazily-built, device-resident (ban_mask, ban_bool) cache keyed off the
-        # current self.weapon_ban so act() doesn't rebuild every frame.
-        self._weapon_ban_cache: tuple[
-            tuple[int, ...], torch.Tensor | None, torch.Tensor | None
-        ] | None = None
         # Optional release-candidate decode hook. Canonical policy decode stays
-        # generic; bench/live candidates (e.g. a24rc1) install their own
-        # postprocessor from eval/export orchestration.
+        # generic; bench/live candidates install their own postprocessor from
+        # eval/export orchestration.
         self.decode_action_postprocess: Callable[
             ["QNNPolicy", Any, torch.Tensor, torch.Tensor], torch.Tensor
         ] | None = None
-        # Resolved guard adapter from the decode config (qnn.model.bench.a24.guard
-        # via qnn.model.decode_config.make_guard), installed alongside
+        # Resolved guard adapter from the decode config (the guard_module's
+        # make_guard via qnn.model.decode_config), installed alongside
         # decode_action_postprocess by eval/export orchestration. ``act``'s shared
         # MOVE decode reads its ``projectile_release_mask(obs)`` (Gate B forced
         # fb/lr hold release) when the adapter defines it (dodge enabled) —
@@ -414,41 +462,50 @@ class QNNPolicy:
     def _decode(self) -> Any:
         """The resolved generation decode facade (see ``_decode_mod``).
 
-        Returns the injected ``_decode_mod`` or, when none was set (a bare policy
-        / tests / eval without a decode config), the default a24 facade. This is
-        the ONLY place the core names a concrete generation decode module."""
+        Returns the injected ``_decode_mod``. There is NO default: a policy with
+        no injected decode module cannot decode — raise with the fix instead of
+        guessing an arch (the a25/a24 silent-default coupling this replaced)."""
         # getattr (not self._decode_mod) so policies built via __new__ — e.g.
-        # parity tests that skip __init__ — still resolve the default facade.
+        # parity tests that skip __init__ — fail the same instructive way.
         mod = getattr(self, "_decode_mod", None)
         if mod is None:
-            import importlib
-            mod = self._decode_mod = importlib.import_module(_DEFAULT_DECODE_MODULE)
+            raise RuntimeError(
+                "QNNPolicy has no decode module injected (policy._decode_mod is None) "
+                "— there is no default decode facade. Resolve the run's decode config "
+                "(qnn.model.decode_config.resolve_decode_config → resolved.decode_module) "
+                "or, for a bare policy loaded from a run dir, resolve the arch "
+                "explicitly via qnn.diag.loader.resolve_decode_module(run_dir, policy) "
+                "before calling act()."
+            )
         return mod
 
     def zero_hidden(self, batch_size: int) -> np.ndarray:
         return np.zeros((batch_size, self.d_gru), dtype=np.float32)
 
-    def _resolve_weapon_ban_tensors(
-        self, device: torch.device,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Cached, device-resident ``(ban_mask, ban_bool)`` for the current ban.
+    def prepare_act_state(self, n_rows: int) -> dict[str, np.ndarray]:
+        """The act() state-threading contract, derived from THIS model's shape
+        — the single source consumers must use instead of hand-rolling lane
+        widths or calling conventions (the 5-lane EnvState bug; the bare-act
+        movearch failures).
 
-        Built by the SHARED helper (qnn.model.bench.a24.decode.build_weapon_ban_tensors)
-        so the offline weapon decode matches the export path's. Empty
-        ``self.weapon_ban`` → ``(None, None)`` → the sticky gate runs UNBANNED.
-        Re-derived only when ``self.weapon_ban`` or the device changes.
-        """
-        build_weapon_ban_tensors = self._decode().build_weapon_ban_tensors
-
-        ban = tuple(int(b) for b in self.weapon_ban)
-        cache = self._weapon_ban_cache
-        if cache is not None and cache[0] == ban and (
-            cache[1] is None or cache[1].device == device
-        ):
-            return cache[1], cache[2]
-        ban_mask, ban_bool = build_weapon_ban_tensors(ban, device=device)
-        self._weapon_ban_cache = (ban, ban_mask, ban_bool)
-        return ban_mask, ban_bool
+        movearch models (no per-tick move head; the jump head owns
+        land-vertical) REQUIRE the commitment decode — it is mandatory for the
+        shape, not a knob — so it is enabled here. Every commitment model
+        needs a caller-carried ``move_commit_state`` at COMMIT_STATE_DIM,
+        initialized to the decode module's reset lanes (the ONNX
+        state_loopback memset). act() mutates the passed array IN PLACE: keep
+        the returned array alive across steps; fancy-indexed row batches are
+        copies, so scatter them back after each call. Rows are per-episode —
+        re-init a row's lanes on episode reset."""
+        if (getattr(self.model, "move_head", None) is None
+                and getattr(self.model, "jump_head", None) is not None):
+            self.move_commitment = True
+        kw: dict[str, np.ndarray] = {}
+        if getattr(self, "move_commitment", False):
+            from qnn.model.bench.a25.decode import commit_reset_lanes
+            kw["move_commit_state"] = np.tile(
+                np.asarray(commit_reset_lanes(), dtype=np.float32), (n_rows, 1))
+        return kw
 
     def _tensor(self, value: np.ndarray | torch.Tensor | Iterable[float], dtype: torch.dtype = torch.float32) -> torch.Tensor:
         if isinstance(value, torch.Tensor):
@@ -641,7 +698,7 @@ class QNNPolicy:
         if sample.ndim != 3:
             raise ValueError("obs must be rank-2 or rank-3")
         reset_mask_tensor = None
-        reset_ts = None
+        reset_ts: tuple[int, ...] | None = None
         if isinstance(masks, Mapping) and "reset_mask" in masks:
             reset_mask_tensor = self._tensor(masks["reset_mask"], dtype=torch.bool)
             raw_reset_ts = masks.get("reset_ts")
@@ -658,7 +715,14 @@ class QNNPolicy:
     def _optimizer(self, name: str, params: Iterable[nn.Parameter], lr: float) -> torch.optim.Optimizer:
         optimizer = self._optimizers.get(name)
         if optimizer is None:
-            optimizer = torch.optim.Adam(list(params), lr=lr, fused=True)
+            # bc_weight_decay > 0 (set by the BC trainer from config.weight_decay)
+            # switches Adam → AdamW with decoupled weight decay. Default 0.0 =
+            # plain Adam, byte-identical to prior behavior.
+            wd = float(getattr(self, "bc_weight_decay", 0.0) or 0.0)
+            if wd > 0.0:
+                optimizer = torch.optim.AdamW(list(params), lr=lr, weight_decay=wd, fused=True)
+            else:
+                optimizer = torch.optim.Adam(list(params), lr=lr, fused=True)
             self._optimizers[name] = optimizer
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -680,13 +744,44 @@ class QNNPolicy:
     # and look-aim-decode.md §11. Operates in tangent space z = logmap(look)
     # (radians); converts back via expmap. State is per-row, reset on episode
     # boundary (reset_mask). Default all-OFF ⇒ this code path is never entered.
+    def _lag_active(self) -> bool:
+        """lag_frames may be a scalar OR a (9,) per-IMPULSE vector (per-weapon
+        skill system, 7/08). Active when any component is > 0."""
+        v = self.look_aim_degrade_lag_frames
+        if isinstance(v, (list, tuple)):
+            return any(float(x) > 0.0 for x in v)
+        return float(v or 0.0) > 0.0
+
     def _aim_degrade_active(self) -> bool:
+        _tr = self.look_aim_degrade_tremor_mag
+        _tr_on = (any(float(x) > 0.0 for x in _tr)
+                  if isinstance(_tr, (list, tuple)) else float(_tr or 0.0) > 0.0)
         return (
             float(self.look_aim_degrade_sluggish_tau or 0.0) > 0.0
-            or float(self.look_aim_degrade_lag_frames or 0.0) > 0.0
-            or float(self.look_aim_degrade_tremor_mag or 0.0) > 0.0
+            or self._lag_active()
+            or _tr_on
             or float(self.look_aim_degrade_jitter_mag or 0.0) > 0.0
         )
+
+    def _degrade_eff_impulse(self, obs, n_rows: int) -> "torch.Tensor":
+        """The intent-keyed effective attack-with impulse per row — the SAME index
+        gain/α use (last committed attack_with choice in ``_intent_impulse_buf``,
+        held fallback via ``self_weapon_id_to_impulse``). Reset rows have already
+        been zeroed in ``_aim_degrade_reset_rows`` (buffer set to -1 → held). This
+        reads the intent buffer only (updated once, post-decode), so it returns the
+        identical index whether the aim-prior block ran this tick or not."""
+        from qnn.vocab import self_weapon_id_to_impulse as _w2i
+        if isinstance(obs, Mapping) and "self_weapon_id" in obs:
+            wid = self._obs_tensors_dequant(obs)["self_weapon_id"].long().reshape(-1)
+        else:
+            return torch.zeros(n_rows, dtype=torch.long)
+        held = _w2i(wid)
+        ib = self._intent_impulse_buf
+        if ib is not None and ib.shape[0] == wid.shape[0]:
+            eff = torch.where(ib >= 0, ib.to(held.device), held)
+        else:
+            eff = held
+        return eff.clamp(0, 8)
 
     def _aim_degrade_reset_rows(self, reset_mask: "torch.Tensor | None") -> None:
         """Zero per-row degradation state on episode boundaries (reset_mask True)."""
@@ -695,13 +790,16 @@ class QNNPolicy:
         m = reset_mask.reshape(-1).bool()
         if self._aim_degrade_lp_state is not None:
             self._aim_degrade_lp_state[m] = 0.0
+        if self._intent_impulse_buf is not None and self._intent_impulse_buf.shape[0] == m.shape[0]:
+            self._intent_impulse_buf[m] = -1
         if self._aim_degrade_tremor_state is not None:
             self._aim_degrade_tremor_state[m] = 0.0
         if self._aim_degrade_lag_buf is not None:
             self._aim_degrade_lag_buf[m] = 0.0
 
     def _apply_aim_degrade(
-        self, look: torch.Tensor, reset_mask: "torch.Tensor | None"
+        self, look: torch.Tensor, reset_mask: "torch.Tensor | None", obs=None,
+        tremor_mag_row: "np.ndarray | None" = None,
     ) -> torch.Tensor:
         """Apply the active degradation mechanism(s) to the decoded look vector.
 
@@ -710,6 +808,11 @@ class QNNPolicy:
           sluggish (EMA low-pass) → lag (fractional-frame delay) → tremor (OU) /
           jitter (white). All are no-ops at their OFF default. The order matters
           little at the magnitudes we sweep; documented for reproducibility.
+
+        ``tremor_mag_row`` (per-LANE override, length R) supersedes the instance
+        scalar ``look_aim_degrade_tremor_mag`` for the tremor stage only, so a
+        batched eval can drive a different tremor magnitude per lane. None ⇒ the
+        instance scalar (bit-identical to callers that never pass it).
         """
         from qnn.model.look_bins import tangent_logmap, tangent_expmap
 
@@ -724,6 +827,11 @@ class QNNPolicy:
             return buf
 
         z = tangent_logmap(look)                                  # (R,2) radians
+        # Head-commanded exact holds (θ==0 → z==0 after decode/pass-through):
+        # captured BEFORE any degrade stage so noise-type degraders can respect
+        # rests — a low-skill hand is noisy while AIMING but still rests
+        # (research/human-band.md: hold occupancy dominates the look channel).
+        _hold_rows = (z.abs().sum(dim=-1, keepdim=True) < 1e-9)
 
         # 1) SLUGGISH — first-order low-pass (EMA) of the turn-delta stream.
         tau_lp = float(self.look_aim_degrade_sluggish_tau or 0.0)
@@ -739,10 +847,22 @@ class QNNPolicy:
             st.copy_(z)
 
         # 2) LAG — fractional-frame delay (the crosshair TRAILS). Linear interp
-        # between floor(L) and ceil(L) frames back in a per-row ring buffer.
-        L = float(self.look_aim_degrade_lag_frames or 0.0)
-        if L > 0.0:
-            depth = int(np.ceil(L)) + 1
+        # between floor(L) and ceil(L) frames back in a per-row ring buffer. L may
+        # be a scalar OR a (9,) per-IMPULSE vector (per-weapon skill system,
+        # 7/08): the ring is sized to the MAX lag; each row's fractional depth is
+        # gathered from its intent-keyed effective impulse (the same index gain/α
+        # use). The scalar branch is bit-identical to the pre-vector code.
+        _lag_spec = self.look_aim_degrade_lag_frames
+        _lag_is_vec = isinstance(_lag_spec, (list, tuple))
+        if _lag_is_vec:
+            L_vec = torch.as_tensor([float(x) for x in _lag_spec],
+                                    dtype=z.dtype, device=dev)          # (9,)
+            L_max = float(L_vec.max().item())
+        else:
+            L_vec = None
+            L_max = float(_lag_spec or 0.0)
+        if L_max > 0.0:
+            depth = int(np.ceil(L_max)) + 1
             buf = _fit(self._aim_degrade_lag_buf, (R, depth, 2))
             if buf is None:
                 # init the history to the CURRENT turn (so the first frames don't
@@ -754,16 +874,52 @@ class QNNPolicy:
             # shift history: newest at index 0
             buf[:, 1:, :] = buf[:, :-1, :].clone()
             buf[:, 0, :] = z
-            i0 = int(np.floor(L)); i1 = min(i0 + 1, depth - 1)
-            frac = L - i0
-            z = (1.0 - frac) * buf[:, i0, :] + frac * buf[:, i1, :]
+            if _lag_is_vec:
+                # per-row fractional gather from the intent-keyed effective impulse
+                eff_imp = self._degrade_eff_impulse(obs, R).to(dev)     # (R,)
+                L_row = L_vec[eff_imp]                                  # (R,)
+                i0 = torch.floor(L_row).long().clamp_(0, depth - 1)     # (R,)
+                i1 = torch.clamp(i0 + 1, max=depth - 1)                 # (R,)
+                frac = (L_row - i0.to(z.dtype)).unsqueeze(-1)           # (R,1)
+                z0 = torch.gather(buf, 1, i0.view(R, 1, 1).expand(R, 1, 2)).squeeze(1)
+                z1 = torch.gather(buf, 1, i1.view(R, 1, 1).expand(R, 1, 2)).squeeze(1)
+                z = (1.0 - frac) * z0 + frac * z1
+            else:
+                L = L_max
+                i0 = int(np.floor(L)); i1 = min(i0 + 1, depth - 1)
+                frac = L - i0
+                z = (1.0 - frac) * buf[:, i0, :] + frac * buf[:, i1, :]
 
         # 3) TREMOR — correlated AR(1)/OU angular offset (drifting unsteady hand).
-        mag_tr = float(self.look_aim_degrade_tremor_mag or 0.0)
+        # Per-LANE override (tremor_mag_row) → a (R,1) magnitude tensor that scales
+        # the innovation per row; else the instance scalar. The OU recursion is
+        # otherwise identical (τ/ρ shared; magnitude is the only per-lane lever).
+        if tremor_mag_row is not None:
+            mag_tr_t = torch.as_tensor(
+                tremor_mag_row, dtype=z.dtype, device=dev).reshape(-1, 1)  # (R,1)
+            mag_tr = float(mag_tr_t.max())
+        else:
+            _tr_spec = self.look_aim_degrade_tremor_mag
+            if isinstance(_tr_spec, (list, tuple)):
+                # per-IMPULSE tremor vector (the a25rc3c per-weapon DOWN-band
+                # fix — the emit's mean-scalar smeared every weapon's tremor
+                # onto every other): magnitude gathered from the intent-keyed
+                # effective impulse, the same index gain/α/lag use.
+                T_vec = torch.as_tensor([float(x) for x in _tr_spec],
+                                        dtype=z.dtype, device=dev)       # (9,)
+                mag_tr = float(T_vec.max().item())
+                mag_tr_t = None
+                if mag_tr > 0.0:
+                    eff_imp = self._degrade_eff_impulse(obs, R).to(dev)  # (R,)
+                    mag_tr_t = T_vec[eff_imp].reshape(-1, 1)             # (R,1)
+            else:
+                mag_tr_t = None
+                mag_tr = float(_tr_spec or 0.0)
         if mag_tr > 0.0:
             tau_tr = max(float(self.look_aim_degrade_tremor_tau or 1.0), 1e-3)
             rho = float(np.exp(-1.0 / tau_tr))
-            innov = mag_tr * float(np.sqrt(max(1.0 - rho * rho, 1e-9)))
+            _sqrt = float(np.sqrt(max(1.0 - rho * rho, 1e-9)))
+            innov = (mag_tr_t * _sqrt) if mag_tr_t is not None else (mag_tr * _sqrt)
             if self._aim_degrade_rng is None:
                 self._aim_degrade_rng = torch.Generator(device="cpu")
                 self._aim_degrade_rng.manual_seed(0xA1A1_BEEF)
@@ -776,7 +932,9 @@ class QNNPolicy:
             eps = torch.randn((R, 2), generator=self._aim_degrade_rng).to(dev, z.dtype)
             new = rho * st + innov * eps
             st.copy_(new)
-            z = z + new
+            # HOLD-GATED: the OU state keeps evolving (the hand keeps drifting)
+            # but hold frames express no offset — rests stay exact.
+            z = torch.where(_hold_rows, z, z + new)
 
         # 4) JITTER — white per-frame Gaussian (REJECT baseline; breaks heading-hold).
         mag_jit = float(self.look_aim_degrade_jitter_mag or 0.0)
@@ -813,6 +971,95 @@ class QNNPolicy:
         features_np = features.detach().cpu().numpy().astype(np.float32)
         return logits, values, next_hidden.detach().cpu().numpy().astype(np.float32), features_np
 
+    def _resolve_per_row_decode(
+        self,
+        spec: "Mapping[str, Any] | None",
+        n_rows: int,
+    ) -> "dict[str, np.ndarray]":
+        """Validate + normalize a ``per_row_decode`` spec into per-row arrays.
+
+        ``spec`` maps a supported decode-config key (see ``_PER_ROW_DECODE_KEYS``)
+        to a length-``n_rows`` array-like (or a scalar, which broadcasts). Returns
+        a dict keyed by the SAME dotted names → float32 arrays of length
+        ``n_rows``. Empty/None ⇒ ``{}`` (the instance-scalar path, bit-identical
+        to callers that never pass the kwarg). Device-free: callers move each
+        array onto the decode tensor's device at its use site.
+        """
+        if not spec:
+            return {}
+        unknown = set(spec) - set(_PER_ROW_DECODE_KEYS)
+        if unknown:
+            raise ValueError(
+                f"per_row_decode: unsupported key(s) {sorted(unknown)}; "
+                f"supported: {sorted(_PER_ROW_DECODE_KEYS)}")
+        out: dict[str, np.ndarray] = {}
+        for key, value in spec.items():
+            arr = np.asarray(value, dtype=np.float32).reshape(-1)
+            if arr.size == 1:
+                arr = np.full((n_rows,), float(arr[0]), dtype=np.float32)
+            if arr.shape[0] != n_rows:
+                raise ValueError(
+                    f"per_row_decode[{key!r}] has length {arr.shape[0]}, "
+                    f"expected {n_rows} (one value per lane)")
+            out[key] = arr
+        return out
+
+    def _aim_prior_geometry(
+        self,
+        obs_model: Dict[str, torch.Tensor],
+        target_logits: torch.Tensor,
+        rows: int,
+        device: torch.device,
+        reset_mask: torch.Tensor | None,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Shared aim-prior geometry off the target pointer — the SINGLE eager
+        computation of ``aim_prior_tangent_ffwd`` consumed by the sampled look
+        decode (aim-prior blend / feet-aim pitch) AND the attack crest gate
+        (per-row hbw). Returns ``(z_aim, z_rate, feet_elev, origin_elev,
+        aim_range, eff_imp)``.
+
+        intent-weapon keying: effective impulse = last committed attack_with
+        choice (buffer, updated after the weapon decode — i.e. most recent PRIOR
+        decision), else held. The intent buffer is reset on episode boundaries
+        via ``reset_mask`` (the pre-captured ``_aim_reset_mask``; ``masks`` is
+        dropped at act() entry)."""
+        from qnn.bc.weapon_physics import build_model_weapon_scalars
+        _dmod = self._decode()
+        if self._aim_prior_weapon_static is None:
+            self._aim_prior_weapon_static = torch.from_numpy(
+                build_model_weapon_scalars()).float().to(device)
+        # Re-run the (idempotent, cached) dequant already applied by the caller:
+        # live obs carries native keys, not entity_scalars_raw.
+        dq = obs_model
+        esc = dq["entity_scalars_raw"].float()
+        esc = esc.reshape(rows, *esc.shape[-2:])                      # (R, N, S)
+        etypes = dq["entity_types"].long().reshape(rows, -1)          # (R, N)
+        wid = dq["self_weapon_id"].long().reshape(-1)
+        from qnn.vocab import self_weapon_id_to_impulse as _w2i
+        _held_imp = _w2i(wid)
+        _ib = self._intent_impulse_buf
+        if _ib is None or _ib.shape[0] != wid.shape[0]:
+            _ib = torch.full_like(wid, -1)
+            self._intent_impulse_buf = _ib
+        if reset_mask is not None:
+            _rm = reset_mask.reshape(-1)
+            if _rm.shape[0] == _ib.shape[0]:
+                _ib[_rm] = -1
+        eff_imp = torch.where(_ib >= 0, _ib, _held_imp)
+        wid_eff = torch.where(eff_imp > 0, eff_imp + 2, wid)
+        _hold_cap = (None if not self.look_lead_hold_cap_frames
+                     else float(self.look_lead_hold_cap_frames) * _dmod._TICK_DT_MODULE)
+        _hold_cap_rad = (None if not self.look_lead_hold_cap_radial_frames
+                         else float(self.look_lead_hold_cap_radial_frames) * _dmod._TICK_DT_MODULE)
+        z_aim, z_rate, feet_elev, origin_elev, aim_range = _dmod.aim_prior_tangent_ffwd(
+            esc, etypes, wid_eff,
+            target_logits.reshape(rows, -1),
+            self._aim_prior_weapon_static,
+            lead_hold_cap=_hold_cap,
+            lead_hold_cap_radial=_hold_cap_rad,
+        )
+        return z_aim, z_rate, feet_elev, origin_elev, aim_range, eff_imp
+
     def act(
         self,
         obs: np.ndarray | torch.Tensor | Dict[str, np.ndarray | torch.Tensor],
@@ -824,20 +1071,10 @@ class QNNPolicy:
         row_generators: Any | None = None,
         sample_temperatures: Mapping[str, float] | None = None,
         diag_log_path: str | Path | None = None,
-        move_sticky_tau: tuple[float, float] | None = None,
-        move_sticky_prev: np.ndarray | torch.Tensor | None = None,
-        move_hazard: Mapping[str, Any] | None = None,
-        move_dwell_age: np.ndarray | None = None,
-        move_switchback_eps: float | None = None,
-        move_switchback_state: np.ndarray | None = None,
-        move_stop_onset: bool = False,
-        move_state_rng: np.ndarray | None = None,
-        move_tau_engagement_gated: bool = False,
-        move_jump_sample: bool = False,
-        move_jump_bias: float = 0.0,
-        move_jump_temp: float = 1.0,
+        move_commit_state: np.ndarray | None = None,
         attack_state: np.ndarray | None = None,
         attack_rng: np.ndarray | None = None,
+        per_row_decode: "Mapping[str, Any] | None" = None,
         rl_extras: bool = False,
     ) -> "PolicyActionBatch | tuple[PolicyActionBatch, Dict[str, Any]]":
         """Emit engine actions from a forward pass.
@@ -886,153 +1123,146 @@ class QNNPolicy:
         # 3 categorical axes (fb, lr, ud), each a 3-class softmax over
         # {neg, none, pos}.  Greedy = argmax per axis; sampled = categorical
         # per axis.  Decoded engine value per axis = class - 1, i.e. {-1, 0, +1}.
-        move_logits = logits[MOVE_HEAD].reshape(-1, MOVE_AXES, MOVE_AXIS_CLASSES)
-        n_rows = int(move_logits.shape[0])
-        if move_sticky_tau is not None:
-            # ENGINE-PARITY sticky MOVE decode — routed through the SHARED
-            # qnn.model.bench.a24.decode.move_decode_step_graph, the single source
-            # of truth that tools/export_onnx.ExportWrapper ALSO calls. The decode
-            # (sticky-confidence gate + switch-back watermark + stop-onset
-            # suppression + semi-Markov hazard release + generalized
-            # projectile-dodge release) used to be re-implemented inline here, a
-            # ~180-line third copy alongside the graph twin and the C engine
-            # (qnn_onnx_decode_core). This adapter packs the caller's per-episode
-            # state arrays into the (B,11) flat move_state the graph consumes, runs
-            # the shared step, and unpacks the watermark state back in place — so
-            # offline eval and the deployed ONNX/C graph decode bit-for-bit (modulo
-            # the hazard RNG SOURCE; see below).
-            #
-            # CALLER STATE CONTRACT (unchanged):
-            #   move_sticky_prev      (R,3) int  held class per axis (1=none reset).
-            #   move_dwell_age        (R,3) int  current run length per axis.
-            #   move_switchback_state (R,2,2) f  [axis][0]=banned class (-1 idle),
-            #                                    [axis][1]=watermark prob; MUTATED
-            #                                    IN PLACE (eval threads it by view).
-            # The eval recomputes move_prev / move_age itself from the emitted
-            # move after the call, so this path only writes the watermark back.
-            _d = self._decode()
-            _MOVE_STATE_SWBB, _MOVE_STATE_SWBW = _d._MOVE_STATE_SWBB, _d._MOVE_STATE_SWBW
-            move_decode_params = _d.move_decode_params
-            move_decode_reset_flat = _d.move_decode_reset_flat
-            move_decode_step_graph = _d.move_decode_step_graph
-            dev = move_logits.device
-            # prev: (R,3) held classes; accepts legacy (R,2) fb/lr-only callers
-            # (ud column defaults to class 1 = none).
-            prev = torch.ones((n_rows, 3), dtype=torch.long, device=dev)
-            if move_sticky_prev is not None:
-                msp = self._tensor(move_sticky_prev, dtype=torch.long).reshape(n_rows, -1)
-                prev[:, : msp.shape[1]] = msp
-            age = (torch.ones((n_rows, 3), dtype=torch.long, device=dev)
-                   if move_dwell_age is None
-                   else self._tensor(move_dwell_age, dtype=torch.long).reshape(n_rows, 3))
-
-            # Pack the (B,11) flat move_state + a fresh xorshift32 rng. The flat
-            # layout (qnn.model.bench.a24.decode): [prev(3) | dwell_fb,dwell_lr |
-            # swb_banned_fb,swb_banned_lr | swb_w_fb,swb_w_lr | legacy(1) |
-            # fire_hold(1)]. fire_hold stays 0 here — attack is decoded separately
-            # below via the cross-gen base, so the graph's attack/hold-tail output
-            # is intentionally discarded.
-            move_state, move_rng_t = move_decode_reset_flat(batch=n_rows, device=dev)
-            # Thread the caller's per-episode xorshift32 rng if provided (mutated
-            # in place below), so the hazard-release draw is a PERSISTED stochastic
-            # stream — matching the deployed ONNX (move_state_rng init=entropy,
-            # reset=persist). Without it move_decode_reset_flat reseeds the SAME
-            # fixed constant every tick → a constant draw → degenerate hazard
-            # (a deterministic dwell cutoff, not a semi-Markov release).
-            if move_state_rng is not None:
-                move_rng_t = self._tensor(move_state_rng, dtype=torch.int64).reshape(n_rows)
-            move_state[:, 0:3] = prev.to(torch.float32)
-            move_state[:, 3:5] = age[:, :2].to(torch.float32)
-            swb = None
-            if move_switchback_eps is not None and move_switchback_state is not None:
-                swb = move_switchback_state.reshape(n_rows, 2, 2)
-                swb_t = self._tensor(swb, dtype=torch.float32)
-                move_state[:, _MOVE_STATE_SWBB] = swb_t[:, :, 0]   # banned class
-                move_state[:, _MOVE_STATE_SWBW] = swb_t[:, :, 1]   # watermark prob
-
-            # Build the load-time decode params. swb_eps=0 disables the watermark
-            # (matches the inline guard). Only fb/lr hazard is threaded — the
-            # shared graph decodes the ud/jump axis statelessly (argmax of the
-            # row), exactly as the export does; ud-hazard is not a deployed lever
-            # (move-head.md, "labeler is fb/lr-only").
-            # Equation-direct dwell hazard: read the log-normal (mu,sigma) per cell
-            # from the config's lognorm block — the source of truth. NO bucketed
-            # fb/lr table; the decode evaluates h(t) per dwell-age (decode.py).
-            haz_lognorm = None
-            if move_hazard is not None and "lognorm" not in move_hazard \
-                    and any(k in move_hazard for k in ("fb", "lr", "edges")):
-                raise ValueError(
-                    "move_hazard carries a stored fb/lr/edges table but no 'lognorm' "
-                    "block — the decode is equation-direct now (no static tables). "
-                    "Re-fit via qnn.model.move_hazard.lognorm_hazard_from_collect.")
-            ln = move_hazard.get("lognorm") if move_hazard is not None else None
-            if ln is not None and ln.get("fb") is not None and ln.get("lr") is not None:
-                haz_lognorm = torch.tensor(
-                    [ln["fb"], ln["lr"]], dtype=torch.float32, device=dev)   # (2,3,2)
-            params = move_decode_params(
-                tau_fb=float(move_sticky_tau[0]), tau_lr=float(move_sticky_tau[1]),
-                swb_eps=(float(move_switchback_eps)
-                         if (move_switchback_eps is not None and swb is not None) else 0.0),
-                stop_onset=bool(move_stop_onset),
-                hazard_lognorm=haz_lognorm,
-                tau_engagement_gated=bool(move_tau_engagement_gated),
-                jump_sample=bool(move_jump_sample),
-                jump_bias=float(move_jump_bias),
-                jump_temp=float(move_jump_temp),
-            )
-
-            # Engagement signal for tau gating: a frame is "in combat" iff the
-            # model perceives an enemy actor — the same no-enemy gate the aim
-            # prior uses (lead_aim.pooled_aim_vec). Robust to the zero-entity
-            # frame (any over an empty dim → False, unlike target argmax which
-            # errors and carries no no-target slot in the entity-only pointer).
-            # Stays inside the decode contract (the engine never decides this).
-            engaged = None
-            if move_tau_engagement_gated:
-                from qnn.vocab import TOKEN_ACTOR
-                etypes = obs_model["entity_types"].long().reshape(n_rows, -1)
-                engaged = (etypes == TOKEN_ACTOR).any(dim=-1)
-
-            # Gate B generalized projectile-dodge: force an fb/lr hold release when
-            # the installed decode regime's projectile_release_mask flags an
-            # incoming threat. Computed from the dequanted obs exactly as
-            # tools/export_onnx.ExportWrapper.forward does (self._regime_mod). No
-            # regime / no mask method ⇒ None ⇒ no dodge term (historical behavior).
+        # movearch (full_movearch) models have NO per-tick move head: fb/lr
+        # come from the seg commit, ud from the jump head (land) and the seg
+        # head's water-ud commit (deep water). The commit path is mandatory.
+        _is_movearch = MOVE_HEAD not in logits and JUMP_HEAD in logits
+        if _is_movearch:
+            move_logits = None
+            n_rows = int(logits[JUMP_HEAD].reshape(-1).shape[0])
+            if not (self.move_commitment and "move_seg" in logits
+                    and move_commit_state is not None):
+                raise RuntimeError(
+                    "movearch model requires the commitment decode: enable "
+                    "move.commitment and thread move_commit_state "
+                    "(COMMIT_STATE_DIM lanes)")
+        else:
+            move_logits = logits[MOVE_HEAD].reshape(-1, MOVE_AXES, MOVE_AXIS_CLASSES)
+            n_rows = int(move_logits.shape[0])
+        if (self.move_commitment and "move_seg" in logits
+                and move_commit_state is not None):
+            # a25 COMMITMENT decode: fb/lr from the segment head's sampled
+            # (class, duration) commitments (expiry/Gate-B-interrupt/reset →
+            # resample; held class masked at expiry only — an interrupt is a
+            # re-decision); ud from the cross-gen base decode.
+            # Caller threads move_commit_state (R,4) [fb_cls,fb_rem,lr_cls,
+            # lr_rem], cls<0 = unset — MUTATED IN PLACE like the swb state.
+            from qnn.model.bench.a25.decode import move_commit_step
+            from qnn.model.decode import decode_move_axes
+            # Slice axes, don't blind-reshape: a water_ud seg head emits
+            # (N, 3, JOINT) and reshape(n_rows, 2, -1) would silently garble
+            # fb/lr into (N, 2, 45). The commit decode is fb/lr-only; the
+            # water-ud axis gets its own decode gate later.
+            seg_all = logits["move_seg"]
+            if seg_all.dim() != 3:
+                seg_all = seg_all.reshape(n_rows, 2, -1)
+            seg_logits = seg_all[:, :2, :]
             projectile_release = None
-            if (self._regime_mod is not None
+            if (self.move_commit_interrupt
+                    and self._regime_mod is not None
                     and hasattr(self._regime_mod, "projectile_release_mask")
                     and isinstance(obs, Mapping)):
-                projectile_release = self._regime_mod.projectile_release_mask(obs_model)
-
-            # MOVE-ONLY decode: attack is decoded separately (its own path), never
-            # coupled into the move decode.
-            move_classes, move_state_out, rng_out = move_decode_step_graph(
-                move_logits, move_state, move_rng_t, params,
-                present_move=True,
-                projectile_release=projectile_release,
-                engaged=engaged,
-            )
-            # Thread the advanced rng back into the caller's array IN PLACE so the
-            # next tick continues the stream (else the hazard draw would repeat).
-            if move_state_rng is not None:
-                ro = rng_out.detach().cpu().numpy().astype(move_state_rng.dtype).reshape(-1)
-                move_state_rng[...] = ro.reshape(np.asarray(move_state_rng).shape)
-            # Unpack the watermark state back into the caller's array IN PLACE
-            # (banned class + watermark prob); prev/dwell are recomputed by the
-            # eval from the emitted move, so they are not written back here.
-            if swb is not None:
-                banned_out = move_state_out[:, _MOVE_STATE_SWBB].round()
-                wmark_out = move_state_out[:, _MOVE_STATE_SWBW]
-                if isinstance(swb, torch.Tensor):
-                    swb[:, :, 0] = banned_out.to(swb.dtype)
-                    swb[:, :, 1] = wmark_out.to(swb.dtype)
-                else:   # numpy (the eval contract: a view into state.move_swb)
-                    swb[:, :, 0] = banned_out.detach().cpu().numpy().astype(swb.dtype)
-                    swb[:, :, 1] = wmark_out.detach().cpu().numpy().astype(swb.dtype)
+                projectile_release = self._regime_mod.projectile_release_mask(
+                    self._obs_tensors_dequant(obs))
+            commit_t = self._tensor(move_commit_state, dtype=torch.float32).reshape(n_rows, -1).clone()
+            water = None
+            if _is_movearch:
+                # Deep water (waist/submerged) = the swim-feasible context the
+                # water-ud axis trained on; ground + feet-wet = jump context;
+                # airborne = neither (training rewrote/masked those frames).
+                # NOTE: approximates QNN_PackInputMask bits 5-7 from
+                # self_movement_id — verify exact parity against the engine
+                # pack before the closed-loop A/B.
+                _mv_id = self._tensor(obs["self_movement_id"], dtype=torch.long).reshape(-1)
+                from qnn.engine_norm import (
+                    MOVEMENT_GROUND, MOVEMENT_WATER_LOW, MOVEMENT_WATER_MID,
+                    MOVEMENT_WATER_HIGH,
+                )
+                water = (_mv_id == MOVEMENT_WATER_MID) | (_mv_id == MOVEMENT_WATER_HIGH)
+                # ANTI-POGO: training's bit7 is a pmove eval of a FRESH press
+                # (qnn_qwd_collect.c QNN_QwdEvalPmoveJump — a held button2
+                # cannot re-trigger). The bot's own previous ud-press is
+                # carried in commit lane [7], so the live gate replicates the
+                # trained population: ground/feet-wet AND not-already-pressing.
+                # (Corpus check: this closes the 13% ground-but-infeasible
+                # disagreement class; the ~10% airborne-but-feasible class —
+                # landing timing inside the pmove tick — stays unrecoverable
+                # from movement_id and under-fires slightly.)
+                _prev_press = (commit_t[:, 7] > 0.5) if commit_t.shape[1] > 7                     else torch.zeros_like(water)
+                jump_ctx = ((_mv_id == MOVEMENT_GROUND)
+                            | (_mv_id == MOVEMENT_WATER_LOW)) & ~_prev_press
+            _threat = None
+            if (self.move_threat_break_hazard > 0.0 and isinstance(obs, Mapping)
+                    and "entity_types" in obs):
+                # rel source by obs form: field-granular (eval/env) carries
+                # entity_rel directly; the packed wire form carries it at
+                # entity_scalars_raw[..., 0:3] (PROJECTILE_FIELDS lead with rel).
+                _rel_src = obs.get("entity_rel")
+                if _rel_src is None and "entity_scalars_raw" in obs:
+                    _rel_src = np.asarray(obs["entity_scalars_raw"])[..., 0:3]
+                if _rel_src is not None:
+                    from qnn.model.bench.a25.decode import incoming_projectile_present
+                    _threat = incoming_projectile_present(
+                        self._tensor(obs["entity_types"], dtype=torch.long
+                                     ).reshape(n_rows, -1),
+                        self._tensor(_rel_src).reshape(n_rows, -1, 3).float())
+            commit_out = move_commit_step(
+                seg_all if _is_movearch else seg_logits, commit_t,
+                release=projectile_release,
+                greedy=(sample_mode == "greedy"),
+                row_generators=row_generators,
+                dur_tilt=self.move_commit_dur_tilt,
+                water=water,
+                threat=_threat,
+                threat_break_hazard=float(self.move_threat_break_hazard))
+            fblr = commit_out[:, :2]
+            _cs = np.asarray(move_commit_state)
+            _cs[...] = commit_t.detach().cpu().numpy().reshape(_cs.shape).astype(_cs.dtype)
+            if _is_movearch:
+                # ud: jump head's calibrated posterior sampled AS-IS on jump
+                # context (no rate knob — jump is contextual; the posterior IS
+                # the decode); water-ud commit in deep water; none elsewhere.
+                jl = logits[JUMP_HEAD].reshape(-1)
+                p_jump = torch.sigmoid(jl)
+                if sample_mode == "greedy":
+                    jump_fire = p_jump > 0.5
+                elif row_generators is None:
+                    jump_fire = torch.rand_like(p_jump) < p_jump
+                else:
+                    # One vectorized per-row uniform draw (row_uniforms fast branch
+                    # for BatchedRNG; bit-identical per-row torch.rand for a
+                    # generator list) — replaces the O(rows) per-generator loop.
+                    from qnn.model.decode import row_uniforms
+                    u = row_uniforms(row_generators, 1, p_jump.device)[:, 0].reshape(p_jump.shape)
+                    jump_fire = u < p_jump
+                move_classes = torch.ones(n_rows, MOVE_AXES, dtype=torch.long,
+                                          device=fblr.device)
+                move_classes[:, :2] = fblr
+                ud = torch.ones(n_rows, dtype=torch.long, device=fblr.device)
+                ud = torch.where(jump_fire,
+                                 torch.full_like(ud, MOVE_CLASS_POS), ud)
+                if commit_out.shape[1] > 2:
+                    ud = torch.where(water, commit_out[:, 2], ud)
+                move_classes[:, 2] = ud
+                # Guard shim: downstream guards argmax per-tick move logits
+                # for splash-direction checks. movearch has no move head —
+                # one-hot the EMITTED commit classes (strictly better: the
+                # guard sees what the bot actually does this tick).
+                _move_logits_guard = torch.nn.functional.one_hot(
+                    move_classes, MOVE_AXIS_CLASSES).to(torch.float32) * 10.0
+            else:
+                move_classes = decode_move_axes(
+                    move_logits, sampled=(sample_mode != "greedy"),
+                    temperature=float(temps.get("move", 1.0)),
+                    row_generators=row_generators,
+                ).clone()
+                move_classes[:, :2] = fblr
         else:
             # Basic per-axis readout (cross-gen base, qnn.model.decode):
-            # argmax (greedy) / categorical-sample (sampled). The sticky/hazard/
-            # switch-back/stop-onset layers above are a24-recent and stay inline.
+            # argmax (greedy) / categorical-sample (sampled). This is the ONLY
+            # non-commitment move decode — the a24 sticky/hazard/switch-back/
+            # stop-onset stack is retired (an a25 model runs the commitment
+            # decode above or this plain per-axis readout; no sticky state).
             from qnn.model.decode import decode_move_axes
             move_classes = decode_move_axes(
                 move_logits, sampled=(sample_mode != "greedy"),
@@ -1040,6 +1270,17 @@ class QNNPolicy:
                 row_generators=row_generators,
             )
         move = (move_classes.float() - float(MOVE_CLASS_NONE))             # {-1, 0, +1} per axis
+
+        # PER-LANE decode overrides (aim-grid enabler): resolve once now that
+        # n_rows is known. ``_pr`` maps a dotted decode key → a float32 (n_rows,)
+        # array; empty ⇒ the instance-scalar path (bit-identical to no-kwarg).
+        _pr = self._resolve_per_row_decode(per_row_decode, n_rows)
+
+        # crest-gate alignment signal (attack decode below): filled by the
+        # sampled-look aim block when it runs this tick; the attack block
+        # computes it itself otherwise (greedy look / all aim knobs at 0).
+        _crest_z_err = None
+        _crest_aim_range = None
 
         # ---- look ----
         # Greedy: look_predict is the head's deterministic readout (already
@@ -1066,7 +1307,7 @@ class QNNPolicy:
             # policy's own sampler. This legitimately differs from the export's
             # in-graph Gumbel-argmax and is NOT shared. The continuous direction +
             # z-assembly + aim-prior blend + expmap ARE shared, via
-            # qnn.model.bench.a24.decode.decode_look_from_polar (single source of truth,
+            # the decode facade's decode_look_from_polar (single source of truth,
             # co-decoded with tools/export_onnx.ExportWrapper). See
             # src/docs/look-head.md §3.
             mag_bin = self._categorical_sample(
@@ -1075,10 +1316,27 @@ class QNNPolicy:
             # blend z_prior = gain·z_aim + ffwd·z_rate, zero on no-enemy frames.
             # The gain SOURCES (instance overrides / AIM_*_GAIN defaults) are the
             # offline path's own; the blend math itself lives in the shared
-            # decode. See qnn.model.bench.a24.lead_aim and src/docs/look-head.md §5.
+            # decode. See the facade's lead_aim module and src/docs/look-head.md §5.
             AIM_FFWD_GAIN, AIM_PRIOR_GAIN = _dmod.AIM_FFWD_GAIN, _dmod.AIM_PRIOR_GAIN
-            _aim_gain = (AIM_PRIOR_GAIN if self.look_aim_prior_gain is None
-                         else float(self.look_aim_prior_gain))
+            # gain / alpha accept a (9,) per-IMPULSE vector (per-weapon skill
+            # system, 7/08): resolved per row below via the canonical
+            # self_weapon_id_to_impulse lookup (mirrors weapon_pitch_gain).
+            # PER-LANE gain override wins: a (R,1) tensor drives assemble_aim_prior
+            # per row (the SAME shape the per-impulse vector path builds), so each
+            # lane blends at its own gain in one forward.
+            _gain_rows = None
+            if "look.aim_prior_gain" in _pr:
+                _gain_rows = torch.as_tensor(
+                    _pr["look.aim_prior_gain"], dtype=torch.float32,
+                    device=mag_logits.device).reshape(-1, 1)
+                _gain_is_vec = False
+                _aim_gain = float(_gain_rows.max())   # activation test
+            else:
+                _gain_spec = (AIM_PRIOR_GAIN if self.look_aim_prior_gain is None
+                              else self.look_aim_prior_gain)
+                _gain_is_vec = isinstance(_gain_spec, (list, tuple))
+                _aim_gain = (max(float(g) for g in _gain_spec) if _gain_is_vec
+                             else float(_gain_spec))   # activation test only when vec
             _aim_ffwd = (AIM_FFWD_GAIN if self.look_aim_ffwd is None
                          else float(self.look_aim_ffwd))
             # Per-weapon VERTICAL pitch authority (RL feet-aiming): active when any
@@ -1094,31 +1352,25 @@ class QNNPolicy:
             if (((_aim_gain > 0.0 or _aim_ffwd > 0.0) or _pitch_active)
                     and target_logits is not None
                     and getattr(self.model, "_has_target_pointer", False)):
-                from qnn.bc.weapon_physics import build_model_weapon_scalars
-                aim_prior_tangent_ffwd = _dmod.aim_prior_tangent_ffwd
-                if self._aim_prior_weapon_static is None:
-                    self._aim_prior_weapon_static = torch.from_numpy(
-                        build_model_weapon_scalars()).float().to(mag_logits.device)
-                # Re-run the (idempotent, cached) dequant: live obs carries
-                # native keys, not entity_scalars_raw.
-                dq = obs_model
-                esc = dq["entity_scalars_raw"].float()
-                esc = esc.reshape(mag_bin.shape[0], *esc.shape[-2:])         # (R, N, S)
-                etypes = dq["entity_types"].long().reshape(mag_bin.shape[0], -1)  # (R, N)
-                wid = dq["self_weapon_id"].long().reshape(-1)
-                _hold_cap = (None if not self.look_lead_hold_cap_frames
-                             else float(self.look_lead_hold_cap_frames) * _dmod._TICK_DT_MODULE)
-                _hold_cap_rad = (None if not self.look_lead_hold_cap_radial_frames
-                                 else float(self.look_lead_hold_cap_radial_frames) * _dmod._TICK_DT_MODULE)
-                z_aim, z_rate, _feet_elev, _origin_elev = aim_prior_tangent_ffwd(
-                    esc, etypes, wid,
-                    target_logits.reshape(mag_bin.shape[0], -1),
-                    self._aim_prior_weapon_static,
-                    lead_hold_cap=_hold_cap,
-                    lead_hold_cap_radial=_hold_cap_rad,
-                )
+                # SHARED geometry (see _aim_prior_geometry: intent-keyed lead
+                # tangent + anchors + pooled range); the crest gate below reuses
+                # z_aim/range from this tick instead of recomputing.
+                (z_aim, z_rate, _feet_elev, _origin_elev, _crest_aim_range,
+                 eff_imp) = self._aim_prior_geometry(
+                    obs_model, target_logits, mag_bin.shape[0],
+                    mag_logits.device, _aim_reset_mask)
+                _crest_z_err = z_aim
                 if _aim_gain > 0.0 or _aim_ffwd > 0.0:
-                    z_prior = assemble_aim_prior(z_aim, z_rate, _aim_gain, _aim_ffwd)
+                    if _gain_rows is not None:
+                        # per-LANE override (already (R,1)) — no intent keying.
+                        z_prior = assemble_aim_prior(z_aim, z_rate, _gain_rows, _aim_ffwd)
+                    elif _gain_is_vec:
+                        _gt = torch.as_tensor([float(g) for g in _gain_spec],
+                                              dtype=torch.float32, device=mag_logits.device)
+                        _gain_rows_vec = _gt[eff_imp].unsqueeze(-1)    # (R,1) intent-keyed
+                        z_prior = assemble_aim_prior(z_aim, z_rate, _gain_rows_vec, _aim_ffwd)
+                    else:
+                        z_prior = assemble_aim_prior(z_aim, z_rate, _aim_gain, _aim_ffwd)
                 if _pitch_active:
                     pg = torch.as_tensor([float(g) for g in _pitch_gain],
                                          dtype=torch.float32, device=mag_logits.device)
@@ -1126,13 +1378,45 @@ class QNNPolicy:
                     pb = (torch.as_tensor([float(b) for b in _pb], dtype=torch.float32,
                                           device=mag_logits.device) if _pb else None)
                     pitch_correction = _dmod.assemble_pitch_correction(
-                        z_aim, pg, wid, weapon_pitch_bias=pb)
+                        z_aim, pg, wid_eff, weapon_pitch_bias=pb)
+            if "look.aim_mag_gain" in _pr:
+                # PER-LANE α override: (R,) tensor → decode's mag_gain per-row
+                # branch (rows at 0 are exact no-ops).
+                _alpha_val = torch.as_tensor(
+                    _pr["look.aim_mag_gain"], dtype=torch.float32,
+                    device=mag_logits.device).reshape(-1)
+                _alpha_spec = None
+            else:
+                _alpha_spec = self.look_aim_mag_gain or 0.0
+            if _alpha_spec is None:
+                pass
+            elif isinstance(_alpha_spec, (list, tuple)):
+                # per-impulse alpha -> per-row tensor (decode's tensor path is
+                # exact-no-op at 0 rows, so vec alpha is bit-compatible).
+                # Intent-keyed when the aim block computed eff_imp this tick.
+                _at = torch.as_tensor([float(a) for a in _alpha_spec], dtype=torch.float32,
+                                      device=mag_logits.device)
+                try:
+                    _imp_a = eff_imp
+                except NameError:
+                    from qnn.vocab import self_weapon_id_to_impulse as _w2i_a
+                    _imp_a = _w2i_a(self._obs_tensors_dequant(obs)["self_weapon_id"].long().reshape(-1))
+                _alpha_val = _at[_imp_a]
+            else:
+                _alpha_val = float(_alpha_spec)
             look = decode_look_from_polar(
                 mag_bin, dir_logits,
                 MAG_CENTERS.to(mag_logits.device), DIR_CENTERS.to(dir_logits.device),
                 z_prior,
-                mag_gain=float(self.look_aim_mag_gain or 0.0),
-                turn_mag_scale=float(self.look_turn_mag_scale if self.look_turn_mag_scale is not None else 1.0),
+                mag_gain=_alpha_val,
+                turn_mag_scale=(
+                    torch.as_tensor(_pr["look.turn_mag_scale"], dtype=torch.float32,
+                                    device=mag_logits.device)
+                    if "look.turn_mag_scale" in _pr
+                    else float(self.look_turn_mag_scale
+                               if self.look_turn_mag_scale is not None else 1.0)),
+                hold_drift_eps=float(self.look_hold_drift_eps or 0.0),
+                hold_passthrough=bool(self.look_hold_passthrough),
                 pitch_correction=pitch_correction,
                 feet_elev=(_feet_elev if (_pitch_active and self.look_weapon_pitch_mode != "off") else None),
                 origin_elev=(_origin_elev if _pitch_active else None),
@@ -1143,90 +1427,101 @@ class QNNPolicy:
             look = torch.clamp(logits[LOOK_HEAD].reshape(-1, LOOK_HEAD_SIZE), -1.0, 1.0)
 
         # ---- aim DEGRADATION (DOWN-half skill knob; default OFF = bit-identical)
-        if self._aim_degrade_active():
-            look = self._apply_aim_degrade(look, _aim_reset_mask)
+        # PER-LANE tremor override forces the degrade path (some lane may want
+        # tremor even when the instance default is OFF).
+        _tremor_row = _pr.get("look.aim_degrade_tremor_mag")
+        if self._aim_degrade_active() or (
+                _tremor_row is not None and float(np.max(_tremor_row)) > 0.0):
+            look = self._apply_aim_degrade(
+                look, _aim_reset_mask, obs=obs, tremor_mag_row=_tremor_row)
 
-        # ---- fire ----
-        # Attack-bit decode is cross-gen base (qnn.model.decode): sigmoid >
-        # self.attack_threshold (greedy) / temp-bernoulli (sampled). EXPORT defers
-        # this to the C engine (emits the attack logit + stamps the threshold), so
-        # the base fn is policy-only.
-        attack_decode_step_graph = self._decode().attack_decode_step_graph
-        attack_decode_reset_flat = self._decode().attack_decode_reset_flat
-        attack_logit = logits[ATTACK_HEAD].reshape(-1)
-        n_atk = int(attack_logit.shape[0])
-        # Alignment-conditioned logit bias: suppress attack at large misalignment
-        # to match the human attack-by-angle distribution (guard.attack_align_strength).
-        # attack_bias is applied INSIDE attack_decode_step_graph (shared with export),
-        # so it is NOT pre-added here.
-        if (self._regime_mod is not None
-                and hasattr(self._regime_mod, "preprocess_attack_logit")
-                and isinstance(obs, Mapping)):
-            attack_logit = self._regime_mod.preprocess_attack_logit(
-                obs_model, attack_logit,
+        # ---- fire (+ weapon, when joint) ----
+        # a25 attack-with: ONE 9-way head owns both decisions. Detected by the
+        # weapon slot's logit width (8+1); there is no attack head in that graph.
+        # Greedy joint decode (qnn.model.bench.a25.decode) — deterministic argmax
+        # preserves the rocket-jump coupling; align bias + hard guards compose on
+        # the class-0 logit / a veto mask. Stateless: no hold-tail, no sticky gate.
+        _wl_raw = logits.get(WEAPON_HEAD) if self.use_weapon_head else None
+        is_attack_with = (
+            _wl_raw is not None and int(_wl_raw.shape[-1]) == WEAPON_HEAD_SIZE + 1
+            and isinstance(obs, Mapping) and "self_weapon_id" in obs
+        )
+        if is_attack_with:
+            from qnn.model.bench.a25.decode import (
+                attack_with_decode, attack_with_marginal_logit,
             )
-        fire_prob = torch.sigmoid(attack_logit + float(self.attack_bias))   # diag-log readout
-        # SAMPLED attack decode — the SAME in-graph function the ONNX export bakes
-        # (qnn.model.bench.a24.decode.attack_decode_step_graph): Bernoulli on
-        # sigmoid((logit+bias)/temp) off attack's own threaded xorshift rng, plus
-        # the continuous-weapon hold-tail in attack_state. Reproducible given the
-        # seeded attack_rng (so greedy-mode eval stays deterministic), and
-        # deploy-faithful (matches wire.11). State threaded like move_state_rng.
-        _swid = (self._tensor(obs["self_weapon_id"], dtype=torch.long).reshape(-1)
-                 if isinstance(obs, Mapping) and "self_weapon_id" in obs
-                 else torch.zeros(n_atk, dtype=torch.long, device=attack_logit.device))
-        if attack_state is not None:
-            _atk_state = self._tensor(attack_state, dtype=torch.float32).reshape(n_atk, -1)
+            logits9 = _wl_raw.reshape(-1, WEAPON_HEAD_SIZE + 1)
+            _bias_vec = (None if self.attack_bias_vec is None
+                         else self._tensor(self.attack_bias_vec, dtype=torch.float32).reshape(-1))
+            # ONE shared decode (qnn.model.bench.a25.decode.attack_with_decode) —
+            # the SAME call the ONNX ExportWrapper bakes, so the offline and the
+            # deployed attack decode (held-impulse + guard align/veto + per-weapon
+            # operating point + crest gate) cannot skew. No decode logic inline
+            # here. attack_state (the crest countdown latch's wire slot) is
+            # caller-threaded and MUTATED IN PLACE like move_commit_state.
+            _crest_theta = (None if self.attack_crest_theta_vec is None
+                            else self._tensor(self.attack_crest_theta_vec,
+                                              dtype=torch.float32).reshape(-1))
+            _att_state_t = (None if attack_state is None
+                            else self._tensor(attack_state, dtype=torch.float32
+                                              ).reshape(int(logits9.shape[0]), -1))
+            fire, weapon_impulse, _att_state_out = attack_with_decode(
+                logits9,
+                self._tensor(obs["self_weapon_id"], dtype=torch.long),
+                self._obs_tensors_dequant(obs),
+                _move_logits_guard if _is_movearch else logits["move"],
+                guard=self._regime_mod,
+                attack_bias=float(self.attack_bias), bias_vec=_bias_vec,
+                stick_bias=float(self.attack_stick_bias),
+                crest_theta_vec=_crest_theta,
+                crest_hold_ticks=int(self.attack_crest_hold_ticks or 0),
+                aim_z_err=_crest_z_err, aim_range=_crest_aim_range,
+                attack_state=_att_state_t)
+            if attack_state is not None and _att_state_out is not None:
+                _as = np.asarray(attack_state)
+                _as[...] = (_att_state_out.detach().cpu().numpy()
+                            .reshape(_as.shape).astype(_as.dtype))
+            attack_logit = attack_with_marginal_logit(logits9)   # diag readout
+            fire_prob = torch.sigmoid(attack_logit)              # diag readout
         else:
-            _atk_state, _ = attack_decode_reset_flat(batch=n_atk, device=attack_logit.device)
-        if attack_rng is not None:
-            _atk_rng = self._tensor(attack_rng, dtype=torch.int64).reshape(n_atk)
-        else:
-            _, _atk_rng = attack_decode_reset_flat(batch=n_atk, device=attack_logit.device)
-        fire, _atk_state_out, _atk_rng_out = attack_decode_step_graph(
-            attack_logit, _swid, _atk_state, _atk_rng,
-            attack_bias=float(self.attack_bias),
-            temperature=float(temps.get("attack", 1.0)),
-            attack_threshold=self.attack_threshold)
-        fire = fire.reshape(-1)
-        # Thread the advanced hold-tail + rng back into the caller's arrays IN PLACE
-        # (mirrors move_state_rng) so the next tick continues the stream.
-        if attack_state is not None:
-            _so = _atk_state_out.detach().cpu().numpy()
-            np.asarray(attack_state)[...] = _so.reshape(np.asarray(attack_state).shape)
-        if attack_rng is not None:
-            _ro = _atk_rng_out.detach().cpu().numpy().astype(np.asarray(attack_rng).dtype)
-            np.asarray(attack_rng)[...] = _ro.reshape(np.asarray(attack_rng).shape)
-
-        if self.decode_action_postprocess is not None:
-            fire = self.decode_action_postprocess(self, obs, move_classes, fire)
+            # SPLIT attack head (no attack_with): basic cross-gen readout
+            # (qnn.model.decode.decode_attack_bit) — sigmoid(logit+bias) > 0.5
+            # greedy / temperature-Bernoulli sampled. The a24 stateful attack
+            # decode (hold-tail + threaded xorshift rng + scalar threshold) is
+            # retired with the a24 arch; the attack_state / attack_rng kwargs
+            # are accepted for caller-state-threading compatibility and pass
+            # through untouched (the a25 wire keeps the slots for parity).
+            from qnn.model.decode import decode_attack_bit
+            attack_logit = logits[ATTACK_HEAD].reshape(-1)
+            fire_prob = torch.sigmoid(attack_logit + float(self.attack_bias))   # diag-log readout
+            fire = decode_attack_bit(
+                attack_logit + float(self.attack_bias),
+                sampled=(sample_mode == "sampled"),
+                temperature=float(temps.get("attack", 1.0)),
+                row_generators=row_generators,
+            )
+            if self.decode_action_postprocess is not None:
+                fire = self.decode_action_postprocess(self, obs, move_classes, fire)
 
         # ---- weapon ----
-        # Sticky weapon controller: pick the desired weapon class when
-        # the head is both confident and separated from the runner-up;
-        # otherwise emit the currently-held weapon so the resulting
-        # impulse is a no-op.  The action dict carries the engine
-        # impulse byte 1..8 directly (class index + 1); the bridge
-        # writes it to the binary wire unchanged.
-        weapon_impulse = torch.ones(int(move.shape[0]), dtype=torch.long, device=move.device)
-        if self.use_weapon_head and WEAPON_HEAD in logits and isinstance(obs, Mapping) and "self_weapon_id" in obs:
-            decide_weapon_sticky = self._decode().decide_weapon_sticky
+        # attack_with decoded its impulse jointly above. SPLIT weapon heads
+        # (8-way + sticky confidence/margin gate + weapon_ban) are an a24-only
+        # protocol, retired with the arch: a split-head model emits the plain
+        # per-row argmax impulse (no gate, no hysteresis, no ban).
+        if not is_attack_with:
+            weapon_impulse = torch.ones(int(move.shape[0]), dtype=torch.long, device=move.device)
+        if (not is_attack_with and self.use_weapon_head and WEAPON_HEAD in logits
+                and isinstance(obs, Mapping) and "self_weapon_id" in obs):
             weapon_logits = logits[WEAPON_HEAD].reshape(-1, WEAPON_HEAD_SIZE)
-            current_ids = self._tensor(obs["self_weapon_id"], dtype=torch.long).reshape(-1)
-            current_class = weapon_index_from_id(current_ids)
-            # Shared sticky gate (qnn.model.bench.a24.decode, co-decoded with
-            # tools/export_onnx.ExportWrapper._decide_weapon). The offline policy
-            # applies the SAME per-model weapon_ban the export path enforces,
-            # built via the shared helper, so the two weapon decodes are
-            # bit-identical given identical inputs + ban. No ban configured →
-            # (None, None) → the gate runs UNBANNED, identical to historical
-            # behavior.
-            ban_mask, ban_bool = self._resolve_weapon_ban_tensors(weapon_logits.device)
-            weapon_impulse = decide_weapon_sticky(
-                weapon_logits, current_class,
-                self.weapon_switch_confidence, self.weapon_switch_margin,
-                ban_mask=ban_mask, ban_bool=ban_bool,
-            )
+            weapon_impulse = weapon_logits.argmax(dim=-1).to(torch.long) + 1
+
+        # record the attack_with intent for NEXT tick's aim keying (nonzero
+        # decided impulse = committed intent; 0 = keep previous intent).
+        if self._intent_impulse_buf is not None:
+            _wi = weapon_impulse.reshape(-1).long().to(self._intent_impulse_buf.device)
+            if _wi.shape[0] == self._intent_impulse_buf.shape[0]:
+                _upd = _wi > 0
+                self._intent_impulse_buf[_upd] = _wi[_upd]
 
         actions = {
             "move":   move.detach().cpu().numpy().astype(np.float32),
@@ -1293,6 +1588,21 @@ class QNNPolicy:
         # entity_types lets us see how many actor indices actually contain a bot
         et = obs.get("entity_types") if isinstance(obs, dict) else None
         actor_counts = None
+        # attack_finished input sanity (raw wire + dequantized) — added during
+        # the A1 live-collapse hunt to verify the live cooldown value per tick.
+        af_raw = af_dq = None
+        if isinstance(obs, dict):
+            _afr = obs.get("attack_finished")
+            if _afr is not None:
+                af_raw = np.asarray(_afr).reshape(-1).astype(float).tolist()
+            try:
+                from qnn.model.dequant import SelfDequantizer
+                _dq = SelfDequantizer()({k: torch.as_tensor(np.asarray(v)) for k, v in obs.items()})
+                _afd = _dq.get("self_arsenal_scalars")
+                if _afd is not None:
+                    af_dq = _afd.reshape(-1, _afd.shape[-1])[:, 0].detach().cpu().numpy().astype(float).tolist()
+            except Exception:
+                af_dq = None
         if et is not None:
             et_np = np.asarray(et)
             actor_counts = (et_np == TOKEN_ACTOR).sum(axis=-1).reshape(-1).tolist()
@@ -1339,7 +1649,9 @@ class QNNPolicy:
         # head is echoing its held-weapon input (never wants to switch).
         weapon_logits_np = weapon_desired = weapon_conf = held_class = None
         if WEAPON_HEAD in logits and isinstance(obs, dict) and "self_weapon_id" in obs:
-            wl = logits[WEAPON_HEAD].reshape(-1, WEAPON_HEAD_SIZE)
+            # width-agnostic: 8 (split weapon head) or 9 (a25 attack-with joint)
+            wl = logits[WEAPON_HEAD]
+            wl = wl.reshape(-1, wl.shape[-1])
             wp = torch.softmax(wl, dim=-1)
             weapon_logits_np = _np(wl).tolist()
             weapon_desired = wp.argmax(dim=-1).detach().cpu().numpy().reshape(-1).tolist()
@@ -1355,6 +1667,8 @@ class QNNPolicy:
                 rec = {
                     "row": i,
                     "actor_count": (actor_counts[i] if actor_counts is not None else None),
+                    "attack_finished_raw": (af_raw[i] if af_raw is not None and i < len(af_raw) else None),
+                    "attack_finished_dq": (af_dq[i] if af_dq is not None and i < len(af_dq) else None),
                     "target": ({
                         "argmax_idx": int(argmax_idx[i]),
                         "max_prob": float(max_prob[i]),
@@ -1402,8 +1716,8 @@ class QNNPolicy:
         """Sample one class index per row from probs (B, K).
 
         Thin instance-side alias for the cross-gen base sampler
-        (qnn.model.decode.categorical_sample) — retained because the inline
-        a24-recent move sticky/hazard layers in act() call it as a method.
+        (qnn.model.decode.categorical_sample) — retained as the look decode's
+        magnitude sampler seam (analysis harnesses monkeypatch it).
         """
         from qnn.model.decode import categorical_sample
         return categorical_sample(probs, row_generators)
@@ -1421,9 +1735,11 @@ class QNNPolicy:
         epoch end. Emitted under the ``looksum_`` raw-sum prefix + n_look_valid.
         """
         def _logmap(u: torch.Tensor) -> torch.Tensor:
-            theta = torch.arccos(u[:, 0].clamp(-1.0, 1.0))                # (n,)
+            # atan2(|yz|, x), not arccos(x) — the fp16 near-1 cosine trap
+            # (research/look-head.md 7/06 root cause); mirrors tangent_logmap.
             yz = u[:, 1:3]                                                # (n,2)
             yz_norm = torch.linalg.vector_norm(yz, dim=-1)               # (n,)
+            theta = torch.atan2(yz_norm, u[:, 0])                         # (n,)
             scale = torch.where(yz_norm > 1e-8, theta / yz_norm.clamp(min=1e-8),
                                 torch.zeros_like(theta))
             return yz * scale[:, None]
@@ -1451,6 +1767,39 @@ class QNNPolicy:
         from qnn.model.decode import bernoulli_sample
         return bernoulli_sample(prob, row_generators)
 
+    def _mean_real_losses(
+        self,
+        losses: list[torch.Tensor],
+        loss_is_real: list[bool | torch.Tensor],
+    ) -> torch.Tensor:
+        """Average active head losses without synchronizing device flags.
+
+        Most heads are statically active and retain the cheap Python-bool path.
+        Sparse target/move/look heads provide scalar device booleans so an
+        all-masked microbatch does not force the GPU queue to synchronize merely
+        to decide which losses enter the mean.
+        """
+        if not losses:
+            return torch.zeros((), device=self.device)
+        if all(isinstance(active, bool) for active in loss_is_real):
+            real = [loss for loss, active in zip(losses, loss_is_real) if active]
+            return (
+                torch.stack(real).mean()
+                if real
+                else torch.zeros((), device=self.device)
+            )
+
+        stacked = torch.stack(losses)
+        # torch.full fills on device (scalar rides the kernel args);
+        # new_tensor(float) is a synchronizing pageable host→device copy.
+        weights = torch.stack([
+            active.to(device=stacked.device, dtype=stacked.dtype)
+            if isinstance(active, torch.Tensor)
+            else torch.full((), float(active), device=stacked.device, dtype=stacked.dtype)
+            for active in loss_is_real
+        ])
+        return (stacked * weights).sum() / weights.sum().clamp(min=1)
+
     def _compute_head_losses_and_metrics(
         self,
         logits: Dict[str, torch.Tensor],
@@ -1461,10 +1810,10 @@ class QNNPolicy:
         target_logits: torch.Tensor | None = None,
         obs: Mapping[str, np.ndarray | torch.Tensor] | None = None,
         valid_mask: torch.Tensor | None = None,
-    ) -> tuple[list[torch.Tensor], list[bool], Dict[str, torch.Tensor | int | float]]:
+    ) -> tuple[list[torch.Tensor], list[bool | torch.Tensor], Dict[str, torch.Tensor | int | float]]:
         weights_map = head_loss_weights or HEAD_LOSS_WEIGHTS
         losses: list[torch.Tensor] = []
-        loss_is_real: list[bool] = []
+        loss_is_real: list[bool | torch.Tensor] = []
         metrics: Dict[str, torch.Tensor | int | float] = {}
         accuracy_components: list[torch.Tensor] = []
         valid_flat = valid_mask.reshape(-1).bool() if valid_mask is not None else None
@@ -1527,25 +1876,30 @@ class QNNPolicy:
                 if valid_flat is not None
                 else torch.ones_like(present, dtype=torch.bool)
             )
-            aux_is_real = bool(valid.any().item())
-            if aux_is_real:
-                # Present-weighted soft CE: -sum_s p_idx * log_softmax(logits).
-                # idx_dist sums to `present`; renormalize so each frame's
-                # target probability mass sums to 1 before computing CE, then
-                # weight the per-frame term by `present`.
-                log_probs = F.log_softmax(target_flat[valid], dim=-1)
-                present_v = present[valid]
-                idx_target = idx_dist[valid] / present_v.clamp(min=1e-6).unsqueeze(-1)
-                per_frame_ce = -(idx_target * log_probs).sum(dim=-1)
-                aux_ce = (present_v * per_frame_ce).sum() / present_v.sum().clamp(min=1e-6)
-            else:
-                aux_ce = torch.zeros((), dtype=target_flat.dtype, device=target_flat.device)
+            aux_is_real = valid.any()
+            # Present-weighted soft CE: -sum_s p_idx * log_softmax(logits).
+            # Computed dense over ALL rows with the valid mask folded into the
+            # per-frame weight — boolean indexing (`x[valid]`) calls nonzero(),
+            # which blocks on a device→host sync; profiling showed those syncs
+            # dominating the training step. Weighted-sum over masked rows is
+            # value-identical: invalid rows carry weight exactly 0.
+            valid_f = valid.to(target_flat.dtype)
+            log_probs_all = F.log_softmax(target_flat, dim=-1)
+            idx_target_all = idx_dist / present.clamp(min=1e-6).unsqueeze(-1)
+            per_frame_ce_all = -(idx_target_all * log_probs_all).sum(dim=-1)
+            present_w = present * valid_f
+            aux_ce = (present_w * per_frame_ce_all).sum() / present_w.sum().clamp(min=1e-6)
             losses.append(aux_ce * target_loss_weight)
             loss_is_real.append(aux_is_real)
             if compute_metrics:
+                aux_has_rows = bool(aux_is_real.item())
                 metrics["loss_target"] = aux_ce.detach()
                 metrics["target_present_mean"] = present.mean().detach()
-                if aux_is_real:
+                if aux_has_rows:
+                    # Metrics run on the sampled reporting step only, so the
+                    # subset indexing (and its sync) is off the hot path.
+                    present_v = present[valid]
+                    idx_target = idx_target_all[valid]
                     # Aggregate KL — primary selection metric for target heads.
                     # KL(label || model) = present-weighted-NLL - entropy(label).
                     ent_per_frame = -(idx_target.clamp(min=1e-8) * idx_target.clamp(min=1e-8).log()).sum(dim=-1)
@@ -1611,12 +1965,34 @@ class QNNPolicy:
                                     device=target_flat.device,
                                 )
 
+        jump_loss_fn = getattr(getattr(self.model, "jump_head", None), "jump_loss", None)
+        if jump_loss_fn is not None and JUMP_HEAD in logits:
+            # a25 land-jump head owns its loss (label = press-byte bit7, scored
+            # on ground-jump-feasible frames only; see jump_head.py).
+            j_loss, _jm = jump_loss_fn(logits, actions, valid_flat, compute_metrics)
+            losses.append(j_loss * float(weights_map.get(JUMP_HEAD, 1.0)))
+            loss_is_real.append(True)
+            if compute_metrics and _jm:
+                metrics.update(_jm)
+
+        move_seg_loss_fn = getattr(getattr(self.model, "move_seg_head", None), "move_seg_loss", None)
+        if move_seg_loss_fn is not None and "move_seg" in logits and MOVE_HEAD in actions:
+            # a25 segment head owns its loss (labels derived on the fly from the
+            # sequence move classes; frame-shuffled batches contribute nothing).
+            seg_loss, _sm = move_seg_loss_fn(
+                logits, actions, valid_mask, compute_metrics,
+                ud_weight=float(weights_map.get("move_seg_ud", 1.0)))
+            losses.append(seg_loss * float(weights_map.get("move_seg", 1.0)))
+            loss_is_real.append(True)
+            if compute_metrics and _sm:
+                metrics.update(_sm)
+
         weapon_loss_fn = getattr(getattr(self.model, "weapon_head", None), "weapon_loss", None)
         if weapon_loss_fn is not None and WEAPON_HEAD in logits and WEAPON_HEAD in actions:
             # A head may own its loss (mirrors look_head.look_loss) by
             # exposing a ``weapon_loss`` method. Production heads lack the
             # method, so they fall through to the canonical CE below.
-            weapon_loss, _wm = weapon_loss_fn(logits, actions, valid_flat, compute_metrics)
+            weapon_loss, _wm = weapon_loss_fn(logits, actions, valid_flat, compute_metrics, obs=obs)
             losses.append(weapon_loss * weights_map.get(WEAPON_HEAD, 1.0))
             loss_is_real.append(True)
             if compute_metrics and _wm:
@@ -1802,7 +2178,7 @@ class QNNPolicy:
                     ),
                 )
                 move_target = rewritten
-            move_is_real = bool(base_move_valid.any().item())
+            move_is_real = base_move_valid.any()
             # ud (jump) axis is heavily imbalanced (~4% pos rate); upweight
             # the POS class via jump_pos_weight when set above 1.0.  fb/lr
             # are balanced enough that plain CE works.
@@ -1837,12 +2213,27 @@ class QNNPolicy:
                 else:
                     ce_axis = F.cross_entropy(axis_pred, axis_target, reduction="mean")
                 ce_per_axis.append(ce_axis)
-            move_loss = torch.stack(ce_per_axis).mean()  # equal-weight axes
+            # Optional per-axis weights via head_loss_weights keys
+            # "move_fb"/"move_lr"/"move_ud" (default 1.0 = the historical
+            # equal-weight mean). The /n_axes normalization is kept so a
+            # zeroed axis drops its gradient without rescaling the
+            # surviving axes' contribution.
+            axis_weights = [
+                float(weights_map.get(f"{MOVE_HEAD}_{axis_name}", 1.0))
+                for axis_name in MOVE_AXIS_NAMES
+            ]
+            if all(w == 1.0 for w in axis_weights):
+                move_loss = torch.stack(ce_per_axis).mean()  # equal-weight axes
+            else:
+                move_loss = (
+                    torch.stack(ce_per_axis) * move_pred.new_tensor(axis_weights)
+                ).sum() / len(ce_per_axis)
             losses.append(move_loss * weights_map.get(MOVE_HEAD, 1.0))
             loss_is_real.append(move_is_real)
             if compute_metrics:
+                move_has_rows = bool(move_is_real.item())
                 metrics["loss_move"] = move_loss.detach()
-                if move_is_real:
+                if move_has_rows:
                     with torch.no_grad():
                         # Per-axis argmax computed once; per-axis indexing
                         # below selects each axis's valid frames separately
@@ -2228,80 +2619,97 @@ class QNNPolicy:
             valid = target_norm.squeeze(-1) > 1e-6
             if valid_flat is not None:
                 valid = valid & valid_flat
-            aux_is_real = bool(valid.any().item())
+            aux_is_real = valid.any()
+            aux_has_rows = bool(aux_is_real.item()) if compute_metrics else False
             # Bench look heads may carry their own loss (binned/polar/vMF), so a new
             # loss form needs NO canonical change: the head reads its outputs from
             # `logits` (forwarded generically by Network) and returns (loss, metrics).
             look_loss_fn = getattr(getattr(self.model, "look_head", None), "look_loss", None)
-            if aux_is_real:
+            if look_loss_fn is not None:
+                # Hook contract (dense): the label covers EVERY row — invalid
+                # rows are filled with the no-turn unit vector (+x), which maps
+                # to the protected hold bin — and the head folds `valid` into
+                # its loss weights. Subset indexing (`x[valid]`) calls
+                # nonzero(), whose device→host sync was the profiled training
+                # bottleneck; the fill keeps polar_targets NaN-free on the
+                # rows the mask zeroes out anyway.
+                look_unit = look_label_raw / target_norm.clamp(min=1e-6)
+                no_turn = torch.zeros_like(look_unit)
+                no_turn[..., 0] = 1.0
+                look_label = torch.where(valid.unsqueeze(-1), look_unit, no_turn)
+                look_loss, _look_metrics = look_loss_fn(
+                    logits, look_label, valid, compute_metrics and aux_has_rows,
+                )
+                if compute_metrics and aux_has_rows:
+                    metrics.update(_look_metrics)
+            elif "_look_bins" in logits:
                 look_label = look_label_raw[valid] / target_norm[valid].clamp(min=1e-6)
-                if look_loss_fn is not None:
-                    look_loss, _look_metrics = look_loss_fn(
-                        logits, look_label, valid, compute_metrics,
-                    )
-                    if compute_metrics:
-                        metrics.update(_look_metrics)
-                elif "_look_bins" in logits:
-                    # Binned (classification) look head: per-axis cross-entropy
-                    # over foveated tangent bins instead of smooth_l1 on the
-                    # delta. look_predict (decoded direction) still drives the
-                    # look_r2 metric. See qnn.model.look_bins.
-                    from qnn.model.look_bins import (
-                        N_BINS as _LOOK_N_BINS,
-                        bin_targets as _look_bin_targets,
-                        soft_bin_targets as _look_soft_targets,
-                        tangent_logmap as _look_logmap,
-                    )
-                    bins = logits["_look_bins"].reshape(-1, 2, _LOOK_N_BINS)[valid]
-                    z_look = _look_logmap(look_label)                      # (V, 2) tangent
-                    tgt = _look_bin_targets(z_look)                        # (V, 2) long
-                    if self.look_label_smoothing_sigma > 0.0:
-                        # Distance-aware Gaussian soft-target CE: per axis,
-                        # -(soft * log_softmax(logits)).sum over bins, mean over
-                        # rows, summed over the 2 axes — same reduction as the
-                        # hard two-CE path below.
-                        soft = _look_soft_targets(z_look, self.look_label_smoothing_sigma)
-                        logp = F.log_softmax(bins, dim=-1)                 # (V, 2, N_BINS)
-                        look_loss = -(soft * logp).sum(dim=-1).mean(dim=0).sum()
-                    else:
-                        look_loss = (
-                            F.cross_entropy(bins[:, 0, :], tgt[:, 0])
-                            + F.cross_entropy(bins[:, 1, :], tgt[:, 1])
-                        )
-                    if compute_metrics:
-                        # Human-likeness sufficient statistics (additive; combined at
-                        # epoch end into look_dll / look_emd_deg — see
-                        # qnn.bc.look_metrics.humanlike_from_sums). The binned head's
-                        # PRODUCT is its per-axis bin DISTRIBUTION, so we score the
-                        # distribution, not the decoded mean. look_r2 / look_ewa_deg
-                        # (mean-fidelity proxies) are intentionally NOT emitted for the
-                        # binned head — for human-likeness they reward mean-regression.
-                        # Emit as SCALARS only — the metric flush stacks all raw-sum
-                        # metrics into one tensor (qnn.bc.supervised_loop), so per-bin
-                        # vectors must be unrolled. Combined into look_dll / look_emd_deg
-                        # at epoch end (and these keys popped). Prefix: lookdist_.
-                        with torch.no_grad():
-                            logp = torch.log_softmax(bins, dim=-1)          # (V,2,N_BINS)
-                            p = logp.exp()
-                            V = bins.shape[0]
-                            ar = torch.arange(V, device=bins.device)
-                            metrics["lookdist_n"] = bins.new_tensor(float(V))
-                            for a in (0, 1):
-                                metrics[f"lookdist_ce_{a}"] = (-logp[ar, a, tgt[:, a]].sum()).detach()
-                                hist_a = torch.bincount(tgt[:, a], minlength=_LOOK_N_BINS).to(bins.dtype)
-                                pred_a = p[:, a, :].sum(0)                  # (N_BINS,)
-                                for b in range(_LOOK_N_BINS):
-                                    metrics[f"lookdist_h_{a}_{b}"] = hist_a[b].detach()
-                                    metrics[f"lookdist_p_{a}_{b}"] = pred_a[b].detach()
+                # Binned (classification) look head: per-axis cross-entropy
+                # over foveated tangent bins instead of smooth_l1 on the
+                # delta. look_predict (decoded direction) still drives the
+                # look_r2 metric. See qnn.model.look_bins.
+                from qnn.model.look_bins import (
+                    N_BINS as _LOOK_N_BINS,
+                    bin_targets as _look_bin_targets,
+                    soft_bin_targets as _look_soft_targets,
+                    tangent_logmap as _look_logmap,
+                )
+                bins = logits["_look_bins"].reshape(-1, 2, _LOOK_N_BINS)[valid]
+                z_look = _look_logmap(look_label)                      # (V, 2) tangent
+                tgt = _look_bin_targets(z_look)                        # (V, 2) long
+                n_valid = max(int(bins.shape[0]), 1)
+                if self.look_label_smoothing_sigma > 0.0:
+                    # Distance-aware Gaussian soft-target CE: per axis,
+                    # -(soft * log_softmax(logits)).sum over bins, mean over
+                    # rows, summed over the 2 axes — same reduction as the
+                    # hard two-CE path below.
+                    soft = _look_soft_targets(z_look, self.look_label_smoothing_sigma)
+                    logp = F.log_softmax(bins, dim=-1)                 # (V, 2, N_BINS)
+                    look_loss = -(soft * logp).sum() / n_valid
                 else:
-                    # Target residual: what delta should be to make
-                    # normalize(base + delta) = look_label.
-                    look_residual = look_label - look_prior[valid]
-                    look_loss = F.smooth_l1_loss(
-                        look_delta[valid], look_residual, beta=0.05, reduction="mean",
-                    )
+                    look_loss = (
+                        F.cross_entropy(
+                            bins[:, 0, :], tgt[:, 0], reduction="sum",
+                        )
+                        + F.cross_entropy(
+                            bins[:, 1, :], tgt[:, 1], reduction="sum",
+                        )
+                    ) / n_valid
+                if compute_metrics and aux_has_rows:
+                    # Human-likeness sufficient statistics (additive; combined at
+                    # epoch end into look_dll / look_emd_deg — see
+                    # qnn.bc.look_metrics.humanlike_from_sums). The binned head's
+                    # PRODUCT is its per-axis bin DISTRIBUTION, so we score the
+                    # distribution, not the decoded mean. look_r2 / look_ewa_deg
+                    # (mean-fidelity proxies) are intentionally NOT emitted for the
+                    # binned head — for human-likeness they reward mean-regression.
+                    # Emit as SCALARS only — the metric flush stacks all raw-sum
+                    # metrics into one tensor (qnn.bc.supervised_loop), so per-bin
+                    # vectors must be unrolled. Combined into look_dll / look_emd_deg
+                    # at epoch end (and these keys popped). Prefix: lookdist_.
+                    with torch.no_grad():
+                        logp = torch.log_softmax(bins, dim=-1)          # (V,2,N_BINS)
+                        p = logp.exp()
+                        V = bins.shape[0]
+                        ar = torch.arange(V, device=bins.device)
+                        metrics["lookdist_n"] = bins.new_tensor(float(V))
+                        for a in (0, 1):
+                            metrics[f"lookdist_ce_{a}"] = (-logp[ar, a, tgt[:, a]].sum()).detach()
+                            hist_a = torch.bincount(tgt[:, a], minlength=_LOOK_N_BINS).to(bins.dtype)
+                            pred_a = p[:, a, :].sum(0)                  # (N_BINS,)
+                            for b in range(_LOOK_N_BINS):
+                                metrics[f"lookdist_h_{a}_{b}"] = hist_a[b].detach()
+                                metrics[f"lookdist_p_{a}_{b}"] = pred_a[b].detach()
             else:
-                look_loss = torch.zeros((), dtype=look_pred.dtype, device=look_pred.device)
+                # Target residual: what delta should be to make
+                # normalize(base + delta) = look_label. Sum + explicit divisor
+                # keeps the all-masked case finite without a host-side branch.
+                look_label = look_label_raw[valid] / target_norm[valid].clamp(min=1e-6)
+                look_residual = look_label - look_prior[valid]
+                look_delta_valid = look_delta[valid]
+                look_loss = F.smooth_l1_loss(
+                    look_delta_valid, look_residual, beta=0.05, reduction="sum",
+                ) / max(int(look_delta_valid.numel()), 1)
             losses.append(look_loss * weights_map.get(LOOK_HEAD, 1.0))
             loss_is_real.append(aux_is_real)
             if compute_metrics:
@@ -2309,7 +2717,7 @@ class QNNPolicy:
                 # Regression-only diagnostics (delta magnitude + tangent-space
                 # look_r2 sums). Skipped when the head carries its own loss
                 # (hook path) or is binned — those emit their own metrics.
-                if aux_is_real and look_loss_fn is None and "_look_bins" not in logits:
+                if aux_has_rows and look_loss_fn is None and "_look_bins" not in logits:
                     with torch.no_grad():
                         # Track delta magnitude so we can confirm the head
                         # is no longer growing it unbounded.
@@ -2355,10 +2763,19 @@ class QNNPolicy:
         """
         weapon = self._tensor(actions[WEAPON_HEAD], dtype=torch.long).reshape(-1)
         bad = (weapon < 0) | (weapon > WEAPON_HEAD_SIZE)
-        if bool(bad.any().item()):
-            sample = weapon[bad][:8].detach().cpu().tolist()
-            raise ValueError(
-                f"weapon bytes must be in 0..{WEAPON_HEAD_SIZE}, got {sample}"
+        if weapon.device.type == "cpu":
+            if bool(bad.any()):
+                sample = weapon[bad][:8].tolist()
+                raise ValueError(
+                    f"weapon bytes must be in 0..{WEAPON_HEAD_SIZE}, got {sample}"
+                )
+        else:
+            # Corpus validation reports detailed samples once at preload. Keep
+            # the per-batch device-side guard without synchronizing the GPU just
+            # to inspect a condition that is expected to be false.
+            torch._assert_async(
+                (~bad).all(),
+                f"weapon bytes must be in 0..{WEAPON_HEAD_SIZE}",
             )
         # 1..8 → class 0..7; 0 (no weapon) → -100 ignore.
         target = weapon - 1
@@ -2410,8 +2827,7 @@ class QNNPolicy:
                 obs=obs,
                 valid_mask=valid_mask,
             )
-            real = [l for l, r in zip(losses, loss_is_real) if r]
-            loss = torch.stack(real).mean() if real else torch.zeros((), device=self.device)
+            loss = self._mean_real_losses(losses, loss_is_real)
         (loss * float(loss_scale)).backward()
         if not accumulate_only:
             optimizer.step()
@@ -2454,8 +2870,7 @@ class QNNPolicy:
                 obs=obs,
                 valid_mask=valid_mask,
             )
-        real = [l for l, r in zip(losses, loss_is_real) if r]
-        metrics["loss"] = torch.stack(real).mean() if real else torch.zeros((), device=self.device)
+        metrics["loss"] = self._mean_real_losses(losses, loss_is_real)
         metrics["_next_hidden"] = next_hidden.detach()
         return metrics
 

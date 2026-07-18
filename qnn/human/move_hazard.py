@@ -13,7 +13,7 @@ the same wall-clock dwell, so the dwell-age bucket edges differ by tick rate.
                                                  resets at episode boundaries)
   axis      = 0:fb 1:lr      held_class = 0:neg 1:none 2:pos
 
-This is computed at COLLECT time (beside ``qnn.model.look_grid``) and recorded in
+This is computed as a post-collect step (beside ``qnn.human.look_grid``) and recorded in
 ``collect_metadata.json['move_hazard']``; a *run* pins the table into its own
 ``config/move_hazard.json`` (adopt-not-recompute, like the look grid). The move
 decode reads ``edges`` + ``fb`` + ``lr`` from the run's pinned table, so the table
@@ -392,7 +392,7 @@ def pinned_hazard_from_collect(collect_dir: str | Path) -> dict:
     if not mh or "fb" not in mh:
         raise ValueError(
             f"{collect_dir}/collect_metadata.json has no move_hazard — recollect "
-            "(or backfill via `python -m qnn.model.move_hazard <collect_dir> --backfill`) first.")
+            "(or backfill via `python -m qnn.human <collect_dir>`) first.")
     pinned = {
         "schema": "move_hazard_v1",
         "source": "corpus_fit",

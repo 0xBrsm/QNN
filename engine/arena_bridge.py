@@ -2,9 +2,10 @@
 
 The grouped protocol deliberately separates action staging from world advance:
 
-1. every externally controlled seat sends its action to the NQ server;
-2. the arena server advances exactly one frame;
-3. every seat drains the resulting observation and QTRN sidecar.
+1. observer clients apply their action locally for view/prediction parity;
+2. one packed action batch is sent directly to the NQ server;
+3. the arena server advances exactly one frame;
+4. every seat drains the resulting observation and QTRN sidecar.
 
 That preserves the synchronous, zero-policy-lag PPO contract while sharing one
 server/world simulation across up to eight isolated 1v1 matches.
@@ -125,6 +126,30 @@ class _ArenaPipeProcess:
                 raise NativeEngineError("Arena process accepted no input bytes")
             view = view[written:]
 
+    def read_training_frame(
+        self,
+        *,
+        episode_id: str,
+    ) -> tuple[TrustedTrainingExtrasV1, bytes]:
+        chunks: list[bytes] = []
+        magic = self.read_exact(4)
+        if magic != TRAINING_BINARY_MAGIC:
+            raise NativeEngineError(f"Unexpected arena training prefix {magic!r}")
+        header = magic + self.read_exact(TRAINING_BINARY_HEADER_SIZE - 4)
+        chunks.append(header)
+
+        def read_more(size: int) -> bytes:
+            payload = self.read_exact(size)
+            chunks.append(payload)
+            return payload
+
+        extras = decode_binary_training_extras(
+            header,
+            read_more,
+            episode_id=episode_id,
+        )
+        return extras, b"".join(chunks)
+
     def stop(self, opcode: int) -> None:
         proc = self.proc
         if proc is None:
@@ -152,6 +177,7 @@ class ArenaServerProcess(_ArenaPipeProcess):
 
     OP_STEP = 2
     OP_RESET_MASK = 3
+    OP_STEP_BATCH = 7
     OP_SHUTDOWN = 255
 
     def __init__(
@@ -167,8 +193,28 @@ class ArenaServerProcess(_ArenaPipeProcess):
         env: Mapping[str, str] | None = None,
         workdir: str | Path | None = None,
         extra_args: Sequence[str] = (),
+        observer_seats: Sequence[tuple[int, int]] = (),
+        observer_mode: str = "external",
+        reward_json: str = "",
+        weapon_config: Mapping[str, object] | None = None,
     ) -> None:
         self.port = int(port)
+        if observer_mode not in {"external", "virtual", "shadow"}:
+            raise ValueError(f"unknown arena observer mode {observer_mode!r}")
+        self.observer_mode = observer_mode
+        self.observer_seats = tuple(
+            (int(match_id), int(seat_id)) for match_id, seat_id in observer_seats
+        )
+        self._episode_generations = [0] * len(self.observer_seats)
+        self.last_training_frames: tuple[bytes, ...] = ()
+        server_env = dict(env or {})
+        if observer_mode != "external":
+            server_env["QNN_REWARD_JSON"] = str(reward_json)
+        observer_args: tuple[str, ...] = ()
+        if observer_mode == "virtual":
+            observer_args = ("-qnn_virtual_clients", "1")
+        elif observer_mode == "shadow":
+            observer_args = ("-qnn_shadow_clients", "1")
         super().__init__(
             executable,
             args=(
@@ -180,11 +226,48 @@ class ArenaServerProcess(_ArenaPipeProcess):
                 "-qnn_bots", str(int(bot_count)),
                 "-qnn_bot_skill", str(int(bot_skill)),
                 "-qnn_selfplay", "1" if self_play else "0",
+                *observer_args,
+                *self._weapon_args(weapon_config),
                 *extra_args,
             ),
-            env=env,
+            env=server_env,
             workdir=workdir,
         )
+
+    # Scenario inventory key -> arena-server CLI flag. Weapon names are resolved
+    # to IT_ bits inside the engine (QNN_ArenaWeaponBit), so the encoding stays
+    # authoritative in one place; ammo/armor/health flow through as-is.
+    _WEAPON_ARG_FLAGS: tuple[tuple[str, str], ...] = (
+        ("model_weapon", "-qnn_inv_selected"),
+        ("bot_weapon_pin", "-qnn_bot_weapon_pin"),
+        ("shells", "-qnn_inv_shells"),
+        ("nails", "-qnn_inv_nails"),
+        ("rockets", "-qnn_inv_rockets"),
+        ("cells", "-qnn_inv_cells"),
+        ("health", "-qnn_inv_health"),
+        ("armor_value", "-qnn_inv_armor"),
+        ("armor_type", "-qnn_inv_armor_type"),
+    )
+
+    @classmethod
+    def _weapon_args(
+        cls, weapon_config: Mapping[str, object] | None
+    ) -> tuple[str, ...]:
+        """Turn a single-weapon arena loadout dict into deterministic server CLI
+        args. Only keys present in ``weapon_config`` are emitted; every other
+        inventory cvar keeps its registered engine default. Unknown keys fail
+        loud (no silent drop)."""
+        if not weapon_config:
+            return ()
+        known = {key for key, _ in cls._WEAPON_ARG_FLAGS}
+        unknown = set(weapon_config) - known
+        if unknown:
+            raise ValueError(f"unknown arena weapon_config keys: {sorted(unknown)}")
+        args: list[str] = []
+        for key, flag in cls._WEAPON_ARG_FLAGS:
+            if key in weapon_config and weapon_config[key] is not None:
+                args.extend((flag, str(weapon_config[key])))
+        return tuple(args)
 
     def start_listening(self) -> None:
         self.spawn()
@@ -192,23 +275,68 @@ class ArenaServerProcess(_ArenaPipeProcess):
         if state.get("state") != "listening":
             raise NativeEngineError(f"Unexpected arena server state {state!r}")
 
-    def wait_ready(self) -> None:
+    def wait_ready(self) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
         state = self.read_json()
         if state.get("state") != "ready":
             raise NativeEngineError(f"Unexpected arena server state {state!r}")
+        return self._read_observer_transitions()
+
+    def _read_observer_transitions(
+        self,
+    ) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
+        if getattr(self, "observer_mode", "external") == "external":
+            self.last_training_frames = ()
+            return []
+        transitions: list[tuple[bytes, TrustedTrainingExtrasV1]] = []
+        frames: list[bytes] = []
+        for index, (match_id, seat_id) in enumerate(self.observer_seats):
+            obs = self.read_exact(OBS_BUFFER_SIZE)
+            extras, raw_frame = self.read_training_frame(
+                episode_id=(
+                    f"arena:{match_id}:{seat_id}:"
+                    f"{self._episode_generations[index]}"
+                )
+            )
+            transitions.append((obs, extras))
+            frames.append(raw_frame)
+            if extras.done:
+                self._episode_generations[index] += 1
+        self.last_training_frames = tuple(frames)
+        return transitions
 
     def step(self) -> None:
         self.write(bytes((self.OP_STEP,)))
         if self.read_exact(1) != bytes((self.OP_STEP,)):
             raise NativeEngineError("Invalid arena server step acknowledgement")
 
-    def reset_matches(self, match_mask: int) -> None:
+    def step_batch(
+        self,
+        action_packets: Sequence[bytes | bytearray | memoryview],
+    ) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
+        count = len(action_packets)
+        if not 1 <= count <= 16:
+            raise ValueError("arena action batch must contain 1..16 seats")
+        payload = bytearray((self.OP_STEP_BATCH, count))
+        for action_packet in action_packets:
+            packet = memoryview(action_packet)
+            if len(packet) != 17 or packet[0] != ArenaClientProcess.OP_STAGE:
+                raise ValueError("arena action packet must be the packed 17-byte step format")
+            payload.extend(packet[1:])
+        self.write(payload)
+        if self.read_exact(1) != bytes((self.OP_STEP_BATCH,)):
+            raise NativeEngineError("Invalid arena server batch-step acknowledgement")
+        return self._read_observer_transitions()
+
+    def reset_matches(
+        self, match_mask: int
+    ) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
         mask = int(match_mask)
         if not 0 < mask <= 0xFF:
             raise ValueError("match_mask must select at least one of eight matches")
         self.write(bytes((self.OP_RESET_MASK, mask)))
         if self.read_exact(1) != bytes((self.OP_RESET_MASK,)):
             raise NativeEngineError("Invalid arena server reset acknowledgement")
+        return self._read_observer_transitions()
 
     def close(self) -> None:
         self.stop(self.OP_SHUTDOWN)
@@ -221,6 +349,7 @@ class ArenaClientProcess(_ArenaPipeProcess):
     OP_RECEIVE = 4
     OP_RESUME_SIGNON = 5
     OP_RECEIVE_RESET = 6
+    OP_STAGE_LOCAL = 7
     OP_SHUTDOWN = 255
 
     def __init__(
@@ -240,6 +369,7 @@ class ArenaClientProcess(_ArenaPipeProcess):
         self.match_id = int(match_id)
         self.seat_id = int(seat_id)
         self._episode_generation = 0
+        self.last_training_frame = b""
         super().__init__(
             executable,
             args=(
@@ -270,15 +400,10 @@ class ArenaClientProcess(_ArenaPipeProcess):
         return self._read_transition()
 
     def _read_training(self) -> TrustedTrainingExtrasV1:
-        magic = self.read_exact(4)
-        if magic != TRAINING_BINARY_MAGIC:
-            raise NativeEngineError(f"Unexpected arena training prefix {magic!r}")
-        header = magic + self.read_exact(TRAINING_BINARY_HEADER_SIZE - 4)
-        return decode_binary_training_extras(
-            header,
-            self.read_exact,
+        extras, self.last_training_frame = self.read_training_frame(
             episode_id=f"arena:{self.match_id}:{self.seat_id}:{self._episode_generation}",
         )
+        return extras
 
     def _read_transition(self) -> tuple[bytes, TrustedTrainingExtrasV1]:
         obs = self.read_exact(OBS_BUFFER_SIZE)
@@ -293,6 +418,14 @@ class ArenaClientProcess(_ArenaPipeProcess):
     def wait_staged(self) -> None:
         if self.read_exact(1) != bytes((self.OP_STAGE,)):
             raise NativeEngineError("Invalid arena client stage acknowledgement")
+
+    def stage_local(self, action_packet: bytes | bytearray | memoryview) -> None:
+        packet = memoryview(action_packet)
+        if len(packet) != 17 or packet[0] != self.OP_STAGE:
+            raise ValueError("arena action packet must be the packed 17-byte step format")
+        payload = bytearray(packet)
+        payload[0] = self.OP_STAGE_LOCAL
+        self.write(payload)
 
     def receive_send(self) -> None:
         self.write(bytes((self.OP_RECEIVE,)))
@@ -325,10 +458,20 @@ class ArenaGroupProcess:
         bot_skill: int,
         self_play: bool,
         reward_json: str,
+        direct_actions: bool,
+        observer_mode: str = "external",
         env: Mapping[str, str] | None = None,
         workdir: str | Path | None = None,
+        weapon_config: Mapping[str, object] | None = None,
     ) -> None:
         seats = tuple((int(match_id), int(seat_id)) for match_id, seat_id in external_seats)
+        if observer_mode not in {"external", "virtual", "shadow"}:
+            raise ValueError(f"unknown arena observer mode {observer_mode!r}")
+        if observer_mode != "external" and not direct_actions:
+            raise ValueError("virtual and shadow observers require direct actions")
+        self.direct_actions = bool(direct_actions)
+        self.observer_mode = observer_mode
+        self.shadow_checks = 0
         self.server = ArenaServerProcess(
             server_executable,
             port=port,
@@ -339,6 +482,10 @@ class ArenaGroupProcess:
             self_play=self_play,
             env=env,
             workdir=workdir,
+            observer_seats=seats,
+            observer_mode=observer_mode,
+            reward_json=reward_json,
+            weapon_config=weapon_config,
         )
         self.clients = tuple(
             ArenaClientProcess(
@@ -355,11 +502,52 @@ class ArenaGroupProcess:
                 extra_args=("-port", str(int(port)), "-qnn_direct_connect"),
             )
             for match_id, seat_id in seats
+            if observer_mode != "virtual"
         )
+
+    @staticmethod
+    def _first_difference(left: bytes, right: bytes) -> int:
+        return next(
+            (index for index, pair in enumerate(zip(left, right, strict=True)) if pair[0] != pair[1]),
+            -1,
+        )
+
+    def _check_shadow(
+        self,
+        external: Sequence[tuple[bytes, TrustedTrainingExtrasV1]],
+        shadow: Sequence[tuple[bytes, TrustedTrainingExtrasV1]],
+    ) -> None:
+        if len(external) != len(shadow):
+            raise NativeEngineError("arena shadow returned the wrong seat count")
+        for index, ((external_obs, external_extras), (shadow_obs, shadow_extras)) in enumerate(
+            zip(external, shadow, strict=True)
+        ):
+            if external_obs != shadow_obs:
+                offset = self._first_difference(external_obs, shadow_obs)
+                raise NativeEngineError(
+                    f"arena shadow obs mismatch at seat {index}, byte {offset}: "
+                    f"external={external_obs[offset]} shadow={shadow_obs[offset]}"
+                )
+            external_frame = self.clients[index].last_training_frame
+            shadow_frame = self.server.last_training_frames[index]
+            if external_frame != shadow_frame or external_extras != shadow_extras:
+                offset = (
+                    self._first_difference(external_frame, shadow_frame)
+                    if len(external_frame) == len(shadow_frame)
+                    else min(len(external_frame), len(shadow_frame))
+                )
+                raise NativeEngineError(
+                    f"arena shadow QTRN mismatch at seat {index}, byte {offset}: "
+                    f"external={external_frame[offset] if offset < len(external_frame) else 'EOF'} "
+                    f"shadow={shadow_frame[offset] if offset < len(shadow_frame) else 'EOF'}"
+                )
+        self.shadow_checks += 1
 
     def start(self) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
         self.server.start_listening()
         try:
+            if self.observer_mode == "virtual":
+                return self.server.wait_ready()
             for client in self.clients:
                 client.start_connecting()
                 # Stock NetQuake's reliable sign-on stream is effectively
@@ -368,41 +556,86 @@ class ArenaGroupProcess:
                 client.wait_signed_on()
             for client in self.clients:
                 client.resume_signon()
-            self.server.wait_ready()
-            return [client.wait_ready() for client in self.clients]
+            shadow = self.server.wait_ready()
+            external = [client.wait_ready() for client in self.clients]
+            if self.observer_mode == "shadow":
+                # Initial readiness is asynchronous: the external process parks
+                # on whichever ready datagram the OS schedules first, while the
+                # mirror parser runs in the server frame loop.  Re-broadcast a
+                # reset snapshot as an explicit barrier before byte comparison.
+                match_mask = 0
+                for match_id, _seat_id in self.server.observer_seats:
+                    match_mask |= 1 << match_id
+                shadow = self.server.reset_matches(match_mask)
+                for client in self.clients:
+                    client.receive_reset_send()
+                external = [client.receive_recv() for client in self.clients]
+                self._check_shadow(external, shadow)
+            return external
         except Exception as exc:
             self.close()
+            server_details = self.server.last_stderr[-4000:] if self.server.last_stderr else ""
             client_details = [
                 f"seat {client.match_id}:{client.seat_id}: {client.last_stderr[-4000:]}"
                 for client in self.clients
                 if client.last_stderr
             ]
-            if client_details:
+            if server_details or client_details:
+                diagnostics = []
+                if server_details:
+                    diagnostics.append(f"Arena server diagnostics:\n{server_details}")
+                if client_details:
+                    diagnostics.append("Arena client diagnostics:\n" + "\n".join(client_details))
                 raise NativeEngineError(
-                    f"{exc}\nArena client diagnostics:\n" + "\n".join(client_details)
+                    f"{exc}\n" + "\n".join(diagnostics)
                 ) from exc
             raise
+
+    def step_many(
+        self,
+        action_packets: Sequence[bytes | bytearray | memoryview],
+    ) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
+        """Advance every policy seat through exactly one shared world tick."""
+        observer_mode = getattr(self, "observer_mode", "external")
+        if len(action_packets) != len(self.clients):
+            if observer_mode != "virtual" or len(action_packets) != len(self.server.observer_seats):
+                raise ValueError("one action packet is required for each external arena seat")
+        if observer_mode == "virtual":
+            return self.server.step_batch(action_packets)
+        if self.direct_actions:
+            for client, packet in zip(self.clients, action_packets, strict=True):
+                client.stage_local(packet)
+            shadow = self.server.step_batch(action_packets)
+        else:
+            for client, packet in zip(self.clients, action_packets, strict=True):
+                client.stage(packet)
+            for client in self.clients:
+                client.wait_staged()
+            self.server.step()
+        for client in self.clients:
+            client.receive_send()
+        external = [client.receive_recv() for client in self.clients]
+        if observer_mode == "shadow":
+            self._check_shadow(external, shadow)
+        return external
 
     def step(
         self,
         action_packets: Sequence[bytes | bytearray | memoryview],
     ) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
-        if len(action_packets) != len(self.clients):
-            raise ValueError("one action packet is required for each external arena seat")
-        for client, packet in zip(self.clients, action_packets, strict=True):
-            client.stage(packet)
-        for client in self.clients:
-            client.wait_staged()
-        self.server.step()
-        for client in self.clients:
-            client.receive_send()
-        return [client.receive_recv() for client in self.clients]
+        """Compatibility alias for callers predating native ``step_many``."""
+        return self.step_many(action_packets)
 
     def reset_matches(self, match_mask: int) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
-        self.server.reset_matches(match_mask)
+        shadow = self.server.reset_matches(match_mask)
+        if self.observer_mode == "virtual":
+            return shadow
         for client in self.clients:
             client.receive_reset_send()
-        return [client.receive_recv() for client in self.clients]
+        external = [client.receive_recv() for client in self.clients]
+        if self.observer_mode == "shadow":
+            self._check_shadow(external, shadow)
+        return external
 
     def close(self) -> None:
         for client in self.clients:

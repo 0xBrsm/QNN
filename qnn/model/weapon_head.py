@@ -52,6 +52,11 @@ def weapon_index_from_id(weapon_ids: torch.Tensor) -> torch.Tensor:
 class WeaponHeadInput:
     selector: torch.Tensor                  # (B*, selector_dim) — features for the classifier
     obs_weapon_id: torch.Tensor | None      # (B*,) raw obs ID; required iff context_from_obs
+    # Optional per-class additive feasibility mask (0 on feasible classes,
+    # -1e9 on infeasible) built by Network from obs; the head adds it to its
+    # logits BEFORE the context softmax so logits, context, loss, and decode
+    # all see the same gated distribution. None = no masking (default).
+    feasibility_mask: torch.Tensor | None = None  # (B*, n_classes)
 
 
 @dataclass(frozen=True, slots=True)

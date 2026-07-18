@@ -105,6 +105,10 @@ class ObsAccessor:
         """Per-weapon readiness ``(B*, 8)`` (axe-first) for the einsum source."""
         return self.dq["self_weapon_readiness"]
 
+    def ammo_pools(self) -> torch.Tensor:
+        """Per-ammo-pool fraction ``(B*, 4)`` [shells, nails, rockets, cells]."""
+        return self.dq["self_ammo_pools"]
+
     def aux(self, name: str) -> torch.Tensor:
         """Return a non-obs aux signal, delegating to its active context."""
         if self._aux_override is not None and name in self._aux_override:

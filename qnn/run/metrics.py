@@ -15,6 +15,8 @@ EPISODE_MEAN_ALIASES = {
     "kd_ratio": "kd_ratio_mean",
     "damage_dealt": "episode_damage_dealt_mean",
     "damage_taken": "episode_damage_taken_mean",
+    "damage_taken_self": "episode_damage_taken_self_mean",
+    "damage_taken_other": "episode_damage_taken_other_mean",
     "accuracy": "accuracy",
     "hits": "episode_hit_count_mean",
     "shots_fired": "episode_shots_fired_mean",
@@ -115,6 +117,8 @@ def build_episode_extra_stats(
     damage_taken: float,
     steps: int,
     reward_total: float,
+    damage_taken_self: float = 0.0,
+    damage_taken_other: float = 0.0,
     hits: int,
     shots_fired: int,
     health_pickups: float,
@@ -142,6 +146,8 @@ def build_episode_extra_stats(
         "kd_ratio": float(frags / max_deaths),
         "damage_dealt": float(damage_dealt),
         "damage_taken": float(damage_taken),
+        "damage_taken_self": float(damage_taken_self),
+        "damage_taken_other": float(damage_taken_other),
         "steps": float(steps),
         "accuracy": float(hits / max_shots),
         "hits": float(hits),
@@ -171,6 +177,8 @@ class EpisodeStatAccumulator:
     suicides: int = 0
     damage_dealt: float = 0.0
     damage_taken: float = 0.0
+    damage_taken_self: float = 0.0
+    damage_taken_other: float = 0.0
     steps: int = 0
     reward_total: float = 0.0
     hits: int = 0
@@ -202,6 +210,8 @@ class EpisodeStatAccumulator:
                 self.suicides += 1
         self.damage_dealt += float(info.get("damage_dealt", 0.0))
         self.damage_taken += float(info.get("damage_taken", 0.0))
+        self.damage_taken_self += float(info.get("damage_taken_self", 0.0))
+        self.damage_taken_other += float(info.get("damage_taken_other", 0.0))
         self.steps += 1
         self.reward_total += float(reward)
         self.hits += int(info.get("hit_count", 0))
@@ -225,6 +235,8 @@ class EpisodeStatAccumulator:
             suicides=self.suicides,
             damage_dealt=self.damage_dealt,
             damage_taken=self.damage_taken,
+            damage_taken_self=self.damage_taken_self,
+            damage_taken_other=self.damage_taken_other,
             steps=self.steps,
             reward_total=self.reward_total,
             hits=self.hits,

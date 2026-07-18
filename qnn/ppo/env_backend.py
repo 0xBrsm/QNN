@@ -17,7 +17,7 @@ to accept sparse/out-of-order completions without changing the rollout ABI.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Mapping, Protocol, runtime_checkable
 
 import numpy as np
@@ -59,6 +59,7 @@ class EnvStepBatch:
     valid: np.ndarray
     final_obs_rows: FinalObsRows
     episodes: list[EpisodeResult]
+    infos: list[dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.env_ids = np.asarray(self.env_ids, dtype=np.int64)
@@ -88,6 +89,8 @@ class EnvStepBatch:
                     f"obs[{name!r}] must have leading dimension {count}, "
                     f"got {np.asarray(values).shape}"
                 )
+        if self.infos and len(self.infos) != count:
+            raise ValueError(f"infos must contain {count} rows, got {len(self.infos)}")
 
     @property
     def hold(self) -> np.ndarray:

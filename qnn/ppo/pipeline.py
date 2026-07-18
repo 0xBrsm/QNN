@@ -218,7 +218,10 @@ def run_pipeline(ctx: Any, *, post_train_eval: bool = True, write_report: bool =
         ppo_cfg.get("native_args") if isinstance(ppo_cfg.get("native_args"), list) else None,
     )
     worker_path = ensure_worker(ctx.worker_binary, rebuild=False)
-    if str(ppo_cfg.get("env_backend", "process")) == "arena_grid":
+    if (
+        str(ppo_cfg.get("env_backend", "process")) == "arena_grid"
+        or str(eval_cfg.get("env_backend", "process")) == "arena_grid"
+    ):
         arena_server, arena_client = ensure_arena_workers(
             Path(str(ppo_cfg["arena_server_binary"])),
             Path(str(ppo_cfg["arena_client_binary"])),
@@ -232,6 +235,8 @@ def run_pipeline(ctx: Any, *, post_train_eval: bool = True, write_report: bool =
             )
         ppo_cfg["arena_server_binary"] = str(arena_server)
         ppo_cfg["arena_client_binary"] = str(arena_client)
+        eval_cfg["arena_server_binary"] = str(arena_server)
+        eval_cfg["arena_client_binary"] = str(arena_client)
 
     started = time.monotonic()
     ppo_cfg["native_env"] = {"QUAKE_BASEDIR": str(ctx.asset_root)}

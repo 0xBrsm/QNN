@@ -15,6 +15,15 @@
 +	"svc_cutscene",
 +	"svc_qnn_training"
  };
+@@ -308,7 +311,7 @@
+ // local state
+ 	cl_entities[0].model = cl.worldmodel = cl.model_precache[1];
+ 	
+-	R_NewMap ();
++	QNN_ArenaNewMap ();
+ 
+ 	Hunk_Check ();		// make sure nothing is hurt
+ 	
 @@ -769,3 +772,7 @@
 +		case svc_qnn_training:
 +			QNN_TrainingReadNetwork();
@@ -23,3 +32,6 @@
  		case svc_nop:
  //			Con_Printf ("svc_nop\n");
  			break;
+@@ -861 +868 @@
+-			CL_NewTranslation (i);
++			QNN_ArenaNewTranslation (i);

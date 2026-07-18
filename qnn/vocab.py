@@ -118,6 +118,15 @@ TOKEN_ACTOR = 1
 TOKEN_ITEM = 2
 TOKEN_MOVER = 3
 
+# INCOMING-projectile gate for reactivity instruments (human PSTH refs, eval
+# threat_trace, offline threat scorers — ONE definition everywhere): a newly
+# appeared projectile counts as an incoming threat only if the nearest
+# projectile is farther than this (game units). Own rockets spawn ~16-60u
+# ahead and otherwise contaminate every threat trigger with fire-while-
+# strafing correlation (the phantom "+0.032 @ 200 ms human dodge peak",
+# retracted 2026-07-11 — the clean human response is a small SUSTAINED lift).
+OWN_FIRE_DIST_U = 120.0
+
 # Per-type scalar dimensions (includes dist after rel[3], path_dist after path[3])
 PROJECTILE_SCALAR_DIM = 8
 ACTOR_SCALAR_DIM = 19

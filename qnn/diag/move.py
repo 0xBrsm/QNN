@@ -749,13 +749,7 @@ def rate_fidelity(
     corpus_10 = Path(corpus_10)
 
     if human_episodes_fn is None:
-        import sys
-        import importlib
-        # resolve humanlikeness_human_reference relative to the scripts dir
-        scripts_dir = Path(__file__).resolve().parents[3] / "scripts" / "analysis"
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
-        mod = importlib.import_module("humanlikeness_human_reference")
+        from qnn.eval.humanlikeness import human_reference as mod
         human_episodes_fn = mod._episodes
 
     streams = sorted(eval_dir.glob("rc_*_streams.npz"))

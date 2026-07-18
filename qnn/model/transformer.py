@@ -42,7 +42,7 @@ from qnn.model.tokens.token_builder import TokenBuilder
 from qnn.vocab import (
     TOKEN_PROJECTILE, TOKEN_ACTOR, TOKEN_ITEM, TOKEN_MOVER,
     ENTITY_VOCAB_SIZE, ACTION_VOCAB_SIZE, MODALITY_VOCAB_SIZE,
-    MAX_PLAYER_INDICES, MAX_TOKEN_OBJECTS, MAX_ENTITY_EVENTS,
+    MAX_PLAYER_INDICES, MAX_TOKEN_OBJECTS,
     PROJECTILE_SCALAR_DIM, ACTOR_SCALAR_DIM, ITEM_SCALAR_DIM, MOVER_SCALAR_DIM,
 )
 from qnn.schema import (
@@ -170,22 +170,47 @@ class ObsEmbedding(nn.Module):
         Returns:
             (batch, 16, d_model) — projected entity representations
         """
-        batch, n_indices, _ = entity_scalars_raw.shape
-        device = entity_scalars_raw.device
-        result = torch.zeros(batch, n_indices, self.d_model, device=device, dtype=entity_scalars_raw.dtype)
         proj_map = {
             TOKEN_PROJECTILE: (self.proj_projectile, PROJECTILE_SCALAR_DIM),
             TOKEN_ACTOR: (self.proj_actor, ACTOR_SCALAR_DIM),
             TOKEN_ITEM: (self.proj_item, ITEM_SCALAR_DIM),
             TOKEN_MOVER: (self.proj_mover, MOVER_SCALAR_DIM),
         }
+        out_dtype = entity_scalars_raw.dtype
+
+        if self.training:
+            # One fused GEMM over the four type projections, then a per-slot
+            # gather on the type tag. The weights stay the four checkpoint
+            # Linears — they are zero-padded to the max scalar width and
+            # concatenated per forward (tiny tensors; autograd splits the
+            # grads back). TOKEN_* values are contiguous 0..3, so the tag
+            # doubles as the gather index; empty slots (-1) clamp to 0 and
+            # are zeroed by the mask. Eval/export keep the per-type form so
+            # the traced inference graph is unchanged.
+            max_dim = int(entity_scalars_raw.shape[-1])
+            weights = torch.cat([
+                nn.functional.pad(proj.weight, (0, max_dim - proj.weight.shape[1]))
+                for proj, _ in proj_map.values()
+            ])                                                    # (4·d, max_dim)
+            bias = torch.cat([proj.bias for proj, _ in proj_map.values()])
+            fused = nn.functional.linear(entity_scalars_raw, weights, bias)
+            fused = fused.view(*entity_types.shape, len(proj_map), self.d_model)
+            idx = entity_types.clamp(min=0).view(*entity_types.shape, 1, 1)
+            picked = fused.gather(2, idx.expand(*entity_types.shape, 1, self.d_model))
+            picked = picked.squeeze(2) * (entity_types >= 0).unsqueeze(-1).to(fused.dtype)
+            return picked.to(out_dtype)
+
+        # Eval/export: project every slot through every type's Linear and
+        # select by type mask. Branch-free and sync-free (boolean-mask
+        # gather/scatter would call nonzero(), a blocking device→host copy);
+        # the four dense GEMMs over 16 slots are microseconds.
+        result: torch.Tensor | None = None
         for tok_type, (proj, sdim) in proj_map.items():
-            mask = (entity_types == tok_type)  # (batch, 16)
-            if mask.any():
-                raw = entity_scalars_raw[mask][:, :sdim]  # (k, sdim)
-                # Cast back to result.dtype so autocast (e.g. bf16) doesn't
-                # mismatch the fp32 destination buffer.
-                result[mask] = proj(raw).to(result.dtype)
+            mask = (entity_types == tok_type).unsqueeze(-1)  # (batch, 16, 1)
+            out = proj(entity_scalars_raw[..., :sdim]).to(out_dtype)
+            typed = out * mask.to(out_dtype)
+            result = typed if result is None else result + typed
+        assert result is not None
         return result
 
     def _build_self_block(
@@ -257,25 +282,22 @@ class ObsEmbedding(nn.Module):
         evt_sources = obs_dict["entity_event_sources"].long().clamp(0, vocab_max)
         evt_counts  = obs_dict["entity_event_counts"].long()
         evt_embed = self.action_embed(evt_actions) + self.entity_embed(evt_sources)
-        evt_range = torch.arange(MAX_ENTITY_EVENTS, device=device).view(1, 1, MAX_ENTITY_EVENTS)
+        # Resident corpora compact these tensors to their corpus-wide used
+        # width (often one slot rather than the four-slot wire maximum).
+        # Inference retains the full wire width.
+        n_event_slots = evt_actions.shape[-1]
+        evt_range = torch.arange(n_event_slots, device=device).view(1, 1, n_event_slots)
         evt_mask = (evt_range < evt_counts.unsqueeze(-1)).unsqueeze(-1).float()
         entity_repr = entity_repr + (evt_embed * evt_mask).sum(dim=2)
 
-        # Kind tag on entity tokens — second-dim is data-dependent under
-        # the variable-length entity wire, so read it from the input.
-        kind_entity = torch.full(
-            (batch, entity_types.shape[1]), _TOKEN_KIND_ENTITY,
-            dtype=torch.long, device=device,
-        )
-        entity_repr = entity_repr + self.kind_embed(kind_entity)
+        # Kind tag on entity tokens — constant for the whole block, so add the
+        # table row broadcast instead of materializing an index tensor and an
+        # embedding lookup (whose backward is an atomic scatter).
+        entity_repr = entity_repr + self.kind_embed.weight[_TOKEN_KIND_ENTITY]
 
         if self.include_spatial:
             spatial_token = self.spatial_proj(obs_dict["spatial_scalars"])
-            kind_spatial = torch.full(
-                (batch, SPATIAL_TOKEN_COUNT), _TOKEN_KIND_SPATIAL,
-                dtype=torch.long, device=device,
-            )
-            spatial_token = spatial_token + self.kind_embed(kind_spatial)
+            spatial_token = spatial_token + self.kind_embed.weight[_TOKEN_KIND_SPATIAL]
             tokens = torch.cat([self_block, spatial_token, entity_repr], dim=1)
             non_entity_valid = torch.zeros(
                 (batch, self._N_SELF_TOKENS + SPATIAL_TOKEN_COUNT),

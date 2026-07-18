@@ -33,6 +33,7 @@
  */
 
 #include "qnn.h"
+#include "qnn_context.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -70,6 +71,11 @@ static struct {
 	float          pred[2];           /* this tick's predicted velocity */
 	int            has_pred;
 } qnn_pred;
+
+void QNN_PredictRegisterContext(void)
+{
+	QNN_ContextRegister(&qnn_pred, sizeof(qnn_pred));
+}
 
 /* One horizontal physics step: friction (grounded) + accelerate toward the
  * cmd wishdir. Mirrors the python prototype validated against live paired

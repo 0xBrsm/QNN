@@ -84,6 +84,9 @@ def _run_episode(
     """Run one greedy episode. Returns (summary, per_tick_data)."""
     obs = env.reset()
     hidden = None
+    # act() state-threading contract (movearch commitment lanes) — same (1,D)
+    # array each step = in-place carry; fresh per episode.
+    act_state = policy.prepare_act_state(1)
     total_reward = 0.0
     frags = 0
     deaths = 0
@@ -97,7 +100,7 @@ def _run_episode(
         else:
             batched = np.expand_dims(obs, 0)
         target_step = _target_tick_values(policy, batched, hidden)
-        result = policy.act(batched, mode="greedy", hidden=hidden)
+        result = policy.act(batched, mode="greedy", hidden=hidden, **act_state)
         hidden = result.next_hidden
 
         action: dict[str, Any] = {}

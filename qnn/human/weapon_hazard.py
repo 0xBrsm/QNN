@@ -24,7 +24,7 @@ charged here. dwell_age is computed over the FULL episode (true hold duration), 
 hazard accumulated only on engaged frames. The decode gates the head's WHAT pick on a
 Bernoulli(hazard) draw with a persisted RNG (move-style).
 
-Computed at COLLECT time (beside ``qnn.model.move_hazard`` / ``look_grid``), recorded
+Computed as a post-collect step (beside ``qnn.human.move_hazard`` / ``look_grid``), recorded
 in ``collect_metadata.json['weapon_hazard']``; a *run* pins it into
 ``config/weapon_hazard.json`` (adopt-not-recompute). Rate-dependent like move.
 
@@ -41,26 +41,17 @@ import numpy as np
 from qnn import engine_norm as en
 from qnn.vocab import self_weapon_id_to_impulse
 
-# Same tick-aware dwell-age bucket edges as move (11 buckets = 10 edges); validated
-# 20 Hz Fibonacci set against the clean corpus (corr 0.96 train→held-out).
-EDGES_BY_HZ: dict[int, list[int]] = {
-    10: [1, 2, 3, 4, 6, 9, 13, 19, 28, 42],
-    20: [1, 2, 3, 5, 8, 13, 21, 34, 55, 89],
-}
+# The tick-aware dwell-age bucket edges are the SAME as move (same corpus timing,
+# validated 20 Hz Fibonacci set, corr 0.96 train→held-out) — import from their owner
+# rather than duplicate the table + the fallback.
+from qnn.human.move_hazard import EDGES_BY_HZ, default_edges  # noqa: F401,E402
+
 N_HELD = 8           # impulse 1..8 stored at rows 0..7
 N_OWNED_BINS = 9     # n_owned 0..8 → index 0..8 (small ints, used directly; dense)
 HELD_NAMES = ["Axe", "SG", "SSG", "NG", "SNG", "GL", "RL", "LG"]
 # Weapon-ownership bits in the engine items bitmask (deploy-consistent: the engine
 # computes n_owned the same way from its own item state).
 _WEAPON_BITS = [b for b in range(32) if (en.ITEMS_WEAPON_MASK >> b) & 1]
-
-
-def default_edges(tick_hz: int | float | None) -> list[int]:
-    """Bucket edges for a tick rate; falls back to the 20 Hz set when unknown."""
-    try:
-        return EDGES_BY_HZ[int(round(float(tick_hz)))]
-    except (TypeError, ValueError, KeyError):
-        return EDGES_BY_HZ[20]
 
 
 def n_owned_from_items(items: np.ndarray) -> np.ndarray:
@@ -173,7 +164,7 @@ def pinned_hazard_from_collect(collect_dir: str | Path) -> dict:
     if not wh or "hazard" not in wh:
         raise ValueError(
             f"{collect_dir}/collect_metadata.json has no weapon_hazard — recollect "
-            "(or backfill via `python -m qnn.model.weapon_hazard <collect_dir> --backfill`).")
+            "(or backfill via `python -m qnn.human <collect_dir>`).")
     return {
         "schema": "weapon_hazard_v1",
         "axes": wh.get("axes", ["held_impulse", "dwell_bucket", "n_owned"]),

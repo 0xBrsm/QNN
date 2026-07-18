@@ -1,0 +1,42 @@
+{
+  "decode_version": 1,
+  "version": "a25base",
+  "description": "a25-native BASE decode template \u2014 the decode-fit pipeline's emit base (replaces the retired a24rc1q oracle). Names the a25 decode/guard modules and carries ONLY live a25 param keys with neutral placeholder values: look.* (aim gain/alpha/ffwd, turn dampener, hazard-discounted lead caps look.lead_hold_cap_frames/radial=4/5 @20Hz — the a24 deployed operating point, carried so every a25 decode-fit emits them, hold pass-through, tremor demoter), the move.commitment family, the attack_with operating point (attack.bias_vec / attack.stick_bias), weapon_ban (always [] on a25 \u2014 no ban gate in the attack_with decode), and the guard.* Gate B selection. Per-model values are filled by the decode-fit pipeline.",
+  "decode_module": "qnn.model.bench.a25.decode",
+  "guard_module": "qnn.model.bench.a25.guard",
+  "look_grid": "config/look_grid.json",
+  "params": {
+    "look.aim_prior_gain": 0.0,
+    "look.aim_ffwd_gain": 0.0,
+    "look.aim_mag_gain": 0.0,
+    "look.turn_mag_scale": 1.0,
+    "look.lead_hold_cap_frames": 4.0,
+    "look.lead_hold_cap_radial_frames": 5.0,
+    "look.hold_passthrough": true,
+    "look.aim_degrade_lag_frames": 0.0,
+    "look.aim_degrade_tremor_mag": 0.0,
+    "look.aim_degrade_tremor_tau": 5.0,
+    "weapon_ban": [],
+    "move.commitment": true,
+    "move.commit_interrupt": false,
+    "move.commit_dur_tilt": [
+      0.0,
+      0.0
+    ],
+    "attack.bias": 0.0,
+    "attack.bias_vec": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "attack.stick_bias": 0.0,
+    "guard.projectile_release": true,
+    "guard.projectile_release_mode": "rocket",
+    "move.threat_break_hazard": 0.0
+  }
+}

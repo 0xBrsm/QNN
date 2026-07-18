@@ -44,6 +44,9 @@ def _run_episode(
 ) -> dict[str, float]:
     obs = env.reset()
     hidden = None
+    # act() state-threading contract (movearch commitment lanes) — same (1,D)
+    # array each step = in-place carry; fresh per episode.
+    act_state = policy.prepare_act_state(1)
     total_reward = 0.0
     frags = 0
     deaths = 0
@@ -56,7 +59,7 @@ def _run_episode(
             batched = {k: np.expand_dims(v, 0) for k, v in obs.items()}
         else:
             batched = np.expand_dims(obs, 0)
-        result = policy.act(batched, mode=policy_mode, hidden=hidden)
+        result = policy.act(batched, mode=policy_mode, hidden=hidden, **act_state)
         hidden = result.next_hidden
 
         action: dict[str, Any] = {}
