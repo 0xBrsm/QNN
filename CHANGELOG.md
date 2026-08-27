@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.29.0
+
+### Added
+
+- Finalized the packed depth atlas as `wire.12.2`: a 24×11 center-ray atlas, nibble-packed to 132 spatial bytes in the 864-byte observation frame; the model expands each packed band to 24 depth and 24 hit scalars. The earlier 72-yaw unpacked atlas is registered as `wire.12.1`, and bare `wire.12` is retired as ambiguous (the codec registry refuses it). Replaces the 9-sector raycast spatial block.
+- Dual-format atlas serving: the engine detects whether a loaded ONNX declares the packed 24-yaw (`wire.12.2`) or legacy 72-yaw (`wire.12.1`) `spatial_atlas` input and feeds the matching buffer, so one binary serves both atlas generations.
+- Decode-config knobs: a jump confidence gate (`jump.threshold`, deterministic jump-iff-confident replacing the sampled posterior), move re-commit (`move.commit_recommit`), and engagement-gated idle stillness (the `move.idle_none_bias` family) with an ammo-lockout override that forces stillness when a held weapon's ammo pool stops moving despite commanded fire.
+- Convergence-gated crest hold for the attack discharge-quality gate: a held, misaligned discharge releases early once alignment is predicted to worsen, instead of riding out its full hold to a blind fire.
+- `qnn.decode_fit.crest`: fits the crest gate's per-weapon θ by offline replay of the discharge alignment windows the aim fit already captured — no eval episodes spent. Placement is clamped CI-conservatively at the human elite anchor; an over-elite ask is refused and rides the clamp, the same semantics as a gain refusal riding the achievable frontier.
+- `qnn.decode_fit.move_gates`: per-checkpoint fits for jump τ (confidence gate placed by cut factor, never frequency-matched) and idle β (no-enemy stand-still matched to the human fraction) on the rollout ruler — the realized lr-none occupancy law the deployed graph runs, replacing an estimator whose β entered the decode ~10× too small. A lane-retiring rollout makes the fit minutes instead of hours.
+- `qnn.eval.h2h`: head-to-head closed-loop eval — two decode-fitted checkpoints fight across the grouped self-play arena, one batched forward per side per tick. Fixed-quota rounds (death/suicide/double/timeout semantics), seat-swapped arms plus a model-vs-itself null arm for seat-bias calibration, per-round death context, and band-v5 gate streams the human-band scorer consumes unchanged. ~26× realtime per eight-match group; same-wire pairings only (a `wire.12.1` model cannot share a bridge world with a `wire.12.2` model).
+
+### Changed
+
+- A live runtime image (`src/docker/Dockerfile.live`, `compose.live.yaml`) packages the standalone ONNX-serving client with ONNX Runtime.
+- Decode-fit reconciled the fire operating point into explicit `attack.fire_bias_vec` (fire-only) and `weapon.preference_bias_vec` (selection-only) controls, replacing the ambiguous joint `attack.bias_vec` and the retired `attack.stick_bias` hysteresis lever with `weapon.switch_margin`.
+- Decode-fit calibrates conditional family cadence in four forced class-weapon pins, mirrors SG+SSG and NG+SNG onto their family response, and collapses per-weapon fits into calibration families, so selection-starved free play or style warm starts can no longer rewrite an already-fitted cadence.
+- Zero-discharge tracking waves emit a schema-bearing empty artifact instead of being silently skipped, so a wave with no discharges is distinguishable from one that predates the instrument.
+- Continuous-weapon (NG/SNG/LG) fire hold-tail now applies across every wire generation instead of being gated off past wire.11.
+- The occupancy bias controllers behind deployed decode configs moved out of analysis scripts into `qnn.decode_fit.occupancy` — importable, tested, versioned; behavior unchanged (bias trajectories replay identically).
+
+### Fixed
+
+- The crest-firing discharge gate is now applied in offline eval, not only in the exported ONNX: the decode-param mapping was hand-written at three drifted sites, which now all read one registry (`DECODE_PARAMS`) owning the coercions and OFF-defaults. No pinned config sets the crest params, so no shipped model's behavior changes.
+- The move-commitment decode's world inputs — threat-break, engagement, and the ammo-lockout pair — are derived once for both offline eval and the exported graph. The export copy read dequantized entity rel against a projectile gate it could never clear (the projectile half of threat/engagement was inert in every shipped graph); the eval copy failed open on dequantized observations (a configured `move.idle_none_bias` was quietly disabled). Both paths now share one fail-loud helper; graphs that pin these knobs now run the response their fits measured and want a live re-validation before the next deploy.
+- The RL self-splash guard reconstructs the conservative (nearest-possible) true distance from a quantized atlas reading instead of trusting it verbatim, closing a false-safe window where rounding could move a lethal-range shot into the safe zone.
+- Checkpoint loading rebuilds `spatial_proj` to a checkpoint's own saved atlas width before loading weights, so older and newer atlas-resolution checkpoints both load their exact saved weights natively.
+
 ## 0.28.0
 
 ### Added

@@ -72,11 +72,9 @@ SCALAR_COLS = [
     "obs_attack_finished", "obs_self_movement_id", "obs_self_weapon_id",
     "obs_self_items",
 ]
+# rev-8 depth-atlas spatial field (spatial-tokens-v2).
 SPATIAL_COLS = [
-    "obs_spatial_clearance", "obs_spatial_dropoff", "obs_spatial_mean_dist",
-    "obs_spatial_nearest_dist", "obs_spatial_openness", "obs_spatial_solid_frac",
-    "obs_spatial_traversable", "obs_spatial_water_frac", "obs_spatial_lava_frac",
-    "obs_spatial_slime_frac", "obs_spatial_dir",
+    "obs_spatial_atlas",
 ]
 ENTITY_COLS = ["obs_entity_count", "obs_entity_types", "obs_entity_rel",
                "obs_entity_vel", "obs_entity_eta", "obs_entity_facing"]
@@ -1017,9 +1015,10 @@ def jump_onset_probe(
             None if split == "train" else data["train"]["sp_masks"],
         )
         p_target = 1.0 - cols["act_target_probs"][:, 0].astype(np.float64)
-        dry = (
-            cols["obs_spatial_water_frac"].reshape(len(jump), -1) == 0
-        ).all(axis=1)
+        # Spatial v2 spends its fixed byte budget on reconstructable geometry;
+        # liquid contents are not part of that payload.  The self movement ID
+        # still gives an exact player-state split (0 ground, 1 air, 2..4 water).
+        dry = cols["obs_self_movement_id"].reshape(-1) < 2
         data[split] = dict(
             groups=groups, sp_masks=sp_masks, onset=onset,
             onset_btn=onset_btn, drop=drop, upcoming=upcoming,

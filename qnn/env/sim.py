@@ -32,10 +32,11 @@ import torch
 import torch.nn.functional as F
 
 from qnn.model.policy import QNNPolicy
+from qnn import engine_norm as en
 from qnn.schema import OBS_SCHEMA, SPATIAL_TOKEN_COUNT
 from qnn.vocab import (
     ACTION_IDS, ENTITY_IDS, MAX_TOKEN_OBJECTS,
-    MODALITY_IDS, SPATIAL_SECTOR_IDS,
+    MODALITY_IDS, SPATIAL_BAND_IDS,
     TOKEN_ACTOR, TOKEN_ITEM, TOKEN_MOVER, TOKEN_PROJECTILE,
 )
 
@@ -104,19 +105,14 @@ _SELF_SCALAR_LAYOUT: Dict[str, int] = {
     "ammo_shells": 9, "ammo_nails": 10, "ammo_rockets": 11, "ammo_cells": 12,
     # "vel" handled separately — maps to indices 13, 14, 15.
     "attack_finished": 16,  # normalized seconds remaining over QNN_TIME_SCALE (60s)
+    "view_pitch": 17,
 }
+# Final depth-atlas layout (dequantized spatial_scalars, dim 48 per
+# band token: 24 normalized depths then 24 hit flags) — mirrors
+# qnn.model.dequant SpatialDequantizer.
 _SPATIAL_LAYOUT: Dict[str, Tuple[int, int]] = {
-    "dir":          (0, 3),
-    "nearest_dist": (3, 1),
-    "mean_dist":    (4, 1),
-    "openness":     (5, 1),
-    "clearance":    (6, 1),
-    "traversable":  (7, 1),
-    "dropoff":      (8, 1),
-    "solid_frac":   (9, 1),
-    "water_frac":   (10, 1),
-    "slime_frac":   (11, 1),
-    "lava_frac":    (12, 1),
+    "depth": (0, en.ATLAS_YAWS),  # per yaw cell, depth / DIST_SCALE
+    "hit": (en.ATLAS_YAWS, en.ATLAS_YAWS),  # 1 = surface within range
 }
 
 
@@ -223,12 +219,12 @@ def _write_self_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any]) -> None:
 
     # Derive subtoken scalar tensors from the legacy slot layout so the
     # dequant's "self_state_scalars in obs" short-circuit sees real
-    # values rather than zeros from _zero_obs. view_pitch defaults to 0
-    # — probes don't currently expose pitch as a separate field.
+    # values rather than zeros from _zero_obs.
     obs["self_state_scalars"][:]   = obs["self_scalars"][0:2]
     obs["self_arsenal_scalars"][:] = obs["self_scalars"][16:17]
     obs["self_motion_scalars"][:3] = obs["self_scalars"][13:16]
     obs["self_motion_scalars"][3]  = float(tok.get("view_pitch", 0.0))
+    obs["self_scalars"][17]        = float(tok.get("view_pitch", 0.0))
     # look_delta = the engine-computed change in the look vector
     # (look[t-1] - look[t-2]), supplied by the worker when available;
     # otherwise left at the zero default (see SelfDequantizer._ensure_look_delta).
@@ -240,31 +236,32 @@ def _write_self_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any]) -> None:
 
 
 def _write_spatial_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: int) -> None:
-    sector_idx = index - 1  # production: spatial tokens at stream indices 1..9
-    if not 0 <= sector_idx < SPATIAL_TOKEN_COUNT:
+    band_idx = index - 1  # production: spatial band tokens at stream indices 1..11
+    if not 0 <= band_idx < SPATIAL_TOKEN_COUNT:
         raise ValueError(
             f"spatial token index {index} out of range [1, {SPATIAL_TOKEN_COUNT}]"
         )
-    # sector name is a label, not written to the obs tensor — but we still
+    # band name is a label, not written to the obs tensor — but we still
     # validate it for sanity.
-    if "sector" in tok:
-        expected = {v: k for k, v in SPATIAL_SECTOR_IDS.items()}[sector_idx]
-        if tok["sector"] != expected:
+    if "band" in tok:
+        expected = {v: k for k, v in SPATIAL_BAND_IDS.items()}[band_idx]
+        if tok["band"] != expected:
             raise ValueError(
-                f"spatial token at index {index} has sector={tok['sector']!r}; "
+                f"spatial token at index {index} has band={tok['band']!r}; "
                 f"expected {expected!r} for that stream position"
             )
-    dest = obs["spatial_scalars"][sector_idx]
+    dest = obs["spatial_scalars"][band_idx]
     for field, (off, length) in _SPATIAL_LAYOUT.items():
         if field in tok:
             _write_scalar_field(dest, tok[field], off, length, f"spatial.{field}")
 
 
 def _write_entity_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any], index: int) -> int:
-    idx = index - (1 + SPATIAL_TOKEN_COUNT)  # 10..25 → 0..15
+    idx = index - (1 + SPATIAL_TOKEN_COUNT)  # 12..27 → 0..15
     if not 0 <= idx < MAX_TOKEN_OBJECTS:
         raise ValueError(
-            f"entity token index {index} out of range [12, {12 + MAX_TOKEN_OBJECTS - 1}]"
+            f"entity token index {index} out of range "
+            f"[{1 + SPATIAL_TOKEN_COUNT}, {SPATIAL_TOKEN_COUNT + MAX_TOKEN_OBJECTS}]"
         )
     type_name = tok.get("type")
     if type_name not in _ENTITY_TYPE_NAMES:

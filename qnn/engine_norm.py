@@ -21,17 +21,18 @@ Per-field native dtype is chosen to match how the engine actually
 carries the value:
 
 - Health, armor, ammo, score, state — **u8** (engine byte ranges).
-- Distances (``rel``, ``path``, ``path_dist``, spatial ``nearest_dist`` /
-  ``mean_dist``) — **i16/u16** raw Quake units. See "Deviations from
+- Distances and coordinates (``rel``, ``path``, ``path_dist``) — **i16/u16**
+  raw Quake units. See "Deviations from
   Quake" below for the precision note.
 - Velocities — **i16** clamped to ±MAX_VELOCITY (sv_maxvelocity).
 - Time scalars (``attack_finished``, ``recency``, ``eta``, ``regen``) —
   **f16 seconds**. u8 fails because the meaningful range spans 0.1s up
   to 60s and we need ~10ms precision at the low end.
 - Already-normalized [0,1] floats (``facing``, ``team``, ``score``,
-  ``state``, all spatial fractions and clamped clearance/dropoff/
-  traversable/openness) — **u8** with 1/255 precision.
-- Spatial ``dir[3]`` unit vectors — **i8** with ~1/127 precision.
+  ``state``) — **u8** with 1/255 precision.
+- Spatial clearance — **u8** in four-Quake-unit increments.
+- Spatial plane normals — **u8 azimuth + i8 z**, reconstructing xyz with
+  about 0.7-degree azimuth and 1/127 vertical precision; z=-128 is a miss.
 - Categorical IDs — **u8** (vocab fits in <256).
 - ``cl.items`` — **i32**, matches Quake's ``int items``.
 - ``act_target_probs`` — NOT on disk. Recomputed at training start
@@ -156,6 +157,7 @@ revision would add ``act_jump u8`` as a dedicated field.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -220,7 +222,23 @@ import numpy as np
 #
 # (The third axis, ARCH — model internals / weight layout — is checkpoint-side
 #  only; the live bin ignores it. Tracked by qnn/utils/checkpoint_converter.py.)
-WIRE_CONTRACT_ID = "wire.11"
+# wire.12.x = wire.11 + the spatial-tokens-v2 depth-atlas obs block (the 11
+# v1 raycast-scalar spatial inputs replaced by a single spatial_atlas grid).
+# The atlas GRID itself moved once while the line was in flight, and both
+# resolutions have deployed artifacts, so each gets its own id:
+#
+#   wire.12.1  a26 rc1: 72 yaw cells per band, unpacked one code per byte.
+#   wire.12.2  finalized frontier: 24 yaw cells per band, nibble-packed to
+#              12 bytes per row. HEAD — what this exporter produces.
+#
+# BARE `wire.12` IS RETIRED AND MUST NOT BE RE-USED. It was stamped on both
+# families before the frontier was settled, so it cannot select a codec
+# without inspecting tensor shapes; the bin refuses it with a re-stamp hint
+# (QNN_RETIRED_WIRES in src/engine/common/qnn_onnx.c). Same rule as wire.10.
+WIRE_CONTRACT_ID = "wire.12.2"
+# The a26 rc1 atlas line (ATLAS_YAWS_LEGACY-wide, unpacked). Still loadable:
+# its codec is registered and its artifacts are deployed.
+WIRE_CONTRACT_ID_ATLAS_LEGACY = "wire.12.1"
 SEMANTICS_CONTRACT_ID = "semantics.1"
 
 
@@ -455,100 +473,66 @@ SELF_BLOCK_BYTES: int = sum(f.bytes_per_frame for f in SELF_FIELDS)
 
 
 # ── Spatial block ────────────────────────────────────────────────
-# Per-sector layout, shared by all 9 sectors (FOV_*, FLANK_*, REAR_*,
-# GROUND, CEILING — see qnn.vocab.SPATIAL_SECTOR_IDS). The on-disk
-# array is (SPATIAL_TOKEN_COUNT=9, sum_of_per_field_bytes).
+# Final wire.12 center-ray depth atlas (spatial-tokens-v2 rev 15).
+# ATLAS_ELEVS elevation bands × ATLAS_YAWS yaw cells; each cell is the
+# exact first intersection of the cell's CENTER direction with the
+# carved hull-1 face set (world + live-translated brush movers), 4-bit
+# quantized: codes 0..14 index ATLAS_DEPTH_LEVELS, code 15 is the miss
+# sentinel. Two adjacent yaw codes share one wire byte: low nibble = even
+# cell, high nibble = odd cell. The model dequantizer expands the packed row.
 #
-# All values are BSP-derived in qnn_spatial.c (not in any protocol
-# field) — the collect pipeline computes them via raycasts from the
-# player origin. Most are already produced in [0, 1] range by the
-# C-side compute, so u8 quantization is lossless within signal floor.
+# Grid convention: elevation-major. Band b centers at
+# ATLAS_ELEV_DEG[b] (−75°..+75°, 15° steps); yaw cell y centers at
+# 15°·y counter-clockwise from the player's view yaw (cell 0 = straight
+# ahead), wrapping the full circle. Pitch is excluded from the frame —
+# it is self-state (view_pitch). Per-band trace range is
+# ATLAS_BAND_LIMIT[b] = min(1024, 128/|sin elev|): the horizontal
+# contract is 1024 units, the vertical contract 128, matching v1.
+# Validated by the reconstruction gate (wire.12.md) before adoption.
+
+ATLAS_YAWS = 24
+ATLAS_PACKED_BYTES = ATLAS_YAWS // 2
+assert ATLAS_YAWS % 2 == 0
+# Pre-wire.12 rc1-line atlas width (72 yaw cells, unpacked one code/byte, no
+# nibble packing). Kept ONLY so the corpus caches and checkpoints of the
+# still-deployed a26 rc1 line stay loadable/decodable under the current
+# (narrower) atlas — see qnn.model.dequant.SpatialDequantizer._decode and
+# qnn.utils.checkpoint_converter.migrate_legacy_spatial_atlas_dim. Never use
+# this for new work.
+ATLAS_YAWS_LEGACY = 72
+ATLAS_ELEV_DEG: Tuple[int, ...] = (
+    -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75,
+)
+ATLAS_DEPTH_LEVELS: Tuple[int, ...] = (
+    0, 8, 16, 24, 36, 52, 72, 100, 136, 184, 248, 336, 456, 620, 1016,
+)
+ATLAS_MISS_CODE = 15
+ATLAS_HORIZ_RANGE = 1024.0
+ATLAS_VERT_RANGE = 128.0
+ATLAS_BAND_LIMIT: Tuple[float, ...] = tuple(
+    min(ATLAS_HORIZ_RANGE,
+        ATLAS_VERT_RANGE / abs(math.sin(math.radians(e))))
+    if e != 0 else ATLAS_HORIZ_RANGE
+    for e in ATLAS_ELEV_DEG
+)
 
 SPATIAL_FIELDS: Tuple[Field, ...] = (
     Field(
-        name="dir",
-        dtype=np.int8, shape=(3,),
-        scale=127.0, transform=None,
-        source="Unit vector from player to sector centroid, in view "
-               "frame. C-side computed as DotProduct(world_dir, "
-               "{forward, right, up}). Range [-1, 1]; i8 gives "
-               "~0.008 precision.",
-    ),
-    Field(
-        name="nearest_dist",
-        dtype=np.uint16, shape=(),
-        scale=DIST_SCALE, transform=None,
-        source="Closest raycast hit distance into the sector, raw "
-               "Quake units. Range 0..DIST_SCALE typically; u16 covers "
-               "the full Quake coord range with 1-unit precision.",
-    ),
-    Field(
-        name="mean_dist",
-        dtype=np.uint16, shape=(),
-        scale=DIST_SCALE, transform=None,
-        source="Mean of raycast hit distances. Same range and units "
-               "as nearest_dist.",
-    ),
-    Field(
-        name="openness",
-        dtype=np.uint8, shape=(),
-        scale=255.0, transform=None,
-        source="mean_dist / max_dist, clamped to [0, 1] in "
-               "qnn_spatial.c:59. u8 with 1/255 precision.",
-    ),
-    Field(
-        name="clearance",
-        dtype=np.uint8, shape=(),
-        scale=255.0, transform=None,
-        source="Per-ray clearance (head-to-ceiling) averaged over the "
-               "sector. Already clamped to [0, 1] in qnn_spatial.c.",
-    ),
-    Field(
-        name="traversable",
-        dtype=np.uint8, shape=(),
-        scale=255.0, transform=None,
-        source="Fraction of rays with clear forward-walkable space. "
-               "[0, 1] after averaging.",
-    ),
-    Field(
-        name="dropoff",
-        dtype=np.uint8, shape=(),
-        scale=255.0, transform=None,
-        source="Per-ray drop-off magnitude (ground distance below) "
-               "averaged over the sector. [0, 1] after clamping.",
-    ),
-    Field(
-        name="solid_frac",
-        dtype=np.uint8, shape=(),
-        scale=255.0, transform=None,
-        source="Fraction of rays hitting CONTENTS_SOLID. [0, 1].",
-    ),
-    Field(
-        name="water_frac",
-        dtype=np.uint8, shape=(),
-        scale=255.0, transform=None,
-        source="Fraction of rays hitting CONTENTS_WATER. [0, 1].",
-    ),
-    Field(
-        name="slime_frac",
-        dtype=np.uint8, shape=(),
-        scale=255.0, transform=None,
-        source="Fraction of rays hitting CONTENTS_SLIME. [0, 1].",
-    ),
-    Field(
-        name="lava_frac",
-        dtype=np.uint8, shape=(),
-        scale=255.0, transform=None,
-        source="Fraction of rays hitting CONTENTS_LAVA. [0, 1].",
+        name="atlas",
+        dtype=np.uint8, shape=(ATLAS_PACKED_BYTES,),
+        scale=None, transform=None,
+        source="One packed elevation row: 24 fifteen-degree yaw cells, two "
+               "4-bit codes per byte (low nibble even, high nibble odd). "
+               "Each code is the exact center-ray depth against the carved "
+               "hull-1 face set quantized to ATLAS_DEPTH_LEVELS (0..14); "
+               "15 is miss. The dequantizer expands the row, clamps decoded "
+               "depth to the band limit, and derives hit from the miss code.",
     ),
 )
 
-SPATIAL_TOKEN_COUNT = 9
+SPATIAL_TOKEN_COUNT = len(ATLAS_ELEV_DEG)
 SPATIAL_BLOCK_BYTES: int = SPATIAL_TOKEN_COUNT * sum(f.bytes_per_frame for f in SPATIAL_FIELDS)
-# Computed at import time; expect 9 × 15 = 135 bytes (was 9×13×2 = 234 B in f16).
-#   per sector: dir 3 + nearest 2 + mean 2 + 8 × u8 = 15
-#   (openness, clearance, traversable, dropoff, solid_frac,
-#    water_frac, slime_frac, lava_frac = 8 u8 fields).
+# Computed at import time; expect 11 × 12 = 132 bytes.
 
 
 # ── Entity block (variable-length per type) ──────────────────────
@@ -924,8 +908,9 @@ ENTITY_BLOCK_BYTES_PADDED: int = 16 * _ENTITY_IDX_BYTES_PADDED  # worst-case bou
 
 # Per-frame budget vs today's ~1169 B f16 cache:
 #   self    20 B  (was 42)
-#   spatial 135 B (was 234)
+#   spatial 132 B (final wire.12 atlas; two 4-bit codes per byte)
 #   entity  variable, typically ~265 B at batch-max-pad (was ~608)
 #                                                       worst-case bound = ENTITY_BLOCK_BYTES_PADDED
 #   actions 12 B  (was 86)
-#   typical total ~430 B (was ~970, ~55% smaller).
+#   typical total ~430 B — the atlas restores the v1 spatial budget while
+#   retaining the geometry gate (see wire.12.md).

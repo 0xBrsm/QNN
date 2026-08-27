@@ -244,10 +244,7 @@ _VALID_TOKEN_FIELDS = frozenset({
     "vel", "attack_finished",
     "self_weapon_id", "self_movement_id", "self_items",
     # Spatial block (per-field arrays).
-    "spatial_dir", "spatial_nearest_dist", "spatial_mean_dist",
-    "spatial_openness", "spatial_clearance", "spatial_traversable",
-    "spatial_dropoff", "spatial_solid_frac", "spatial_water_frac",
-    "spatial_slime_frac", "spatial_lava_frac",
+    "spatial_atlas",
     # Entity block (variable-length on disk, see _ShardWriter docstring).
     "entity_types", "entity_subject_id", "entity_modality_id",
     "entity_player_id", "entity_event_count",
@@ -1185,11 +1182,7 @@ _NATIVE_SELF_FIELDS = (
     "view_pitch",
 )
 _NATIVE_SPATIAL_FIELDS = (
-    "spatial_dir",
-    "spatial_nearest_dist", "spatial_mean_dist",
-    "spatial_openness", "spatial_clearance", "spatial_traversable",
-    "spatial_dropoff", "spatial_solid_frac", "spatial_water_frac",
-    "spatial_slime_frac", "spatial_lava_frac",
+    "spatial_atlas",
 )
 _NATIVE_ENTITY_FIELDS = (
     "entity_types", "entity_subject_id", "entity_modality_id",
@@ -1387,14 +1380,9 @@ def _validate_native_obs(obs: dict[str, np.ndarray]) -> None:
         "ammo_rockets":     np.uint8,   "ammo_cells":       np.uint8,
         "vel":              np.int16,   "attack_finished":  np.float16,
         "self_weapon_id":   np.uint8,   "self_movement_id": np.uint8,
-        "self_items":       np.int32,
+        "self_items":       np.int32,   "view_pitch":       np.int8,
         # Spatial
-        "spatial_dir":          np.int8,
-        "spatial_nearest_dist": np.uint16, "spatial_mean_dist": np.uint16,
-        "spatial_openness":    np.uint8,  "spatial_clearance":  np.uint8,
-        "spatial_traversable": np.uint8,  "spatial_dropoff":    np.uint8,
-        "spatial_solid_frac":  np.uint8,  "spatial_water_frac": np.uint8,
-        "spatial_slime_frac":  np.uint8,  "spatial_lava_frac":  np.uint8,
+        "spatial_atlas":        np.uint8,
         # Entity
         "entity_count":         np.uint8,
         "entity_types":         np.int8,

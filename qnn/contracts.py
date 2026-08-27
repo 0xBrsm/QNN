@@ -90,7 +90,7 @@ def semantics_sig() -> str:
               "ITEMS_MEANINGFUL", "MOVEMENT_GROUND", "MOVEMENT_AIR",
               "MOVEMENT_WATER_LOW", "MOVEMENT_WATER_MID", "MOVEMENT_WATER_HIGH"):
         parts.append(f"{k}={getattr(en, k)}")
-    tables = [("SELF", en.SELF_FIELDS), ("SPATIAL", en.SPATIAL_FIELDS),
+    tables = [("SELF", en.SELF_FIELDS),
               ("ENTITY_COMMON", en.ENTITY_COMMON_FIELDS)]
     tables += [(f"ENTITY_{t}", tbl) for t, tbl in en.ENTITY_FIELDS.items()]
     for tname, tbl in tables:
@@ -98,14 +98,25 @@ def semantics_sig() -> str:
             parts.append(f"{tname}.{f.name}|scale={f.scale}|tf={f.transform}")
     parts.append("ITEM_AMOUNT_MULT=" + ",".join(f"{x:.8g}" for x in en.ITEM_AMOUNT_MULT))
     parts.append("ITEM_AMOUNT_CONST=" + ",".join(f"{x:.8g}" for x in en.ITEM_AMOUNT_CONST))
+    # Spatial VALUE semantics: how depth-atlas codes map to world geometry.
+    # These change meaning while leaving tensor shapes intact — exactly the
+    # silent-miscalibration class this signature exists to catch. The
+    # spatial tensor's shape and row identity (band/yaw counts, band-id
+    # names) are wire-scoped: a change there cannot bind at load, so the
+    # WIRE axis covers it and it is deliberately NOT hashed here.
+    parts.append("ATLAS_DEPTH_LEVELS=" + ",".join(str(x) for x in en.ATLAS_DEPTH_LEVELS))
+    parts.append(f"ATLAS_MISS_CODE={en.ATLAS_MISS_CODE}")
+    parts.append("ATLAS_ELEV_DEG=" + ",".join(str(x) for x in en.ATLAS_ELEV_DEG))
+    parts.append(
+        f"ATLAS_RANGES={en.ATLAS_HORIZ_RANGE:.8g},{en.ATLAS_VERT_RANGE:.8g}"
+    )
     for k in ("ENTITY_VOCAB_SIZE", "ACTION_VOCAB_SIZE", "MODALITY_VOCAB_SIZE",
               "MAX_PLAYER_INDICES", "TOKEN_PROJECTILE", "TOKEN_ACTOR", "TOKEN_ITEM",
               "TOKEN_MOVER", "PROJECTILE_SCALAR_DIM", "ACTOR_SCALAR_DIM",
               "ITEM_SCALAR_DIM", "MOVER_SCALAR_DIM", "MAX_ENTITY_EVENTS",
               "MAX_TOKEN_OBJECTS"):
         parts.append(f"{k}={getattr(vb, k)}")
-    parts.append(f"SPATIAL_TOKEN_COUNT={en.SPATIAL_TOKEN_COUNT}")
-    for vname in ("ENTITY_IDS", "ACTION_IDS", "MODALITY_IDS", "SPATIAL_SECTOR_IDS"):
+    for vname in ("ENTITY_IDS", "ACTION_IDS", "MODALITY_IDS"):
         tbl = getattr(vb, vname)
         parts.append(f"{vname}=" + ",".join(f"{k}:{v}" for k, v in tbl.items()))
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:16]
@@ -152,12 +163,17 @@ _ARCH_V22 = "v22"
 #  them; they are deliberately absent here. recognize_generation returns None and
 #  backfill_contract refuses rather than guessing.)
 GENERATION_CONTRACTS: Dict[str, Contract] = {
-    MODERN:  {"wire": "wire.11", "semantics": "semantics.1", "arch": "full_4head"},
+    # wire.12.2 = wire.11 + finalized 24x11 nibble-packed depth-atlas obs.
+    # (The a26 rc1 line's 72-wide unpacked atlas is wire.12.1; it is not a
+    # GENERATION of its own — same modern ModelConfig — so it has no row
+    # here. The exporter picks the id from the checkpoint's atlas width,
+    # see tools/export_onnx.py:_native_obs_for_model.)
+    MODERN:  {"wire": "wire.12.2", "semantics": "semantics.1", "arch": "full_4head"},
     GEN_V17: {"wire": "wire.7",  "semantics": "semantics.1", "arch": _ARCH_V17},
     GEN_V22: {"wire": "wire.7",  "semantics": "semantics.1", "arch": _ARCH_V22},
 }
 
-# Defensive parity: the MODERN registry row pins wire.9/semantics.1, which must
+# Defensive parity: the MODERN registry row pins HEAD wire/semantics, which must
 # equal the live engine_norm ids (HEAD == the modern native contract). If HEAD
 # bumps a contract axis, add a new generation row and update this — don't let the
 # registry silently drift from the constants the save-time stamp uses.
@@ -189,11 +205,15 @@ def render_version(contract: Contract) -> str:
     """Render a contract triple as the canonical ``a{arch}.s{sem}.w{wire}`` string
     (e.g. ``a24b.s1.w9``). Display/provenance only — NOT a codec-selection key.
     An unmapped arch id falls back to the raw id so an unknown lineage is visible,
-    not silently mis-tagged. ``wire``/``semantics`` are already int-suffixed
-    (``wire.9`` → ``w9``)."""
+    not silently mis-tagged.
+
+    The wire/semantics tags are the id with its family prefix stripped, NOT the
+    last dot-segment: a minor-versioned id like ``wire.12.1`` must render
+    ``w12.1``, not ``w1`` (which would read as ``wire.1``, a different and much
+    older contract). Same rule for semantics."""
     a = _ARCH_A_TAG.get(contract["arch"], contract["arch"])
-    s = contract["semantics"].rsplit(".", 1)[-1]
-    w = contract["wire"].rsplit(".", 1)[-1]
+    s = contract["semantics"].removeprefix("semantics.")
+    w = contract["wire"].removeprefix("wire.")
     return f"{a}.s{s}.w{w}"
 
 

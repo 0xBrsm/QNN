@@ -46,8 +46,11 @@ from qnn.vocab import (
     PROJECTILE_SCALAR_DIM, ACTOR_SCALAR_DIM, ITEM_SCALAR_DIM, MOVER_SCALAR_DIM,
 )
 from qnn.schema import (
-    SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM,
+    SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM, PROBE_OFFSET_DIM,
+    PROBE_SPATIAL_SOURCES, SPATIAL_SOURCES, SPATIAL_SOURCE_EGO,
+    SPATIAL_SOURCE_POOLED9, SPATIAL_SOURCE_PROBE_GRID_NF,
 )
+from qnn.model.spatial_pool import SectorPool9
 
 # Token-kind embedding rows. ObsEmbedding tags each output token with
 # one of these so the attention can distinguish self / entity / spatial
@@ -56,9 +59,19 @@ _TOKEN_KIND_SELF    = 0
 _TOKEN_KIND_ENTITY  = 1
 _TOKEN_KIND_SPATIAL = 2
 
+# Near-field floor ring (probe_grid_nf source, rev-11): the agent's own
+# steep downward atlas bands, emitted as extra egocentric spatial tokens
+# beside the k probe tokens. Bands {-75,-60,-45} are elevation-row indices
+# 0,1,2 in the atlas (SPATIAL_FIELDS order); yaw is sub-sampled to 12 cells
+# (every other one of 24), the offline-priced knee where floor MAE holds
+# near the full-atlas reference at ~18 wire bytes.
+_NF_FLOOR_BANDS = (0, 1, 2)
+_NF_YAW_STRIDE  = 2
+
 # Canonical self-block layout:
 #   slot 0                  monolithic self token (carries all self info)
-#   slot 1..9               spatial tokens (when include_spatial=True)
+#   slot 1..11              spatial band tokens (when include_spatial=True;
+#                           9 sector tokens for the pooled9 source)
 #   slot 1+spatial..        entity tokens (MAX_TOKEN_OBJECTS)
 # Subclasses (see ``ObsEmbedding._N_SELF_TOKENS``) can change the self-block
 # width.
@@ -78,7 +91,7 @@ class ObsEmbedding(nn.Module):
     TransformerEncoder.
 
     Token layout:
-        [self, [spatial_0..8,] entity_0..N-1]
+        [self, [spatial_0..10,] entity_0..N-1]
         ↑                                    ↑
         self_slice.start (= 0)               entity_slice
 
@@ -99,6 +112,9 @@ class ObsEmbedding(nn.Module):
         *,
         self_weapon_embed_in_self: bool,
         include_spatial: bool = True,
+        spatial_source: str = SPATIAL_SOURCE_EGO,
+        spatial_k: int = 0,
+        probe_bands: tuple[int, ...] = (),
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
@@ -106,6 +122,20 @@ class ObsEmbedding(nn.Module):
         self.out_dim = self.d_model
         self.self_weapon_embed_in_self = bool(self_weapon_embed_in_self)
         self.include_spatial = bool(include_spatial)
+        self.spatial_source = str(spatial_source)
+        if self.spatial_source not in SPATIAL_SOURCES:
+            raise ValueError(
+                f"unknown spatial_source {self.spatial_source!r}; "
+                f"expected one of {SPATIAL_SOURCES}"
+            )
+        self.spatial_k = int(spatial_k)
+        # Probe-source band prune: () keeps all 11 atlas bands; a tuple keeps
+        # only those band rows as probe tokens (the rest are supplied by the
+        # ego ring or dropped). Applied before band-major fusion.
+        self._probe_bands = tuple(int(b) for b in probe_bands) or None
+        self._n_probe_tokens = (
+            len(self._probe_bands) if self._probe_bands else SPATIAL_TOKEN_COUNT
+        )
 
         # Native-width → float adapters. Each is a no-op pass-through
         # when the obs dict already carries the dequanted floats, so
@@ -123,13 +153,67 @@ class ObsEmbedding(nn.Module):
         self.proj_item       = nn.Linear(ITEM_SCALAR_DIM,       self.d_model)
         self.proj_mover      = nn.Linear(MOVER_SCALAR_DIM,      self.d_model)
 
-        self.spatial_proj = nn.Linear(SPATIAL_SCALAR_DIM, self.d_model)
+        # Ego source projects the row's own band panorama; probe_grid
+        # projects the k nearest map probes' same-band panoramas plus
+        # their relative-pose encodings (rev-10 probe-grid direction);
+        # pooled9 reduces the ego atlas to the v1 9-sector depth summary
+        # (capacity-class bench arm) before projecting. Ego/probe_grid
+        # emit 11 band tokens; pooled9 emits 9 sector tokens.
+        if self.spatial_source in PROBE_SPATIAL_SOURCES:
+            self.spatial_proj = nn.Linear(
+                self.spatial_k * (SPATIAL_SCALAR_DIM + PROBE_OFFSET_DIM),
+                self.d_model,
+            )
+        elif self.spatial_source == SPATIAL_SOURCE_POOLED9:
+            self.sector_pool = SectorPool9()
+            self.spatial_proj = nn.Linear(SectorPool9.OUT_DIM, self.d_model)
+        else:
+            self.spatial_proj = nn.Linear(SPATIAL_SCALAR_DIM, self.d_model)
+        # probe_grid_nf adds one token per near-field floor band; each
+        # projects that band's sub-sampled [depth, hit] ring (12 yaw cells
+        # → 24 scalars) into d_model, beside the k probe band tokens.
+        self._nf_bands = (
+            len(_NF_FLOOR_BANDS)
+            if self.include_spatial
+            and self.spatial_source == SPATIAL_SOURCE_PROBE_GRID_NF
+            else 0
+        )
+        if self._nf_bands:
+            half = SPATIAL_SCALAR_DIM // 2               # 24 yaw depth + 24 hit
+            self._nf_yaws = len(range(0, half, _NF_YAW_STRIDE))
+            self.nf_proj = nn.Linear(2 * self._nf_yaws, self.d_model)
+            # Ring gather indices are compile-time constants — register them
+            # once instead of rebuilding them on every forward.
+            self.register_buffer(
+                "_nf_yaw_idx", torch.arange(0, half, _NF_YAW_STRIDE),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_nf_band_idx", torch.tensor(_NF_FLOOR_BANDS), persistent=False,
+            )
+        self._spatial_count = (
+            0 if not self.include_spatial
+            else SectorPool9.N_SECTORS
+            if self.spatial_source == SPATIAL_SOURCE_POOLED9
+            else self._n_probe_tokens + self._nf_bands
+        )
+        if self._probe_bands is not None:
+            self.register_buffer(
+                "_probe_band_idx", torch.tensor(self._probe_bands), persistent=False,
+            )
 
         # Shared embeddings.
         self.entity_embed   = nn.Embedding(ENTITY_VOCAB_SIZE,    self.d_model)
         self.action_embed   = nn.Embedding(ACTION_VOCAB_SIZE,    self.d_model)
         self.modality_embed = nn.Embedding(MODALITY_VOCAB_SIZE,  self.d_model)
         self.player_embed   = nn.Embedding(MAX_PLAYER_INDICES + 1, self.d_model)
+        # Fixed row order is a wire convention, not something a transformer
+        # without positional encoding can observe. Give each atlas band
+        # (or pooled9 sector) an explicit learned identity.
+        self.band_embed = (
+            nn.Embedding(self._spatial_count, self.d_model)
+            if self.include_spatial else None
+        )
         # Self / entity / spatial token-kind tags.
         self.kind_embed     = nn.Embedding(3, self.d_model)
         self.movement_embed = nn.Embedding(5, self.d_model)
@@ -140,7 +224,7 @@ class ObsEmbedding(nn.Module):
 
         # Token-layout invariants. Computed from _N_SELF_TOKENS so
         # subclasses inherit the right slices for free.
-        spatial_count = SPATIAL_TOKEN_COUNT if self.include_spatial else 0
+        spatial_count = self._spatial_count
         self.n_tokens = self._N_SELF_TOKENS + spatial_count + MAX_TOKEN_OBJECTS
         self.self_slice = slice(0, self._N_SELF_TOKENS)
         entity_start = self._N_SELF_TOKENS + spatial_count
@@ -244,7 +328,7 @@ class ObsEmbedding(nn.Module):
               OR entity_scalars_raw: (batch, N, MAX_ENTITY_SCALAR_DIM)
             entity_ids: (batch, N, max_ids) — [subject, modality, player_id]
             entity_event_actions / _sources / _counts
-            spatial_scalars: (batch, 9, 13)
+            spatial_scalars: (batch, 11, 48)
         """
         obs_dict = self.entity_dequant(
             self.spatial_dequant(
@@ -296,11 +380,54 @@ class ObsEmbedding(nn.Module):
         entity_repr = entity_repr + self.kind_embed.weight[_TOKEN_KIND_ENTITY]
 
         if self.include_spatial:
-            spatial_token = self.spatial_proj(obs_dict["spatial_scalars"])
+            if self.spatial_source in PROBE_SPATIAL_SOURCES:
+                # (B, K, 11, 144) probe panoramas, already rolled into
+                # the agent's view frame loader-side; band-major fusion:
+                # each band token sees all K probes' rows plus each
+                # probe's relative-pose encoding.
+                probe = obs_dict["probe_scalars"]
+                if self._probe_bands is not None:
+                    probe = probe.index_select(2, self._probe_band_idx)
+                b, k, bands, dim = probe.shape
+                per_band = probe.permute(0, 2, 1, 3).reshape(b, bands, k * dim)
+                offsets = obs_dict["probe_offsets"].to(per_band.dtype)
+                offsets = offsets.reshape(b, 1, k * PROBE_OFFSET_DIM)
+                spatial_in = torch.cat(
+                    [per_band, offsets.expand(b, bands, -1)], dim=-1,
+                )
+                spatial_token = self.spatial_proj(spatial_in)
+                if self._nf_bands:
+                    # Egocentric near-field ring from the agent's own atlas
+                    # (dequant produced spatial_scalars above): steep floor
+                    # bands, sub-sampled in yaw, [depth, hit] concatenated.
+                    ss = obs_dict["spatial_scalars"].to(spatial_token.dtype)
+                    half = ss.shape[-1] // 2
+                    depth = ss[..., :half]
+                    hit = ss[..., half:]
+                    bandsel, yaw = self._nf_band_idx, self._nf_yaw_idx
+                    ring = torch.cat(
+                        [depth[:, bandsel][..., yaw], hit[:, bandsel][..., yaw]],
+                        dim=-1,
+                    )                                    # (B, nf_bands, 2*nf_yaws)
+                    ring_token = self.nf_proj(ring)      # (B, nf_bands, d_model)
+                    spatial_token = torch.cat(
+                        [spatial_token, ring_token], dim=1,
+                    )
+            elif self.spatial_source == SPATIAL_SOURCE_POOLED9:
+                spatial_token = self.spatial_proj(
+                    self.sector_pool(obs_dict["spatial_scalars"])
+                )
+            else:                                    # SPATIAL_SOURCE_EGO
+                spatial_token = self.spatial_proj(obs_dict["spatial_scalars"])
+            assert self.band_embed is not None
+            # One row per spatial token, in order — that is the whole table,
+            # so add it broadcast instead of gathering through arange (whose
+            # backward is an atomic scatter). Same form as kind_embed below.
+            spatial_token = spatial_token + self.band_embed.weight.unsqueeze(0)
             spatial_token = spatial_token + self.kind_embed.weight[_TOKEN_KIND_SPATIAL]
             tokens = torch.cat([self_block, spatial_token, entity_repr], dim=1)
             non_entity_valid = torch.zeros(
-                (batch, self._N_SELF_TOKENS + SPATIAL_TOKEN_COUNT),
+                (batch, self._N_SELF_TOKENS + self._spatial_count),
                 dtype=torch.bool, device=device,
             )
         else:

@@ -73,6 +73,32 @@ static qboolean qnn_ephemeral_present[MAX_EDICTS];
 /* Track scoreboard for connect/disconnect */
 static qboolean qnn_player_present[MAX_EDICTS];
 
+/* Collision-only map state.  Brush blockers are keyed by their real server
+ * edict so their last transmitted origin can follow doors, plats, trains,
+ * rotating/mod-specific bmodels, and other solid brush entities without a
+ * semantic classname whitelist.  Static bbox blockers have no client model:
+ * QuakeC deliberately clears it after using the BSP submodel to set size. */
+#define QNN_TRACE_MAX_MOVERS MAX_EDICTS
+#define QNN_TRACE_MAX_STATIC_BLOCKERS QNN_MAX_RAW_ENTITIES
+
+typedef struct {
+	vec3_t mins;
+	vec3_t maxs;
+} qnn_trace_static_blocker_t;
+
+static qboolean qnn_trace_brush_registered[MAX_EDICTS];
+static qboolean qnn_trace_brush_active[MAX_EDICTS];
+static model_t *qnn_trace_brush_models[MAX_EDICTS];
+static vec3_t qnn_trace_brush_origins[MAX_EDICTS];
+static qnn_trace_static_blocker_t qnn_trace_static_blockers[QNN_TRACE_MAX_STATIC_BLOCKERS];
+static int qnn_trace_static_blocker_count;
+
+static double qnn_trace_mover_time = -1.0;
+static int qnn_trace_mover_valid;
+static int qnn_trace_mover_count;
+static model_t *qnn_trace_mover_models[QNN_TRACE_MAX_MOVERS];
+static vec3_t qnn_trace_mover_origins[QNN_TRACE_MAX_MOVERS];
+
 /* Primary observation source by entity type. Keep this centralized so
  * token qualification, metrics, and reward all key off the same source. */
 #define QNN_PRIMARY_OBS_ACTOR      QNN_PRIMARY_OBS_VIS
@@ -100,6 +126,76 @@ static float QNN_RawPropFloat(const qnn_raw_entity_t *r, const char *key, float 
 {
 	const char *v = QNN_RawProp(r, key);
 	return (v && v[0]) ? (float)atof(v) : fb;
+}
+
+static qboolean QNN_RawBrushBlocks(const qnn_raw_entity_t *r)
+{
+	if (!r->has_model || r->model_name[0] != '*')
+		return false;
+	/* Trigger volumes are normally non-blocking.  The health-bearing bbox
+	 * exception is reconstructed separately because QuakeC hides its model. */
+	if (!strncasecmp(r->classname, "trigger_", 8))
+		return false;
+	/* These standard brush classes intentionally render without colliding. */
+	if (!strcasecmp(r->classname, "func_illusionary")
+		|| !strcasecmp(r->classname, "func_water"))
+		return false;
+	return true;
+}
+
+static qboolean QNN_RawIsStaticBBoxBlocker(const qnn_raw_entity_t *r)
+{
+	return r->has_model && r->model_name[0] == '*'
+		&& (!strcasecmp(r->classname, "trigger_multiple")
+			|| !strcasecmp(r->classname, "trigger_once"))
+		&& QNN_RawPropFloat(r, "health", 0.0f) > 0.0f;
+}
+
+static void QNN_TraceRegisterBrushBlocker(const qnn_raw_entity_t *r)
+{
+	entity_t *ent;
+	model_t *model;
+	int model_index;
+
+	if (!QNN_RawBrushBlocks(r) || r->entity_num <= 0 || r->entity_num >= MAX_EDICTS)
+		return;
+	ent = &cl_entities[r->entity_num];
+	model_index = ent->baseline.modelindex;
+	if (model_index <= 0 || model_index >= MAX_MODELS)
+		return;
+	model = cl.model_precache[model_index];
+	if (model == NULL || model->name[0] != '*')
+		return;
+	qnn_trace_brush_registered[r->entity_num] = true;
+	qnn_trace_brush_active[r->entity_num] = true;
+	qnn_trace_brush_models[r->entity_num] = model;
+	VectorCopy(ent->baseline.origin, qnn_trace_brush_origins[r->entity_num]);
+}
+
+static void QNN_TraceRegisterStaticBBox(const qnn_raw_entity_t *r)
+{
+	dmodel_t *model;
+	qnn_trace_static_blocker_t *blocker;
+	vec3_t offset;
+	int model_index;
+
+	if (!QNN_RawIsStaticBBoxBlocker(r))
+		return;
+	model_index = atoi(r->model_name + 1);
+	if (model_index <= 0 || model_index >= cl.worldmodel->numsubmodels)
+		return;
+	model = &cl.worldmodel->submodels[model_index];
+	blocker = &qnn_trace_static_blockers[qnn_trace_static_blocker_count++];
+	if (r->origin_is_explicit)
+	{
+		VectorCopy(r->origin, offset);
+	}
+	else
+	{
+		VectorCopy(vec3_origin, offset);
+	}
+	VectorAdd(model->mins, offset, blocker->mins);
+	VectorAdd(model->maxs, offset, blocker->maxs);
 }
 
 static const qnn_item_def_t *QNN_LookupItem(const char *classname, int spawnflags)
@@ -308,7 +404,16 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 	memset(qnn_store, 0, sizeof(qnn_store));
 	memset(qnn_ephemeral_present, 0, sizeof(qnn_ephemeral_present));
 	memset(qnn_player_present, 0, sizeof(qnn_player_present));
+	memset(qnn_trace_brush_registered, 0, sizeof(qnn_trace_brush_registered));
+	memset(qnn_trace_brush_active, 0, sizeof(qnn_trace_brush_active));
+	memset(qnn_trace_brush_models, 0, sizeof(qnn_trace_brush_models));
+	memset(qnn_trace_brush_origins, 0, sizeof(qnn_trace_brush_origins));
+	memset(qnn_trace_static_blockers, 0, sizeof(qnn_trace_static_blockers));
 	qnn_store_overflow_count = 0;
+	qnn_trace_static_blocker_count = 0;
+	qnn_trace_mover_time = -1.0;
+	qnn_trace_mover_valid = 0;
+	qnn_trace_mover_count = 0;
 
 	baseline_raw = (qnn_raw_entity_t *)calloc(QNN_MAX_RAW_ENTITIES, sizeof(*baseline_raw));
 	bsp_raw = (qnn_raw_entity_t *)calloc(QNN_MAX_RAW_ENTITIES, sizeof(*bsp_raw));
@@ -328,6 +433,8 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 		qnn_raw_entity_t *r = &baseline_raw[i];
 		qnn_entity_t *e;
 		const qnn_item_def_t *item;
+
+		QNN_TraceRegisterBrushBlocker(r);
 
 		if (r->entity_num <= 0 || r->entity_num >= MAX_EDICTS)
 			continue;
@@ -375,6 +482,8 @@ void QNN_StoreInit(const qnn_map_state_t *map_state)
 	for (i = 0; i < bsp_count; ++i)
 	{
 		qnn_raw_entity_t *r = &bsp_raw[i];
+
+		QNN_TraceRegisterStaticBBox(r);
 
 		/* Movers from BSP (may overlap with baselines) */
 		{
@@ -792,31 +901,18 @@ void QNN_StoreDumpSounds(FILE *out, int tick, const qnn_snapshot_t *snapshot)
 	}
 }
 
-/* ── Mover occlusion cache (shared by QNN_TraceLine, both engines) ─────
+/* ── Brush occlusion cache (shared by QNN_TraceLine, both engines) ─────
  *
- * Solid brush-submodel movers (func_door / func_plat / func_train /
- * func_button — model name "*N") are excluded from world hull 0, so the
- * world-only PM_/SV_RecursiveHullCheck that QNN_TraceLine runs sees
- * straight through them.  That makes the bot's spatial rays and enemy
- * LOS X-ray through closed doors / moving platforms.
- *
- * QNN_TraceLine now clips against each solid mover at its live origin.
+ * Brush submodels are excluded from the world hull, so a world-only trace
+ * sees through them.  Cache every map brush whose spawn class is blocking,
+ * not only the four mover classes represented as observation tokens.
+ * QNN_TraceLine clips against each blocker at its last known live origin.
  * To keep that off the per-ray hot path, the mover set is enumerated
  * ONCE per observation frame here (keyed on cl.time — movers only move
  * as cl.time advances) and reused by every ray of that frame.  The
  * per-variant qnn_sys.c pulls the cached model+origin and runs the
- * engine's own hull-clip against each.
- *
- * Enumeration mirrors QNN_BuildMoverRefs (qnn_collect_helpers.c) but
- * lives here because qnn_store.c is linked into every worker — including
- * nq_client, which does NOT link qnn_collect_helpers.c. */
-#define QNN_TRACE_MAX_MOVERS QNN_MAX_PHYS_MOVERS
-
-static double   qnn_trace_mover_time = -1.0;
-static int      qnn_trace_mover_valid = 0;
-static int      qnn_trace_mover_count = 0;
-static model_t *qnn_trace_mover_models[QNN_TRACE_MAX_MOVERS];
-static vec3_t   qnn_trace_mover_origins[QNN_TRACE_MAX_MOVERS];
+ * engine's own hull-clip against each.  The historical Mover API name is
+ * retained because the spatial carve path shares this cache. */
 
 void QNN_StoreRegisterContext(void)
 {
@@ -824,6 +920,12 @@ void QNN_StoreRegisterContext(void)
 	QNN_ContextRegister(&qnn_store_overflow_count, sizeof(qnn_store_overflow_count));
 	QNN_ContextRegister(qnn_ephemeral_present, sizeof(qnn_ephemeral_present));
 	QNN_ContextRegister(qnn_player_present, sizeof(qnn_player_present));
+	QNN_ContextRegister(qnn_trace_brush_registered, sizeof(qnn_trace_brush_registered));
+	QNN_ContextRegister(qnn_trace_brush_active, sizeof(qnn_trace_brush_active));
+	QNN_ContextRegister(qnn_trace_brush_models, sizeof(qnn_trace_brush_models));
+	QNN_ContextRegister(qnn_trace_brush_origins, sizeof(qnn_trace_brush_origins));
+	QNN_ContextRegister(qnn_trace_static_blockers, sizeof(qnn_trace_static_blockers));
+	QNN_ContextRegister(&qnn_trace_static_blocker_count, sizeof(qnn_trace_static_blocker_count));
 	QNN_ContextRegister(&qnn_trace_mover_time, sizeof(qnn_trace_mover_time));
 	QNN_ContextRegister(&qnn_trace_mover_valid, sizeof(qnn_trace_mover_valid));
 	QNN_ContextRegister(&qnn_trace_mover_count, sizeof(qnn_trace_mover_count));
@@ -836,25 +938,37 @@ static void QNN_TraceGatherMovers(void)
 	int i;
 
 	qnn_trace_mover_count = 0;
-	for (i = 1; i < MAX_EDICTS && qnn_trace_mover_count < QNN_TRACE_MAX_MOVERS; i++)
+	for (i = 1; i < MAX_EDICTS; i++)
 	{
 		entity_t *ent;
 		model_t *m;
 
-		/* Only entities the store has classified as solid movers.  This
-		 * excludes non-occluding brush models (func_illusionary) and
-		 * trigger fields, matching QNN_BuildMoverRefs. */
-		if (qnn_store[i].type != QNN_ENT_MOVER)
+		if (!qnn_trace_brush_registered[i])
 			continue;
 		ent = &cl_entities[i];
-		m = ent->model;
-		if (m == NULL || m->name[0] != '*')
+		/* A current packet explicitly changes modelindex when a brush is
+		 * disabled or restored.  When the entity merely leaves the PVS,
+		 * retain its last state: it can still separate viewer and target. */
+		if (cl.mtime[0] != 0.0 && ent->msgtime == cl.mtime[0])
+		{
+			m = ent->model;
+			if (m == NULL || m->name[0] != '*')
+				qnn_trace_brush_active[i] = false;
+			else
+			{
+				qnn_trace_brush_active[i] = true;
+				qnn_trace_brush_models[i] = m;
+				VectorCopy(ent->origin, qnn_trace_brush_origins[i]);
+			}
+		}
+		if (!qnn_trace_brush_active[i])
 			continue;
+		m = qnn_trace_brush_models[i];
 		/* Needs a usable clip tree for the recursive hull check. */
-		if (m->hulls[0].firstclipnode > m->hulls[0].lastclipnode)
+		if (m == NULL || m->hulls[0].firstclipnode > m->hulls[0].lastclipnode)
 			continue;
 		qnn_trace_mover_models[qnn_trace_mover_count] = m;
-		VectorCopy(ent->origin, qnn_trace_mover_origins[qnn_trace_mover_count]);
+		VectorCopy(qnn_trace_brush_origins[i], qnn_trace_mover_origins[qnn_trace_mover_count]);
 		qnn_trace_mover_count++;
 	}
 }
@@ -892,4 +1006,118 @@ float *QNN_TraceMoverOrigin(int index)
 	if (index < 0 || index >= qnn_trace_mover_count)
 		return zero;
 	return qnn_trace_mover_origins[index];
+}
+
+static qboolean QNN_TraceSegmentAabb(const vec3_t start, const vec3_t end,
+	const vec3_t mins, const vec3_t maxs, float *fraction, vec3_t normal,
+	qboolean *startsolid, qboolean *allsolid)
+{
+	float enter = 0.0f;
+	float leave = 1.0f;
+	int enter_axis = -1;
+	float enter_sign = 0.0f;
+	qboolean inside_start = true;
+	qboolean inside_end = true;
+	int axis;
+
+	for (axis = 0; axis < 3; ++axis)
+	{
+		float delta = end[axis] - start[axis];
+		float near_fraction, far_fraction, near_sign;
+
+		if (start[axis] < mins[axis] || start[axis] > maxs[axis])
+			inside_start = false;
+		if (end[axis] < mins[axis] || end[axis] > maxs[axis])
+			inside_end = false;
+		if (fabsf(delta) < 0.000001f)
+		{
+			if (start[axis] < mins[axis] || start[axis] > maxs[axis])
+				return false;
+			continue;
+		}
+		if (delta > 0.0f)
+		{
+			near_fraction = (mins[axis] - start[axis]) / delta;
+			far_fraction = (maxs[axis] - start[axis]) / delta;
+			near_sign = -1.0f;
+		}
+		else
+		{
+			near_fraction = (maxs[axis] - start[axis]) / delta;
+			far_fraction = (mins[axis] - start[axis]) / delta;
+			near_sign = 1.0f;
+		}
+		if (near_fraction > enter)
+		{
+			enter = near_fraction;
+			enter_axis = axis;
+			enter_sign = near_sign;
+		}
+		if (far_fraction < leave)
+			leave = far_fraction;
+		if (enter > leave)
+			return false;
+	}
+	if (!inside_start && (enter < 0.0f || enter > 1.0f))
+		return false;
+	VectorCopy(vec3_origin, normal);
+	if (inside_start)
+	{
+		*fraction = 0.0f;
+		*startsolid = true;
+		*allsolid = inside_end;
+	}
+	else
+	{
+		*fraction = enter;
+		if (enter_axis >= 0)
+			normal[enter_axis] = enter_sign;
+		*startsolid = false;
+		*allsolid = false;
+	}
+	return true;
+}
+
+void QNN_TraceStaticBlockers(const vec3_t start, const vec3_t end,
+	qboolean player_hull, trace_t *trace)
+{
+	int i;
+
+	for (i = 0; i < qnn_trace_static_blocker_count; ++i)
+	{
+		const qnn_trace_static_blocker_t *blocker = &qnn_trace_static_blockers[i];
+		vec3_t mins, maxs, normal;
+		qboolean startsolid, allsolid;
+		float fraction;
+
+		VectorCopy(blocker->mins, mins);
+		VectorCopy(blocker->maxs, maxs);
+		if (player_hull)
+		{
+			mins[0] -= QNN_PLAYER_MAXS_X;
+			mins[1] -= QNN_PLAYER_MAXS_Y;
+			mins[2] -= QNN_PLAYER_MAXS_Z;
+			maxs[0] -= QNN_PLAYER_MINS_X;
+			maxs[1] -= QNN_PLAYER_MINS_Y;
+			maxs[2] -= QNN_PLAYER_MINS_Z;
+		}
+		if (!QNN_TraceSegmentAabb(start, end, mins, maxs, &fraction,
+			normal, &startsolid, &allsolid) || fraction >= trace->fraction)
+			continue;
+		trace->fraction = fraction;
+		trace->startsolid = startsolid;
+		trace->allsolid = allsolid;
+		VectorCopy(normal, trace->plane.normal);
+		if (normal[0] != 0.0f)
+			trace->plane.dist = normal[0] > 0.0f ? maxs[0] : -mins[0];
+		else if (normal[1] != 0.0f)
+			trace->plane.dist = normal[1] > 0.0f ? maxs[1] : -mins[1];
+		else if (normal[2] != 0.0f)
+			trace->plane.dist = normal[2] > 0.0f ? maxs[2] : -mins[2];
+		{
+			vec3_t delta;
+			VectorSubtract(end, start, delta);
+			VectorMA(start, fraction, delta, trace->endpos);
+		}
+	}
 }

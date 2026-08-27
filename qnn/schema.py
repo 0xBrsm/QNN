@@ -24,10 +24,33 @@ from qnn.vocab import (
     MOVER_ID_DIM,
 )
 
-SPATIAL_TOKEN_COUNT = 9
-SPATIAL_SCALAR_DIM = 13
+SPATIAL_TOKEN_COUNT = 11  # depth-atlas elevation bands (rev 8)
+SPATIAL_SCALAR_DIM = 48  # per band: [depth_norm x 24 yaw cells, hit x 24]
+# Probe-grid relative pose, per probe: offset xyz in the agent's view
+# frame (/DIST_SCALE), yaw-cell residual (deg/5), |offset|/DIST_SCALE.
+PROBE_OFFSET_DIM = 5
 
-SELF_SCALAR_DIM = 17  # legacy flat layout, kept for ablation heads / probes (+ attack_finished at idx 16)
+# Spatial token payload source (rev-10 probe-grid direction). Lives here
+# rather than in qnn.model.graph.spec because both the spec (which
+# validates the name) and qnn.model.transformer (which dispatches on it)
+# need it, and transformer cannot import the graph package without a cycle.
+SPATIAL_SOURCE_EGO = "ego"
+SPATIAL_SOURCE_PROBE_GRID = "probe_grid"
+SPATIAL_SOURCE_POOLED9 = "pooled9"
+# probe_grid + an egocentric near-field floor ring (rev-11): the k probes
+# carry the mid/far field, and 3 extra tokens carry the agent's own steep
+# downward bands (the drop signal the probes structurally can't supply from
+# a distance — see agents/plans/spatial-tokens-v2.md). Same k knob as
+# probe_grid; the ring is sourced in-graph from the agent's spatial_atlas.
+SPATIAL_SOURCE_PROBE_GRID_NF = "probe_grid_nf"
+SPATIAL_SOURCES = (
+    SPATIAL_SOURCE_EGO, SPATIAL_SOURCE_PROBE_GRID, SPATIAL_SOURCE_POOLED9,
+    SPATIAL_SOURCE_PROBE_GRID_NF,
+)
+# Sources that fuse k precomputed probes (carry the probe-count knob).
+PROBE_SPATIAL_SOURCES = (SPATIAL_SOURCE_PROBE_GRID, SPATIAL_SOURCE_PROBE_GRID_NF)
+
+SELF_SCALAR_DIM = 18  # flat layout: legacy 17 + view_pitch at idx 17
 
 # Version of the flat gate-stream schema in move_streams_*.npz (the band /
 # rc_humanlikeness subject format written by qnn.eval.run and read by

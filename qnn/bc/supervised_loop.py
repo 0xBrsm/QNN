@@ -38,11 +38,7 @@ _NATIVE_DEQUANT_INPUT_KEYS: tuple[str, ...] = (
     "health", "effective_armor",
     "ammo_shells", "ammo_nails", "ammo_rockets", "ammo_cells",
     "vel", "attack_finished", "self_items", "view_pitch",
-    "spatial_dir",
-    "spatial_nearest_dist", "spatial_mean_dist",
-    "spatial_openness", "spatial_clearance", "spatial_traversable",
-    "spatial_dropoff", "spatial_solid_frac", "spatial_water_frac",
-    "spatial_slime_frac", "spatial_lava_frac",
+    "spatial_atlas",
     "entity_count",
     "entity_subject_id", "entity_modality_id", "entity_player_id",
     "entity_half_extents", "entity_rel", "entity_vel",
@@ -57,6 +53,7 @@ def _drop_dequant_inputs(
     obs: dict[str, torch.Tensor],
     *,
     enabled: bool,
+    keep: tuple[str, ...] = (),
 ) -> dict[str, torch.Tensor]:
     if not enabled:
         return obs
@@ -64,8 +61,13 @@ def _drop_dequant_inputs(
     # (self_scalars/split self fields, spatial_scalars, entity_scalars_raw,
     # entity_ids, event tensors), these native inputs are no longer read by
     # the policy. Dropping them cuts resident unified-memory footprint instead
-    # of keeping both native and dequantized copies.
+    # of keeping both native and dequantized copies. ``keep`` exempts native
+    # keys the resident path deliberately retains (the atlas stays native +
+    # nibble-packed; its f32 dequant is derived per batch — see
+    # make_resident_source_direct).
     for key in _NATIVE_DEQUANT_INPUT_KEYS:
+        if key in keep:
+            continue
         obs.pop(key, None)
     return obs
 
@@ -1088,16 +1090,26 @@ def make_resident_source(
     # ~6 GB additional VRAM, which still fits comfortably on the
     # APU's shared pool.
     if "health" in gpu_obs and "self_scalars" not in gpu_obs:
+        from qnn import engine_norm as _en
         from qnn.model.dequant import (
-            SelfDequantizer, SpatialDequantizer, EntityDequantizer,
+            SelfDequantizer, EntityDequantizer, pack_atlas_codes,
         )
         with torch.no_grad():
+            # Spatial deliberately NOT pre-dequantized: 11×48 f32
+            # spatial_scalars is 4× the native packed bytes. The atlas stays
+            # resident nibble-packed; the
+            # ObsEmbedding's SpatialDequantizer derives scalars per batch.
             gpu_obs = EntityDequantizer().to(device)(
-                SpatialDequantizer().to(device)(
-                    SelfDequantizer().to(device)(gpu_obs)
-                )
+                SelfDequantizer().to(device)(gpu_obs)
             )
-        gpu_obs = _drop_dequant_inputs(gpu_obs, enabled=compact_dequantized)
+            if (
+                "spatial_atlas" in gpu_obs
+                and int(gpu_obs["spatial_atlas"].shape[-1]) == _en.ATLAS_YAWS
+            ):
+                gpu_obs["spatial_atlas"] = pack_atlas_codes(gpu_obs["spatial_atlas"])
+        gpu_obs = _drop_dequant_inputs(
+            gpu_obs, enabled=compact_dequantized, keep=("spatial_atlas",),
+        )
 
     gpu_obs = _compact_resident_event_slots(gpu_obs)
 
@@ -1612,6 +1624,11 @@ class StreamingSource:
         view._attack_shifted = (
             self._attack_shifted[:n_rows_head] if self._attack_shifted is not None else None
         )
+        view._needs_move_hazard = self._needs_move_hazard
+        view._hz_held = self._hz_held[:n_rows_head] if self._hz_held is not None else None
+        view._hz_dwell = self._hz_dwell[:n_rows_head] if self._hz_dwell is not None else None
+        view._hz_release = self._hz_release[:n_rows_head] if self._hz_release is not None else None
+        view._hz_valid = self._hz_valid[:n_rows_head] if self._hz_valid is not None else None
         return view
 
 
@@ -1692,7 +1709,20 @@ def make_resident_source_from_cache(
         end = min(start + chunk_rows, n_rows)
         idx = torch.arange(start, end, dtype=torch.int64, device=streaming.device)
         obs_chunk, act_chunk = streaming.gather(idx)
-        obs_chunk = _drop_dequant_inputs(obs_chunk, enabled=compact_dequantized)
+        if "spatial_atlas" in obs_chunk:
+            # Atlas-resident policy: never materialize f32 spatial_scalars
+            # (11×48 f32 = 4× the native packed bytes). The atlas stays
+            # resident nibble-packed; the
+            # ObsEmbedding's SpatialDequantizer re-derives scalars per batch
+            # (shape-sniffed unpack; packed wire/streaming/ONNX are canonical).
+            from qnn import engine_norm as _en
+            from qnn.model.dequant import pack_atlas_codes as _pack_atlas
+            obs_chunk.pop("spatial_scalars", None)
+            if int(obs_chunk["spatial_atlas"].shape[-1]) == _en.ATLAS_YAWS:
+                obs_chunk["spatial_atlas"] = _pack_atlas(obs_chunk["spatial_atlas"])
+        obs_chunk = _drop_dequant_inputs(
+            obs_chunk, enabled=compact_dequantized, keep=("spatial_atlas",),
+        )
 
         if obs_out is None:
             obs_out = {

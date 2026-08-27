@@ -687,7 +687,11 @@ def _pad_self_scalar_weight_for_attack_finished(tensor: torch.Tensor) -> torch.T
 def migrate_self_attack_finished_scalar(
     state: Dict[str, torch.Tensor], optimizer: Dict[str, Any] | None = None,
 ) -> bool:
-    """Pad pre-c38a5a26 self_proj weights from 16 → 17 input dims."""
+    """Pad historical self projections through the current 18-wide layout.
+
+    The two appended columns are attack_finished (16→17) and view_pitch
+    (17→18). Zero padding preserves old checkpoint behavior.
+    """
     migrated = False
     param_keys = [
         key for key in state
@@ -695,9 +699,16 @@ def migrate_self_attack_finished_scalar(
     ]
     for idx, key in enumerate(param_keys):
         tensor = state[key]
-        if not (key.endswith("self_proj.weight") and tensor.ndim == 2 and tensor.shape[1] == 16):
+        if not (
+            (key.endswith("self_proj.weight")
+             or key.endswith("self_token_builder.projs.0.weight"))
+            and tensor.ndim == 2 and tensor.shape[1] in (16, 17)
+        ):
             continue
-        state[key] = _pad_self_scalar_weight_for_attack_finished(tensor)
+        expanded = tensor
+        while expanded.shape[1] < SELF_SCALAR_DIM:
+            expanded = _pad_self_scalar_weight_for_attack_finished(expanded)
+        state[key] = expanded
         migrated = True
 
         if optimizer is not None and idx in optimizer.get("state", {}):
@@ -705,14 +716,20 @@ def migrate_self_attack_finished_scalar(
             for buf_key in ("exp_avg", "exp_avg_sq"):
                 if buf_key in opt_entry and hasattr(opt_entry[buf_key], "shape"):
                     buf = opt_entry[buf_key]
-                    if buf.ndim == 2 and buf.shape[1] == 16:
-                        opt_entry[buf_key] = _pad_self_scalar_weight_for_attack_finished(buf)
+                    if buf.ndim == 2 and buf.shape[1] in (16, 17):
+                        while buf.shape[1] < SELF_SCALAR_DIM:
+                            buf = _pad_self_scalar_weight_for_attack_finished(buf)
+                        opt_entry[buf_key] = buf
                         migrated = True
 
     for key, tensor in list(state.items()):
-        if ".self_scalars." in key and hasattr(tensor, "shape") and tensor.shape == torch.Size([16]):
-            zeros = torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
-            state[key] = torch.cat([tensor, zeros], dim=0)
+        if (".self_scalars." in key and hasattr(tensor, "shape")
+                and tensor.shape in (torch.Size([16]), torch.Size([17]))):
+            expanded = tensor
+            while expanded.shape[0] < SELF_SCALAR_DIM:
+                zeros = torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
+                expanded = torch.cat([expanded, zeros], dim=0)
+            state[key] = expanded
             migrated = True
 
     return migrated
@@ -824,6 +841,39 @@ def migrate_entity_embed(state: Dict[str, torch.Tensor], optimizer: Dict[str, An
                     opt_entry[buf_key] = permuted_buf
                     migrated = True
     return migrated
+
+
+def migrate_legacy_spatial_atlas_dim(model: torch.nn.Module, state: Dict[str, torch.Tensor]) -> bool:
+    """Rebuild ``obs_embedding.spatial_proj`` in-place to match a checkpoint's
+    saved atlas width when it differs from the current ``SPATIAL_SCALAR_DIM``.
+
+    The 2026-07-22 atlas-resolution migration narrowed ``SPATIAL_SCALAR_DIM``
+    from 144 (the full rc1-line atlas: 72 yaw depth + 72 hit) to 48 (24 + 24,
+    finalized wire.12/24x11). That's a genuine yaw-resolution SUBSAMPLE, not
+    an added-columns change, so there's no sensible way to pad/slice the
+    weight itself the way the migrations above do — a checkpoint's
+    spatial_proj must be rebuilt at its OWN trained width instead, then
+    load_state_dict copies its exact saved weight in (shapes now match).
+    Only this one Linear layer's in_features differs between atlas formats;
+    every downstream layer (spatial_proj's d_model output onward) is
+    architecture-identical regardless, so this is the only rebuild needed to
+    keep pre-migration checkpoints (the whole rc1 line) loadable. No-op if
+    the module doesn't use the direct ``nn.Linear(SPATIAL_SCALAR_DIM,
+    d_model)`` path (e.g. probe_grid/pooled9 spatial sources) or the
+    checkpoint doesn't carry this key at all.
+    """
+    key = "obs_embedding.spatial_proj.weight"
+    if key not in state:
+        return False
+    ckpt_dim = state[key].shape[1]
+    obs_embedding = getattr(model, "obs_embedding", None)
+    proj = getattr(obs_embedding, "spatial_proj", None)
+    if not isinstance(proj, torch.nn.Linear) or proj.in_features == ckpt_dim:
+        return False
+    new_proj = torch.nn.Linear(ckpt_dim, proj.out_features)
+    new_proj = new_proj.to(device=proj.weight.device, dtype=proj.weight.dtype)
+    obs_embedding.spatial_proj = new_proj
+    return True
 
 
 # ------------------------------------------------------------------

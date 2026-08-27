@@ -238,6 +238,9 @@ qboolean QNN_ActionIsFrozen(const qnn_action_t *a)
 		&& fabsf(a->look[2]) < QNN_FROZEN_LOOK_TOL;
 }
 
+static int QNN_PoseDiagEnabled(void);
+static void QNN_DumpPose(int row, const uint8_t *obs);
+
 /* Emit one framed tick: "QOBS" magic + 16-byte header + obs + action.
  * Header is (tick, steps, tick_hz, flags, action_size) little-endian. */
 void QNN_EmitTick(FILE *out, const uint8_t *obs, const qnn_action_t *action,
@@ -245,6 +248,24 @@ void QNN_EmitTick(FILE *out, const uint8_t *obs, const qnn_action_t *action,
 {
 	uint8_t header[16];
 	uint16_t asize = (uint16_t)sizeof(qnn_action_t);
+
+	if (QNN_PoseDiagEnabled())
+	{
+		/* Per-demo row counter, reset when the demo changes; rows
+		 * number the QOBS records of one demo in stream order. */
+		static int pose_row;
+		static char pose_demo[MAX_OSPATH];
+
+		if (strncmp(pose_demo, qnn_runtime.demo_path,
+			sizeof(pose_demo)) != 0)
+		{
+			strncpy(pose_demo, qnn_runtime.demo_path,
+				sizeof(pose_demo) - 1);
+			pose_demo[sizeof(pose_demo) - 1] = '\0';
+			pose_row = 0;
+		}
+		QNN_DumpPose(pose_row++, obs);
+	}
 
 	memcpy(header + 0,  &tick,    4);
 	memcpy(header + 4,  &steps,   4);
@@ -344,11 +365,67 @@ void QNN_FlushTickEmit(qnn_tick_emit_state_t *st)
 	QNN_TickEmitFlush(st);
 }
 
+/* ── Pose diagnostic (QNN_POSE_DIAG) ─────────────────────────────
+ * Probe-grid studies need (origin, view_yaw) per emitted QOBS row,
+ * which the egocentric obs deliberately omits.  When QNN_POSE_DIAG
+ * names a JSONL path, the packer stashes the capture-time pose in the
+ * obs buffer's guaranteed-zero tail (entity stream tops out ~1.5 KB of
+ * the 4 KB buffer) and QNN_EmitTick — the single choke point every
+ * emit path funnels through, in final stream order — reads it back and
+ * appends one line per record.  Off by default; the tail stays zero.
+ * The tail offset + stash live in qnn_io (QNN_POSE_TAIL_OFF /
+ * QNN_IOStashPoseTail) — shared with the closed-loop workers'
+ * QNN_POSE_TAIL channel. */
+
+static int QNN_PoseDiagEnabled(void)
+{
+	static int checked, enabled;
+
+	if (!checked)
+	{
+		const char *path = getenv("QNN_POSE_DIAG");
+		enabled = (path != NULL && path[0] != '\0');
+		checked = 1;
+	}
+	return enabled;
+}
+
+static void QNN_DumpPose(int row, const uint8_t *obs)
+{
+	static FILE *out;
+	float pose[4];
+
+	if (!QNN_PoseDiagEnabled())
+		return;
+	if (out == NULL)
+	{
+		/* Per-process file: parallel collect workers share the env
+		 * var, and concurrent appends to one file would interleave
+		 * partial lines. */
+		char path[MAX_OSPATH + 32];
+		snprintf(path, sizeof(path), "%s.%d.jsonl",
+			getenv("QNN_POSE_DIAG"), (int)getpid());
+		out = fopen(path, "a");
+		if (out == NULL)
+			return;
+	}
+	memcpy(pose, obs + QNN_POSE_TAIL_OFF, sizeof(pose));
+	fprintf(out, "{\"demo\":");
+	QNN_WriteJsonEscaped(out, qnn_runtime.demo_path);
+	fprintf(out, ",\"row\":%d,\"origin\":[%.3f,%.3f,%.3f],"
+		"\"view_yaw\":%.3f}\n",
+		row, (double)pose[0], (double)pose[1], (double)pose[2],
+		(double)pose[3]);
+	fflush(out);
+}
+
 void QNN_PackSnapshotObs(const qnn_snapshot_t *snapshot, uint8_t *obs_out)
 {
 	qnn_tick_result_t result;
 	QNN_IOEmit(snapshot, &result);
 	QNN_IOPackObsBuffer(obs_out, &result);
+	if (QNN_PoseDiagEnabled())
+		QNN_IOStashPoseTail(obs_out, snapshot);
 }
 
 /* Internal: drive the obs/jitter pipeline from pre-packed obs bytes.

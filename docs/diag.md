@@ -61,6 +61,209 @@ python -m qnn.diag diagnostic ... --include pruning,linear_probe
 The legacy flat-arg form (`python -m qnn.diag --checkpoint …`) is still
 accepted for backward compatibility and routes to the same `run_report` path.
 
+### `spatial_reconstruction` — pre-training geometry fidelity
+
+Spatial-v2 can be evaluated before training by comparing its quantized token
+payload with independent dense hull-1 traces from real-map demos:
+
+```bash
+python -m qnn.diag.spatial_reconstruction run \
+  --worker assets/bin/qw_demo_worker --assets assets \
+  --demo path/to/demo.qwd --sidecar spatial.jsonl
+
+python -m qnn.diag.spatial_reconstruction score \
+  povdmm4.jsonl dm2.jsonl dm6.jsonl \
+  --max-false-block-rate-all 0.01 \
+  --max-blocked-early-gt-32-rate 0.03
+```
+
+The scorer reconstructs directional supporting-plane depth from token bytes
+alone. It reports error, obstacle misses, per-elevation results, and
+near-obstacle classification at 32–256 units. False blocks are reported both
+conditional on a truly open direction (`false_block_rate_given_open`) and as
+a fraction of every sampled direction (`false_block_rate_all`), with raw
+confusion counts. This tests preservation of local collision geometry; it does
+not replace a trained policy ablation or prove full map-topology recovery. See
+[`wire.12`](contracts/wire/wire.12.md#reconstruction-diagnostic) for the
+payload, optional acceptance gates, and current three-map reference results.
+
+### `static_map_memory` — immutable map-load geometry memory
+
+This diagnostic tests whether exact static hull-1 faces can be encoded once at
+map load and queried from moving poses without rebuilding map tokens. First
+build the diagnostic worker and export one face table per map:
+
+```bash
+src/engine/build/build_qw_demo_worker.sh
+
+python -m qnn.diag.static_map_memory dump-faces \
+  --worker assets/bin/qw_demo_worker \
+  --demo-dir artifacts/corpus/qwd \
+  --manifest artifacts/corpus/qwd_probe_manifest.ndjson \
+  --asset-root assets --maps dm2 dm4 dm6 \
+  --out-dir artifacts/diag/static_map_memory/faces
+```
+
+Schema-8 `spatial_reconstruction run` sidecars include
+`static_atlas_code` and `static_atlas_distance`. These fields use the exact
+static world and exclude translated mover instances, so movers cannot make an
+immutable map table appear wrong. Fit either learned query arm against those
+targets:
+
+```bash
+python -m qnn.diag.static_map_memory train \
+  --faces-dir artifacts/diag/static_map_memory/faces \
+  --sidecars artifacts/diag/static_map_memory/sidecars/*.jsonl \
+  --position-mode relative_bias --device cuda \
+  --output-dir runs/eval/_static_map_memory_relative_v1
+```
+
+`absolute` uses only static and query Fourier positions through dot-product
+attention. `relative_bias` adds pose-dependent center distance, ray alignment,
+and face-orientation bias while retaining the same cached map K/V. Reports hash
+the cache before and after every validation query and include map-encode time,
+cache bytes, and query latency.
+
+Use the deterministic ceiling to distinguish missing geometry from failed
+learned routing:
+
+```bash
+python -m qnn.diag.static_map_memory oracle-routing \
+  --faces-dir artifacts/diag/static_map_memory/faces \
+  --sidecars artifacts/diag/static_map_memory/sidecars/*.jsonl \
+  --face-limits 16,32,64,128,256,512 \
+  --output runs/eval/_static_map_memory_oracle_v1/report.json
+```
+
+The oracle intersects rays exactly against either the full immutable face table
+or the nearest-N faces selected once per pose. It uses the same reconstruction
+acceptance thresholds as the shipped spatial atlas. This command measures the
+information and routing ceiling; it does not measure policy utility.
+
+### `static_probe_memory` — cached directional field
+
+This diagnostic tests a query-conditioned static field after flat hull faces
+fail. Build a dense 3D navmesh probe table at map load:
+
+```bash
+python -m qnn.bc.probe_atlas \
+  --worker assets/bin/qw_demo_worker \
+  --demo-dir artifacts/corpus/qwd_probe \
+  --manifest artifacts/corpus/qwd_probe_manifest.ndjson \
+  --maps dm2 dm4 dm6 --spacing 32 --z-spacing 32 \
+  --out-dir artifacts/diag/static_probe_memory/navatlas_s32z32
+```
+
+Each probe stores all eleven world-anchored panorama bands as one directional
+function. The query route selects K probe indices, evaluates one band at the
+ray's world yaw, and fuses K values. It never rolls or projects a panorama at
+tick time. Score the target-informed information ceiling and deterministic
+fusion arms before training:
+
+```bash
+python -m qnn.diag.static_probe_memory \
+  --probe-dir artifacts/diag/static_probe_memory/navatlas_s32z32 \
+  --sidecars artifacts/diag/static_map_memory/sidecars/*.jsonl \
+  --k 9 \
+  --oracle-output runs/eval/_static_probe_memory_k9_oracle/report.json
+```
+
+`best_k` may choose the target-closest raw or parallax-corrected donor and is
+therefore an information ceiling, not a runtime rule. The same report includes
+nearest, fixed-quantile, hit-point-reprojection, and hybrid rules.
+
+Train the learned selective-fusion arm only when its matching ceiling passes:
+
+```bash
+python -m qnn.diag.static_probe_memory \
+  --probe-dir artifacts/diag/static_probe_memory/navatlas_s32z32 \
+  --sidecars artifacts/diag/static_map_memory/sidecars/*.jsonl \
+  --k 9 --harmonics 12 --device cuda \
+  --output-dir runs/eval/_static_probe_memory_h12k9
+```
+
+Reports include nearest-probe coverage, immutable cache hashes, cached field
+bytes, query latency, probe-function count, and the common spatial gate.
+
+### `static_cell_memory` — convex cells and portals
+
+This diagnostic retains the non-solid hull-1 convex leaves that the engine's
+map-load carve already constructs. It labels each face fragment as a solid
+boundary or a portal to another leaf, then tests exact analytic portal
+traversal and bounded-hop approximations against the static atlas teacher.
+
+Export the map complexes:
+
+```bash
+python -m qnn.diag.static_cell_memory dump-cells \
+  --worker assets/bin/qw_demo_worker \
+  --demo-dir artifacts/corpus/qwd \
+  --manifest artifacts/corpus/qwd_probe_manifest.ndjson \
+  --maps dm2 dm4 dm6 \
+  --out-dir artifacts/diag/static_cell_memory_v1/cells
+```
+
+Run the retained information and gather-budget sweep:
+
+```bash
+python -m qnn.diag.static_cell_memory analyze \
+  --cells-dir artifacts/diag/static_cell_memory_v1/cells \
+  --sidecars artifacts/diag/static_map_memory_v1/sidecars/*.jsonl \
+  --output runs/eval/_static_cell_memory_v1/report.json
+```
+
+The report includes point-location coverage, portal reciprocity, compact map
+bytes, portal-hop percentiles, local neighborhood sizes, exact reconstruction,
+and optimistic/conservative hop truncations. Origins outside every non-solid
+cell and polygon-edge degeneracies use the immutable global solid-face table;
+the report measures that fallback rather than silently snapping the origin.
+
+### `static_cell_plane_cache` — first-hit plane field
+
+A probe's cached distance is tied to the probe origin. This diagnostic instead
+caches the first-hit solid-face index on a world-yaw grid inside each convex
+cell, then evaluates that face's plane at the actual pose. It measures whether
+plane identity removes parallax and prices the spatial spacing required when a
+collision leaf is not a visibility cell.
+
+```bash
+python -m qnn.diag.static_cell_plane_cache \
+  --cells-dir artifacts/diag/static_cell_memory_v1/cells \
+  --sidecars artifacts/diag/static_map_memory_v1/sidecars/*.jsonl \
+  --grid-spacings 24 16 \
+  --output runs/eval/_static_cell_plane_cache_v1/report.json
+```
+
+The cell-center depth, cell-center plane, same-direction oracle, fixed-grid
+plane, and full portal-control arms share the common spatial gate. Map cost is
+reported as sample count, compact bytes, and load-time ray-query count. Python
+timings are diagnostic implementation timings, not an engine runtime claim.
+
+When two spacings are supplied from coarse to fine, the report also prices a
+sparse first-hit override proxy. It compares face identities at retained poses
+and estimates a per-fine-sample change mask with packed 12-bit face values.
+This is a feasibility estimate until a full-map face-change census reproduces
+the byte count.
+
+### `spatial_atlas_bench` — C-side atlas query cost
+
+Use the worker's timed `atlas_bench` query to compare true 72-, 36-, and
+24-yaw emission loops without demo reset or JSON time:
+
+```bash
+python -m qnn.diag.spatial_atlas_bench \
+  --worker assets/bin/qw_demo_worker \
+  --demo-dir artifacts/corpus/qwd \
+  --manifest artifacts/corpus/qwd_probe_manifest.ndjson \
+  --sidecars artifacts/diag/static_map_memory_v1/sidecars/*.jsonl \
+  --yaw-counts 72 36 24 --iterations 2000 --repeats 5 \
+  --output runs/eval/_spatial_atlas_bench_v1/report.json
+```
+
+The timed region includes direction construction, static carved-face queries,
+and quantization. It excludes IPC, reset, JSON, and dynamic movers. Reported
+single-core fractions assume 20 Hz.
+
 ## Per-head `analyze()` dispatch
 
 `qnn.diag.analyze.run_analyze` dispatches to each head module's `analyze()`
@@ -188,5 +391,11 @@ but the absolute gap may overstate the asymptotic delta.
 - `qnn/diag/loader.py` — `load_policy`, shared by all analysis scripts
 - `qnn/diag/attack.py`, `look.py`, `move.py`, `weapon.py` — per-head analysis modules
 - `qnn/diag/look_data.py`, `move_metrics.py` — shared computation kernels
+- `qnn/diag/spatial_reconstruction.py` — map/token geometry reconstruction
+- `qnn/diag/static_map_memory.py` — immutable hull-face memory reconstruction
+- `qnn/diag/static_probe_memory.py` — cached directional-field routing
+- `qnn/diag/static_cell_memory.py` — convex-cell and portal reconstruction
+- `qnn/diag/static_cell_plane_cache.py` — cell-clipped first-hit plane fields
+- `qnn/diag/spatial_atlas_bench.py` — in-engine atlas cost frontier
 - `qnn/diag/{history,convergence,rank,ablation,gradients,participation,attention,pruning,linear_probe}.py` — suite tools
 - `agents/skills/diag/SKILL.md` — when-to-use procedural guidance (outside `src/`, full path)

@@ -395,6 +395,42 @@ static float QNN_EmitFovDeg(void)
 	return cv->value;
 }
 
+/* A clear point ray can still cross a clip-hull-only wall.  Conversely, an
+ * ordinary small window also blocks hull 1 because the player bbox catches
+ * its frame, and must remain shootable.  Probe the hull-0 contact implied by
+ * the clearance plane: a real frame has point-solid geometry there; a pure
+ * playerclip barrier does not. */
+static qboolean QNN_ClearanceHitHasShotSurface(const trace_t *clearance)
+{
+	const float mins[3] = {
+		QNN_PLAYER_MINS_X, QNN_PLAYER_MINS_Y, QNN_PLAYER_MINS_Z
+	};
+	const float maxs[3] = {
+		QNN_PLAYER_MAXS_X, QNN_PLAYER_MAXS_Y, QNN_PLAYER_MAXS_Z
+	};
+	vec3_t contact, probe_start, probe_end;
+	trace_t point_trace;
+	float normal_length_sq;
+	int axis;
+
+	normal_length_sq = DotProduct(clearance->plane.normal, clearance->plane.normal);
+	if (normal_length_sq < 0.5f)
+		return false;
+	VectorCopy(clearance->endpos, contact);
+	for (axis = 0; axis < 3; ++axis)
+	{
+		if (clearance->plane.normal[axis] > 0.0f)
+			contact[axis] += mins[axis];
+		else if (clearance->plane.normal[axis] < 0.0f)
+			contact[axis] += maxs[axis];
+	}
+	VectorMA(contact, 4.0f, clearance->plane.normal, probe_start);
+	VectorMA(contact, -4.0f, clearance->plane.normal, probe_end);
+	memset(&point_trace, 0, sizeof(point_trace));
+	QNN_TraceLine(probe_start, probe_end, &point_trace);
+	return point_trace.startsolid || point_trace.fraction < 1.0f;
+}
+
 qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target)
 {
 	vec3_t forward;
@@ -406,7 +442,8 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 	float dot;
 	float cos_half;
 	float fov_deg;
-	trace_t trace;
+	trace_t shot_trace;
+	trace_t clearance_trace;
 
 	fov_deg = QNN_EmitFovDeg();
 	if (fov_deg <= 0.0f)
@@ -427,9 +464,20 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 
 	VectorCopy(player_origin, eye);
 	eye[2] += QNN_VIEW_OFS_Z;
-	memset(&trace, 0, sizeof(trace));
-	QNN_TraceLine(eye, target, &trace);
-	return trace.fraction >= 1.0f;
+	memset(&shot_trace, 0, sizeof(shot_trace));
+	QNN_TraceLine(eye, target, &shot_trace);
+	if (shot_trace.fraction < 1.0f)
+		return false;
+
+	/* Reject a direct path cut by playerclip-only geometry (the large
+	 * invisible viewing barriers used by several RA maps).  If hull 1 only
+	 * caught real hull-0 geometry around a narrow aperture, the center shot
+	 * remains valid and the actor stays visible through the window. */
+	memset(&clearance_trace, 0, sizeof(clearance_trace));
+	QNN_TraceClearance(player_origin, target, &clearance_trace);
+	if (clearance_trace.fraction >= 1.0f)
+		return true;
+	return QNN_ClearanceHitHasShotSurface(&clearance_trace);
 }
 
 /* ══════════════════════════════════════════════════════════════════

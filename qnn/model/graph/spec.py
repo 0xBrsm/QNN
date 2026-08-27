@@ -28,6 +28,12 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from qnn.model.tokens.obs_fields import SCALAR_FIELDS, VOCAB_FIELDS
+from qnn.schema import (
+    PROBE_SPATIAL_SOURCES as _PROBE_SOURCES,
+    SPATIAL_SOURCE_EGO,
+    SPATIAL_SOURCES as _SPATIAL_SOURCES,
+    SPATIAL_TOKEN_COUNT,
+)
 
 GRAPH_VERSION = 1
 
@@ -35,6 +41,7 @@ GRAPH_VERSION = 1
 TOKEN_KIND_FIELDS = "fields"
 TOKEN_KIND_CLS = "cls"
 TOKEN_KIND_SPATIAL = "spatial"
+
 TOKEN_KIND_ENTITIES = "entities"
 _TOKEN_KINDS = (TOKEN_KIND_FIELDS, TOKEN_KIND_CLS, TOKEN_KIND_SPATIAL, TOKEN_KIND_ENTITIES)
 _SELF_KINDS = (TOKEN_KIND_FIELDS, TOKEN_KIND_CLS)
@@ -149,13 +156,27 @@ class TokenSpec:
     readiness: bool = False
     ammo_pools: bool = False
     kind_tag: bool = False
+    # Spatial-kind only: where the band panoramas come from. "ego" is the
+    # per-tick wire atlas; "probe_grid" fuses the k nearest precomputed
+    # map probes (loader-supplied probe_atlas/probe_offsets fields);
+    # "pooled9" reduces the ego atlas to the v1 9-sector depth summary
+    # (capacity-class bench arm — qnn.model.spatial_pool).
+    source: str = SPATIAL_SOURCE_EGO
+    k: int = 0
+    # Probe-source only: which of the 11 atlas elevation bands the probe
+    # tokens carry (default () = all 11). Used to prune bands a cheaper
+    # source now owns — e.g. probe_grid_nf drops the steep floor bands the
+    # ego ring supplies, shrinking the spatial sequence. Band indices index
+    # SPATIAL_FIELDS order (0=-75° … 10=+75°).
+    probe_bands: tuple[int, ...] = ()
 
     @classmethod
     def from_dict(cls, name: str, raw: Mapping[str, Any]) -> "TokenSpec":
         ctx = f"tokens[{name!r}]"
         _reject_unknown(
             raw,
-            ("kind", "scalars", "vocab", "vocab_sum", "readiness", "ammo_pools", "kind_tag"),
+            ("kind", "scalars", "vocab", "vocab_sum", "readiness", "ammo_pools",
+             "kind_tag", "source", "k", "probe_bands"),
             ctx,
         )
         kind = str(raw.get("kind", TOKEN_KIND_FIELDS))
@@ -170,12 +191,37 @@ class TokenSpec:
             readiness=bool(raw.get("readiness", False)),
             ammo_pools=bool(raw.get("ammo_pools", False)),
             kind_tag=bool(raw.get("kind_tag", False)),
+            source=str(raw.get("source", SPATIAL_SOURCE_EGO)),
+            k=int(raw.get("k", 0)),
+            probe_bands=tuple(int(b) for b in raw.get("probe_bands", ()) or ()),
         )
         spec._validate()
         return spec
 
     def _validate(self) -> None:
         ctx = f"tokens[{self.name!r}]"
+        if self.kind != TOKEN_KIND_SPATIAL and (
+                self.source != SPATIAL_SOURCE_EGO or self.k != 0):
+            raise GraphSpecError(f"{ctx}: source/k are spatial-token knobs")
+        if self.kind == TOKEN_KIND_SPATIAL:
+            if self.source not in _SPATIAL_SOURCES:
+                raise GraphSpecError(
+                    f"{ctx}: unknown source {self.source!r}; "
+                    f"allowed: {list(_SPATIAL_SOURCES)}"
+                )
+            if self.source in _PROBE_SOURCES and not 1 <= self.k <= 8:
+                raise GraphSpecError(f"{ctx}: {self.source} needs k in 1..8, got {self.k}")
+            if self.source not in _PROBE_SOURCES and self.k != 0:
+                raise GraphSpecError(f"{ctx}: k is a probe_grid knob")
+            if self.probe_bands:
+                if self.source not in _PROBE_SOURCES:
+                    raise GraphSpecError(f"{ctx}: probe_bands is a probe-source knob")
+                if (len(set(self.probe_bands)) != len(self.probe_bands)
+                        or not all(0 <= b < SPATIAL_TOKEN_COUNT for b in self.probe_bands)):
+                    raise GraphSpecError(
+                        f"{ctx}: probe_bands must be distinct indices in "
+                        f"0..{SPATIAL_TOKEN_COUNT - 1}, got {self.probe_bands}"
+                    )
         if self.kind != TOKEN_KIND_FIELDS:
             if (self.scalars or self.vocab or self.vocab_sum
                     or self.readiness or self.ammo_pools or self.kind_tag):
@@ -196,7 +242,13 @@ class TokenSpec:
 
     def to_dict(self) -> dict[str, Any]:
         if self.kind != TOKEN_KIND_FIELDS:
-            return {"kind": self.kind}
+            out = {"kind": self.kind}
+            if self.source != SPATIAL_SOURCE_EGO:
+                out["source"] = self.source
+                out["k"] = self.k
+                if self.probe_bands:
+                    out["probe_bands"] = list(self.probe_bands)
+            return out
         out: dict[str, Any] = {}
         if self.scalars:
             out["scalars"] = list(self.scalars)

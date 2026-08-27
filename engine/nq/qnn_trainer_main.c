@@ -96,6 +96,9 @@ static cvar_t qnn_inv_armor_type_cvar = {"qnn_inv_armor_type", "0", false, false
 static cvar_t qnn_inv_health_cvar     = {"qnn_inv_health",     "0", false, false};
 static cvar_t qnn_inv_powerups_cvar   = {"qnn_inv_powerups",   "0", false, false};
 static cvar_t qnn_inv_selected_cvar   = {"qnn_inv_selected",   "0", false, false};
+/* Per-frame QuakeC ammo top-up (qnn_infinite_ammo_frame): pin waves set 1 so
+   90s pinned episodes never run the measured weapon dry. Default off. */
+static cvar_t qnn_inv_infinite_ammo_cvar = {"qnn_inv_infinite_ammo", "0", false, false};
 /* FrikBot opponent weapon pin: weapon BIT (same encoding as qnn_inv_selected),
    0 = off (default, range-based bot_weapon_switch). When non-zero, the QuakeC
    bot is forced to hold this weapon, fixing its engagement range. Mirrors the
@@ -202,6 +205,7 @@ static void QNN_ParseInventory(const char *line)
 	QNN_CvarSetInt("qnn_inv_health", 0);
 	QNN_CvarSetInt("qnn_inv_powerups", 0);
 	QNN_CvarSetInt("qnn_inv_selected", 0);
+	QNN_CvarSetInt("qnn_inv_infinite_ammo", 0);
 
 	if (strstr(line, "\"inventory\"") == NULL)
 		return;
@@ -228,6 +232,8 @@ static void QNN_ParseInventory(const char *line)
 	QNN_CvarSetInt("qnn_inv_nails", QNN_JsonExtractInt(line, "\"nails\"", 0));
 	QNN_CvarSetInt("qnn_inv_rockets", QNN_JsonExtractInt(line, "\"rockets\"", 0));
 	QNN_CvarSetInt("qnn_inv_cells", QNN_JsonExtractInt(line, "\"cells\"", 0));
+	QNN_CvarSetInt("qnn_inv_infinite_ammo",
+	               QNN_JsonExtractInt(line, "\"infinite_ammo\"", 0));
 
 	/* Armor */
 	QNN_CvarSetInt("qnn_inv_armor", QNN_JsonExtractInt(line, "\"armor_value\"", 0));
@@ -786,6 +792,8 @@ static void QNN_WriteObsToStdout(const qnn_snapshot_t *snapshot)
 	qnn_tick_result_t result;
 	QNN_IOEmit(snapshot, &result);
 	QNN_IOPackObsBuffer(obs, &result);
+	if (QNN_IOPoseTailEnabled())
+		QNN_IOStashPoseTail(obs, snapshot);
 	fwrite(obs, 1, QNN_OBS_BUFFER_SIZE, stdout);
 	fflush(stdout);
 }
@@ -1060,6 +1068,7 @@ int main(int argc, char **argv)
 	Cvar_RegisterVariable(&qnn_inv_health_cvar);
 	Cvar_RegisterVariable(&qnn_inv_powerups_cvar);
 	Cvar_RegisterVariable(&qnn_inv_selected_cvar);
+	Cvar_RegisterVariable(&qnn_inv_infinite_ammo_cvar);
 	Cvar_RegisterVariable(&qnn_bot_weapon_pin_cvar);
 	Cvar_RegisterVariable(&qnn_spawn_face_away_cvar);
 	Cvar_RegisterVariable(&qnn_arena_selfplay_cvar);

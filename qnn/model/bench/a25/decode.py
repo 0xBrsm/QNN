@@ -7,31 +7,37 @@ deterministic commit preserves coordinated actions (rocket jump), and the
 offline shape analysis showed raw argmax self-calibrates to ~the human fire
 rate (runs/bc/bench/_attack_with_shape.json).
 
-Decode law (per frame):
+Decode law (per frame) — two explicitly parameterised decisions:
 
-    # selection (which weapon to attack-with) — sticky hysteresis toward held
-    sel    = (l1..l8) + stick_bias * onehot(held)
-    choice = argmax(sel) + 1                       # engine impulse 1..8
-    # attack decision (whether) — per-weapon operating point, POST-selection
+    select_score = (l1..l8) + bias_vec + preference_bias_vec
+    ideal  = argmax(select_score)                  # best weapon this frame
+    choice = hysteresis(select_score, held, switch_margin)
+    fire_score = (l1..l8)[choice] + bias_vec[choice] + fire_bias_vec[choice]
+    # attack decision (whether) — conditional on the weapon that will fire
     l0'    = l0 - attack_bias - align_bias         # class-0 = "don't attack" anchor
-    fire   = (l_choice + bias_vec[choice]) > l0'   AND NOT veto
-    weapon = fire ? choice : held_impulse          # held = server no-op
+    fire   = fire_score > l0'   AND NOT veto
+    weapon = fire ? choice+1 : held_impulse        # held = server no-op
 
-Knob mapping from the a24 decode contract:
+Knob mapping:
   * ``attack_bias`` (the s-slider / propensity knob) and the alignment-
-    conditioned bias both act on the MARGINAL log-odds by subtracting from
-    the class-0 logit — sign-compatible with the a24 semantics (bias > 0 →
-    more attack).
-  * ``bias_vec`` (8,) is the PER-WEAPON operating point (research/attack-head.md
-    §11): applied to the SELECTED weapon's logit AFTER the argmax, so it tunes
-    each weapon's attack rate to its own human cadence (LG/NG/SNG ~3.5x RL)
-    with ZERO effect on weapon selection. A uniform ``bias_vec`` reproduces the
-    scalar ``attack_bias`` exactly; ``None`` is bit-identical to no per-weapon
-    knob. Attack rate is fit to the per-weapon op-attack targets offline.
-  * ``stick_bias`` is selection-side hysteresis toward the held weapon — added
-    to the held weapon's logit BEFORE the argmax to stop selection chatter. It
-    moves *which* weapon, never *whether* to attack (the attack test re-reads
-    the un-stickied logit), so it composes cleanly with ``bias_vec``.
+    conditioned bias act on the MARGINAL log-odds by subtracting from the
+    class-0 logit (bias > 0 → more attack).
+  * ``bias_vec`` (8,) is the LEGACY JOINT operating point. It is retained so
+    existing a26 configs keep their exact meaning: it affects both selection
+    and firing. New fits emit it as all-zero and use the two explicit vectors
+    below; silently reinterpreting an old config would make branch artifacts
+    non-reproducible.
+  * ``fire_bias_vec`` (8,) affects only the fire comparison for the selected
+    weapon. It cannot change the ideal or clear a switch margin.
+  * ``preference_bias_vec`` (8,) affects only weapon selection. It is the
+    closed-loop occupancy-restoration lever used after adding hysteresis; it
+    does not directly lift a weapon over the no-attack class.
+  * ``switch_margin`` is weapon-switch hysteresis (anti-jitter / anti-camp):
+    leave the held weapon only when the ideal beats it by the margin. Under the
+    split-v1 law the fire test is conditional on that selected weapon, so every
+    per-weapon fire correction is identifiable from the emitted action stream.
+    The final closed-loop gate fits switching, occupancy, and firing jointly.
+    Feasibility rides the score (dead held scores low → forced switch).
   * hard guards (attack-splash / RL self-splash / LG range) arrive as a
     boolean veto mask from the a24 guard primitives instead of a buried
     logit.
@@ -39,16 +45,22 @@ Knob mapping from the a24 decode contract:
     ("crest-firing"): a deterministic countdown latch that shifts WHEN a
     commanded fire lands within a bounded window (≤ H ticks) without changing
     the count — hold until crosshair→lead alignment crosses θ_w, blind-fire at
-    expiry. Composes AFTER the step (guards outrank); OFF = bit-identical.
-    See attack_crest_gate_step + agents/plans/discharge-quality-gate.md.
+    expiry. A hold only continues while alignment is CONVERGING (the
+    feed-forward rate predicts the next tick's hbw improving); the moment it's
+    predicted to worsen instead, the gate releases immediately rather than
+    waiting out a hold that isn't going to pay off — same check at arm time
+    (never start a hold that's already diverging) and every hold tick
+    (bail the instant it turns). Composes AFTER the step (guards outrank);
+    OFF = bit-identical. See attack_crest_gate_step +
+    agents/plans/discharge-quality-gate.md.
   * the a24 sticky gate / hazard / switch-back weapon machinery has no analog —
     it is retired for this head; selection happens only at attack frames and
-    emitting the held impulse otherwise is a server no-op. ``stick_bias`` is a
-    new, single-scalar hysteresis, NOT a revival of that stack.
+    emitting the held impulse otherwise is a server no-op. ``switch_margin`` is a
+    single-scalar switch hysteresis, NOT a revival of that stack.
 
 TRACE-SAFETY: torch-only, no ``.item()``, no data-dependent control flow
-(``stick_bias``/``bias_vec`` presence is decided on static python config, not
-tensor values).
+(``switch_margin``/vector presence is decided on static python config, not tensor
+values).
 """
 from __future__ import annotations
 
@@ -72,22 +84,30 @@ ATTACK_WITH_SIZE = 1 + WEAPON_HEAD_SIZE  # 9
 
 
 def _attack_with_select(
-    weap: torch.Tensor,
+    score: torch.Tensor,
     held: torch.Tensor,
-    stick_bias: float,
+    switch_margin: float,
 ) -> torch.Tensor:
-    """Selection argmax over (optionally) held-stickied weapon logits.
+    """Weapon SELECTION with switch hysteresis (anti-jitter / anti-camp).
+
+    Switch off the currently-held weapon only when the ideal weapon (argmax of
+    ``score`` = weapon logits + per-weapon bias_vec) beats the held weapon by
+    more than ``switch_margin``; otherwise stay on held. This replaces the a25
+    ``stick_bias`` (which biased selection toward held AND perturbed the fire
+    decision, causing weapon camping): the margin only gates *which* weapon and
+    cannot change fire rate. Feasibility rides the score (an infeasible held
+    scores low → the margin is cleared → forced switch off a dead weapon).
 
     The SINGLE selection law shared by :func:`attack_with_decode_step` and the
-    crest gate's per-tick θ re-read (selection is re-evaluated each tick, so a
-    weapon switch mid-hold releases against the release-tick selection's θ).
-    Returns the (B,) class index 0..7 (impulse − 1)."""
-    if stick_bias != 0.0:
-        held_idx = (held - 1).clamp(0, WEAPON_HEAD_SIZE - 1)
-        stick = torch.zeros_like(weap).scatter(
-            -1, held_idx.unsqueeze(-1), float(stick_bias))
-        return (weap + stick).argmax(dim=-1)
-    return weap.argmax(dim=-1)
+    crest gate's per-tick θ re-read. ``switch_margin`` = 0 → always take the
+    ideal (no hysteresis). Returns the (B,) class index 0..7 (impulse − 1)."""
+    n = score.shape[-1]
+    held_idx = (held.reshape(score.shape[:-1]).to(torch.long) - 1).clamp(0, n - 1)
+    w_star = score.argmax(dim=-1)
+    s_star = score.gather(-1, w_star.unsqueeze(-1)).squeeze(-1)
+    s_held = score.gather(-1, held_idx.unsqueeze(-1)).squeeze(-1)
+    switch = (s_star - s_held) > float(switch_margin)
+    return torch.where(switch, w_star, held_idx)
 
 
 def attack_with_decode_step(
@@ -96,22 +116,38 @@ def attack_with_decode_step(
     *,
     attack_bias: float = 0.0,
     bias_vec: torch.Tensor | None = None,
-    stick_bias: float = 0.0,
+    fire_bias_vec: torch.Tensor | None = None,
+    preference_bias_vec: torch.Tensor | None = None,
+    switch_margin: float = 0.0,
     align_bias: torch.Tensor | None = None,
     veto_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Greedy attack-with decode.
+
+    Two DECOUPLED decisions (the a25 ``stick_bias`` coupling — which perturbed
+    the fire decision and caused weapon camping — is retired):
+
+      1. WEAPON — switch off the held weapon only if the ideal beats it by
+         ``switch_margin`` (:func:`_attack_with_select`); else select held.
+      2. ATTACK — under the explicit split-v1 vectors, fire iff the SELECTED
+         weapon's raw+legacy+fire score beats no-attack. This makes each
+         weapon's rate correction observable on the weapon that actually
+         fires. Legacy configs (both explicit vectors absent) retain the old
+         ideal-weapon fire comparison exactly.
 
     Parameters
     ----------
     logits9 : (B, 9) raw head logits (class 0 = no-attack, 1..8 = attack weapon k)
     held_impulse : (B,) int64 engine impulse 1..8 of the currently held weapon
     attack_bias : global propensity knob (positive = more attack)
-    bias_vec : optional (8,) per-weapon attack operating point, applied to the
-        SELECTED weapon's logit AFTER the argmax (positive = more attack for
-        that weapon). None = no per-weapon knob (bit-identical to today).
-    stick_bias : selection hysteresis toward held weapon (>= 0), added to the
-        held weapon's logit BEFORE the argmax. 0.0 = plain argmax.
+    bias_vec : optional legacy (8,) JOINT operating point, added to both the
+        selection and fire scores. Existing configs retain their exact law.
+    fire_bias_vec : optional (8,) fire-only operating point. It is gathered at
+        the ideal selected weapon and cannot affect selection.
+    preference_bias_vec : optional (8,) selection-only operating point. It
+        cannot directly affect the no-attack comparison.
+    switch_margin : weapon-switch hysteresis (>= 0) — leave held only if the
+        ideal weapon's score exceeds held's by this margin. 0.0 = always ideal.
     align_bias : optional (B,) additive alignment bias (positive = more attack)
     veto_mask : optional (B,) bool — hard guard veto rows (True = never attack)
 
@@ -121,21 +157,31 @@ def attack_with_decode_step(
     """
     weap = logits9[..., 1:]                                  # (B, 8) raw weapon logits
     held = held_impulse.reshape(weap.shape[:-1]).to(torch.long)  # impulse 1..8
-    # ── selection: argmax over (optionally) held-stickied logits ────────────
-    rest_arg = _attack_with_select(weap, held, stick_bias)
-    # ── attack decision: per-weapon operating point on the SELECTED weapon ──
-    # re-read the UN-stickied logit of the chosen weapon so stick_bias moves
-    # only *which* weapon, never *whether* to attack.
-    sel_logit = weap.gather(-1, rest_arg.unsqueeze(-1)).squeeze(-1)
-    if bias_vec is not None:
-        sel_logit = sel_logit + bias_vec.reshape(-1).to(sel_logit.dtype)[rest_arg]
+    legacy = (torch.zeros_like(weap) if bias_vec is None
+              else bias_vec.reshape(-1).to(weap.dtype))
+    select_score = weap + legacy
+    if preference_bias_vec is not None:
+        select_score = select_score + preference_bias_vec.reshape(-1).to(weap.dtype)
+    # ── weapon selection ───────────────────────────────────────────────────
+    ideal_idx = select_score.argmax(dim=-1)
+    sel_idx = _attack_with_select(select_score, held, switch_margin)
+    # Explicit vectors opt into split-v1: condition fire on the weapon that
+    # will actually be emitted. With both absent, preserve the historical a26
+    # law byte-for-byte (fire on ideal even when hysteresis holds another).
+    split_v1 = fire_bias_vec is not None or preference_bias_vec is not None
+    fire_idx = sel_idx if split_v1 else ideal_idx
+    # ── attack decision ────────────────────────────────────────────────────
+    fire_score = weap + legacy
+    if fire_bias_vec is not None:
+        fire_score = fire_score + fire_bias_vec.reshape(-1).to(weap.dtype)
+    score_ideal = fire_score.gather(-1, fire_idx.unsqueeze(-1)).squeeze(-1)
     l0 = logits9[..., 0] - float(attack_bias)
     if align_bias is not None:
         l0 = l0 - align_bias.reshape(l0.shape).to(l0.dtype)
-    fire = sel_logit > l0
+    fire = score_ideal > l0
     if veto_mask is not None:
         fire = fire & ~veto_mask.reshape(fire.shape)
-    choice = rest_arg.to(held.dtype) + 1                     # impulse 1..8
+    choice = sel_idx.to(held.dtype) + 1                      # impulse 1..8
     weapon_impulse = torch.where(fire, choice, held)
     return fire.to(torch.int64), weapon_impulse.to(torch.int64)
 
@@ -200,6 +246,7 @@ def attack_crest_gate_step(
     hbw: torch.Tensor,              # (B,) crosshair→lead alignment (crest_alignment_hbw)
     live: torch.Tensor,             # (B,) bool — enemy perceived (z_err presence gate)
     ready: torch.Tensor,            # (B,) bool — obs attack_finished expired (engine honors)
+    diverging: torch.Tensor,        # (B,) bool — hbw predicted to WORSEN next tick (feed-forward)
     veto_mask: torch.Tensor | None = None,  # (B,) bool — hard guards outrank the gate
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
     """One tick of the crest latch. Returns ``(attack, weapon_impulse,
@@ -208,12 +255,14 @@ def attack_crest_gate_step(
     Decode law (all rows in parallel; countdown ``pending`` = state lane 0):
 
     * arm     — head fires, gate applies (θ>0, enemy live, weapon ready), not at
-                crest, latch idle → HOLD: emit attack=0 + held impulse (a server
-                no-op), start the countdown at H.
-    * release — at crest (``hbw ≤ θ`` of the CURRENT selection), or countdown
-                expiring (pending==1 → blind-fire; the head's discharge is never
-                canceled), or a gate-exempt fire (θ≤0 / no enemy / on cooldown /
-                already aligned) passing straight through on its own tick.
+                crest, not diverging, latch idle → HOLD: emit attack=0 + held
+                impulse (a server no-op), start the countdown at H.
+    * release — at crest (``hbw ≤ θ`` of the CURRENT selection), or predicted to
+                diverge (waiting won't help — fire now instead of riding a hold
+                that's only getting worse), or countdown expiring (pending==1 →
+                blind-fire; the head's discharge is never canceled), or a
+                gate-exempt fire (θ≤0 / no enemy / on cooldown / already aligned)
+                passing straight through on its own tick.
     * fire    — release minus this tick's hard-guard veto (guards outrank; a
                 vetoed release still clears the latch — the discharge is lost,
                 same as a vetoed raw fire).
@@ -222,7 +271,13 @@ def attack_crest_gate_step(
     (attack_finished pending) is passed through raw, never converted into a
     delayed REAL discharge. No restack: arm requires pending==0, so a head
     re-fire during a hold is absorbed into the pending discharge. Exactly one
-    attack=1 tick per armed discharge (single-tick preserved)."""
+    attack=1 tick per armed discharge (single-tick preserved).
+
+    Convergence gating: ``diverging`` is re-read every tick (arm AND each hold
+    tick share the identical ``stop_waiting`` predicate) — a hold is only ever
+    worth continuing while the feed-forward rate predicts hbw improving; the
+    tick it turns, the gate stops waiting immediately rather than riding out
+    the remaining hold to a worse blind-fire at expiry."""
     st = attack_state.reshape(-1, ATTACK_STATE_DIM)
     pending = st[:, 0].round().to(torch.int64)
     fire_b = fire_raw.reshape(-1).to(torch.bool)
@@ -235,11 +290,14 @@ def attack_crest_gate_step(
     # (hbw > 0 whenever live), so a mid-hold switch to an OFF weapon runs to
     # expiry — the release-tick selection's θ is what's evaluated.
     aligned = live & (hbw <= theta)
+    # diverging needs live too, same reasoning as aligned: a dead row (LOS
+    # lost) must hold to expiry, not release as a fake divergence.
+    stop_waiting = aligned | (live & diverging)
     idle = pending == 0
-    arm = fire_b & gate_on & ~aligned & idle
+    arm = fire_b & gate_on & ~stop_waiting & idle
     tick = pending > 0
-    release = ((fire_b & (aligned | ~gate_on) & idle)
-               | (tick & (aligned | (pending == 1))))
+    release = ((fire_b & (stop_waiting | ~gate_on) & idle)
+               | (tick & (stop_waiting | (pending == 1))))
     fire = release if veto_mask is None else release & ~veto_mask.reshape(release.shape)
     pending_next = torch.where(
         arm, torch.full_like(pending, int(crest_hold_ticks)),
@@ -260,11 +318,14 @@ def attack_with_decode(
     guard=None,
     attack_bias: float = 0.0,
     bias_vec: torch.Tensor | None = None,
-    stick_bias: float = 0.0,
+    fire_bias_vec: torch.Tensor | None = None,
+    preference_bias_vec: torch.Tensor | None = None,
+    switch_margin: float = 0.0,
     crest_theta_vec: torch.Tensor | None = None,
     crest_hold_ticks: int = 0,
     aim_z_err: torch.Tensor | None = None,
     aim_range: torch.Tensor | None = None,
+    aim_z_rate: torch.Tensor | None = None,
     attack_state: torch.Tensor | None = None,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]":
     """Full a25 attack-with decode — the SINGLE implementation shared by
@@ -286,7 +347,8 @@ def attack_with_decode(
     guard : the resolved guard module (``guard_attack_logit_for_export``); None →
         no alignment bias / veto. The guard applies the SAME hard vetoes
         (attack-splash / RL self-splash / LG range) that the deployed graph bakes.
-    attack_bias / bias_vec / stick_bias : the operating-point knobs
+    attack_bias / bias_vec / fire_bias_vec / preference_bias_vec /
+        switch_margin : the operating-point knobs
         (research/attack-head.md §11), forwarded to :func:`attack_with_decode_step`.
     crest_theta_vec / crest_hold_ticks : the discharge-quality gate
         (attack.crest_theta_vec (8,) θ per impulse-1, ≤0 = OFF per weapon;
@@ -297,6 +359,12 @@ def attack_with_decode(
         error tangent + pooled lead-point range from ``aim_prior_tangent_ffwd``
         (both callers compute it upstream for the look decode). Required when
         the gate is armed; a pointer-less caller must fail loud, not skip.
+    aim_z_rate : the same function's feed-forward tangent DELTA (one tick
+        ahead, under the target's current relative velocity) — reconstructs
+        ``z_next = aim_z_err + aim_z_rate`` to predict whether hbw is
+        converging or diverging, so the gate never holds a discharge that
+        isn't going to improve. Required when the gate is armed, same as
+        aim_z_err/aim_range.
     attack_state : (B, ATTACK_STATE_DIM) — the countdown latch's wire slot
         (lane 0; zeros = idle). Required when the gate is armed.
 
@@ -325,7 +393,10 @@ def attack_with_decode(
         align_bias = torch.where(veto_mask, torch.zeros_like(probe), probe)
     fire, weapon_impulse = attack_with_decode_step(
         l9, held_impulse,
-        attack_bias=attack_bias, bias_vec=bias_vec, stick_bias=stick_bias,
+        attack_bias=attack_bias, bias_vec=bias_vec,
+        fire_bias_vec=fire_bias_vec,
+        preference_bias_vec=preference_bias_vec,
+        switch_margin=switch_margin,
         align_bias=align_bias, veto_mask=veto_mask)
     # crest activation is STATIC python config (trace-safe branch): OFF returns
     # the step result + the untouched state slot, bit-identical to pre-crest.
@@ -337,6 +408,11 @@ def attack_with_decode(
             "but no aim geometry was supplied — the gate needs the aim-prior "
             "z_err tangent + pooled range (target pointer required; a "
             "pointer-less model cannot run θ>0).")
+    if aim_z_rate is None:
+        raise ValueError(
+            "attack crest gate is armed but aim_z_rate was not supplied — the "
+            "convergence check needs the feed-forward tangent delta from the "
+            "same aim_prior_tangent_ffwd call that produced aim_z_err/aim_range.")
     if attack_state is None:
         raise ValueError(
             "attack crest gate is armed but attack_state was not threaded — the "
@@ -350,13 +426,25 @@ def attack_with_decode(
     # `<= eps` the eval's discharge definition uses; 0 is 0 in any scaling).
     ready = obs_tensors["attack_finished"].reshape(-1).float() <= 1e-6
     hbw, live = crest_alignment_hbw(aim_z_err, aim_range)
-    # per-tick selection re-read (same law as the step, incl. stick hysteresis)
+    # Feed-forward convergence check: predict next tick's z_err under the
+    # target's current relative velocity (z_next = z_err + z_rate, exactly the
+    # quantity aim_prior_tangent_ffwd's z_rate is defined from) and run it
+    # through the SAME hbw law. diverging = the gate would be worse off a tick
+    # from now, so holding can't pay off — release now instead of waiting.
+    hbw_next, _ = crest_alignment_hbw(
+        aim_z_err.reshape(-1, 2) + aim_z_rate.reshape(-1, 2), aim_range)
+    diverging = hbw_next > hbw
+    # per-tick selection re-read (same law as the step, incl. switch hysteresis)
     # so a mid-hold weapon switch releases against the NEW weapon's θ.
-    choice = _attack_with_select(l9[..., 1:], held_impulse, stick_bias) + 1
+    _score = (l9[..., 1:] if bias_vec is None
+              else l9[..., 1:] + bias_vec.reshape(-1).to(l9.dtype))
+    if preference_bias_vec is not None:
+        _score = _score + preference_bias_vec.reshape(-1).to(l9.dtype)
+    choice = _attack_with_select(_score, held_impulse, switch_margin) + 1
     return attack_crest_gate_step(
         fire, choice.to(torch.int64), held_impulse, attack_state,
         crest_theta_vec=crest_theta_vec, crest_hold_ticks=int(crest_hold_ticks),
-        hbw=hbw, live=live, ready=ready, veto_mask=veto_mask)
+        hbw=hbw, live=live, ready=ready, diverging=diverging, veto_mask=veto_mask)
 
 
 # ── a25 MOVE COMMITMENT decode (segment head → semi-Markov generative) ───────
@@ -382,13 +470,18 @@ _BUCKET_LO = list(FIB_EDGES)
 _BUCKET_HI = [e - 1 for e in FIB_EDGES[1:]] + [144]
 
 # Flat carried-state width for the commitment decode in the graph. We reuse the
-# a24 move_state slot (MOVE_STATE_DIM=9) so the ONNX I/O tensor names/shapes are
-# UNCHANGED — only the column semantics + episode-reset init differ:
+# a24 move_state slot so the ONNX I/O tensor NAME is unchanged across dim bumps
+# (move_state_out rode (B,11)->(B,9) at wire.9->wire.11 the same way — a
+# decode-regime change, not a wire bump; see wire.11.md) — only the column
+# semantics + episode-reset init differ:
 #   [0]=fb_cls [1]=fb_rem [2]=lr_cls [3]=lr_rem [4]=prev_release
-#   [5]=ud_cls [6]=ud_rem  (water-ud swim commit; movearch only)  ([7:9] unused).
+#   [5]=ud_cls [6]=ud_rem  (water-ud swim commit; movearch only)
+#   [7]=ammo-lockout baseline (last-seen watched-ammo value)
+#   [8]=engagement cooldown counter
+#   [9]=ammo-lockout staleness ticks (ticks since last observed decrement)
 # cls<0 = unset (episode start) -> decode samples a fresh commitment.
-COMMIT_STATE_DIM = 9
-_COMMIT_RESET_LANES = (-1.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0)
+COMMIT_STATE_DIM = 10
+_COMMIT_RESET_LANES = (-1.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0)
 
 
 def commit_reset_lanes() -> "list[float]":
@@ -417,6 +510,265 @@ def incoming_projectile_present(entity_types: torch.Tensor,
     return (pm & (d > OWN_FIRE_DIST_U)).any(dim=-1)
 
 
+def world_enemy_present(entity_types: torch.Tensor) -> torch.Tensor:
+    """(B,) bool — an ACTOR (other player) entity is observed. The low-end gate
+    for the movement engagement scalar (no actor => engagement 0). Torch-only,
+    trace-safe."""
+    from qnn.vocab import TOKEN_ACTOR
+    return (entity_types == TOKEN_ACTOR).any(dim=-1)
+
+
+def world_engaged_active(entity_types: torch.Tensor,
+                         entity_event_actions: torch.Tensor,
+                         entity_event_count: torch.Tensor,
+                         entity_scalars_raw: torch.Tensor) -> torch.Tensor:
+    """(B,) bool — an EXTERNAL combat event this tick: a target (ACTOR) is
+    firing (an observed FIRE action event) OR a non-self projectile is present.
+    Drives the movement engagement scalar to 1 (with a cooldown hold applied by
+    the caller). Purely external — no bot intent. Torch-only, trace-safe.
+
+    entity_event_actions : (B, N, MAX_ENTITY_EVENTS) action ids (see vocab.ACTION_IDS)
+    entity_event_count   : (B, N) valid-event count per entity
+    entity_scalars_raw   : (B, N, >=3) — rel[0:3] lead (projectile distance gate)
+    """
+    from qnn.vocab import TOKEN_ACTOR, ACTION_IDS
+    is_actor = (entity_types == TOKEN_ACTOR)                          # (B,N)
+    ev = entity_event_actions.shape[-1]
+    evt_idx = torch.arange(ev, device=entity_types.device)
+    evt_valid = evt_idx.reshape(1, 1, -1) < entity_event_count.unsqueeze(-1)  # (B,N,ev)
+    is_fire = (entity_event_actions == int(ACTION_IDS["FIRE"]))       # (B,N,ev)
+    actor_fire = (is_actor.unsqueeze(-1) & is_fire & evt_valid).any(dim=-1).any(dim=-1)  # (B,)
+    nonself_proj = incoming_projectile_present(entity_types, entity_scalars_raw)
+    return actor_fire | nonself_proj
+
+
+# ── obs → move-decode signals: ONE derivation, both decode call sites ───────
+#
+# The commitment decode's EXTERNAL inputs (threat, engagement, ammo lockout)
+# are not head outputs — they are read off the observation. That read is
+# decode logic, not caller glue, so it lives here beside the predicates it
+# feeds and is called by BOTH QNNPolicy.act and the ONNX ExportWrapper (the
+# same doctrine attack_with_decode states: one implementation, no twin).
+#
+# It used to be assembled independently at each call site, and the copies were
+# NOT equivalent — the eval copy read ``entity_rel`` (raw game units) while the
+# export copy read ``entity_scalars_raw[..., 0:3]`` (the DEQUANTIZED rel, i.e.
+# raw / DIST_SCALE). Against the OWN_FIRE_DIST_U = 120 u gate the export copy
+# could never be true (|rel| / 1000 ≤ 32.8), so the whole projectile half of
+# the threat / engagement signal was silently dead in the shipped graph while
+# live in eval. The eval copy was additionally wrapped in a key-presence guard
+# that left every signal None — and the knob a silent no-op — on any obs whose
+# entity fields use the dequantized key names.
+#
+# Both hazards are structural: derive the signals in ONE place, in ONE unit
+# convention, and RAISE on an obs that cannot supply them.
+
+
+def _entity_types(obs: "Mapping[str, torch.Tensor]", rows: int, why: str) -> torch.Tensor:
+    if "entity_types" not in obs:
+        raise KeyError(f"{why} but the obs lacks 'entity_types'")
+    return torch.as_tensor(obs["entity_types"]).reshape(rows, -1).long()
+
+
+def projectile_rel_raw(obs: "Mapping[str, torch.Tensor]", rows: int,
+                       entity_types: torch.Tensor) -> torch.Tensor:
+    """(rows, N, 3) PROJECTILE-token rel in RAW GAME UNITS (zero elsewhere) —
+    the convention every distance gate in this module is written in
+    (``OWN_FIRE_DIST_U`` et al).
+
+    Two obs forms carry the vector, and they are the SAME quantity in
+    different encodings, so either is accepted and both yield identical
+    values — that equivalence is what makes eval and deploy comparable:
+
+    * ``entity_rel`` — the native/wire field, int16 raw game units (an ONNX
+      graph input; the field-granular env obs and the BC native cache carry
+      it verbatim).
+    * ``entity_scalars_raw[..., 0:3]`` — the dequantized packing, rel /
+      ``DIST_SCALE``, multiplied back out here.
+
+    Non-projectile rows are zeroed rather than returned as-is: the two
+    encodings only agree on projectile tokens (the packed layout leads with
+    rel for PROJECTILE but with half-extents for ACTOR/ITEM/MOVER, which put
+    rel at [3:6]), and every caller masks to projectiles anyway. Zeroing makes
+    the two sources interchangeable everywhere instead of only where the
+    caller happens to look.
+
+    Raises when neither key is present: a decode that silently drops its own
+    world input is worse than one that stops.
+    """
+    rel = obs.get("entity_rel")
+    if rel is not None:
+        rel = torch.as_tensor(rel).reshape(rows, -1, 3).float()
+    else:
+        esr = obs.get("entity_scalars_raw")
+        if esr is None:
+            raise KeyError(
+                "move decode needs the entity rel vector: obs carries neither "
+                "'entity_rel' (native) nor 'entity_scalars_raw' (dequantized)")
+        esr = torch.as_tensor(esr)
+        esr = esr.reshape(rows, -1, esr.shape[-1])
+        rel = esr[..., 0:3].float() * float(_DIST_SCALE)
+    from qnn.vocab import TOKEN_PROJECTILE
+    keep = (entity_types == TOKEN_PROJECTILE).unsqueeze(-1)
+    return torch.where(keep, rel, torch.zeros_like(rel))
+
+
+def move_threat_signal(obs: "Mapping[str, torch.Tensor]", rows: int) -> torch.Tensor:
+    """(rows,) bool — the threat-break input: an incoming projectile is
+    present. Obs-side twin of :func:`incoming_projectile_present`, shared by
+    both decode paths so the distance gate sees the same units everywhere."""
+    et = _entity_types(obs, rows, "move.threat_break_hazard is enabled")
+    return incoming_projectile_present(et, projectile_rel_raw(obs, rows, et))
+
+
+def move_engagement_signals(
+    obs: "Mapping[str, torch.Tensor]", rows: int,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+    """``(enemy_present, engaged_active, ammo_pools, held_impulse)`` — the
+    external engagement inputs of the idle stillness bias, derived from one
+    obs by one implementation for both decode paths.
+
+    ``ammo_pools`` is the dequantized ``self_ammo_pools`` (per-pool normalized
+    fraction), NOT the raw byte counts: :func:`ammo_staleness_step` only ever
+    compares a pool against its own previous value, so the normalization is
+    irrelevant to the law — but the two paths must pick the SAME one, or a
+    tick that switches the held weapon across pools compares two different
+    scales and disagrees about whether ammo dropped.
+
+    Accepts either entity-event-count spelling (``entity_event_counts`` is the
+    dequantizer/schema output, ``entity_event_count`` the native wire field).
+    Raises on an obs missing any required field — the caller asked for the
+    engagement gate, so it must be computable.
+    """
+    from qnn.vocab import self_weapon_id_to_impulse
+    missing = [k for k in ("entity_types", "entity_event_actions",
+                           "self_ammo_pools", "self_weapon_id") if k not in obs]
+    counts = obs.get("entity_event_counts")
+    if counts is None:
+        counts = obs.get("entity_event_count")
+        if counts is None:
+            missing.append("entity_event_counts")
+    if missing:
+        raise KeyError(
+            "move.idle_none_bias is enabled but the obs lacks the engagement "
+            f"fields {sorted(missing)} — the engagement gate cannot be "
+            "derived from this observation source")
+    et = _entity_types(obs, rows, "move.idle_none_bias is enabled")
+    rel = projectile_rel_raw(obs, rows, et)
+    actions = torch.as_tensor(obs["entity_event_actions"]).reshape(
+        rows, et.shape[1], -1).long()
+    cnt = torch.as_tensor(counts).reshape(rows, -1).long()
+    ammo_pools = torch.as_tensor(obs["self_ammo_pools"]).reshape(rows, 4).float()
+    held_impulse = self_weapon_id_to_impulse(
+        torch.as_tensor(obs["self_weapon_id"]).reshape(rows).long())
+    return (world_enemy_present(et),
+            world_engaged_active(et, actions, cnt, rel),
+            ammo_pools, held_impulse)
+
+
+# ── Ammo-lockout: a world-results override for the engagement gate ──────────
+#
+# Some external attack-disable states have no engine-visible flag at all (a
+# competitive mod's pre-match freeze; any other server-side lockout) — but
+# their world-result is unmistakable: the bot keeps commanding fire and its
+# ammo never moves. Reuses the SAME shared threshold as the engagement
+# cooldown hold (idle_cooldown_ticks) rather than a second knob: if the ammo
+# pool relevant to the held weapon hasn't decremented in over that many
+# ticks, `engagement_none_bias` forces E to 0 outright — full idle stillness
+# — regardless of what enemy_present/engaged_active say. Needs 2 lanes of
+# persistent state (a baseline ammo value + a staleness counter), threaded on
+# commit_state lanes [7]/[9] by the caller (move_commit_step /
+# move_commit_step_graph); see agents/plans/discharge-quality-gate.md's
+# convergence-gating addition for the same "reuse an existing signal, add a
+# small counter" shape.
+
+_AMMO_POOL_BY_IMPULSE = torch.tensor(
+    [-1, -1, 0, 0, 1, 1, 2, 2, 3], dtype=torch.long)
+# impulse:   0     1    2    3   4    5   6   7   8
+#          (pad) (axe) SG  SSG  NG  SNG  GL  RL  LG
+# pool:     -1    -1    0    0   1    1   2   2   3   (shells,nails,rockets,cells)
+# Axe (impulse 1, melee) has no ammo pool: -1 EXEMPTS it below — there is
+# nothing to observe a decrement of, so it must never accrue staleness.
+
+
+def held_ammo_for_impulse(
+    ammo_pools: torch.Tensor,   # (B, 4) [shells, nails, rockets, cells]
+    impulse: torch.Tensor,      # (B,) held weapon impulse 1..8
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """``(ammo, has_pool)`` — the ammo count relevant to the held weapon,
+    gathered from ``ammo_pools``. ``has_pool`` is False for the axe (no ammo
+    pool at all); callers must exempt those rows from staleness tracking.
+    Trace-safe (index_select/gather only)."""
+    imp = impulse.reshape(-1).to(torch.long).clamp(0, 8)
+    pool_idx = _AMMO_POOL_BY_IMPULSE.to(imp.device).index_select(0, imp)  # (B,) -1..3
+    has_pool = pool_idx >= 0
+    safe_idx = pool_idx.clamp(min=0)
+    ammo = ammo_pools.reshape(-1, 4).gather(-1, safe_idx.unsqueeze(-1)).squeeze(-1)
+    return torch.where(has_pool, ammo, torch.zeros_like(ammo)), has_pool
+
+
+def ammo_staleness_step(
+    ammo_prev: torch.Tensor,    # (B,) last tick's watched-ammo value (state)
+    stale_prev: torch.Tensor,   # (B,) ticks since last observed decrement (state)
+    ammo_now: torch.Tensor,     # (B,) this tick's watched-ammo value
+    has_pool: torch.Tensor,     # (B,) bool — False (axe) exempts the row
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """``(ammo_next, stale_next)`` — tick-to-tick ammo-decrement tracking. A
+    row with no ammo pool (``has_pool`` False) never accrues staleness: both
+    outputs hold at 0, so it can never trigger the lockout override.
+    Trace-safe (no data-dependent control flow)."""
+    decreased = ammo_now < ammo_prev
+    stale_next = torch.where(
+        has_pool,
+        torch.where(decreased, torch.zeros_like(stale_prev), stale_prev + 1.0),
+        torch.zeros_like(stale_prev))
+    ammo_next = torch.where(has_pool, ammo_now, torch.zeros_like(ammo_now))
+    return ammo_next, stale_next
+
+
+def engagement_none_bias(cooldown_prev: torch.Tensor,
+                         enemy_present: torch.Tensor,
+                         engaged_active: torch.Tensor,
+                         idle_none_bias: "tuple[float, float]",
+                         base: float,
+                         cooldown_ticks: int,
+                         ammo_lockout: "torch.Tensor | None" = None
+                         ) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Engagement-gated stillness bias for the move commitment decode.
+
+    External engagement E in [0,1]: 1 while actively engaged (target firing or
+    non-self projectile) OR within the cooldown hold; ``base`` when an enemy is
+    merely present; 0 when there is no target. The cooldown is a retriggerable
+    one-shot: any active tick re-arms it to ``cooldown_ticks`` and it counts
+    down otherwise, so E holds at 1 for ``cooldown_ticks`` after combat stops.
+
+    ``ammo_lockout`` (B,) bool, optional: forces E to 0 outright — as if no
+    enemy were present — regardless of enemy_present/engaged_active, when
+    :func:`ammo_staleness_step` has observed no ammo decrement for longer than
+    ``cooldown_ticks`` (the SAME shared threshold, not a second knob). See the
+    module-level ammo-lockout comment above.
+
+    Returns ``(none_bias (B,2), cooldown_new (B,))``: ``none_bias[:,ai] =
+    idle_none_bias[ai] * (1 - E)`` — a per-axis additive bias on the seg head's
+    ``none`` (stand-still) class that vanishes in combat (E=1) and is full when
+    idle (E=0). Torch-only, trace-safe. Carries the counter on commit_state
+    lane 8 (no wire change)."""
+    cd = torch.where(engaged_active.bool(),
+                     torch.full_like(cooldown_prev, float(cooldown_ticks)),
+                     (cooldown_prev - 1.0).clamp(min=0.0))
+    E = torch.where(cd > 0.0, torch.ones_like(cd),
+                    torch.where(enemy_present.bool(),
+                                torch.full_like(cd, float(base)),
+                                torch.zeros_like(cd)))
+    if ammo_lockout is not None:
+        E = torch.where(ammo_lockout.reshape(E.shape).bool(),
+                        torch.zeros_like(E), E)
+    one_minus_E = 1.0 - E
+    nb = torch.stack([float(idle_none_bias[0]) * one_minus_E,
+                      float(idle_none_bias[1]) * one_minus_E], dim=-1)  # (B,2)
+    return nb, cd
+
+
 def move_commit_step(
     seg_logits: torch.Tensor,        # (B, 2, 30) fb/lr joint logits
     commit_state: torch.Tensor,      # (B, 5) [fb_cls, fb_rem, lr_cls, lr_rem, prev_release]; cls<0 = unset
@@ -428,6 +780,14 @@ def move_commit_step(
     water: torch.Tensor | None = None,   # (B,) bool — enables the ud (swim) axis
     threat: torch.Tensor | None = None,  # (B,) bool — incoming projectile present
     threat_break_hazard: float = 0.0,    # per-tick re-decision prob on threat rows
+    recommit: bool = False,              # allow re-commit to the held class at expiry
+    enemy_present: torch.Tensor | None = None,   # (B,) bool — an actor is observed
+    engaged_active: torch.Tensor | None = None,  # (B,) bool — target firing / non-self projectile
+    idle_none_bias: "tuple[float, float]" = (0.0, 0.0),  # per-axis (fb,lr) idle stand-still bias
+    idle_engagement_base: float = 0.5,   # E when an enemy is present but not active
+    idle_cooldown_ticks: int = 20,       # 1s @ 20Hz engagement hold after combat
+    ammo_pools: torch.Tensor | None = None,      # (B,4) [shells,nails,rockets,cells]
+    held_impulse: torch.Tensor | None = None,    # (B,) held weapon impulse 1..8
 ) -> torch.Tensor:
     """One tick of the commitment decode. Mutates ``commit_state`` in place;
     returns (B, 2) int64 fb/lr classes to emit this tick — or (B, 3) with the
@@ -492,6 +852,31 @@ def move_commit_step(
             for i, g in enumerate(row_generators):
                 u_b[i] = torch.rand(1, generator=g, device=dev)
         brk = thr & (u_b < float(threat_break_hazard))
+    # Engagement-gated stillness bias (idle_none_bias, default (0,0)=off): when
+    # disengaged, raise the ``none`` (stand-still) class so the bot stops
+    # pointless idle strafing; vanishes in combat (E=1). Cooldown counter on
+    # lane 8 (no wire change). Ammo-lockout override (lanes 7/9, see
+    # ammo_staleness_step above engagement_none_bias) needs one more lane than
+    # the base engagement feature, so it's gated separately — a caller still
+    # on the pre-ammo-lockout 9-lane state gets engagement without the
+    # override rather than losing the whole feature.
+    none_bias = None
+    if (idle_none_bias != (0.0, 0.0) and enemy_present is not None
+            and engaged_active is not None and commit_state.shape[1] > 8):
+        ammo_lockout = None
+        if (ammo_pools is not None and held_impulse is not None
+                and commit_state.shape[1] > 9):
+            _ammo_now, _has_pool = held_ammo_for_impulse(ammo_pools, held_impulse)
+            _ammo_next, _stale_next = ammo_staleness_step(
+                commit_state[:, 7], commit_state[:, 9], _ammo_now, _has_pool)
+            commit_state[:, 7] = _ammo_next.to(commit_state.dtype)
+            commit_state[:, 9] = _stale_next.to(commit_state.dtype)
+            ammo_lockout = _stale_next > float(idle_cooldown_ticks)
+        none_bias, _cd_new = engagement_none_bias(
+            commit_state[:, 8], enemy_present.reshape(B), engaged_active.reshape(B),
+            idle_none_bias, idle_engagement_base, idle_cooldown_ticks,
+            ammo_lockout=ammo_lockout)
+        commit_state[:, 8] = _cd_new.to(commit_state.dtype)
     out = torch.empty(B, 2, dtype=torch.long, device=dev)
     for ai in range(2):
         cls = commit_state[:, ai * 2].long()
@@ -511,10 +896,19 @@ def move_commit_step(
         if tilt != 0.0:
             logits = logits + tilt * torch.arange(
                 N_BUCKETS, dtype=logits.dtype, device=dev).repeat(3)
+        if none_bias is not None:                                # engagement stillness bias
+            logits[:, N_BUCKETS:2 * N_BUCKETS] = (              # class 1 = none buckets
+                logits[:, N_BUCKETS:2 * N_BUCKETS] + none_bias[:, ai].unsqueeze(1))
         held = cls.clamp(min=0)
         bucket_cols = torch.arange(N_BUCKETS, device=dev)
         mask_cols = held.unsqueeze(1) * N_BUCKETS + bucket_cols  # (B, 10)
+        # recommit: allow the head to re-commit to the held class at expiry (no
+        # forced switch) — the held class stays available so a maximal run can
+        # be extended. Off (default) = the maximal-run law (expiry forces a
+        # class change), bit-identical to pre-knob.
         row_has_held = ((cls >= 0) & (rem <= 0)).unsqueeze(1)
+        if recommit:
+            row_has_held = torch.zeros_like(row_has_held)
         logits.scatter_(1, mask_cols, torch.where(
             row_has_held.expand(-1, N_BUCKETS),
             torch.full_like(mask_cols, -1, dtype=logits.dtype).fill_(-1e9),
@@ -627,8 +1021,17 @@ def move_commit_step_graph(
     release: torch.Tensor | None = None,   # (B,) bool — Gate B interrupt, or None (off)
     water: torch.Tensor | None = None,      # (B,) bool — movearch: deep-water rows
     jump_logit: torch.Tensor | None = None, # (B,) — movearch: jump head logit
+    jump_threshold: float = 0.0,            # >0 = deterministic jump gate p_jump > τ
     threat: torch.Tensor | None = None,     # (B,) bool — incoming projectile present
     threat_break_hazard: float = 0.0,       # per-tick re-decision prob on threat rows
+    recommit: bool = False,                 # allow re-commit to the held class at expiry
+    enemy_present: torch.Tensor | None = None,   # (B,) bool — an actor is observed
+    engaged_active: torch.Tensor | None = None,  # (B,) bool — target firing / non-self projectile
+    idle_none_bias: "tuple[float, float]" = (0.0, 0.0),  # per-axis (fb,lr) idle stand-still bias
+    idle_engagement_base: float = 0.5,      # E when an enemy is present but not active
+    idle_cooldown_ticks: int = 20,          # 1s @ 20Hz engagement hold after combat
+    ammo_pools: torch.Tensor | None = None,      # (B,4) [shells,nails,rockets,cells]
+    held_impulse: torch.Tensor | None = None,    # (B,) held weapon impulse 1..8
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
     """TRACE-SAFE in-graph twin of :func:`move_commit_step` (fb/lr only) — the
     DECODE LAW baked into the ONNX so deploy == the QNNPolicy.act commitment decode.
@@ -682,6 +1085,28 @@ def move_commit_step_graph(
         u_b = torch.rand(B, device=dev)
         brk = threat.reshape(B).to(torch.bool) & (u_b < float(threat_break_hazard))
 
+    # Engagement-gated stillness bias (idle_none_bias, default off) — trace-safe
+    # twin of the eager path. Cooldown counter on commit_state lane 8. Ammo-
+    # lockout override (lanes 7/9) needs one more lane than base engagement,
+    # so it's gated separately — same reasoning as the eager twin.
+    none_bias = None
+    cooldown_new = commit_state[:, 8] if commit_state.shape[1] > 8 else None
+    ammo_baseline_new = commit_state[:, 7] if commit_state.shape[1] > 7 else None
+    ammo_stale_new = commit_state[:, 9] if commit_state.shape[1] > 9 else None
+    if (idle_none_bias != (0.0, 0.0) and enemy_present is not None
+            and engaged_active is not None and commit_state.shape[1] > 8):
+        ammo_lockout = None
+        if (ammo_pools is not None and held_impulse is not None
+                and commit_state.shape[1] > 9):
+            _ammo_now, _has_pool = held_ammo_for_impulse(ammo_pools, held_impulse)
+            ammo_baseline_new, ammo_stale_new = ammo_staleness_step(
+                commit_state[:, 7], commit_state[:, 9], _ammo_now, _has_pool)
+            ammo_lockout = ammo_stale_new > float(idle_cooldown_ticks)
+        none_bias, cooldown_new = engagement_none_bias(
+            commit_state[:, 8], enemy_present.reshape(B), engaged_active.reshape(B),
+            idle_none_bias, idle_engagement_base, idle_cooldown_ticks,
+            ammo_lockout=ammo_lockout)
+
     emit_cols = [None, None]
     rem_cols = [None, None]
     for ai in range(N_AXES):
@@ -692,11 +1117,17 @@ def move_commit_step_graph(
         tilt = float(dur_tilt[ai])
         if tilt != 0.0:
             logits = logits + tilt * tilt_ramp
+        if none_bias is not None:                                   # engagement stillness bias (class 1 = none)
+            logits = logits + torch.where(
+                col_class == 1, none_bias[:, ai].reshape(B, 1),
+                torch.zeros((), device=dev, dtype=logits.dtype))
         # expiry-only held-class mask: -1e9 on the held class's buckets when a
         # completed segment is ending (cls>=0 & rem<=0). Interrupt is a
         # re-decision (held stays available) — matches the eager scatter law.
         held = cls.clamp(min=0).reshape(B, 1)                       # (B,1)
         row_has_held = ((cls >= 0) & (rem <= 0)).reshape(B, 1)      # (B,1)
+        if recommit:                                                # allow re-commit: never mask held
+            row_has_held = torch.zeros_like(row_has_held)
         is_held_col = (col_class == held)                          # (B,JOINT) bool
         penalty = torch.where(row_has_held & is_held_col,
                               torch.full((), -1.0e9, device=dev, dtype=logits.dtype),
@@ -723,13 +1154,18 @@ def move_commit_step_graph(
 
     fblr = torch.stack([emit_cols[0], emit_cols[1]], dim=-1).to(torch.int64)  # (B,2)
     zeros = torch.zeros(B, dtype=torch.float32, device=dev)
+    cd_lane = cooldown_new.to(torch.float32) if cooldown_new is not None else zeros    # lane 8
+    ammo_lane = ammo_baseline_new.to(torch.float32) if ammo_baseline_new is not None else zeros  # lane 7
+    stale_lane = ammo_stale_new.to(torch.float32) if ammo_stale_new is not None else zeros       # lane 9
     if water is None or jump_logit is None:
-        # Legacy (fb/lr-only) graph: lanes 5..8 carried as 0 — bit-identical.
+        # Legacy (fb/lr-only) graph: lane 5,6 carried as 0 — bit-identical;
+        # lane 7 = ammo-lockout baseline, lane 8 = engagement cooldown, lane
+        # 9 = ammo-lockout staleness ticks (all 0 when the features are off).
         cols = [
             emit_cols[0].to(torch.float32), rem_cols[0].to(torch.float32),
             emit_cols[1].to(torch.float32), rem_cols[1].to(torch.float32),
             rel_now.to(torch.float32),
-            zeros, zeros, zeros, zeros,
+            zeros, zeros, ammo_lane, cd_lane, stale_lane,
         ]
         commit_state_out = torch.stack(cols, dim=-1)               # (B, COMMIT_STATE_DIM)
         return fblr, commit_state_out, move_state_rng.to(torch.int64)
@@ -773,9 +1209,15 @@ def move_commit_step_graph(
     rem_u = torch.where(w, rem_u, torch.zeros_like(rem_u))
     lane_cls_u = torch.where(w, emit_u, torch.full_like(emit_u, -1))
 
-    # jump: the engine-outcome posterior sampled AS-IS on every land row.
+    # jump: the engine-outcome posterior on every land row. jump_threshold τ>0
+    # gates DETERMINISTICALLY (jump iff p_jump > τ) — only the most-confident,
+    # context-motivated jumps fire, matching the eager act path and making
+    # deploy==offline (the ORT RandomUniformLike stream drops out). τ=0 keeps
+    # the AS-IS decode (greedy argmax>0.5 / sampled Bernoulli).
     p_jump = torch.sigmoid(jump_logit.reshape(B).to(torch.float32))
-    if greedy:
+    if jump_threshold > 0.0:
+        fire_j = p_jump > float(jump_threshold)
+    elif greedy:
         fire_j = p_jump > 0.5
     else:
         fire_j = torch.rand(B, device=dev) < p_jump
@@ -788,7 +1230,7 @@ def move_commit_step_graph(
         emit_cols[1].to(torch.float32), rem_cols[1].to(torch.float32),
         rel_now.to(torch.float32),
         lane_cls_u.to(torch.float32), rem_u.to(torch.float32),
-        zeros, zeros,
+        ammo_lane, cd_lane, stale_lane,      # lane 7 ammo baseline, 8 cooldown, 9 ammo stale
     ]
     commit_state_out = torch.stack(cols, dim=-1)                   # (B, COMMIT_STATE_DIM)
     out3 = torch.stack([emit_cols[0], emit_cols[1], ud_out], dim=-1).to(torch.int64)

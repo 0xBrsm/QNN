@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,24 @@ TEMPLATE = _REPO / "src" / "qnn" / "model" / "bench" / "templates" / "decode.a25
 NON_EXPORTED_KNOBS: dict[str, float] = {}
 
 _STAGED_SUFFIX = ".staged.json"
+
+# rc / bare-tier names are EARNED, never pre-assigned (model-versioning.md):
+# the rc numeral by a passed decode fit, the letter by a deploy slot, the
+# bare tier by line close. Fits stage under PROVISIONAL versions; the rc
+# name is applied to an already-promoted config by ``assign_rc``.
+RESERVED_VERSION_RE = re.compile(r"a\d+(rc\d+[a-z]*)?")
+# an assignable deploy-slot name: tier + rc numeral + single deploy letter
+# (a26rc2a). Bare rcN / bare tier are aliases earned by promotion on the pi
+# share, not emitted config filenames.
+RC_NAME_RE = re.compile(r"a\d+rc\d+[a-z]")
+PROVISIONAL_PREFIX = "prov-"
+
+
+def provisional_version(model_id: str, skill: str) -> str:
+    """The version a fit stages under before any rc name exists: derived from
+    the run id (the only name a checkpoint has pre-pass) + the skill spec."""
+    slug = str(skill).replace("=", "").replace(",", "_")
+    return f"{PROVISIONAL_PREFIX}{model_id}-{slug}"
 
 
 def _log(msg: str) -> None:
@@ -104,7 +123,9 @@ def stage_decode_config(ctx, plans: dict[str, WeaponPlan],
     gain/α vectors, the universal scalar tremor (+ tau), the fitted
     ``look.turn_mag_scale`` substrate (never the template pin — the a24
     0.7 / a25 0.93 cross-arch class), the non-lever ``pins`` merged in
-    (attack.bias_vec etc.), and the ``skill_vector`` block carrying the
+    (the live-pins attack.fire_bias_vec, zero legacy joint vector,
+    move.commit_dur_tilt), and the
+    ``skill_vector`` block carrying the
     plans' placed table including refusal/frontier flags.
 
     Validation (v1 ``_validate_decode_config``, pipeline:934): the staged file
@@ -133,8 +154,9 @@ def stage_decode_config(ctx, plans: dict[str, WeaponPlan],
     cfg["look_grid"] = "config/look_grid.json"
 
     p = cfg.setdefault("params", {})
-    # non-lever pins (invariants-before-skills: attack.bias_vec etc.) merge
-    # first so the fitted levers below always win a key collision.
+    # non-lever pins (invariants-before-skills: the live-pins fire-only vector,
+    # move.commit_dur_tilt) merge first so the fitted levers below always win
+    # a key collision.
     for k, v in (pins or {}).items():
         p[k] = v
     # the (9,) per-impulse gain/α/tremor vectors — the deliverable
@@ -164,6 +186,7 @@ def stage_decode_config(ctx, plans: dict[str, WeaponPlan],
         "emitted_utc": _now(),
         "template": rel_to_repo(tpl),
         "export_gaps": gaps,
+        "calibration_families": ["SG+SSG", "NG+SNG", "RL", "LG"],
         "staged": True,
     }
 
@@ -189,19 +212,19 @@ def stage_decode_config(ctx, plans: dict[str, WeaponPlan],
     return out
 
 
-_STYLE_KEYS = ("attack.bias_vec", "attack.stick_bias",
+_STYLE_KEYS = ("weapon.preference_bias_vec", "weapon.switch_margin",
                "move.threat_break_hazard")
 
 
 def warm_start_style(ctx, staged: Path) -> Path | None:
     """Seed the staged config's style knobs from the LATEST promoted fit of
     the same model (verify-first trim, Brian 2026-07-17): successive fits of
-    one checkpoint converge to near-identical trims, so starting the attack
-    trim at the previous converged values makes iteration 0 a verification —
+    one checkpoint converge to near-identical selection/switch/reactivity
+    trims, so starting at the previous values makes iteration 0 a verification —
     on pass the whole trim tail is ONE eval (its npz doubles as the final
     gate eval via the existing convergence dedup). Cold model (no promoted
-    fit) → None, substrate pins stand. The warm source is stamped into the
-    staged provenance."""
+    fit) → None, substrate pins stand. The forced-pin fire vector is never
+    warmed. The warm source is stamped into the staged provenance."""
     staged = Path(staged)
     prev = [p for p in ctx.out_dir.glob("decode.*.json")
             if not p.name.endswith(_STAGED_SUFFIX) and p != staged
@@ -269,6 +292,85 @@ def promote_decode_config(staged: Path, *, gate_passed: bool,
     return promoted
 
 
+def assign_rc(source: Path, rc: str, *, replace: bool = False,
+              force: bool = False) -> Path:
+    """Mark a PROMOTED provisional config with its earned rc name: copy
+    ``decode.<provisional>.json`` → ``decode.<rc>.json`` (same dir) with the
+    ``version`` field re-stamped and the assignment recorded in provenance
+    (``rc_source`` / ``provisional_version`` / ``rc_assigned_utc``). The
+    source file is stamped ``rc_assigned: <rc>`` so its promotion is visible
+    in place.
+
+    Guards (model-versioning.md — rc names are earned, never pre-assigned):
+
+    * source must be PROMOTED (never a ``.staged.json``) with
+      ``gate_passed: true`` and not force-promoted — no rc name on a fit
+      that did not pass, unless ``force`` (stamped loudly);
+    * ``rc`` must be a full deploy-slot name (``a26rc2a``) — bare rcN and
+      bare tier are share-side promotion aliases, not emitted configs;
+    * an existing target is only overwritten under ``replace`` — the
+      re-emit-same-letter path for a superseded NEVER-shipped artifact.
+      Replacing a deployed config's file is caller error; check the pi
+      share before passing ``replace``."""
+    source = Path(source)
+    if not RC_NAME_RE.fullmatch(rc):
+        raise ValueError(
+            f"not an assignable rc name: {rc!r} (expected tier+rc+deploy "
+            f"letter, e.g. a26rc2a — bare rcN / bare tier are promotion "
+            f"aliases, never emitted filenames)")
+    if source.name.endswith(_STAGED_SUFFIX):
+        raise ValueError(
+            f"{source.name} is STAGED — rc names are assigned to PROMOTED "
+            f"configs only (gate pass promotes; then assign)")
+    cfg = read_json(source)
+    prov = cfg.get("provenance") or {}
+    if prov.get("staged", True) or "promoted_utc" not in prov:
+        raise RuntimeError(
+            f"refusing rc assignment: {source.name} has no promotion "
+            f"provenance — only a gate-promoted config earns an rc name")
+    if not prov.get("gate_passed") and not force:
+        raise RuntimeError(
+            f"refusing rc assignment: {source.name} has gate_passed="
+            f"{prov.get('gate_passed')!r} — the rc numeral is earned by a "
+            f"PASSED fit (force=True for debugging only, stamped loudly)")
+    if prov.get("forced") and not force:
+        raise RuntimeError(
+            f"refusing rc assignment: {source.name} was force-promoted "
+            f"(not gate-blessed); re-run the fit or force the assignment")
+    if prov.get("rc_assigned") and not force:
+        raise RuntimeError(
+            f"refusing rc assignment: {source.name} already assigned "
+            f"{prov['rc_assigned']!r} — one fit, one rc name (a refit "
+            f"promotes its own provisional config first)")
+    target = source.with_name(f"decode.{rc}.json")
+    if target == source:
+        raise ValueError(f"source already carries the rc name: {source}")
+    replaced = target.exists()
+    if replaced and not replace:
+        raise RuntimeError(
+            f"refusing rc assignment: {rel_to_repo(target)} exists. If it "
+            f"was NEVER deployed this is the re-emit-same-letter path — "
+            f"verify against the pi share, then pass replace=True. If it "
+            f"WAS deployed, the next letter is the correct name.")
+    out = dict(cfg)
+    out["version"] = rc
+    out["provenance"] = {
+        **prov,
+        "rc_assigned_utc": _now(),
+        "rc_source": rel_to_repo(source),
+        "provisional_version": cfg.get("version"),
+        **({"replaced_unshipped": True} if replaced else {}),
+        **({"rc_forced": True} if force else {}),
+    }
+    target.write_text(json.dumps(out, indent=2) + "\n")
+    cfg.setdefault("provenance", {})["rc_assigned"] = rc
+    source.write_text(json.dumps(cfg, indent=2) + "\n")
+    _log(f"assigned rc name {rc} → {rel_to_repo(target)}"
+         + (" [REPLACED unshipped artifact]" if replaced else "")
+         + (" [FORCED]" if force else ""))
+    return target
+
+
 def write_sidecar(ctx, doc: dict[str, Any], out_path: Path) -> Path:
     """Write the skill-curve sidecar (schema ``skill_curve_v3``). The content
     is assembled by the CLI — this only wraps schema + provenance and writes.
@@ -291,18 +393,16 @@ def fit_report(ctx, *, fits: dict[str, Any],
                notes: Any = None) -> dict[str, Any]:
     """Assemble the final fit-report skeleton — pure dict assembly, the CLI
     passes the parts (fits summary, resolved plans, budget ledger, gate
-    reports, emit info). The result label folds the gate statuses: any FAIL →
-    FAIL; all PASS → PASS; anything unscored/skipped → PASS-PENDING-VALIDATION
-    (v1's NEEDS-REVIEW emit-resolve label is gone: staging RAISES on an
-    unresolvable config instead of labeling it)."""
+    reports, emit info). The result label folds the gate statuses: only a
+    complete set of PASS statuses is PASS; FAIL, missing, or skipped evidence
+    is FAIL. There is intentionally no ``PASS-PENDING-VALIDATION`` state: that
+    a27 escape hatch emitted rc1a without ever measuring combat behavior."""
     statuses = [g.get("status") for g in (gates or {}).values()
                 if isinstance(g, dict)]
-    if any(s == "FAIL" for s in statuses):
-        label = "FAIL"
-    elif statuses and all(s == "PASS" for s in statuses):
+    if statuses and all(s == "PASS" for s in statuses):
         label = "PASS"
     else:
-        label = "PASS-PENDING-VALIDATION"
+        label = "FAIL"
     plans_out = {
         w: (dataclasses.asdict(p) if dataclasses.is_dataclass(p) else p)
         for w, p in (plans or {}).items()

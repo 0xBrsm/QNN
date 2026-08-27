@@ -873,6 +873,33 @@ def _write_intercept_events(
     return path
 
 
+def _write_intercept_windows(output_dir: str | Path, k: int,
+                             rows: Mapping[str, Sequence[Any]]) -> Path | None:
+    """Write the tracking-window instrument, including an explicit empty file.
+
+    A zero-discharge wave is valid evidence about fire mass but contributes no
+    tracking samples. It still needs a schema-bearing artifact so decode-fit can
+    distinguish that result from a wave produced before the instrument existed.
+    """
+    if not k:
+        return None
+    hbw_win = np.asarray(rows["hbw_win"], dtype=np.float32)
+    if not len(hbw_win):
+        hbw_win = np.empty((0, 2 * int(k) + 1), dtype=np.float32)
+    out = Path(output_dir) / "intercept_windows.npz"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out,
+        k=np.int64(k),
+        scenario_id=np.asarray(rows["scenario_id"], dtype="U64"),
+        weapon=np.asarray(rows["weapon"], dtype="U8"),
+        episode=np.asarray(rows["episode"], dtype=np.int32),
+        env_idx=np.asarray(rows["env_idx"], dtype=np.int32),
+        tick=np.asarray(rows["tick"], dtype=np.int64),
+        hbw_win=hbw_win)
+    return out
+
+
 def _fire_aim_best_cos(obs: object) -> float | None:
     """Best crosshair->actor cosine from one env's obs tokens; None if no actor."""
     if not isinstance(obs, Mapping) or "entity_rel" not in obs or "entity_types" not in obs:
@@ -1073,7 +1100,8 @@ def _batched_los_turn_bins(
     return los_cos, los_bin, turn_bin
 
 
-_ARENA_INV_INT_KEYS = ("shells", "nails", "rockets", "cells", "health", "armor_value")
+_ARENA_INV_INT_KEYS = ("shells", "nails", "rockets", "cells", "infinite_ammo",
+                       "health", "armor_value")
 
 
 def _arena_weapon_config(options: Mapping[str, object]) -> dict[str, object]:
@@ -1286,7 +1314,21 @@ def _evaluate_mode(
     # alignment crest the way the elite-anchor humans do?). Env-gated so wave
     # config hashes are untouched; emitted as intercept_windows.npz.
     _win_k = int(os.environ.get("QNN_EVAL_INTERCEPT_WINDOW", "0") or 0)
-    _win_rows: Dict[str, list] = {"weapon": [], "hbw_win": []}
+    _win_rows: Dict[str, list] = {"scenario_id": [], "weapon": [],
+                                  "episode": [], "env_idx": [], "tick": [],
+                                  "hbw_win": []}
+
+    def _win_emit(_buf: list, pad_to: int | None = None) -> None:
+        _sc, _wn, _ep, _ei, _tk = _buf[0]
+        row = _buf[1:]
+        if pad_to is not None:
+            row = row + [float("nan")] * (pad_to - len(row))
+        _win_rows["scenario_id"].append(_sc)
+        _win_rows["weapon"].append(_wn)
+        _win_rows["episode"].append(_ep)
+        _win_rows["env_idx"].append(_ei)
+        _win_rows["tick"].append(_tk)
+        _win_rows["hbw_win"].append(row)
     _win_trail: Dict[tuple, deque] = {}          # lane key → trailing hbw deque
     _win_pending: Dict[tuple, list] = {}         # lane key → [bufs to fill fwd]
     _WIN_CAP = 100_000
@@ -1703,8 +1745,7 @@ def _evaluate_mode(
                                 _done_bufs.append(_buf)
                         for _buf in _done_bufs:
                             _pend.remove(_buf)
-                            _win_rows["hbw_win"].append(_buf[1:])
-                            _win_rows["weapon"].append(_buf[0])
+                            _win_emit(_buf)
                 if _lead is not None:
                     _lead_cos, _feet_pitch, _origin_pitch, _range_u = _lead
                     _lead_ang = float(np.degrees(np.arccos(np.clip(_lead_cos, -1.0, 1.0))))
@@ -1757,9 +1798,13 @@ def _evaluate_mode(
                             else:
                                 intercept_events_truncated = True
                             if _win_k and len(_win_rows["hbw_win"]) < _WIN_CAP:
-                                # crest-window row: weapon tag + trailing
+                                # crest-window row: identity meta + trailing
                                 # (k+1, NaN-padded left) — forward k ticks
-                                # fill on this lane's next ticks
+                                # fill on this lane's next ticks. The meta
+                                # (scenario/episode/lane/tick) makes the npz
+                                # self-contained for the decode-fit tracking
+                                # loader (cluster keys + op annotation),
+                                # mirroring intercept_events row identity.
                                 _twin = list(_win_trail.get(
                                     (int(env_idxs[batch_idx]),
                                      int(episode_ords[batch_idx])), ()))
@@ -1768,7 +1813,10 @@ def _evaluate_mode(
                                 _win_pending.setdefault(
                                     (int(env_idxs[batch_idx]),
                                      int(episode_ords[batch_idx])), []
-                                ).append([_wname] + _twin)
+                                ).append([(scenario_id, _wname,
+                                           int(episode_ords[batch_idx]),
+                                           int(env_idxs[batch_idx]),
+                                           int(tick))] + _twin)
                         if int(info.get("lead_weapon_id", 0)) == 7:   # RL (raw id)
                             lead_pitch_fire_rl_sum += _feet_pitch
                             lead_fire_rl_n += 1
@@ -2167,18 +2215,12 @@ def _evaluate_mode(
     # (the loader treats absence as "no discharges / predates event logging").
     _write_intercept_events(config.output_dir, intercept_events,
                             truncated=intercept_events_truncated)
-    if _win_k and _win_rows["hbw_win"]:
+    if _win_k:
         # flush pendings cut short by episode end (NaN-pad the forward side)
         for _bufs in _win_pending.values():
             for _buf in _bufs:
-                _pad = 2 * _win_k + 2 - len(_buf)
-                _win_rows["hbw_win"].append(_buf[1:] + [float("nan")] * _pad)
-                _win_rows["weapon"].append(_buf[0])
-        np.savez_compressed(
-            Path(config.output_dir) / "intercept_windows.npz",
-            k=np.int64(_win_k),
-            weapon=np.asarray(_win_rows["weapon"], dtype="U8"),
-            hbw_win=np.asarray(_win_rows["hbw_win"], dtype=np.float32))
+                _win_emit(_buf, pad_to=2 * _win_k + 1)
+        _write_intercept_windows(config.output_dir, _win_k, _win_rows)
     # Decoded turn-magnitude distribution per LOS-angle zone (the lock-on curve):
     # {los_angle_bin: {turn_mag_bin: p}} normalized within each LOS zone. Matched
     # against the human reference to calibrate the turn_mag_scale dampener.
@@ -2292,119 +2334,37 @@ def _install_decode_regime(model: QNNPolicy, regime: str | None):
 
 
 def _apply_decode_config_params(config: "EvalConfig", model: QNNPolicy, resolved) -> None:
-    """Source the MOVE + LOOK decode operating point from the resolved
-    decode-config onto the (mutable) EvalConfig + model, mirroring
-    tools/export_onnx's precedence exactly so eval and export agree. Called only
-    when a regime is resolved; when no regime is set the train.json ``eval_*``
-    keys stand as the legacy fallback. Each key is overridden only when the
-    config DEFINES it, so a config that omits a knob leaves the eval_* fallback
-    in place."""
-    p = resolved.params
-    # ── look aim-prior gain + ffwd (export: kw["look_aim_prior_gain"] etc.). The
-    # model reads model.look_aim_prior_gain / model.look_aim_ffwd directly in
-    # policy.act, so set them on the model (config.look_aim_prior_gain is also
-    # updated for provenance/consistency; there is no config.look_aim_ffwd field).
-    def _scalar_or_impulse_vec(v):
-        # float, or a (9,) per-IMPULSE vector (the per-weapon skill system,
-        # 7/08): policy.act resolves per-row via self_weapon_id_to_impulse.
-        return [float(x) for x in v] if isinstance(v, (list, tuple)) else float(v)
+    """Source the whole decode operating point from the resolved decode-config
+    onto the (mutable) EvalConfig + model.
 
-    # REQUIRED_PARAM_KEYS (validated in resolve_decode_config) are addressed
-    # directly — no `if key in p` presence-gating, so a config that omits one
-    # fails loud upstream instead of silently keeping a code default here.
-    _g = _scalar_or_impulse_vec(p["look.aim_prior_gain"])
+    ONE loop over ``qnn.model.decode_config.DECODE_PARAMS`` — the SAME registry
+    ``tools/export_onnx`` reads — so eval and export cannot describe different
+    decodes. The registry owns the kwarg names, the coercions and the defaults;
+    there is no per-key ``if "..." in p`` chain here any more (that chain is
+    exactly how attack.crest_* came to be baked into the ONNX while running
+    inert offline). Adding a knob = adding a row to the registry.
+
+    ``ResolvedDecode.policy_attrs()`` fails loud on a config that omits a key
+    with no code-side default (REQUIRED_PARAM_KEYS / MODULE_REQUIRED_PARAM_KEYS)
+    and substitutes the registry default — never a second, drifting copy of it —
+    for every optional knob.
+    """
+    for attr, value in resolved.policy_attrs().items():
+        if not hasattr(model, attr):
+            # A registry row naming an attribute QNNPolicy does not define would
+            # otherwise setattr() a DEAD knob: silently inert in eval, live in
+            # the export. Fail loud instead (no silent defaults).
+            raise AttributeError(
+                f"decode-param registry maps a config key onto QNNPolicy.{attr}, "
+                f"which does not exist on {type(model).__name__}. Fix the "
+                f"`name` in qnn.model.decode_config.DECODE_PARAMS (it is BOTH "
+                f"the policy attribute and the ExportWrapper kwarg).")
+        setattr(model, attr, value)
+    # The one EvalConfig-side mirror: config.look_aim_prior_gain is provenance
+    # only and holds a scalar or None (a (9,) per-impulse vector has no scalar
+    # form). There is no config.look_aim_ffwd field.
+    _g = model.look_aim_prior_gain
     config.look_aim_prior_gain = _g if isinstance(_g, float) else None
-    model.look_aim_prior_gain = _g
-    model.look_aim_ffwd = float(p["look.aim_ffwd_gain"])
-    # ── global attack-propensity bias (sampled-mode s-lever): sigmoid(logit+bias)
-    if "attack.bias" in p:
-        model.attack_bias = float(p["attack.bias"])
-    # ── a25 9-way attack-with per-weapon operating point (research/attack-head.md
-    # §11). bias_vec = (8,) per-weapon attack bias (POST-argmax); stick_bias =
-    # scalar selection hysteresis toward the held weapon. Absent = today's behavior.
-    if "attack.bias_vec" in p:
-        model.attack_bias_vec = [float(x) for x in p["attack.bias_vec"]]
-    if "attack.stick_bias" in p:
-        model.attack_stick_bias = float(p["attack.stick_bias"])
-    # ── a25 commitment decode (segment-head (class,duration) sampling replaces the
-    # fb/lr sticky/hazard stack; requires a move_seg checkpoint). REQUIRED for the
-    # a25 decode module — direct access, fails loud upstream on omission (absence
-    # previously reverted silently to per-axis sampling).
-    model.move_commitment = bool(p["move.commitment"])
-    # Gate B projectile interrupt opt-out for the commitment decode
-    if "move.commit_interrupt" in p:
-        model.move_commit_interrupt = bool(p["move.commit_interrupt"])
-    # Threat-break hazard (sustained per-tick re-decision on incoming threat)
-    if "move.threat_break_hazard" in p:
-        model.move_threat_break_hazard = float(p["move.threat_break_hazard"])
-    # per-axis (fb, lr) duration censoring-bias tilt; scalar broadcasts to both
-    if "move.commit_dur_tilt" in p:
-        t = p["move.commit_dur_tilt"]
-        model.move_commit_dur_tilt = (
-            (float(t[0]), float(t[1])) if isinstance(t, (list, tuple))
-            else (float(t), float(t)))
-    # ── combined rotation+magnitude: blend kept |z| from θ (0) toward |z+z_prior| (1)
-    # (REQUIRED — direct access, fails loud on omission via resolve_decode_config)
-    model.look_aim_mag_gain = _scalar_or_impulse_vec(p["look.aim_mag_gain"])
-    # ── head turn-magnitude dampener: scale the head's native |z|=θ before the
-    # aim-prior blend. REQUIRED — omission previously defaulted to 1.0=OFF, which
-    # silently ran the wrong (cross-arch) dampener; now fails loud upstream.
-    model.look_turn_mag_scale = float(p["look.turn_mag_scale"])
-    # ── hold-drift: on hold frames with a live aim prior, emit eps (radians)
-    # toward the prior instead of a dead-zero turn (the hold bin is a collect
-    # quantization artifact; default OFF). See decode_look_from_polar.
-    if "look.hold_drift_eps" in p:
-        model.look_hold_drift_eps = float(p["look.hold_drift_eps"])
-    # ── hold pass-through: head-commanded exact holds (θ==0) bypass the aim-prior
-    # magnitude blend (which otherwise converts every engaged hold into an
-    # α·|aim-error| micro-correction). REQUIRED for the a25 decode module — direct
-    # access, fails loud upstream on omission (absence previously ran passthrough
-    # silently OFF, the a25base/a25rc1 inconsistency this promotion closes).
-    model.look_hold_passthrough = bool(p["look.hold_passthrough"])
-    # ── per-weapon VERTICAL aim authority (RL-splash feet-aiming; default OFF).
-    # A (9,) per-impulse self-limiting pitch gain that restores the feet-anchor
-    # authority the rotation blend starves (look-aim-decode.md §12).
-    if "look.weapon_pitch_gain" in p:
-        model.look_weapon_pitch_gain = [float(x) for x in p["look.weapon_pitch_gain"]]
-    # Per-weapon downward pitch bias (degrees; cancels the static RL high-bias that
-    # β and feed-forward can't touch → rockets stop sailing over and landing behind).
-    if "look.weapon_pitch_bias" in p:
-        model.look_weapon_pitch_bias = [float(x) for x in p["look.weapon_pitch_bias"]]
-    # Feet-elevation LOCK toggle (default on = hard overwrite). Off → β-blend only
-    # (soft bias, head keeps its vertical). See QNNPolicy.look_weapon_pitch_lock.
-    if "look.weapon_pitch_lock" in p:
-        model.look_weapon_pitch_lock = bool(p["look.weapon_pitch_lock"])
-    # Post-expmap pitch mode: "lock" | "shift" | "off" (+ shift strength). "shift"
-    # translates the head's fired elevation toward the feet while preserving spread.
-    if "look.weapon_pitch_mode" in p:
-        model.look_weapon_pitch_mode = str(p["look.weapon_pitch_mode"])
-    if "look.weapon_pitch_shift_strength" in p:
-        model.look_weapon_pitch_shift_strength = float(p["look.weapon_pitch_shift_strength"])
-    # ── hazard-discounted lead: cap the horizontal lead horizon at the expected
-    # strafe-hold (20Hz frames). Stops RL over-leading past the human dwell so
-    # rockets don't overshoot behind a strafing target. REQUIRED — omission
-    # previously defaulted to None=OFF (linear lead), the silent a25 cap-loss bug;
-    # now fails loud upstream. OFF, if ever wanted, is an explicit 0.0.
-    model.look_lead_hold_cap_frames = float(p["look.lead_hold_cap_frames"])
-    model.look_lead_hold_cap_radial_frames = float(p["look.lead_hold_cap_radial_frames"])
-    # ── aim DEGRADATION (DOWN-half skill knob; default 0 = OFF = bit-identical).
-    # Stateful post-head transforms on the look turn-delta; the model reads these
-    # attrs directly in policy.act. See look-aim-decode.md §11.
-    if "look.aim_degrade_sluggish_tau" in p:
-        model.look_aim_degrade_sluggish_tau = float(p["look.aim_degrade_sluggish_tau"])
-    if "look.aim_degrade_lag_frames" in p:
-        # scalar OR a (9,) per-IMPULSE vector (per-weapon skill system, 7/08):
-        # policy.act resolves per-row via the intent-keyed effective impulse.
-        model.look_aim_degrade_lag_frames = _scalar_or_impulse_vec(
-            p["look.aim_degrade_lag_frames"])
-    if "look.aim_degrade_tremor_mag" in p:
-        # scalar OR (9,) per-IMPULSE vector, same contract as lag_frames
-        model.look_aim_degrade_tremor_mag = _scalar_or_impulse_vec(
-            p["look.aim_degrade_tremor_mag"])
-    if "look.aim_degrade_tremor_tau" in p:
-        model.look_aim_degrade_tremor_tau = float(p["look.aim_degrade_tremor_tau"])
-    if "look.aim_degrade_jitter_mag" in p:
-        model.look_aim_degrade_jitter_mag = float(p["look.aim_degrade_jitter_mag"])
     # NOTE: the a24 move keys (move.sticky_tau_*, move.switchback_eps,
     # move.stop_onset, move.tau_engagement_gated, move.jump_*), the inline
     # move_hazard table, and attack.threshold are RETIRED with the a24 arch —

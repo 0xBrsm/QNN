@@ -87,5 +87,5 @@ attack_rng_out   int64 (B,)    attack sampling-rng loop-back     ← NEW
 
 Model/export/contract side: **done + verified** (export stamps `a24rc1q.s1.w11`,
 emits decided `attack`, ORT trunk parity holds; move+attack decode-parity green).
-Engine codec (`QNN_CODEC_WIRE_11`): implemented, **pending arm64 CI build + a live
-trainer check** (the engine is not buildable in the devcontainer).
+Engine codec (`QNN_CODEC_WIRE_11`): implemented, **pending a live trainer check**
+(build the client with `src/engine/build/build_nq_client.sh`).

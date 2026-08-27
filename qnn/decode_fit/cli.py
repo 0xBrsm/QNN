@@ -2,22 +2,42 @@
 
     python -m qnn.decode_fit --run-dir runs/head_probe/<run> \
         [--skill native|p90|SG=p90,RL=p75,...] [--write] [--validate]
-        [--eval-template <dir>] [--version aXXrcN] [--offline-retrofit]
+        [--eval-template <dir>] [--offline-retrofit]
+    python -m qnn.decode_fit --run-dir runs/head_probe/<run> \
+        --assign-rc aXXrcNx [--config <promoted.json>] [--replace]
 
-Flow (plan §P1-P3; every closed-loop artifact manifest-cached under
-``runs/decode_fit/<model>/``):
+Fits stage + promote under a PROVISIONAL version derived from the run id —
+rc names are EARNED, never pre-assigned (src/docs/model-versioning.md): the
+rc numeral by the passed fit, the deploy letter by the deploy slot. After a
+PASS, ``--assign-rc`` marks the promoted config with its rc name (a copy
+with ``version`` re-stamped + assignment provenance); deploy consumes the
+rc-named file.
+
+Flow (plan §P1-P3; every closed-loop artifact lives under
+``runs/decode_fit/<model>/`` — waves resume-skip off their content-hashed
+done dirs + the substrate/env staleness check):
 
   0. context + human baselines (collect-cached, qnn.human)
-  1. invariant pins (qnn.bc.decode_fit.fit — fire-rate first, baked into
-     every wave substrate; invariants-before-skills)
-  2. ACQ round     → turn_mag_scale fit (extend the sweep when target is
-     sweep-bound; NO CLAMP)
+  1. ACQ round     → turn_mag_scale fit on the NATIVE substrate (throughput
+     is target-free — no discharge in the ruler; extend the sweep when
+     target is sweep-bound; NO CLAMP)
+  2. LIVE PINS round 0 (qnn.decode_fit.live_pins) → conditional family
+     cadence at tms*, with SG and SNG as the class representatives; the fitted
+     fire-only attack.fire_bias_vec is baked into every later wave substrate
+     (invariants-before-skills, now measured in-regime — the deleted
+     offline corpus-forward pins mis-signed across the offline↔live gap)
   3. SCREEN round  → per-weapon gain responses (+ measured tms coupling)
   4. EXTEND round  → α rays at fitted knees, tremor arm, refinement gains
      (+ one CI-rejection extension when a decision quantity is undetermined)
   5. plan          → refusal/frontier semantics (decision 1)
-  6. CONFIRM round → CI-overlap gate at percentile ±5 (decision 3), one
-     damped secant correction on a miss, re-confirm once
+  6. PLACEMENT gate → the fit adjudicates itself on its OWN bootstrap CIs
+     at percentile ±5 (no confirmation round — a confirm on the fit's
+     substrate passes by construction, one on a different substrate fails
+     whenever the fit is unrepresentative; representativeness is designed
+     in: all four opponent pins, human range-mix weighting, per-wave
+     content-derived seeds). Degenerate CI / undetermined knee / thin
+     mass FAIL hard. ``--seed-replicates`` re-measures the placed point
+     under fresh seeds (report-only).
   7. attack trim + free-play style gate (per-weapon free-play hbw is a
      report card — decision 4)
   8. promote the staged config ONLY on gate PASS (no emit-despite-FAIL),
@@ -29,16 +49,19 @@ emits the report only — the Phase-1 acceptance path.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
-from qnn.decode_fit import design, events, human_refs, response
-from qnn.decode_fit.context import (INTERCEPT_WEAPONS, WEAPON_IMPULSE,
+from qnn.decode_fit import design, events, human_refs, live_pins, response
+from qnn.decode_fit.context import (INSTRUMENT_WEAPONS, INTERCEPT_WEAPONS,
+                                    MODELNAME_TO_ABBR, TRANSFER_ALIAS,
+                                    WEAPON_IMPULSE,
                                     FitContext, read_json, rel_to_repo,
-                                    resolve_fit_context)
+                                    calibration_members, resolve_fit_context)
 
 _log = lambda m: print(f"[decode-fit] {m}", flush=True)  # noqa: E731
 
@@ -48,7 +71,11 @@ ACQ_TARGET_PCT = 50.0
 
 
 def parse_skill_vector(spec: str) -> dict[str, float] | str:
-    """``native`` | ``p90`` (uniform) | ``SG=p90,RL=p75,...`` (per-weapon)."""
+    """``native`` | ``p90`` | explicit family coordinates.
+
+    SG/SSG and NG/SNG are indivisible fit coordinates. Naming either member
+    expands to both; contradictory coordinates for a family fail loud.
+    """
     spec = str(spec).strip()
     if spec.lower() == "native":
         return "native"
@@ -68,11 +95,18 @@ def parse_skill_vector(spec: str) -> dict[str, float] | str:
         k, _, v = tok.partition("=")
         if k.strip() not in WEAPON_IMPULSE:
             raise ValueError(f"unknown weapon in --skill spec: {k!r}")
-        out[k.strip()] = _pct(v)
+        weapon, pct = k.strip(), _pct(v)
+        for member in calibration_members(weapon):
+            if member in out and abs(out[member] - pct) > 1e-9:
+                family = "+".join(calibration_members(weapon))
+                raise ValueError(
+                    f"conflicting --skill coordinates for {family}: "
+                    f"p{out[member]:g} vs p{pct:g}")
+            out[member] = pct
     return out
 
 
-# ── stage 1: invariant pins (fire-rate before any skill sweep) ───────────────
+# ── non-lever pins (emit-time calibrations that are not wave levers) ─────────
 
 def move_commit_pins(ctx: FitContext) -> dict[str, Any]:
     """The move-commit dur_tilt calibration (teacher-forced CPU fit, cached by
@@ -90,51 +124,30 @@ def move_commit_pins(ctx: FitContext) -> dict[str, Any]:
     from qnn.eval.move_commit_fit import fit_dur_tilt
     _log("move-commit dur_tilt cache miss — running the teacher-forced fit "
          "(~10-15 min)")
-    doc = fit_dur_tilt(ctx.run_dir)
+    doc = fit_dur_tilt(ctx.run_dir, cache_dir=ctx.corpus_dir)
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(doc, indent=1) + "\n")
     return {"move.commit_dur_tilt": [float(x) for x in doc["dur_tilt"]]}
 
 
-def invariant_pins(ctx: FitContext) -> dict[str, Any]:
-    """qnn.bc.decode_fit.fit's pin dict, manifest-cached. The attack.* subset
-    is baked into every wave substrate so the closed-loop discharge sample is
-    fired at a human-calibrated rate (invariants-before-skills, d46104d7)."""
-    key = ctx.content_key(stage="pins")
-    cached = ctx.manifest_get("pins", key)
-    if cached is not None:
-        return read_json(cached)
-    from qnn.bc import decode_fit as bc_fit
-    template = Path(__file__).resolve().parents[2] / "qnn" / "model" / "bench" \
-        / "templates" / "decode.a25base.json"
-    res = bc_fit.fit(ctx.run_dir, template)
-    fit = res.get("fit") if isinstance(res, dict) else None
-    if not fit:
-        _log("WARNING: pin fit unavailable — waves run on the bare-head rate "
-             "(under-fired weapons will rest on a thin sample)")
-        return {}
-    out = ctx.out_dir / "_pins_fit.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(fit, indent=2) + "\n")
-    ctx.manifest_put("pins", out, key)
-    return fit
-
-
-def _wave_substrate(ctx: FitContext, pins: dict[str, Any]) -> dict[str, Any]:
+def _wave_substrate(ctx: FitContext) -> dict[str, Any]:
     """The shared wave substrate: a25 base template, aim levers OFF (per-lane
-    overrides carry the full operating point), fire-rate invariant baked."""
+    overrides carry the full operating point), attack operating point NATIVE —
+    the template's zero legacy/joint and explicit fire/preference vectors plus
+    default ``weapon.switch_margin``
+    stand until the live-pins round bakes its fitted bias vector (no offline
+    pins: qnn.decode_fit.live_pins)."""
     template = Path(__file__).resolve().parents[2] / "qnn" / "model" / "bench" \
         / "templates" / "decode.a25base.json"
     base = read_json(template)
     base.setdefault("params", {})
     base["params"]["look.aim_prior_gain"] = 0.0
     base["params"]["look.aim_mag_gain"] = 0.0
-    base["params"].update({k: v for k, v in pins.items() if k.startswith("attack.")})
     base["version"] = f"decodefit-v2-substrate-{ctx.model_id[:24]}"
     return base
 
 
-# ── stage 2: acquisition (tms) ────────────────────────────────────────────────
+# ── stage 1: acquisition (tms) ────────────────────────────────────────────────
 
 def fit_tms(ctx: FitContext, substrate: dict, ledger: design.BudgetLedger,
             *, target_pct: float = ACQ_TARGET_PCT) -> dict[str, Any]:
@@ -142,6 +155,7 @@ def fit_tms(ctx: FitContext, substrate: dict, ledger: design.BudgetLedger,
     band = human_refs.acquisition_band(ctx.acq_path)
     tms_values = list(design.ACQ_TMS)
     charged: set[float] = set()
+    rep_dirs: list[Path] = []        # one seed-replicate extension, ever
     for _round in range(4):          # bracket-extension loop (NO CLAMP)
         # charge only the NEW tms levels — resume-skip reuses done waves
         new = [v for v in tms_values if v not in charged]
@@ -152,14 +166,32 @@ def fit_tms(ctx: FitContext, substrate: dict, ledger: design.BudgetLedger,
         charged.update(new)
         dirs = instruments.run_acq_waves(
             ctx, tms_values, substrate,
-            episodes_per_cell=design.ACQ_EPISODES_PER_CELL)
+            episodes_per_cell=design.ACQ_EPISODES_PER_CELL) + rep_dirs
         rows = instruments.collect_acq_throughput(ctx, dirs)
         fit = response.fit_acquisition(rows, band, target_pct=target_pct)
+        if fit["unfittable"] and fit["acq_marginal"] and not rep_dirs:
+            # marginal ≠ dead: the lever moved the axis but not decisively.
+            # Spend ONE seed-replicate extension (never a guess) and refit.
+            _log(f"acq corr marginal ({fit['tms_throughput_corr']}, raw "
+                 f"{fit['tms_throughput_corr_raw']}) — one seed-replicate "
+                 "extension")
+            ledger.charge(f"acq-seedrep[{len(tms_values)}tms]",
+                          len(design.plan_acq_round(tuple(tms_values))),
+                          design.ACQ_EPISODES_PER_CELL, ci_extension=True)
+            rep_dirs = instruments.run_acq_waves(
+                ctx, tms_values, substrate,
+                episodes_per_cell=design.ACQ_EPISODES_PER_CELL,
+                tag="acqr1", seed_extra=1)
+            rows = instruments.collect_acq_throughput(ctx, dirs + rep_dirs)
+            fit = response.fit_acquisition(rows, band, target_pct=target_pct)
         if fit["unfittable"]:
             raise RuntimeError(
-                f"acquisition NOT fittable: tms↔throughput corr "
-                f"{fit['tms_throughput_corr']} — the instrument produced no "
-                "target-free flicks (face-away spawn missing?)")
+                "acquisition NOT fittable: settled-weighted tms↔throughput "
+                f"corr {fit['tms_throughput_corr']} (raw "
+                f"{fit['tms_throughput_corr_raw']}"
+                + (", after a seed-replicate extension" if rep_dirs else "")
+                + ") — the lever does not move the axis "
+                "(face-away spawn missing?)")
         if fit["sweep_floor_bound"] and min(tms_values) > TMS_RANGE[0] + 1e-9:
             lo = max(TMS_RANGE[0], min(tms_values) - TMS_EXTEND_STEP)
             _log(f"acq sweep floor-bound; extending down to {lo}")
@@ -179,7 +211,7 @@ def fit_tms(ctx: FitContext, substrate: dict, ledger: design.BudgetLedger,
 def _fit_all_gains(table: events.EventTable, pinw: dict, tms_ref: float
                    ) -> dict[str, response.GainResponse]:
     fits = {}
-    for abbr in ("SG", "NG", "RL", "LG"):
+    for abbr in (MODELNAME_TO_ABBR[w] for w in INSTRUMENT_WEAPONS):
         fits[abbr] = response.fit_gain_response(
             table, abbr, pin_weights=pinw.get(abbr), tms_ref=tms_ref)
     return fits
@@ -191,8 +223,11 @@ def run_intercept_rounds(ctx: FitContext, substrate: dict, tms_star: float,
                          alpha_cap: float | None = None,
                          ) -> dict[str, Any]:
     from qnn.decode_fit import instruments
-    ladder = human_refs.perweapon_human_ladder(ctx.intercept_path)
-    reach = human_refs.reachable_band(ctx.intercept_path)
+    # THE aim ladder rides the window-sampled TRACKING statistic (trigger-
+    # free; decode-fit-v2 addendum 7/18) — at-discharge intercept remains the
+    # report card + crest-capture reference, never the placement target.
+    ladder = human_refs.perweapon_human_ladder(ctx.tracking_path)
+    reach = human_refs.reachable_band(ctx.tracking_path)
     pinw = human_refs.range_pin_weights(ctx.range_path)
 
     def _cells(plan_rows: list[dict]) -> list:
@@ -217,7 +252,7 @@ def run_intercept_rounds(ctx: FitContext, substrate: dict, tms_star: float,
                "tag": "edgescreen"}],
         substrate)
     dirs = grouped["screen"] + grouped["edgescreen"]
-    table = instruments.collect_events(dirs)
+    table = instruments.collect_tracking(dirs)
     gain_fits = _fit_all_gains(table, pinw, tms_ref=1.0)
     plans0 = response.build_plan(gain_fits, {}, None, ladder, reach, targets,
                                  tms=tms_star)
@@ -228,7 +263,7 @@ def run_intercept_rounds(ctx: FitContext, substrate: dict, tms_star: float,
     dirs += instruments.run_botpin_waves(
         ctx, _cells(extend), substrate,
         episodes_per_cell=design.EPISODES_PER_CELL, tag="extend")
-    table = instruments.collect_events(dirs)
+    table = instruments.collect_tracking(dirs)
     gain_fits = _fit_all_gains(table, pinw, tms_ref=1.0)
     alpha_fits = {a: response.fit_alpha_response(
         table, a, pinned_gain=gain_fits[a].knee(0.95)[0],
@@ -262,7 +297,7 @@ def run_intercept_rounds(ctx: FitContext, substrate: dict, tms_star: float,
             dirs += instruments.run_botpin_waves(
                 ctx, _cells(extra), substrate,
                 episodes_per_cell=design.EPISODES_PER_CELL * 2, tag="ciext")
-            table = instruments.collect_events(dirs)
+            table = instruments.collect_tracking(dirs)
             gain_fits = _fit_all_gains(table, pinw, tms_ref=1.0)
             # the knee may have moved past the old α anchor — re-pin the rays
             alpha_fits = {a: response.fit_alpha_response(
@@ -288,7 +323,7 @@ def run_intercept_rounds(ctx: FitContext, substrate: dict, tms_star: float,
         dirs += instruments.run_botpin_waves(
             ctx, _cells(re_cells), substrate,
             episodes_per_cell=design.EPISODES_PER_CELL, tag="alphaanchor")
-        table = instruments.collect_events(dirs)
+        table = instruments.collect_tracking(dirs)
         for abbr in re_abbrs:
             g_star = plans[abbr].gain
             near = table.filter(
@@ -313,32 +348,30 @@ def run_seed_replicates(ctx: FitContext, substrate: dict, tms_star: float,
                         plans: dict[str, Any], state: dict[str, Any],
                         ledger: design.BudgetLedger, *, n: int
                         ) -> dict[str, Any]:
-    """CHEAP-TIER multi-seed rigor (Brian 2026-07-17): re-measure the
-    CONFIRMED placement under ``n`` fresh base seeds and report the spread —
-    never gating. The fit itself is deterministic (content-keyed waves,
-    derived seeds), so its OWN reruns cannot expose sampling sensitivity;
-    each replicate here re-runs the confirmation cells with a distinct seed
+    """Report-only multi-seed re-measurement of the PLACED operating point
+    (Brian 2026-07-17/18): the fit is multi-seed by construction (per-wave
+    content-derived eval seeds), so these replicates are the out-of-sample
+    spread check — each re-runs the placement cells with a distinct seed
     salt (``seed_extra`` → +r·104729 on every wave's eval seed) and scores
-    them against the promoted plans on the confirmation instrument. All
-    replicates ride ONE worker pool (one wall-time round-trip)."""
+    them against the plans' promises. Never gating. All replicates ride ONE
+    worker pool (one wall-time round-trip)."""
     from qnn.decode_fit import gates, instruments
-    cells_raw = design.plan_confirmation_round(plans, tms_star,
-                                               state["pin_weights"])
+    cells_raw = design.plan_placement_round(plans, tms_star)
     cells = [instruments.Cell(model_weapon=c["model_weapon"],
                               frikbot_pin=c["frikbot_pin"], op=c["op"])
              for c in cells_raw]
     ledger.charge(f"seed-replicates x{n}", len(cells) * n,
-                  design.CONFIRM_EPISODES_PER_CELL, ci_extension=True)
+                  design.PLACEMENT_EPISODES_PER_CELL, ci_extension=True)
     grouped = instruments.run_botpin_wave_groups(
         ctx, [{"cells": cells,
-               "episodes_per_cell": design.CONFIRM_EPISODES_PER_CELL,
+               "episodes_per_cell": design.PLACEMENT_EPISODES_PER_CELL,
                "tag": f"seedrep{r}", "seed_extra": r}
               for r in range(1, n + 1)],
         substrate)
     rows: list[dict[str, Any]] = []
     for r in range(1, n + 1):
-        table = instruments.collect_events(grouped[f"seedrep{r}"])
-        g = gates.confirmation_gate(table, plans, state["ladder"])
+        table = instruments.collect_tracking(grouped[f"seedrep{r}"])
+        g = gates.measure_placement(table, plans, state["ladder"])
         rows.append({"replicate": r, "status": g["status"],
                      "weapons": {w: {"measured_hbw_median":
                                      c.get("measured_hbw_median"),
@@ -360,55 +393,7 @@ def run_seed_replicates(ctx: FitContext, substrate: dict, tms_star: float,
     return {"n": n, "seed_salt_stride": 104729, "rows": rows,
             "hbw_spread": spread,
             "note": ("report-only sampling-robustness replicates of the "
-                     "confirmation instrument — never gating")}
-
-
-# ── stage 6: confirmation (+ one secant correction) ──────────────────────────
-
-def run_confirmation(ctx: FitContext, substrate: dict, tms_star: float,
-                     state: dict[str, Any], ledger: design.BudgetLedger
-                     ) -> dict[str, Any]:
-    from qnn.decode_fit import gates, instruments
-    plans = state["plans"]
-    prev_plans = prev_gate = None
-    for attempt in (1, 2, 3):
-        cells_raw = design.plan_confirmation_round(plans, tms_star,
-                                                   state["pin_weights"])
-        cells = [instruments.Cell(model_weapon=c["model_weapon"],
-                                  frikbot_pin=c["frikbot_pin"], op=c["op"])
-                 for c in cells_raw]
-        ledger.charge(f"confirm#{attempt}", len(cells),
-                      design.CONFIRM_EPISODES_PER_CELL,
-                      ci_extension=attempt > 1)
-        dirs = instruments.run_botpin_waves(
-            ctx, cells, substrate,
-            episodes_per_cell=design.CONFIRM_EPISODES_PER_CELL,
-            tag=f"confirm{attempt}")
-        table = instruments.collect_events(dirs)
-        gate = gates.confirmation_gate(table, plans, state["ladder"])
-        if gate["status"] == "PASS" or attempt == 3:
-            return {"gate": gate, "plans": plans, "attempt": attempt}
-        if attempt == 1:
-            corrected = gates.secant_correction(
-                plans, gate, state["gain_fits"], state["alpha_fits"],
-                tremor_fit=state["tremor_fit"],
-                support_elite=human_refs.support_elite_bounds(
-                    ctx.intercept_path))
-            note = "one damped secant correction"
-        else:
-            # third attempt only off two MEASURED points on the same ray —
-            # unchanged weapons' waves are content-keyed cache hits, so the
-            # extra round costs only the failed weapons' cells
-            corrected = gates.empirical_correction(
-                prev_plans, prev_gate, plans, gate,
-                tremor_fit=state["tremor_fit"])
-            note = "one empirical (measured-ray) correction"
-        if corrected is None:
-            return {"gate": gate, "plans": plans, "attempt": attempt}
-        _log(f"confirmation miss — applying {note}")
-        prev_plans, prev_gate = plans, gate
-        plans = corrected
-    return {"gate": gate, "plans": plans, "attempt": attempt}
+                     "placement instrument — never gating")}
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -418,13 +403,48 @@ def _anchor_stamp(ctx: FitContext) -> dict[str, Any]:
     §16.3): version + per-weapon values, selected depths, and the loud flags
     (unvalidated / family_borrowed / shrunk) a report reader must see before
     trusting any band-coordinate number in this fit."""
-    node = human_refs.placement_anchors(ctx.intercept_path)
+    node = human_refs.placement_anchors(ctx.tracking_path)
     keep = ("elite_hbw", "floor_hbw", "elite_depth", "floor_depth",
             "elite_validated", "floor_validated", "reliability_sb",
             "half_log_r", "unvalidated", "family_borrowed", "shrunk")
     return {"anchors_version": node.get("anchors_version"),
             "weapons": {w: {k: e.get(k) for k in keep}
                         for w, e in (node.get("weapons") or {}).items()}}
+
+
+def _assign_rc_cmd(args) -> int:
+    """``--assign-rc``: mark a gate-promoted provisional config with its
+    earned rc name (emit.assign_rc) and exit. Source = ``--config``, else the
+    run's newest promoted config that has no rc assignment yet."""
+    from qnn.decode_fit import emit
+    from qnn.decode_fit.context import _REPO
+    src = args.config
+    if src is None:
+        out_dir = _REPO / "runs" / "decode_fit" / Path(args.run_dir).name
+        cands = []
+        for p in sorted(out_dir.glob("decode.*.json")):
+            if p.name.endswith(".staged.json"):
+                continue
+            prov = (read_json(p).get("provenance") or {})
+            if "promoted_utc" in prov and not prov.get("staged", True) \
+                    and not prov.get("rc_assigned") \
+                    and "rc_assigned_utc" not in prov:
+                cands.append(p)
+        if not cands:
+            _log(f"no unassigned promoted decode config under "
+                 f"{rel_to_repo(out_dir)} — a gate PASS promotes first, "
+                 f"then earns its rc name")
+            return 1
+        src = max(cands, key=lambda p: p.stat().st_mtime)
+    try:
+        target = emit.assign_rc(src, args.assign_rc, replace=args.replace,
+                                force=args.force)
+    except (ValueError, RuntimeError) as e:
+        _log(f"assign-rc refused: {e}")
+        return 1
+    _log(f"deploy consumes {rel_to_repo(target)} (deploy letter = this "
+         f"slot; it only advances once this config actually ships)")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -436,7 +456,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="run the free-play attack-trim + style gate "
                          "(needs --eval-template)")
     ap.add_argument("--eval-template", type=Path, default=None)
-    ap.add_argument("--version", default=None)
+    ap.add_argument("--version", default=None,
+                    help="override the staged config's PROVISIONAL version "
+                         "(ablation arms etc.). rc / bare-tier names are "
+                         "refused — they are earned post-pass via "
+                         "--assign-rc (src/docs/model-versioning.md)")
+    ap.add_argument("--assign-rc", default=None, metavar="aXXrcNx",
+                    help="assign an earned rc name to a gate-promoted "
+                         "config and exit (no fitting). Source = --config, "
+                         "or the run's latest unassigned promoted config")
+    ap.add_argument("--config", type=Path, default=None,
+                    help="explicit promoted decode config for --assign-rc")
+    ap.add_argument("--replace", action="store_true",
+                    help="with --assign-rc: overwrite an existing "
+                         "decode.<rc>.json — ONLY for re-emitting a "
+                         "superseded NEVER-deployed artifact")
     ap.add_argument("--acq-target", default=f"p{ACQ_TARGET_PCT:.0f}")
     ap.add_argument("--budget", type=int, default=design.MAX_EPISODES)
     ap.add_argument("--offline-retrofit", action="store_true",
@@ -449,14 +483,30 @@ def main(argv: list[str] | None = None) -> int:
                          "fitted-vs-native flag and becomes a training "
                          "target, not a skill ceiling.")
     ap.add_argument("--seed-replicates", type=int, default=0,
-                    help="after a PASSing confirmation, re-measure the "
-                         "confirmed placement under N fresh base seeds "
+                    help="after a PASSing placement gate, re-measure the "
+                         "placed operating point under N fresh base seeds "
                          "(report-only sampling-robustness check; one "
                          "worker-pool round-trip)")
     ap.add_argument("--force", action="store_true",
                     help="promote the config even on gate FAIL (debug only; "
                          "stamped into provenance)")
     args = ap.parse_args(argv)
+
+    from qnn.decode_fit import emit
+    if args.assign_rc:
+        return _assign_rc_cmd(args)
+    if args.write and not args.force and (not args.validate or args.eval_template is None):
+        ap.error(
+            "--write requires --validate and --eval-template: a decode config "
+            "cannot be promoted as playable without measuring its final-aim "
+            "fire rate, weapon occupancy/switching, and reactivity. Use --force "
+            "only for a stamped debug artifact.")
+    if args.version and emit.RESERVED_VERSION_RE.fullmatch(args.version):
+        ap.error(
+            f"--version {args.version}: rc / bare-tier names are EARNED, "
+            f"never pre-assigned — the fit stages under a provisional "
+            f"version; on gate PASS assign the name with --assign-rc "
+            f"(src/docs/model-versioning.md)")
 
     ctx = resolve_fit_context(args.run_dir)
     from qnn.human import ensure_from_collect
@@ -466,11 +516,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.offline_retrofit:
         return _offline_retrofit(ctx, args)
 
-    from qnn.decode_fit import emit, gates, instruments
+    from qnn.decode_fit import gates, instruments
     ledger = design.BudgetLedger(max_episodes=args.budget)
-    pins = invariant_pins(ctx)
-    substrate = _wave_substrate(ctx, pins)
+    substrate = _wave_substrate(ctx)
 
+    # ACQ first, on the NATIVE substrate: acquisition throughput is
+    # target-free (flick/settle geometry off the obs streams — no discharge
+    # in the ruler), so the attack operating point cannot starve it.
     acq_pct = parse_skill_vector(args.acq_target)
     acq_pct = ACQ_TARGET_PCT if isinstance(acq_pct, str) else \
         float(np.mean(list(acq_pct.values())))
@@ -478,6 +530,19 @@ def main(argv: list[str] | None = None) -> int:
     tms_star = float(tms_fit["turn_mag_scale"])
     _log(f"turn_mag_scale = {tms_star} (ci {tms_fit['tms_ci']}, "
          f"acq p{tms_fit['achieved_acq_percentile']}, in_band={tms_fit['in_band']})")
+
+    # LIVE PINS round 0 at the fitted dampener — the exact regime SCREEN runs
+    # at — before any gain arm is swept (invariants-before-skills, d46104d7;
+    # the invariant is now MEASURED in-regime instead of corpus-forward).
+    live = live_pins.fit_live_pins(ctx, substrate, tms_star, ledger)
+    _log("live pins: fire_bias_vec=" + str(live["fire_bias_vec"]) + "  " + " ".join(
+        f"{w}[{v['native_rate_per_s']:.2f}"
+        + (f"→{v['fitted_rate_per_s']:.2f}@{v['bias']:+.2f}"
+           f"/{v['secant_steps']}s]" if v["secant_steps"] else "]")
+        for w, v in sorted(live["weapons"].items())))
+    substrate = {**substrate,
+                 "params": {**substrate["params"],
+                            "attack.fire_bias_vec": live["fire_bias_vec"]}}
 
     sk = parse_skill_vector(args.skill)
     alpha_cap = args.alpha_cap if args.alpha_cap and args.alpha_cap > 0 else None
@@ -491,8 +556,7 @@ def main(argv: list[str] | None = None) -> int:
         ladder = state["ladder"]
         natives = {}
         for w in INTERCEPT_WEAPONS:
-            src = w if w in state["gain_fits"] else \
-                {"SSG": "SG", "SNG": "NG"}.get(w, w)
+            src = w if w in state["gain_fits"] else TRANSFER_ALIAS.get(w, w)
             natives[w] = round(human_refs.hbw_to_pct(
                 state["gain_fits"][src].native_at(tms_star), ladder[w]), 1)
         state["plans"] = response.build_plan(
@@ -504,10 +568,15 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"  {w}: band={p.band} gain={p.gain} α={p.alpha} pred={p.pred_hbw} "
              f"→ p{p.achieved_pct}{' REFUSED→frontier p%.1f' % p.frontier_pct if p.refused else ''}")
 
-    conf = run_confirmation(ctx, substrate, tms_star, state, ledger)
-    plans = conf["plans"]
-    gate = conf["gate"]
-    _log(f"confirmation: {gate['status']} (attempt {conf['attempt']})")
+    # No confirmation round: the placement gate rides the fit's OWN bootstrap
+    # CIs — the fit must be representative (all-pin, mix-weighted, per-wave
+    # seeds) and honest about uncertainty, or it fails here, loud.
+    plans = state["plans"]
+    gate = gates.placement_gate(plans, state["gain_fits"], state["ladder"])
+    _log(f"placement gate: {gate['status']}"
+         + (f" — failed {gate['failed']}: " + "; ".join(
+             f"{w}[{', '.join((gate['weapons'][w].get('fail_reasons') or ['band miss']))}]"
+             for w in gate["failed"]) if gate["failed"] else ""))
 
     seed_reps: dict[str, Any] | None = None
     if args.seed_replicates > 0 and gate["status"] == "PASS":
@@ -515,17 +584,57 @@ def main(argv: list[str] | None = None) -> int:
                                         state, ledger,
                                         n=int(args.seed_replicates))
 
+    # crest capture (model): at-discharge vs window-tracking medians over the
+    # SAME fit waves — the trigger-timing tax per weapon, pooled over all
+    # swept operating points (report card + the attack-head RL target; the
+    # human reference lives in _aim_tracking_window.json crest_capture:
+    # SG/RL ≈ 0.83-0.86, spray weapons ≈ 0.94-0.98; an alignment-blind
+    # trigger reads ≈ 1).
+    _disch = instruments.collect_events(state["wave_dirs"])
+    crest: dict[str, Any] = {}
+    for _w in sorted(set(p.alias_of or w for w, p in plans.items())):
+        _td = state["table"].where(weapon=_w)
+        _dd = _disch.where(weapon=_w)
+        if len(_td) and len(_dd):
+            _mt = float(np.median(_td["hbw"]))
+            _md = float(np.median(_dd["hbw"]))
+            crest[_w] = {"window_median_hbw": round(_mt, 4),
+                         "discharge_median_hbw": round(_md, 4),
+                         "capture_ratio": round(_md / max(_mt, 1e-9), 4)}
+    if crest:
+        _log("crest capture (model, pooled): " + "  ".join(
+            f"{w}={v['capture_ratio']}" for w, v in sorted(crest.items())))
+
+    def _fit_stamp(f) -> dict[str, Any]:
+        return {k: v for k, v in dataclasses.asdict(f).items() if k != "_boot"}
+
     result: dict[str, Any] = {
         "skill": args.skill,
-        "pct_basis": ("human sustained-band coordinate: log-hbw-linear "
-                      "between the collect's validated placement anchors "
-                      "(floor = p0, elite = p100; frozen selection procedure, "
-                      "skill-curves §16.3), per weapon — NOT a population "
-                      "percentile and NOT comparable across corpora"),
+        "pct_basis": ("human sustained-band coordinate on the WINDOW-SAMPLED "
+                      "TRACKING statistic (±k ticks around discharges, "
+                      "trigger-free; _aim_tracking_window.json): log-hbw-"
+                      "linear between the collect's validated placement "
+                      "anchors (floor = p0, elite = p100; frozen selection "
+                      "procedure, skill-curves §16.3), per calibration family "
+                      "(SG+SSG, NG+SNG, RL, LG) — NOT a "
+                      "population percentile, NOT comparable across corpora, "
+                      "and NOT comparable to pre-tracking (at-discharge) "
+                      "fits"),
         "placement_anchors": _anchor_stamp(ctx),
+        "live_pins": live,
         "tms_fit": tms_fit, "budget": ledger.as_dict(),
-        "confirmation": gate,
+        "placement_gate": gate,
+        # full fit diagnostics (n_boot_ok, knee CIs, pin offsets) — the gate
+        # rides these, so the report must carry them (the a26 first fit had
+        # no way to see its own degenerate CIs)
+        "fits": {
+            "gain": {a: _fit_stamp(f)
+                     for a, f in state["gain_fits"].items()},
+            "alpha": {a: _fit_stamp(f)
+                      for a, f in state["alpha_fits"].items() if f},
+        },
         **({"seed_replicates": seed_reps} if seed_reps else {}),
+        **({"crest_capture": crest} if crest else {}),
         "plans": {w: vars(p) for w, p in plans.items()},
         "provenance": ctx.provenance(),
     }
@@ -533,9 +642,19 @@ def main(argv: list[str] | None = None) -> int:
         _report(ctx, result, "REPORT-ONLY")
         return 0
 
-    version = args.version or f"{ctx.model_id}-v2-{str(args.skill).replace('=', '').replace(',', '_')}"
+    version = args.version or emit.provisional_version(ctx.model_id, args.skill)
     vectors = response.build_vectors(plans)
-    emit_pins = {**pins, **move_commit_pins(ctx)}   # + move-commit dur_tilt
+    # Non-lever pins: the live-fitted fire-only vector (the exact vector every
+    # wave ran on) + the move-commit dur_tilt. weapon.switch_margin is NOT
+    # pinned — the template default stands; switch-rate parity is owned by
+    # the free-play attack trim (gates.attack_trim) + its warm start.
+    emit_pins = {
+        "attack.bias_vec": [0.0] * 8,
+        "attack.fire_bias_vec": live["fire_bias_vec"],
+        "weapon.preference_bias_vec": [0.0] * 8,
+        "attack.vector_semantics": "split_v1",
+        **move_commit_pins(ctx),
+    }
     staged = emit.stage_decode_config(ctx, plans, vectors, emit_pins, tms_star,
                                       version)
     result["staged"] = rel_to_repo(staged)
@@ -557,10 +676,13 @@ def main(argv: list[str] | None = None) -> int:
             _native = trim.get("native_npz")
             style = gates.style_gate(
                 ctx, Path(npz), plans,
-                native_npz=Path(_native) if _native else None)
+                native_npz=Path(_native) if _native else None,
+                selection_target=trim.get("selection_target"))
     result["style_gate"] = style
 
-    passed = gate["status"] == "PASS" and style.get("status") in ("PASS", "SKIPPED")
+    trim_ok = result.get("attack_trim", {}).get("status") == "CONVERGED"
+    passed = (gate["status"] == "PASS" and trim_ok
+              and style.get("status") == "PASS")
     _flags = (style.get("style_spend") or {}).get("flags") or []
     try:
         promoted = emit.promote_decode_config(staged, gate_passed=passed,
@@ -568,8 +690,6 @@ def main(argv: list[str] | None = None) -> int:
                                               style_flags=_flags)
         result["config"] = rel_to_repo(promoted)
         label = "PASS" if passed else "FORCED"
-        if style.get("status") == "SKIPPED":
-            label = "PASS-PENDING-VALIDATION" if passed else label
     except RuntimeError as e:
         result["promote_refused"] = str(e)
         label = "FAIL"
@@ -588,6 +708,8 @@ def _offline_retrofit(ctx: FitContext, args: argparse.Namespace) -> int:
     if not tables:
         raise FileNotFoundError(f"no legacy grids for {ctx.model_id}")
     table = events.EventTable.concat(tables)
+    # legacy v1 grids are AT-DISCHARGE cell medians — the retrofit keeps the
+    # at-discharge ladder (statistic consistency; report-only legacy path)
     ladder = human_refs.perweapon_human_ladder(ctx.intercept_path)
     reach = human_refs.reachable_band(ctx.intercept_path)
     pinw = human_refs.range_pin_weights(ctx.range_path)
@@ -599,7 +721,7 @@ def _offline_retrofit(ctx: FitContext, args: argparse.Namespace) -> int:
     sk = parse_skill_vector(args.skill)
     targets = sk if isinstance(sk, dict) else {
         w: round(human_refs.hbw_to_pct(
-            gain_fits.get(w, gain_fits.get({"SSG": "SG", "SNG": "NG"}.get(w, w))).native,
+            gain_fits.get(w, gain_fits.get(TRANSFER_ALIAS.get(w, w))).native,
             ladder[w]), 1) for w in INTERCEPT_WEAPONS}
     plans = response.build_plan(gain_fits, {}, None, ladder, reach, targets, tms=tms)
     result = {

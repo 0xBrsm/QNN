@@ -83,7 +83,7 @@ SCALAR_FIELDS: dict[str, ScalarSpec] = {
     # as one ScalarGroup so legacy self_proj weights map 1:1 into TokenBuilder.
     "self_scalars":     _slice("self_scalars",     "self_scalars",          0, SELF_SCALAR_DIM),
     # Prefer the canonical post-dequant subtoken tensors over slicing the
-    # legacy 17-wide self_scalars (less index-fragile).
+    # flat 18-wide self_scalars (less index-fragile).
     "health_armor":    _slice("health_armor",    "self_state_scalars",   0, 2),
     "attack_finished": _slice("attack_finished", "self_arsenal_scalars", 0, 1),
     "velocity":        _slice("velocity",         "self_motion_scalars",  0, 3),

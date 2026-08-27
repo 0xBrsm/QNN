@@ -1,12 +1,12 @@
 services:
   qnn-live:
-    image: ${QNN_LIVE_IMAGE_TAG:-qnn-live:arm64}
-    platform: linux/arm64
+    image: ${QNN_LIVE_IMAGE_TAG:-qnn-live:amd64}
+    platform: linux/amd64
     build:
       context: ../..
       dockerfile: src/docker/Dockerfile.live
       platforms:
-        - linux/arm64
+        - linux/amd64
     working_dir: /app
     volumes:
       - type: bind

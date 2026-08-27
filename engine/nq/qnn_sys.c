@@ -243,8 +243,8 @@ const char *QNN_ProgString(string_t value)
 }
 
 /* QNN_TraceLine (NQ) — forwards to upstream's SV_RecursiveHullCheck from
- * world.c, then clips the same segment against every solid mover brush
- * submodel at its live origin so movers occlude like static geometry
+ * world.c, then clips the same segment against every blocking brush
+ * submodel at its live origin so entities occlude like static geometry
  * (spatial rays shorten at a door face; an enemy behind a closed door
  * drops from SIGHT).  Shared declaration in qnn_object.h. */
 void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
@@ -272,7 +272,7 @@ void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
 	SV_RecursiveHullCheck(cl.worldmodel->hulls, 0, 0, 1,
 		(float *)start, (float *)end, trace);
 
-	/* Clip against solid movers at their live origins.  The mover set is
+	/* Clip against blocking brushes at their live origins.  The set is
 	 * cached once per observation frame (QNN_TraceMoverCacheRefresh), so
 	 * this loop adds no re-scan per ray.  When no mover intersects nearer
 	 * than the world trace, `trace` is left exactly as world.c produced
@@ -305,4 +305,71 @@ void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
 			VectorMA(start, mt.fraction, delta, trace->endpos);
 		}
 	}
+	QNN_TraceStaticBlockers(start, end, false, trace);
+}
+
+/* QNN_TraceClearance (NQ) — hull-1 line trace carrying the hit plane.
+ * Contract in qnn_object.h.  Structure mirrors QNN_TraceLine; deltas:
+ * clip hull 1 instead of hull 0, and the mover branch copies mt.plane
+ * through, translating the mover-local plane to world
+ * (dist' = dist + n·origin).  The world path needs no copy —
+ * SV_RecursiveHullCheck writes trace->plane directly. */
+void QNN_TraceClearance(const vec3_t start, const vec3_t end, trace_t *trace)
+{
+	hull_t *hull;
+	int mover_count;
+	int i;
+
+	if (trace == NULL)
+		return;
+	memset(trace, 0, sizeof(*trace));
+	if (cl.worldmodel == NULL)
+	{
+		trace->fraction = 1.0f;
+		VectorCopy(end, trace->endpos);
+		return;
+	}
+	/* Seed fraction=1 — SV_RecursiveHullCheck only writes it on a hit
+	 * (same convention note as QNN_TraceLine above). */
+	trace->fraction = 1.0f;
+	hull = &cl.worldmodel->hulls[1];
+	if (hull->clipnodes == NULL || hull->planes == NULL)
+		hull = &cl.worldmodel->hulls[0]; /* degenerate map — point fallback */
+	SV_RecursiveHullCheck(hull, hull->firstclipnode, 0, 1,
+		(float *)start, (float *)end, trace);
+
+	mover_count = QNN_TraceMoverCacheRefresh();
+	for (i = 0; i < mover_count; i++)
+	{
+		model_t *m = QNN_TraceMoverModel(i);
+		float *origin = QNN_TraceMoverOrigin(i);
+		hull_t *mh;
+		trace_t mt;
+		vec3_t start_l, end_l;
+
+		if (m == NULL)
+			continue;
+		mh = &m->hulls[1];
+		if (mh->clipnodes == NULL || mh->planes == NULL)
+			mh = &m->hulls[0];
+		VectorSubtract(start, origin, start_l);
+		VectorSubtract(end, origin, end_l);
+		memset(&mt, 0, sizeof(mt));
+		mt.fraction = 1.0f;
+		SV_RecursiveHullCheck(mh, mh->firstclipnode, 0, 1,
+			start_l, end_l, &mt);
+		if (mt.fraction < trace->fraction)
+		{
+			vec3_t delta;
+			trace->fraction = mt.fraction;
+			trace->allsolid = mt.allsolid;
+			trace->startsolid = mt.startsolid;
+			VectorSubtract(end, start, delta);
+			VectorMA(start, mt.fraction, delta, trace->endpos);
+			VectorCopy(mt.plane.normal, trace->plane.normal);
+			trace->plane.dist = mt.plane.dist
+				+ DotProduct(mt.plane.normal, origin);
+		}
+	}
+	QNN_TraceStaticBlockers(start, end, true, trace);
 }

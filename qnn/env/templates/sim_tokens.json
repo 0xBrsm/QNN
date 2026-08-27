@@ -1,53 +1,45 @@
 {
   "_comment": [
-    "Full prod-shape token stream for qnn.env.sim.",
-    "Order matches transformer.py: self (0), spatial (1-9), action_history (10-11), entity (12-27).",
-    "Copy this file and edit — delete tokens you don't care about, change fields to hand-craft scenes.",
-    "Unspecified indices default to all-zero. Vocab fields accept text names from qnn/vocab.py."
+    "Production-shape scene template for qnn.env.sim.",
+    "Order matches transformer.py: self (0), spatial bands (1-11), entity (12-27).",
+    "Unspecified entity slots default to zero; copy and edit this file to hand-craft scenes.",
+    "Each spatial band token takes optional 'depth' (24 normalized depths, yaw cell 0 = forward,",
+    "counter-clockwise) and 'hit' (24 flags) arrays; omitted arrays stay zero."
   ],
 
   "tokens": [
     {
       "index": 0, "kind": "self",
-      "health": 0.0, "armor": 0.0,
-      "weapon_sg": 0.0, "weapon_ssg": 0.0, "weapon_ng": 0.0, "weapon_sng": 0.0,
-      "weapon_gl": 0.0, "weapon_rl": 0.0, "weapon_lg": 0.0,
-      "ammo_shells": 0.0, "ammo_nails": 0.0, "ammo_rockets": 0.0, "ammo_cells": 0.0,
-      "vel": [0.0, 0.0, 0.0],
-      "weapon_id": "NONE",
-      "armor_type_id": "NONE",
-      "powerup_ids": [],
-      "movement_id": 0
+      "health": 1.0, "armor": 0.0,
+      "weapon_sg": 1.0, "weapon_ssg": 0.0, "weapon_ng": 0.0,
+      "weapon_sng": 0.0, "weapon_gl": 0.0, "weapon_rl": 0.0,
+      "weapon_lg": 0.0,
+      "ammo_shells": 0.5, "ammo_nails": 0.0,
+      "ammo_rockets": 0.0, "ammo_cells": 0.0,
+      "vel": [0.0, 0.0, 0.0], "view_pitch": 0.0,
+      "weapon_id": "SHOTGUN", "armor_type_id": "NONE",
+      "powerup_ids": [], "movement_id": 0
     },
 
-    {"index": 1, "kind": "spatial", "sector": "FOV_Center",  "dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
-    {"index": 2, "kind": "spatial", "sector": "FOV_Left",    "dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
-    {"index": 3, "kind": "spatial", "sector": "FOV_Right",   "dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
-    {"index": 4, "kind": "spatial", "sector": "Flank_Left",  "dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
-    {"index": 5, "kind": "spatial", "sector": "Flank_Right", "dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
-    {"index": 6, "kind": "spatial", "sector": "Rear_Left",   "dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
-    {"index": 7, "kind": "spatial", "sector": "Rear_Right",  "dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
-    {"index": 8, "kind": "spatial", "sector": "Ground_State","dir": [0,0,0], "nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
-    {"index": 9, "kind": "spatial", "sector": "Ceiling_State","dir": [0,0,0],"nearest_dist": 0, "mean_dist": 0, "openness": 0, "clearance": 0, "traversable": 0, "dropoff": 0, "solid_frac": 0, "water_frac": 0, "slime_frac": 0, "lava_frac": 0},
+    {"index": 1,  "kind": "spatial", "band": "Elev_n75"},
+    {"index": 2,  "kind": "spatial", "band": "Elev_n60"},
+    {"index": 3,  "kind": "spatial", "band": "Elev_n45"},
+    {"index": 4,  "kind": "spatial", "band": "Elev_n30"},
+    {"index": 5,  "kind": "spatial", "band": "Elev_n15"},
+    {"index": 6,  "kind": "spatial", "band": "Elev_0"},
+    {"index": 7,  "kind": "spatial", "band": "Elev_p15"},
+    {"index": 8,  "kind": "spatial", "band": "Elev_p30"},
+    {"index": 9,  "kind": "spatial", "band": "Elev_p45"},
+    {"index": 10, "kind": "spatial", "band": "Elev_p60"},
+    {"index": 11, "kind": "spatial", "band": "Elev_p75"},
 
-    {"index": 10, "kind": "action_history", "tick_back": 2, "move": [0,0,0], "look": [1,0,0], "attack": 0, "switch_norm": 0.0},
-    {"index": 11, "kind": "action_history", "tick_back": 1, "move": [0,0,0], "look": [1,0,0], "attack": 0, "switch_norm": 0.0},
-
-    {"index": 12, "kind": "entity", "type": "actor", "subject": "NONE", "modality": "NONE", "player_id": 0, "half_extents": [0,0,0], "rel": [0,0,0], "vel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "facing": 0, "team": 0, "score": 0, "recency": 0, "events": []},
-    {"index": 13, "kind": "entity", "type": "actor", "subject": "NONE", "modality": "NONE", "player_id": 0, "half_extents": [0,0,0], "rel": [0,0,0], "vel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "facing": 0, "team": 0, "score": 0, "recency": 0, "events": []},
-    {"index": 14, "kind": "entity", "type": "actor", "subject": "NONE", "modality": "NONE", "player_id": 0, "half_extents": [0,0,0], "rel": [0,0,0], "vel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "facing": 0, "team": 0, "score": 0, "recency": 0, "events": []},
-    {"index": 15, "kind": "entity", "type": "actor", "subject": "NONE", "modality": "NONE", "player_id": 0, "half_extents": [0,0,0], "rel": [0,0,0], "vel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "facing": 0, "team": 0, "score": 0, "recency": 0, "events": []},
-    {"index": 16, "kind": "entity", "type": "item",       "subject": "NONE", "modality": "NONE", "half_extents": [0,0,0], "rel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "amount": 0, "regen": 0, "recency": 0, "events": []},
-    {"index": 17, "kind": "entity", "type": "item",       "subject": "NONE", "modality": "NONE", "half_extents": [0,0,0], "rel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "amount": 0, "regen": 0, "recency": 0, "events": []},
-    {"index": 18, "kind": "entity", "type": "item",       "subject": "NONE", "modality": "NONE", "half_extents": [0,0,0], "rel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "amount": 0, "regen": 0, "recency": 0, "events": []},
-    {"index": 19, "kind": "entity", "type": "item",       "subject": "NONE", "modality": "NONE", "half_extents": [0,0,0], "rel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "amount": 0, "regen": 0, "recency": 0, "events": []},
-    {"index": 20, "kind": "entity", "type": "mover",      "subject": "NONE", "modality": "NONE", "half_extents": [0,0,0], "rel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "state": 0, "recency": 0, "events": []},
-    {"index": 21, "kind": "entity", "type": "mover",      "subject": "NONE", "modality": "NONE", "half_extents": [0,0,0], "rel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "state": 0, "recency": 0, "events": []},
-    {"index": 22, "kind": "entity", "type": "projectile", "subject": "NONE", "modality": "NONE", "rel": [0,0,0], "vel": [0,0,0], "recency": 0, "events": []},
-    {"index": 23, "kind": "entity", "type": "projectile", "subject": "NONE", "modality": "NONE", "rel": [0,0,0], "vel": [0,0,0], "recency": 0, "events": []},
-    {"index": 24, "kind": "entity", "type": "projectile", "subject": "NONE", "modality": "NONE", "rel": [0,0,0], "vel": [0,0,0], "recency": 0, "events": []},
-    {"index": 25, "kind": "entity", "type": "projectile", "subject": "NONE", "modality": "NONE", "rel": [0,0,0], "vel": [0,0,0], "recency": 0, "events": []},
-    {"index": 26, "kind": "entity", "type": "actor", "subject": "NONE", "modality": "NONE", "player_id": 0, "half_extents": [0,0,0], "rel": [0,0,0], "vel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "facing": 0, "team": 0, "score": 0, "recency": 0, "events": []},
-    {"index": 27, "kind": "entity", "type": "actor", "subject": "NONE", "modality": "NONE", "player_id": 0, "half_extents": [0,0,0], "rel": [0,0,0], "vel": [0,0,0], "path": [0,0,0], "path_dist": 0, "eta": 0, "facing": 0, "team": 0, "score": 0, "recency": 0, "events": []}
+    {
+      "index": 12, "kind": "entity", "type": "actor",
+      "subject": "PLAYER", "modality": "SIGHT", "player_id": 1,
+      "half_extents": [16,16,24], "rel": [256,64,0],
+      "vel": [0,0,0], "path": [256,64,0], "path_dist": 264,
+      "eta": 0, "facing": 0, "team": 0, "score": 0,
+      "recency": 0, "events": [], "target": true
+    }
   ]
 }

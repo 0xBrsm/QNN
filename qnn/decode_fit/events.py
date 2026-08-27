@@ -194,6 +194,200 @@ def load_waves(wave_dirs: Iterable[Path]) -> EventTable:
     return EventTable.concat([wave_event_table(d) for d in wave_dirs])
 
 
+# ── tracking windows (the trigger-free aim statistic) ─────────────────────────
+
+TRACKING_WINDOWS_NPZ = "intercept_windows.npz"        # under <run>/metrics/eval/
+# frozen window half-width (20Hz ticks): part of the instrument definition —
+# matches the human baseline's K_ANCHOR (qnn.human.tracking; ±200 ms ≈ one
+# tracking-oscillation period). Changing it re-anchors the ladder.
+TRACKING_K = 4
+
+
+def _load_window_npz(wave_dir: Path) -> dict[str, np.ndarray]:
+    """The validated raw ``intercept_windows.npz`` arrays for one wave. FAILS
+    LOUD when the npz is absent or built at k != TRACKING_K — a pin wave
+    without windows predates the tracking instrument and must be rebuilt (the
+    env signature enforces this; absence is never an empty table)."""
+    p = Path(wave_dir) / "metrics" / "eval" / TRACKING_WINDOWS_NPZ
+    if not p.exists():
+        raise FileNotFoundError(
+            f"{p} missing — the wave predates the tracking-window instrument "
+            f"(QNN_EVAL_INTERCEPT_WINDOW={TRACKING_K}); rebuild the wave")
+    with np.load(p, allow_pickle=False) as z:
+        if int(z["k"]) != TRACKING_K:
+            raise ValueError(
+                f"{p}: window k={int(z['k'])} != frozen TRACKING_K="
+                f"{TRACKING_K} — rebuild the wave on this checkout")
+        if "tick" not in z:
+            raise ValueError(
+                f"{p}: pre-identity window schema (no tick/lane rows) — "
+                "rebuild the wave on this checkout")
+        return {k: z[k] for k in ("scenario_id", "weapon", "episode",
+                                  "env_idx", "tick", "hbw_win")}
+
+
+def wave_tracking_table(wave_dir: Path) -> EventTable:
+    """One wave run-dir → the WINDOW-SAMPLED alignment EventTable (the
+    trigger-free aim statistic; decode-fit-v2 addendum 2026-07-18). Each
+    ``intercept_windows.npz`` row is one discharge's ±k-tick hbw stream;
+    rows explode into per-tick samples, deduped across overlapping burst
+    windows by nearest-discharge (the human baseline's rule), annotated with
+    the lane operating point exactly like discharge events. ``hbw`` is the
+    window-tick alignment; clusters stay (run, lane, episode)."""
+    wave_dir = Path(wave_dir)
+    raw = _load_window_npz(wave_dir)
+    n = len(raw["tick"])
+    if n == 0:
+        return EventTable()
+    k = TRACKING_K
+    hbw_win = raw["hbw_win"].astype(np.float64)        # (n, 2k+1)
+    offs = np.arange(-k, k + 1, dtype=np.int64)
+    abs_tick = raw["tick"].astype(np.int64)[:, None] + offs[None, :]
+    fin = np.isfinite(hbw_win)
+    # nearest-discharge dedup over overlapping burst windows: for identical
+    # (lane, episode, abs_tick) keep the smallest |offset| (its anchor is the
+    # nearest discharge); ties → earlier row. One sample per real tick.
+    lane = raw["env_idx"].astype(np.int64)[:, None]
+    epi = np.maximum(raw["episode"].astype(np.int64), 0)[:, None]
+    key = ((lane << 44) + (epi << 24) + abs_tick).ravel()
+    a_off = np.abs(np.broadcast_to(offs[None, :], hbw_win.shape)).ravel()
+    row_i = np.broadcast_to(np.arange(n)[:, None], hbw_win.shape).ravel()
+    valid = np.flatnonzero(fin.ravel())      # finite FIRST, then dedup — a
+    if not len(valid):                       # NaN slot must never shadow a
+        return EventTable()                  # finite duplicate of its tick
+    order = valid[np.lexsort((row_i[valid], a_off[valid], key[valid]))]
+    sk = key[order]
+    first = np.ones(len(sk), bool)
+    first[1:] = sk[1:] != sk[:-1]
+    sel = order[first]
+    ops = _lane_ops(wave_dir)
+    sid = raw["scenario_id"].astype("U64")
+    unknown = ~np.isin(sid, list(ops))
+    if unknown.any():
+        raise ValueError(
+            f"{wave_dir}: {int(unknown.sum())} window rows carry scenario_ids "
+            "absent from config/scenario.json — wave dir is inconsistent, "
+            "rebuild it")
+    r = sel // hbw_win.shape[1]
+    cols: dict[str, np.ndarray] = {
+        "weapon": raw["weapon"].astype("U8")[r],
+        "hbw": hbw_win.ravel()[sel],
+        "range_u": np.full(len(sel), np.nan),
+        "cluster": _cluster_ids(wave_dir.name, raw["env_idx"][r],
+                                raw["episode"][r]),
+        "weight": np.ones(len(sel), dtype=np.float64),
+        "is_median": np.zeros(len(sel), dtype=bool),
+    }
+    for kk in OP_KEYS + ("pin",):
+        default = "" if kk == "pin" else np.nan
+        vals = [ops.get(str(s), {}).get(kk, default) for s in sid[r]]
+        cols[kk] = (np.array(vals, dtype="U8") if kk == "pin"
+                    else np.array(vals, dtype=np.float64))
+    return EventTable(cols)
+
+
+def load_waves_tracking(wave_dirs: Iterable[Path]) -> EventTable:
+    return EventTable.concat([wave_tracking_table(d) for d in wave_dirs])
+
+
+# ── crest windows (the θ-replay sample unit) ─────────────────────────────────
+# The SAME npz, read the other way round: ``wave_tracking_table`` explodes each
+# window into per-tick samples (the trigger-free aim statistic, all 2k+1 slots,
+# deduped across overlapping bursts); the crest arm instead keeps each row
+# WHOLE and only its FORWARD half, because the discharge-quality gate's
+# counterfactual is "given the head fired at t₀, which tick in [t₀, t₀+H] does
+# the latch actually release on?" — a per-discharge question, not a per-tick
+# one (agents/plans/discharge-quality-gate.md, "the window-replay estimator").
+
+CREST_WINDOW_COLS = ("weapon", "pin", "cluster", "tick", "weight") + OP_KEYS
+
+
+@dataclass
+class CrestWindowTable:
+    """Per-DISCHARGE forward alignment windows. ``fwd`` is ``(n, TRACKING_K+1)``
+    — hbw at t₀ (the fired tick, always finite: the eval only logs a window for
+    an operative in-LOS discharge) through t₀+TRACKING_K, NaN where the lane's
+    episode ended or LOS was lost. ``cols`` carries the same lane operating
+    point / cluster annotation as :class:`EventTable`, so both objects filter
+    to the same (gain, α, tremor, pin) cells and share bootstrap clusters."""
+    cols: dict[str, np.ndarray] = field(default_factory=dict)
+    fwd: np.ndarray = field(default_factory=lambda: np.empty((0, TRACKING_K + 1)))
+
+    def __len__(self) -> int:
+        return len(self.fwd)
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        return self.cols[name]
+
+    def filter(self, mask: np.ndarray) -> "CrestWindowTable":
+        return CrestWindowTable({k: v[mask] for k, v in self.cols.items()},
+                                self.fwd[mask])
+
+    def where(self, **eq: Any) -> "CrestWindowTable":
+        mask = np.ones(len(self), dtype=bool)
+        for k, v in eq.items():
+            mask &= (self.cols[k] == v)
+        return self.filter(mask)
+
+    @staticmethod
+    def concat(tables: "Iterable[CrestWindowTable]") -> "CrestWindowTable":
+        tables = [t for t in tables if len(t)]
+        if not tables:
+            return CrestWindowTable()
+        keys = set(tables[0].cols)
+        for t in tables[1:]:
+            if set(t.cols) != keys:
+                raise ValueError(f"CrestWindowTable column mismatch: "
+                                 f"{sorted(keys)} vs {sorted(t.cols)}")
+        return CrestWindowTable(
+            {k: np.concatenate([t.cols[k] for t in tables]) for k in keys},
+            np.concatenate([t.fwd for t in tables]))
+
+
+def wave_crest_windows(wave_dir: Path) -> CrestWindowTable:
+    """One wave run-dir → its per-discharge FORWARD windows. Same npz, same
+    validation, and the same lane-op annotation as ``wave_tracking_table``.
+    FAILS LOUD on a non-finite t₀ slot: the eval writes a window row only from
+    inside its ``_los_fired`` branch, where the lead geometry is finite by
+    construction, so a NaN there means a corrupt artifact, not a real state."""
+    wave_dir = Path(wave_dir)
+    raw = _load_window_npz(wave_dir)
+    n = len(raw["tick"])
+    if n == 0:
+        return CrestWindowTable()
+    fwd = raw["hbw_win"].astype(np.float64)[:, TRACKING_K:]
+    if not np.isfinite(fwd[:, 0]).all():
+        raise ValueError(
+            f"{wave_dir}: {int((~np.isfinite(fwd[:, 0])).sum())} window rows "
+            "have a non-finite hbw at the FIRED tick — the eval only emits a "
+            "window from its operative in-LOS discharge branch, so this npz is "
+            "corrupt; rebuild the wave")
+    ops = _lane_ops(wave_dir)
+    sid = raw["scenario_id"].astype("U64")
+    unknown = ~np.isin(sid, list(ops))
+    if unknown.any():
+        raise ValueError(
+            f"{wave_dir}: {int(unknown.sum())} window rows carry scenario_ids "
+            "absent from config/scenario.json — wave dir is inconsistent, "
+            "rebuild it")
+    cols: dict[str, np.ndarray] = {
+        "weapon": raw["weapon"].astype("U8"),
+        "cluster": _cluster_ids(wave_dir.name, raw["env_idx"], raw["episode"]),
+        "tick": raw["tick"].astype(np.int64),
+        "weight": np.ones(n, dtype=np.float64),
+    }
+    for k in OP_KEYS + ("pin",):
+        default = "" if k == "pin" else np.nan
+        vals = [ops.get(str(s), {}).get(k, default) for s in sid]
+        cols[k] = (np.array(vals, dtype="U8") if k == "pin"
+                   else np.array(vals, dtype=np.float64))
+    return CrestWindowTable(cols, fwd)
+
+
+def load_waves_crest(wave_dirs: Iterable[Path]) -> CrestWindowTable:
+    return CrestWindowTable.concat([wave_crest_windows(d) for d in wave_dirs])
+
+
 # ── legacy v1 grid adapter (Phase-1 retrofit only) ────────────────────────────
 
 def legacy_grid_table(grid_json: Path) -> EventTable:

@@ -1,21 +1,33 @@
 """Round planning — spend the episode budget where it buys decision-relevant
 information, not grid coverage.
 
-Three closed-loop rounds replace v1's five sweep campaigns (plan §P2, budget
-box ≤1500 episodes with auto-extend only on CI rejection — decision 2):
+The rounds (plan §P2, budget box ≤1500 episodes with auto-extend only on CI
+rejection — decision 2):
 
   * ACQ      : face-away tms sweep (the acquisition instrument), 4 diverse
                matchup cells per tms — throughput is target-free and global,
                so the (mw×fw) matrix buys nothing (v1 burned 20 cells/tms).
-  * SCREEN   : per weapon, log-spaced gains on its top-2 range pins (the human
-               engagement-range mass concentrates; renormalized weights keep
-               the pooling honest) + explicit COUPLING cells (gain {0, mid} at
-               tms_ref vs tms*) so the tms coefficient is measured, not
-               convention-ordered.
+  * SCREEN   : per weapon, log-spaced gains on ALL FOUR opponent pins (each
+               pin is a distinct target-kinematics condition — FrikBot orbits
+               at its pinned weapon's sweet-spot range: SG 128u, NG/RL 180u,
+               LG 350u — so a curve fit on a pin subset estimates a different
+               aggregate than the one the skill claims; the a26 first-fit
+               confirmation offset). Rows are mix-weighted to the human
+               engagement-range mass, so the fitted shared curve IS the human
+               range-mix aggregate over the full condition set. Explicit
+               COUPLING cells (gain {0, mid} at tms_ref vs tms*) identify the
+               tms coefficient.
   * EXTEND   : after the screening fit — the α ray at each weapon's fitted
                knee, the tremor arm, and refinement gains at each weapon's
-               target/knee where the CI is widest.
-  * CONFIRM  : the final operating point on the same instrument (gates.py).
+               target/knee where the CI is widest. Same four-pin coverage.
+
+There is NO confirmation round: a confirm on the fit's own substrate passes
+by construction, and one on a different substrate fails whenever the fit is
+unrepresentative — either way it never gated the right thing (Brian,
+2026-07-18). Placement is gated on the fit's OWN bootstrap CIs
+(gates.placement_gate); per-wave content-derived eval seeds make the fit
+multi-seed by construction, and ``--seed-replicates`` re-measures the placed
+operating point under fresh seeds (report-only).
 
 Planners return plain cell dicts ``{model_weapon, frikbot_pin, op}`` (op =
 all four decode keys); the CLI maps them onto ``instruments.Cell``.
@@ -27,30 +39,39 @@ from typing import Any
 
 import numpy as np
 
-from qnn.decode_fit.context import ABBR_TO_MODELNAME, FRIKBOT_TO_PIN
+from qnn.decode_fit.context import (ABBR_TO_MODELNAME, FRIKBOT_TO_PIN,
+                                    INSTRUMENT_WEAPONS, MODELNAME_TO_ABBR)
 
 _PIN_TO_FRIKBOT = {v: k for k, v in FRIKBOT_TO_PIN.items()}
-# the 4 instrument weapons (SSG/SNG alias SG/NG at plan level)
-_INSTRUMENT_ABBRS = ("SG", "NG", "RL", "LG")
+# the 4 instrument representatives (SG/SSG and NG/SNG collapse end to end)
+_INSTRUMENT_ABBRS = tuple(MODELNAME_TO_ABBR[w] for w in INSTRUMENT_WEAPONS)
 # screening gain levels: 0 anchors native; log-spaced span covers every knee
 # the v1-era fits ever produced (0.015…0.68) with headroom.
 SCREEN_GAINS = (0.0, 0.02, 0.05, 0.12, 0.3, 0.7)
-# Knee-undetermined = the curve may still be DESCENDING at the span edge (the
-# a25rc3c SG case: 0.7 was the best measured point and the "floor" was an
-# extrapolation). The CI-rejection round pushes PAST the edge instead of
-# densifying the middle; 1.2 = the same legal ceiling the refinement clip uses.
-EDGE_GAINS = (0.85, 1.0, 1.2)
+# Knee-undetermined = the curve may still be DESCENDING at the span edge. The
+# a27 sweep established that real p60/p90 operating points can require ~1.5;
+# a26's old 1.2 ceiling therefore extrapolated a candidate it never measured.
+# Keep the full response inside the measured domain, with a broad 5.0 refusal
+# frontier. This is the valid a27 fix reconciled into the representative a26
+# all-pin estimator.
+MAX_GAIN = 5.0
+EDGE_GAINS = (0.85, 1.0, 1.2, 1.6, 2.2, 3.2, MAX_GAIN)
 COUPLING_GAINS = (0.0, 0.12)         # measured at tms_ref AND tms*
 ALPHA_RAY = (0.1, 0.25, 0.5)
 TREMOR_ARM = (0.02, 0.05, 0.1)
 ACQ_TMS = (0.5, 0.8, 1.1, 1.4, 1.7, 2.0)
 # one diverse matchup per pin for the acquisition sweep
-ACQ_MATCHUPS = (("lightning", "shotgun"), ("shotgun", "nailgun"),
-                ("nailgun", "rocket_launcher"), ("rocket_launcher", "lightning"))
+ACQ_MATCHUPS = (("lightning", "shotgun"), ("shotgun", "super_nailgun"),
+                ("super_nailgun", "rocket_launcher"),
+                ("rocket_launcher", "lightning"))
 
-EPISODES_PER_CELL = 8
+# 4 eps/cell × 4 pins = 16 episodes per (weapon, gain) point — the same
+# information mass the old 8 × top-2-pins design spent, redistributed over
+# the full condition set.
+EPISODES_PER_CELL = 4
 ACQ_EPISODES_PER_CELL = 12
-CONFIRM_EPISODES_PER_CELL = 12
+# seed-replicate re-measurement of the placed operating point (report-only)
+PLACEMENT_EPISODES_PER_CELL = 12
 MAX_EPISODES = 1500                  # decision 2; extend only on CI rejection
 
 
@@ -76,8 +97,8 @@ class BudgetLedger:
     """Episode accounting against the box. The box constrains the PLANNED
     spend; CI-rejection extensions (decision 2: the only allowed overrun) are
     recorded and totaled but do NOT consume box headroom — otherwise a
-    legitimate extension would starve the mandatory confirmation round that
-    follows it (the a25rc3d first-flight failure)."""
+    legitimate extension would starve the rounds that follow it (the
+    a25rc3d first-flight failure)."""
     max_episodes: int = MAX_EPISODES
     rounds: list[dict[str, Any]] = field(default_factory=list)
 
@@ -119,14 +140,14 @@ def plan_screening_round(pin_weights: dict[str, dict[str, float]],
     cells: list[dict] = []
     for abbr in _INSTRUMENT_ABBRS:
         mw = ABBR_TO_MODELNAME[abbr]
-        pins = [_PIN_TO_FRIKBOT[p] for p in top_pins(pin_weights, abbr)]
+        pins = [_PIN_TO_FRIKBOT[p] for p in top_pins(pin_weights, abbr, n=4)]
         for fw in pins:
             for g in gains:
                 cells.append({"model_weapon": mw, "frikbot_pin": fw,
                               "op": _op(gain=g, tms=tms_star)})
         # coupling cross on the TOP pin only (c is a single coefficient per
-        # weapon — one pin's contrast identifies it; keeps the round in-box:
-        # 448 + 512 extend + 288 acq + 192 confirm = 1440 ≤ 1500)
+        # weapon — one pin's contrast identifies it and it is pin-invariant;
+        # box: 416 screen + ~416 extend + 288 acq ≤ 1500, confirm deleted)
         if abs(tms_star - tms_ref) > 1e-6:
             for g in COUPLING_GAINS:
                 cells.append({"model_weapon": mw, "frikbot_pin": pins[0],
@@ -147,7 +168,7 @@ def plan_edge_screen(pin_weights: dict[str, dict[str, float]],
     cells: list[dict] = []
     for abbr in _INSTRUMENT_ABBRS:
         mw = ABBR_TO_MODELNAME[abbr]
-        pins = [_PIN_TO_FRIKBOT[p] for p in top_pins(pin_weights, abbr)]
+        pins = [_PIN_TO_FRIKBOT[p] for p in top_pins(pin_weights, abbr, n=4)]
         for fw in pins:
             for g in EDGE_GAINS:
                 cells.append({"model_weapon": mw, "frikbot_pin": fw,
@@ -166,8 +187,8 @@ def plan_extend_round(gain_fits: dict[str, Any], plans: dict[str, Any],
     cells: list[dict] = []
     for abbr, fit in gain_fits.items():
         mw = ABBR_TO_MODELNAME[abbr]
-        pins = [_PIN_TO_FRIKBOT[p] for p in top_pins(pin_weights, abbr)]
-        knee_g = float(np.clip(fit.knee(0.95)[0], 0.005, 1.2))
+        pins = [_PIN_TO_FRIKBOT[p] for p in top_pins(pin_weights, abbr, n=4)]
+        knee_g = float(np.clip(fit.knee(0.95)[0], 0.005, MAX_GAIN))
         for fw in pins:
             for a in alphas:
                 cells.append({"model_weapon": mw, "frikbot_pin": fw,
@@ -179,9 +200,9 @@ def plan_extend_round(gain_fits: dict[str, Any], plans: dict[str, Any],
             plan = plans.get(abbr) or plans.get(
                 next((k for k, v in plans.items()
                       if getattr(v, "alias_of", None) == abbr), ""), None)
-            refine = {float(np.clip(fit.knee(0.9)[0], 0.005, 1.2))}
+            refine = {float(np.clip(fit.knee(0.9)[0], 0.005, MAX_GAIN))}
             if plan is not None and plan.gain > 0:
-                refine.add(float(np.clip(plan.gain, 0.005, 1.2)))
+                refine.add(float(np.clip(plan.gain, 0.005, MAX_GAIN)))
             for g in sorted(refine):
                 if all(abs(g - s) / max(s, 1e-9) > 0.15 for s in SCREEN_GAINS if s > 0):
                     cells.append({"model_weapon": mw, "frikbot_pin": fw,
@@ -208,7 +229,7 @@ def plan_ci_extension(gain_fits: dict[str, Any], plans: dict[str, Any],
                                        alphas=(), tremors=())
             continue
         mw = ABBR_TO_MODELNAME[abbr]
-        pins = [_PIN_TO_FRIKBOT[p] for p in top_pins(pin_weights, abbr)]
+        pins = [_PIN_TO_FRIKBOT[p] for p in top_pins(pin_weights, abbr, n=4)]
         for fw in pins:
             for g in past_edge:
                 cells.append({"model_weapon": mw, "frikbot_pin": fw,
@@ -244,7 +265,7 @@ def plan_alpha_reanchor(plans: dict[str, Any], table: Any,
                     <= ALPHA_REANCHOR_REL * max(p.gain, 1e-6):
                 continue                # ray already anchored near the plan gain
         mw = ABBR_TO_MODELNAME[abbr]
-        pins = [_PIN_TO_FRIKBOT[q] for q in top_pins(pin_weights, abbr)]
+        pins = [_PIN_TO_FRIKBOT[q] for q in top_pins(pin_weights, abbr, n=4)]
         for fw in pins:
             for f in (0.5, 1.0, 1.5):
                 cells.append({"model_weapon": mw, "frikbot_pin": fw,
@@ -254,13 +275,12 @@ def plan_alpha_reanchor(plans: dict[str, Any], table: Any,
     return cells, abbrs
 
 
-def plan_confirmation_round(plans: dict[str, Any], tms_star: float,
-                            pin_weights: dict[str, dict[str, float]]
-                            ) -> list[dict]:
-    """The final operating point per instrument weapon, all four pins (the
-    confirmation measures the range-pooled placement the plan promised).
-    SSG/SNG confirm transitively through their alias (they cannot diverge —
-    same response, own ladder)."""
+def plan_placement_round(plans: dict[str, Any], tms_star: float
+                         ) -> list[dict]:
+    """The placed operating point per instrument weapon, all four pins —
+    used ONLY by the report-only ``--seed-replicates`` re-measurement (the
+    gating confirmation round is gone: placement is gated on the fit's own
+    CIs). SSG/NG ride the identical SG/SNG family plan."""
     cells: list[dict] = []
     for abbr in _INSTRUMENT_ABBRS:
         p = plans.get(abbr)

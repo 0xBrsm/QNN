@@ -16,8 +16,9 @@ Replaces the v1 grid-median pipeline (`qnn.eval.decode_fit_pipeline` +
   * stage 6 confirms on the instrument the fit ran on (CI overlap at
     percentile ±5, decision 3) and style-gates free play; free-play
     per-weapon hbw is a report card only (decision 4);
-  * every fit artifact lives under ``runs/decode_fit/<model>/`` behind a
-    content-keyed manifest — no global ``runs/head_probe`` namespace, no
+  * every fit artifact lives under ``runs/decode_fit/<model>/``; waves
+    resume-skip off their content-hashed done dirs + the substrate/env
+    staleness check — no global ``runs/head_probe`` namespace, no
     cwd-relative defaults, no delete-the-dir cache invalidation.
 
 Entry point: ``python -m qnn.decode_fit --run-dir <bench run> [--skill …]``.
@@ -29,5 +30,10 @@ from qnn.decode_fit.context import (  # noqa: F401
     MODELNAME_TO_ABBR,
     ABBR_TO_MODELNAME,
     TRANSFER_ALIAS,
+    CALIBRATION_FAMILIES,
+    CALIBRATION_FAMILY_KEY,
+    CALIBRATION_GROUPS,
+    CALIBRATION_SOURCE,
+    calibration_members,
     resolve_fit_context,
 )

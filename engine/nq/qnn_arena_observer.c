@@ -117,6 +117,8 @@ void QNN_ArenaObserverWrite(FILE *out, const qnn_action_t *previous_action,
 	QNN_IOUpdate(&snapshot, 1.0f / 20.0f, reset_flag);
 	QNN_IOEmit(&snapshot, &result);
 	QNN_IOPackObsBuffer(obs, &result);
+	if (QNN_IOPoseTailEnabled())
+		QNN_IOStashPoseTail(obs, &snapshot);
 	fwrite(obs, 1, sizeof(obs), out);
 	QNN_WriteTrainingExtrasBinary(out, &snapshot, tick, steps, reset_flag);
 	fflush(out);

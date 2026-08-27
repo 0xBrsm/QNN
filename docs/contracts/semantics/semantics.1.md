@@ -1,17 +1,24 @@
-# Semantics contract `semantics.1` — current (v11 → HEAD)
+# Semantics contract `semantics.1` — current (v11 → spatial-v2)
 
 The meaning behind the wire tensors: normalization scales + vocabulary id
-mappings. Shared by every contract in the load set ([`wire.7`](../wire/wire.7.md),
-[`wire.8`](../wire/wire.8.md), [`wire.9`](../wire/wire.9.md)) — it has **not moved
-since token-spec v11** (the v11 entity-vocab 42→44 bump + weapon impulse
-renumber is the last semantics break; everything before is `semantics.0*`, see
-[`pre-v11.md`](pre-v11.md)).
+mappings + value-interpretation constants. Shared by the v11+ contract
+family, including the finalized [`wire.12`](../wire/wire.12.md). The
+axes divide by failure mode: WIRE covers what fails at bind time (tensor
+set, names, shapes, dtypes); SEMANTICS covers what would NOT fail at bind
+time — identical shapes, silently reinterpreted values. Spatial shape and
+row identity (band/yaw counts, band-id names) are therefore wire-scoped
+and not hashed here; the spatial VALUE constants (depth ladder, band
+centers, ranges, miss code) are semantics and are. The last semantics-ID
+break remains token-spec v11 (entity vocab 42→44 plus weapon impulse
+renumber); everything before is `semantics.0*`, see
+[`pre-v11.md`](pre-v11.md).
 
 Stamped as `semantics_contract=semantics.1`. A mismatch is a **silent**
 failure (tensors load, values mean the wrong thing), so the bin refuses on a
-`semantics_sig` mismatch. The fingerprint is computed by `_semantics_sig()` in
-`tools/export_onnx.py` over exactly the items below; current value
-**`de5f93f393503793`** (recompute from the function — do not treat as frozen).
+`semantics_sig` mismatch. The fingerprint is computed by `qnn.contracts.semantics_sig()` (the exporter
+delegates to it) over exactly the items below; current value
+**`71320316ea34353b`** on spatial-v2 HEAD (recompute from the function — do
+not treat as frozen).
 
 **Source of truth:** `src/qnn/engine_norm.py` (scales, masks, `Field.scale`/
 `Field.transform`, `ITEM_AMOUNT_*`) and `src/qnn/vocab.py` (vocab tables). See
@@ -37,10 +44,16 @@ C mirrors (cross-checked): `QNN_DIST_SCALE=1000`, `QNN_VELOCITY_SCALE=2000`,
 
 ## Per-field (scale, transform)
 The `Field.scale` / `Field.transform` of every field in `SELF_FIELDS`,
-`SPATIAL_FIELDS`, `ENTITY_COMMON_FIELDS`, and the four per-type tables
+`ENTITY_COMMON_FIELDS`, and the four per-type tables
 (`PROJECTILE/ACTOR/ITEM/MOVER_FIELDS`) — the dequant semantics. (Enumerated in
 `engine_norm.py`; included in the hash field-by-field.) Plus the resolved
-`ITEM_AMOUNT_MULT` / `ITEM_AMOUNT_CONST` arrays (per-pickup amount normalization).
+`ITEM_AMOUNT_MULT` / `ITEM_AMOUNT_CONST` arrays (per-pickup amount
+normalization), and the spatial value-interpretation constants:
+`ATLAS_DEPTH_LEVELS` (code→depth ladder), `ATLAS_MISS_CODE`,
+`ATLAS_ELEV_DEG` (band centers and row order), and the horizontal/vertical
+range contract (1024/128). Changing any of these leaves the
+`spatial_atlas` tensor bindable and silently miscalibrated — the exact
+hazard this signature exists to catch.
 
 ## Vocabularies (`vocab.py`)
 | table | size / value |
@@ -48,11 +61,10 @@ The `Field.scale` / `Field.transform` of every field in `SELF_FIELDS`,
 | `ENTITY_IDS` / `ENTITY_VOCAB_SIZE` | 44 (NONE=0 … TRAIN=43); weapons contiguous **AXE=3 … THUNDERBOLT=10 in impulse order** |
 | `ACTION_IDS` / `ACTION_VOCAB_SIZE` | 20 |
 | `MODALITY_IDS` / `MODALITY_VOCAB_SIZE` | 4 (SIGHT/PROXIMITY/SOUND/MEMORY) |
-| `SPATIAL_SECTOR_IDS` | 9 (defines the 9 spatial slots' order) |
 | `MAX_PLAYER_INDICES` | 32 |
 | token tags | `PROJECTILE=0, ACTOR=1, ITEM=2, MOVER=3` |
 | per-type scalar dims | PROJ 8, ACTOR 19, ITEM 15, MOVER 14 |
-| capacities | `MAX_ENTITY_EVENTS=4`, `MAX_TOKEN_OBJECTS=16`, `SPATIAL_TOKEN_COUNT=9` |
+| capacities | `MAX_ENTITY_EVENTS=4`, `MAX_TOKEN_OBJECTS=16` |
 | weapon impulse | 1=AXE … 8=LG; weapon-head class = impulse−1 (0..7), 8 classes. `self_weapon_id` is ENTITY_IDS-encoded with `self_weapon_id_to_impulse(x)=max(0,x−2)` |
 
 ## Temporal alignment — the timeliness clause (normative)

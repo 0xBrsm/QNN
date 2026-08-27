@@ -26,6 +26,9 @@ static cvar_t qnn_inv_health_cvar = {"qnn_inv_health", "100", false, false};
 static cvar_t qnn_inv_powerups_cvar = {"qnn_inv_powerups", "0", false, false};
 static cvar_t qnn_inv_selected_cvar = {"qnn_inv_selected", "0", false, false};
 static cvar_t qnn_bot_weapon_pin_cvar = {"qnn_bot_weapon_pin", "0", false, false};
+/* Per-frame QuakeC ammo top-up (qnn_infinite_ammo_frame): pin waves set 1 so
+   90s pinned episodes never run the measured weapon dry. Default off. */
+static cvar_t qnn_inv_infinite_ammo_cvar = {"qnn_inv_infinite_ammo", "0", false, false};
 
 static int QNN_ArgInt(const char *name, int fallback)
 {
@@ -78,6 +81,7 @@ static void QNN_ArenaApplyInventory(void)
 		{"-qnn_inv_cells", "qnn_inv_cells"},
 		{"-qnn_inv_armor", "qnn_inv_armor"},
 		{"-qnn_inv_health", "qnn_inv_health"},
+		{"-qnn_inv_infinite_ammo", "qnn_inv_infinite_ammo"},
 	};
 	char buf[32];
 	int i;
@@ -121,6 +125,7 @@ static void QNN_RegisterArenaCvars(void)
 	Cvar_RegisterVariable(&qnn_inv_powerups_cvar);
 	Cvar_RegisterVariable(&qnn_inv_selected_cvar);
 	Cvar_RegisterVariable(&qnn_bot_weapon_pin_cvar);
+	Cvar_RegisterVariable(&qnn_inv_infinite_ammo_cvar);
 }
 
 static void QNN_ServerFrame(float dt)

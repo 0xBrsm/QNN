@@ -15,7 +15,9 @@
 typedef struct qnn_route_runtime_s qnn_route_runtime_t;
 #endif
 
-#define QNN_OBS_BUFFER_SIZE 4096
+/* Final wire.12 fixed observation frame. The maximum payload is 848 bytes
+ * (16 maximum-width actor rows); the optional pose tail occupies 848..863. */
+#define QNN_OBS_BUFFER_SIZE 864
 
 extern qboolean qnn_training_client_context;
 #define QNN_MAX_PROPERTY_KEY 64
@@ -33,6 +35,9 @@ extern qboolean qnn_training_client_context;
 #define QNN_MAX_DYNAMIC_OBJECTS 128
 #define QNN_MAX_TOKEN_OBJECTS 16
 #define QNN_MAX_EVENT_ATOMS 256
+/* v1 raycast-scalar spatial sector count (wire.11 obs block). The v2
+ * depth atlas (wire.12) uses QNN_OBS_ATLAS_* in qnn_io.h instead; both
+ * are emitted every tick so the one bin serves both wire contracts. */
 #define QNN_SPATIAL_TOKEN_COUNT 9
 #define QNN_MAX_TRAIN_DAMAGE 64
 #define QNN_MAX_TRAIN_ITEMS 64

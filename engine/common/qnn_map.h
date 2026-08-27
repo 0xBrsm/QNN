@@ -22,6 +22,7 @@ typedef struct qnn_raw_entity_s {
 	vec3_t angles;
 	int spawnflags;
 	qboolean has_origin;
+	qboolean origin_is_explicit;
 	qboolean has_model;
 	qnn_property_t properties[QNN_MAX_STATIC_PROPERTIES];
 	int property_count;

@@ -47,15 +47,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+
 from qnn.decode_fit.context import (
     _REPO,
     _git_sha,
     INSTRUMENT_WEAPONS,
     MODELNAME_TO_ABBR,
+    WEAPON_IMPULSE,
     read_json,
     rel_to_repo,
 )
-from qnn.decode_fit.events import EventTable, OP_KEYS, _SWEPT_KEY_TO_OP
+from qnn.decode_fit.events import (
+    EventTable,
+    OP_KEYS,
+    TRACKING_WINDOWS_NPZ,
+    _SWEPT_KEY_TO_OP,
+)
 
 # The working bot-pin pilot whose config/ is the wave skeleton (v1 BASE_RUN).
 # Tests inject a fabricated template via the build functions' parameter.
@@ -84,6 +92,13 @@ _arena_port_counter = 0
 EVAL_TIMEOUT_S = 1800
 FREEPLAY_TIMEOUT_S = 2400
 
+# Arena startup can lose a bind race to a recently retired server even though
+# every wave in this process has a distinct planned port.  Re-run only the
+# failed tail after the concurrent pool has drained; at that point no sibling
+# wave can still own the port.  Keep this to one attempt so a deterministic
+# engine/config failure still stops promptly and visibly.
+WAVE_RETRY_ATTEMPTS = 1
+
 # Default wave concurrency: fill the box (Brian 2026-07-16: target ≥90%
 # saturation — decode-fit wall clock was dominated by a magic 4 on a 32-core
 # host). Each concurrent wave costs ~1-1.5 cores (serial per-tick Python;
@@ -107,7 +122,7 @@ class Cell:
     """One instrument cell: the model's forced weapon, the opponent frikbot's
     pinned weapon (the engagement-range knob), and the FULL decode operating
     point the cell's lane runs at (all four OP_KEYS, explicit)."""
-    model_weapon: str          # "shotgun" | "nailgun" | "rocket_launcher" | "lightning"
+    model_weapon: str          # "shotgun" | "super_nailgun" | "rocket_launcher" | "lightning"
     frikbot_pin: str           # same vocabulary (the opponent weapon pin)
     op: dict[str, float]       # {"gain","alpha","tremor","tms"} — ALL FOUR present
 
@@ -153,7 +168,22 @@ def _max_workers(param: int | None) -> int:
 
 
 def _done(d: Path) -> bool:
-    return (d / "metrics" / "eval" / "eval_summary.json").exists()
+    eval_dir = d / "metrics" / "eval"
+    if not (eval_dir / "eval_summary.json").exists():
+        return False
+    # Every content-keyed instrument wave declares its aim statistic in the
+    # env signature. A summary without the matching tracking-window payload is
+    # incomplete even when the wave legitimately produced zero discharges;
+    # rebuilding on the current writer emits an explicit empty schema file.
+    sig_path = d / "_sweep_env.json"
+    if sig_path.exists():
+        try:
+            aim_stat = str(read_json(sig_path).get("aim_stat", ""))
+        except Exception:
+            return False
+        if aim_stat.startswith("tracking-window-"):
+            return (eval_dir / TRACKING_WINDOWS_NPZ).exists()
+    return True
 
 
 def _validate_cells(cells: Sequence[Cell]) -> None:
@@ -256,6 +286,12 @@ def _scenario_options(base_opts: dict, mw: str, fw: str, *,
     opts = json.loads(json.dumps(base_opts))   # deep copy
     opts["inventory"]["weapons"] = [mw]
     opts["inventory"]["selected_weapon"] = mw
+    # Pin episodes are 90s of near-continuous fire: spawn ammo alone runs the
+    # high-consumption weapons dry in seconds (LG: 100 cells = 10s; NG: 200
+    # nails = 20s) and the dry-weapon forced switch corrupts the rate/mass
+    # measurement. The QuakeC per-frame top-up holds BOTH players at their
+    # spawn loadout for the whole episode.
+    opts["inventory"]["infinite_ammo"] = 1
     opts["bot_weapon_pin"] = fw
     if spawn_face_away:
         opts["spawn_face_away"] = int(spawn_face_away)
@@ -272,7 +308,18 @@ def _env_sig(spawn_face_away: int, fov: int, episodes_per_cell: int) -> dict:
     at a different signature must NOT be reused — the resume check compares
     this alongside the baked substrate params."""
     return {"fov": int(fov), "spawn_face_away": int(spawn_face_away),
-            "episodes_per_cell": int(episodes_per_cell)}
+            "episodes_per_cell": int(episodes_per_cell),
+            # constant, but IN the signature: every wave built before the
+            # infinite-ammo regime landed measured ammo-starved fire rates
+            # for the high-consumption weapons and must not be resumed.
+            "infinite_ammo": 1,
+            # per-wave content-derived eval seed (see build_wave_dir): waves
+            # built on the old global seed-42 anchor must not be resumed.
+            "seed_scheme": "cells-hash-v1",
+            # the aim statistic the fit consumes: window-sampled tracking at
+            # the frozen k (events.TRACKING_K). Waves without the window npz
+            # (pre-instrument) must not be resumed.
+            "aim_stat": "tracking-window-k4"}
 
 
 # Each PROCESS shard spawns its own full engine set (eval_num_envs pairs), so
@@ -426,7 +473,14 @@ def build_wave_dir(spec: WaveSpec, *, waves_dir: Path, template_run_dir: Path,
     # of every wave.
     t["eval_log_action_streams"] = True
     t["eval_log_acq_streams"] = True
-    _seed_off = spec.shard * 7919 + spec.seed_extra * 104729
+    # Content-derived per-wave seed salt: without it every wave anchored on
+    # the one global eval seed (42), so the whole fit was a single-seed
+    # sample dressed as many waves. The salt rides the same cells hash that
+    # names the dir, so resume stays content-keyed (same cell → same seed)
+    # while distinct cells — every (weapon, pin, op) — sample distinct RNG
+    # streams; the cluster bootstrap then covers seed variation.
+    _seed_off = (spec.shard * 7919 + spec.seed_extra * 104729
+                 + (int(_cells_hash(spec.cells), 16) % 99991) * 13)
     if _seed_off:
         # episode shards / seed replicates MUST diverge: identical seeds
         # replay identical episodes (duplicated, not independent, data)
@@ -468,7 +522,11 @@ def build_wave_dir(spec: WaveSpec, *, waves_dir: Path, template_run_dir: Path,
 
 def _run_wave(dst: Path) -> str:
     """Run one wave via the router; DONE waves resume-skip. The subprocess is
-    killed at EVAL_TIMEOUT_S so a stray bridge hang can't block the pool."""
+    killed at EVAL_TIMEOUT_S so a stray bridge hang can't block the pool.
+    Every pin wave runs the tracking-window instrument (the trigger-free aim
+    statistic the fit consumes — events.TRACKING_K, part of the frozen
+    instrument definition; the env signature's aim_stat pins it)."""
+    from qnn.decode_fit.events import TRACKING_K
     if _done(dst):
         return f"skip (done): {dst.name}"
     log = dst / "logs" / "decodefit.log"
@@ -477,7 +535,9 @@ def _run_wave(dst: Path) -> str:
             subprocess.run(
                 [sys.executable, "-m", "qnn.run.router", "--run-dir", str(dst)],
                 stdout=lf, stderr=subprocess.STDOUT, timeout=EVAL_TIMEOUT_S,
-                cwd=_REPO)
+                cwd=_REPO,
+                env={**os.environ,
+                     "QNN_EVAL_INTERCEPT_WINDOW": str(TRACKING_K)})
     except subprocess.TimeoutExpired:
         return f"TIMEOUT: {dst.name}"
     return f"{'done' if _done(dst) else 'FAILED'}: {dst.name}"
@@ -485,8 +545,10 @@ def _run_wave(dst: Path) -> str:
 
 def _launch_waves(wave_dirs: Sequence[Path], max_workers: int | None) -> None:
     """Run the pending waves concurrently (waves are independent; each is one
-    python driver + its engines). Raises RuntimeError naming every wave that
-    finished without an eval summary (failed/timeout)."""
+    python driver + its engines). A failed tail gets one sequential retry after
+    the pool drains, which clears transient arena-port bind races without
+    concealing deterministic failures. Raises RuntimeError naming every wave
+    that still has no eval summary."""
     pend = [d for d in wave_dirs if not _done(d)]
     if not pend:
         return
@@ -498,9 +560,25 @@ def _launch_waves(wave_dirs: Sequence[Path], max_workers: int | None) -> None:
             d = futs[fut]
             statuses[d] = fut.result()
             print(f"  {statuses[d]}", flush=True)
-    bad = sorted(statuses[d] for d in pend if not _done(d))
-    if bad:
-        raise RuntimeError("decode-fit waves failed:\n" + "\n".join(bad))
+
+    bad_dirs = [d for d in pend if not _done(d)]
+    for attempt in range(1, WAVE_RETRY_ATTEMPTS + 1):
+        if not bad_dirs:
+            break
+        print(f"  retrying {len(bad_dirs)} failed wave(s) sequentially "
+              f"({attempt}/{WAVE_RETRY_ATTEMPTS})", flush=True)
+        retry_bad = []
+        for d in bad_dirs:
+            statuses[d] = _run_wave(d)
+            print(f"  retry {attempt}: {statuses[d]}", flush=True)
+            if not _done(d):
+                retry_bad.append(d)
+        bad_dirs = retry_bad
+
+    if bad_dirs:
+        bad = sorted(statuses[d] for d in bad_dirs)
+        raise RuntimeError("decode-fit waves failed after retry:\n"
+                           + "\n".join(bad))
 
 
 # ── public entry points ───────────────────────────────────────────────────────
@@ -561,13 +639,18 @@ def run_botpin_waves(ctx, cells: list[Cell], substrate: dict, *,
 
 def run_acq_waves(ctx, tms_values: list[float], substrate: dict, *,
                   episodes_per_cell: int = 12, spawn_face_away: int = 180,
-                  fov: int = 0, tag: str = "acq",
+                  fov: int = 0, tag: str = "acq", seed_extra: int = 0,
                   max_workers: int | None = None,
                   template_run_dir: Path = DEFAULT_TEMPLATE) -> list[Path]:
     """Face-away acquisition instrument on the PROCESS backend: cells = every
     (model_weapon × frikbot_pin) × tms value (like the v1 tms sweep), op =
-    {"gain":0,"alpha":0,"tremor":0,"tms":v}."""
+    {"gain":0,"alpha":0,"tremor":0,"tms":v}. ``seed_extra`` salts the eval
+    seeds for a replicate round (pair it with a fresh ``tag`` so the wave
+    dirs don't resume-skip onto the base round's)."""
     specs = plan_acq_waves(tms_values, tag=tag)
+    if seed_extra:
+        specs = [dataclasses.replace(s, seed_extra=int(seed_extra))
+                 for s in specs]
     specs = _shard_specs(specs, episodes_per_cell, _max_workers(max_workers))
     git = _git_sha() or ctx.git_commit
     dirs = [build_wave_dir(s, waves_dir=ctx.waves_dir,
@@ -587,9 +670,51 @@ def run_acq_waves(ctx, tms_values: list[float], substrate: dict, *,
 
 def collect_events(wave_dirs: list[Path]) -> EventTable:
     """The pooled per-discharge EventTable over the wave dirs (each lane's rows
-    annotated with its full operating point + pin via events._lane_ops)."""
+    annotated with its full operating point + pin via events._lane_ops).
+    At-discharge rows: the world-results report card + crest-capture numerator
+    — the FIT consumes ``collect_tracking`` (trigger-free) instead."""
     from qnn.decode_fit.events import load_waves
     return load_waves([Path(d) for d in wave_dirs])
+
+
+def collect_tracking(wave_dirs: list[Path]) -> EventTable:
+    """The pooled WINDOW-SAMPLED tracking EventTable over the wave dirs — the
+    trigger-free aim statistic the response fits and the placement gate ride
+    (decode-fit-v2 addendum 2026-07-18). Fails loud on any wave missing the
+    window npz (pre-instrument waves must rebuild, never silently thin the
+    sample)."""
+    from qnn.decode_fit.events import load_waves_tracking
+    return load_waves_tracking([Path(d) for d in wave_dirs])
+
+
+def collect_forced_attack_rate(wave_dirs: list[Path],
+                               abbr: str) -> dict[str, float]:
+    """Conditional attack-pulse rate for one forced-weapon pin cell."""
+    impulse = WEAPON_IMPULSE[abbr]
+    fires = 0
+    engaged = 0
+    tick_hz: float | None = None
+    for wave_dir in map(Path, wave_dirs):
+        p = wave_dir / "metrics" / "eval" / "move_streams_sampled.npz"
+        if not p.exists():
+            raise FileNotFoundError(f"forced cadence stream missing: {p}")
+        with np.load(p) as z:
+            hz = float(np.asarray(z["tick_hz"]).reshape(-1)[0])
+            if tick_hz is not None and abs(hz - tick_hz) > 1e-9:
+                raise ValueError(
+                    f"forced cadence tick_hz mismatch: {tick_hz} vs {hz} in {p}")
+            tick_hz = hz
+            keep = np.asarray(z["keep"]).astype(bool)
+            weapon = np.asarray(z["weapon"]).astype(np.int64)
+            attack = np.asarray(z["attack"]).astype(bool)
+            mask = keep & (weapon == impulse)
+            engaged += int(mask.sum())
+            fires += int((attack & mask).sum())
+    if tick_hz is None or engaged == 0:
+        raise ValueError(f"forced cadence cell for {abbr} has no engaged ticks")
+    return {"fires": float(fires), "engaged_ticks": float(engaged),
+            "tick_hz": tick_hz,
+            "rate_per_s": float(fires / engaged * tick_hz)}
 
 
 def collect_acq_throughput(ctx, wave_dirs: list[Path]) -> list[dict]:

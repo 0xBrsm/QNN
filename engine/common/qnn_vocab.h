@@ -94,7 +94,7 @@
 #define QNN_SOURCE_NONE    0  /* alias for QNN_SUBJECT_NONE */
 #define QNN_ENTITY_VOCAB_SIZE 44  /* total entries in shared subject/source table */
 
-/* ── Spatial sector IDs ────────────────────────────────────────── */
+/* ── Spatial sector IDs (v1 raycast-scalar spatial, wire.11) ───── */
 
 #define QNN_SPATIAL_FOV_CENTER   0
 #define QNN_SPATIAL_FOV_LEFT     1

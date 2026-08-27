@@ -47,7 +47,11 @@ def collect_events(policy, source):
             continue
         obs = {k: v[s:e] for k, v in source.obs.items()}
         act = {k: v[s:e] for k, v in source.actions.items()}
-        obs_t = {k: torch.as_tensor(np.asarray(v)).unsqueeze(1) for k, v in obs.items()}
+        # Tensorize through the policy's inference dequant (idempotent):
+        # resident/collect obs may carry packed spatial_atlas, and the raw
+        # forward path below bypasses act()'s dequant boundary.
+        obs_t = {k: v.unsqueeze(1)
+                 for k, v in policy._obs_tensors_dequant(obs).items()}
         act_t = {k: torch.as_tensor(np.asarray(v)) for k, v in act.items()}
         with bench_side_channel_scope(act_t, None):
             _, logits, _, _, _ = policy._forward_tensors(obs_t, hidden=None, masks=None)
@@ -105,13 +109,16 @@ def fit_tilt(logits: torch.Tensor, prev: torch.Tensor, target_mean: float) -> fl
 
 
 @torch.inference_mode()
-def fit_dur_tilt(run_dir: Path, cache_dir: Path | str = "artifacts/collect/qwd",
+def fit_dur_tilt(run_dir: Path, cache_dir: Path | str,
                  out_path: Path | None = None) -> dict:
     """Fit the per-axis ``move.commit_dur_tilt`` for one checkpoint.
 
     Teacher-forced over the engaged val cache (CPU, ~10-15 min). Returns (and
     optionally writes) the calibration report; ``dur_tilt`` is the [fb, lr]
-    pair ready for the decode config.
+    pair ready for the decode config. ``cache_dir`` must be the run's OWN
+    pinned corpus (decode-fit passes ctx.corpus_dir): teacher-forcing on any
+    other collect is out-of-distribution AND may not even share the obs
+    layout (an atlas model on the pre-atlas qwd cache has no spatial token).
     """
     from qnn.diag.loader import load_policy
     from qnn.bc.supervised_loop import make_resident_source_from_cache

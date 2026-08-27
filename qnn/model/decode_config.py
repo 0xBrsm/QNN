@@ -125,38 +125,243 @@ def _validate_required_params(
             f"them to the config with an explicit value (OFF is 0.0, not omission).")
 
 
-# decode-config param key -> ExportWrapper / policy kwarg. guard.* keys are not
-# here: they are consumed by the guard module and stamped for provenance.
-# move.stop_onset (bool) and the move_hazard table (a file ref) are handled
-# explicitly by the caller, not via this float-kwarg map.
-PARAM_TO_KWARG: dict[str, str] = {
-    "look.aim_prior_gain": "look_aim_prior_gain",
-    "look.aim_ffwd_gain": "look_aim_ffwd",
-    # a24-only keys (weapon.sticky_*, move.sticky_tau_*, move.switchback_eps,
-    # attack.threshold) were RETIRED with the a24 arch — their decode laws no
-    # longer exist; a config carrying them simply has those keys ignored here
-    # (and flagged by the export's provenance path if load-bearing).
-    "move.commitment": "move_commitment",  # a25 segment-head commitment decode
-    "move.commit_dur_tilt": "move_commit_dur_tilt",  # duration censoring-bias tilt
-    "move.commit_interrupt": "move_commit_interrupt",  # Gate B interrupt opt-out
+def _validate_attack_vectors(path: Path, params: dict[str, Any]) -> None:
+    """Validate the reconciled attack-vector contract without reinterpreting
+    legacy configs. A config with no explicit vectors remains an old a26-style
+    artifact; any config that opts into split semantics must name split_v1,
+    carry all three vectors, and neutralize the branch-dependent joint vector."""
+    keys = ("attack.bias_vec", "attack.fire_bias_vec",
+            "weapon.preference_bias_vec")
+    for key in keys:
+        if key not in params:
+            continue
+        value = params[key]
+        if not isinstance(value, (list, tuple)) or len(value) != 8:
+            raise ValueError(f"{path}: {key} must be an 8-element vector")
+        try:
+            [float(x) for x in value]
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{path}: {key} must contain numeric values") from e
+    semantics = params.get("attack.vector_semantics")
+    split_claimed = semantics is not None or any(k in params for k in keys[1:])
+    if not split_claimed:
+        return
+    if semantics != "split_v1":
+        raise ValueError(
+            f"{path}: explicit fire/preference vectors require "
+            "attack.vector_semantics='split_v1'")
+    missing = [k for k in keys if k not in params]
+    if missing:
+        raise ValueError(f"{path}: split_v1 missing required vector(s) {missing}")
+    legacy = params["attack.bias_vec"]
+    if any(abs(float(x)) > 1e-9 for x in legacy):
+        raise ValueError(
+            f"{path}: split_v1 requires zero legacy attack.bias_vec; its "
+            "nonzero meaning diverged between a26 and a27")
+
+
+# ── THE DECODE-PARAM REGISTRY (single source of truth) ───────────────────────
+# ONE table maps every decode-config param key to the QNNPolicy attribute that
+# carries it, the coercion that normalizes its JSON value, and the default used
+# when the config omits it. BOTH consumers read this table and nothing else:
+#
+#   qnn.eval.run._apply_decode_config_params  -> ResolvedDecode.policy_attrs()
+#   tools/export_onnx.main                    -> ResolvedDecode.export_kwargs()
+#
+# It exists because the mapping used to be hand-written at all three sites and
+# DRIFTED: attack.crest_* reached the exported ONNX but was never applied in
+# offline eval, so a crest-gated config shipped a decode qnn.eval never ran.
+# Adding a knob to one site only is now impossible-by-construction (and
+# tests/test_decode_param_registry.py fails if anyone tries).
+#
+# CONTRACT: ``name`` is BOTH the QNNPolicy attribute and the ExportWrapper
+# kwarg. The two historical exceptions (the tremor pair) carry an explicit
+# ``export_name``; nothing else may.
+#
+# NOT in this table (by design):
+#   * guard.* — consumed by the guard module, stamped for provenance only.
+#   * weapon_ban / look_grid / move_hazard / attack.vector_semantics — file refs
+#     and schema fields, handled explicitly by the callers.
+#   * retired a24 keys (weapon.sticky_*, move.sticky_tau_*, move.switchback_eps,
+#     move.stop_onset, attack.threshold) — their decode laws no longer exist, so
+#     a config still carrying them simply has those keys ignored.
+
+class _NoDefault:
+    """Sentinel: this key has NO code-side default — omission must FAIL LOUD."""
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "<required>"
+
+
+NO_DEFAULT = _NoDefault()
+
+
+def scalar_or_impulse_vec(v: Any) -> float | list[float]:
+    """float, or a (9,) per-IMPULSE vector (the per-weapon skill system, 7/08):
+    policy.act resolves per-row via self_weapon_id_to_impulse, and the export
+    bakes the vector as a graph constant gathered by the held impulse."""
+    return [float(x) for x in v] if isinstance(v, (list, tuple)) else float(v)
+
+
+def _axis_pair(v: Any) -> tuple[float, float]:
+    """A per-axis (fb, lr) pair. A scalar broadcasts to both axes; a two-element
+    list/tuple indexes; a "fb,lr" string parses (some staged configs stringify)."""
+    if isinstance(v, str):
+        v = [float(x) for x in v.split(",")]
+    if isinstance(v, (list, tuple)):
+        return (float(v[0]), float(v[1]))
+    return (float(v), float(v))
+
+
+def _float_vec_or_none(v: Any) -> list[float] | None:
+    return None if v is None else [float(x) for x in v]
+
+
+@dataclass(frozen=True)
+class DecodeParam:
+    """One decode knob: config key -> policy attribute / export kwarg."""
+    key: str                      # decode-config ``params`` key
+    name: str                     # QNNPolicy attribute AND ExportWrapper kwarg
+    coerce: Any                   # callable: raw JSON value -> normalized value
+    default: Any = NO_DEFAULT     # NO_DEFAULT => omission raises (fail loud)
+    export_name: str | None = None  # ExportWrapper kwarg when it differs
+    graph: bool = True            # False => eval-only law, no in-graph twin
+    doc: str = ""
+
+    @property
+    def kwarg(self) -> str:
+        """The ExportWrapper keyword this knob is passed as."""
+        return self.export_name or self.name
+
+
+DECODE_PARAMS: tuple[DecodeParam, ...] = (
+    # ── look: aim-prior geometry (the REQUIRED_PARAM_KEYS family) ────────────
+    DecodeParam("look.aim_prior_gain", "look_aim_prior_gain", scalar_or_impulse_vec,
+                doc="(9,) per-impulse aim-prior blend gain; 0.0 = off"),
+    DecodeParam("look.aim_ffwd_gain", "look_aim_ffwd", float,
+                doc="feed-forward on the aim point's angular rate"),
+    DecodeParam("look.aim_mag_gain", "look_aim_mag_gain", scalar_or_impulse_vec,
+                doc="α: blend kept |z| from θ (0) toward |z+z_prior| (1)"),
+    DecodeParam("look.turn_mag_scale", "look_turn_mag_scale", float,
+                doc="all-humans dampener on the head's native |z|; 1.0 = off"),
+    DecodeParam("look.lead_hold_cap_frames", "look_lead_hold_cap_frames", float,
+                doc="hazard-discounted horizontal lead cap (20Hz frames); 0 = off"),
+    DecodeParam("look.lead_hold_cap_radial_frames", "look_lead_hold_cap_radial_frames",
+                float, doc="radial (approach/retreat) lead cap; 0 = off"),
+    # ── look: hold handling (hold_passthrough is a25-module REQUIRED) ────────
+    DecodeParam("look.hold_passthrough", "look_hold_passthrough", bool,
+                doc="head-commanded exact holds (θ==0) bypass the aim-prior blend"),
+    DecodeParam("look.hold_drift_eps", "look_hold_drift_eps", float, 0.0,
+                doc="on hold frames with a live prior, drift eps rad toward it"),
+    # ── look: per-weapon vertical authority (RL feet-aiming) ─────────────────
+    DecodeParam("look.weapon_pitch_gain", "look_weapon_pitch_gain",
+                _float_vec_or_none, None,
+                doc="(9,) per-impulse feet-aim blend weight β; None = off"),
+    DecodeParam("look.weapon_pitch_bias", "look_weapon_pitch_bias",
+                _float_vec_or_none, None,
+                doc="(9,) downward pitch bias (degrees) on the feet-aim target"),
+    DecodeParam("look.weapon_pitch_mode", "look_weapon_pitch_mode", str, "lock",
+                doc="post-expmap pitch mode: lock | shift | off"),
+    DecodeParam("look.weapon_pitch_shift_strength", "look_weapon_pitch_shift_strength",
+                float, 1.0, doc="strength of the 'shift' pitch mode"),
+    # look.weapon_pitch_lock is the BACK-COMPAT alias of weapon_pitch_mode
+    # (False -> "off"); the export threads the mode, never the alias.
+    DecodeParam("look.weapon_pitch_lock", "look_weapon_pitch_lock", bool, True,
+                graph=False, doc="legacy alias of weapon_pitch_mode (False -> off)"),
+    # ── look: AIM DEGRADATION (the DOWN half of the skill knob) ──────────────
+    # Only TREMOR has an in-graph twin (ExportWrapper look_tremor_*). sluggish /
+    # lag / jitter are eval-side research knobs: lag was RETIRED 7/10 (never
+    # emitted by decode-fit — see qnn.decode_fit.emit) and the others are
+    # study-only, so they are marked graph=False rather than silently missing.
+    DecodeParam("look.aim_degrade_tremor_mag", "look_aim_degrade_tremor_mag",
+                scalar_or_impulse_vec, 0.0, export_name="look_tremor_mag",
+                doc="AR(1)/OU angular tremor RMS (rad); 0 = off"),
+    DecodeParam("look.aim_degrade_tremor_tau", "look_aim_degrade_tremor_tau",
+                float, 5.0, export_name="look_tremor_tau",
+                doc="tremor correlation time (frames)"),
+    DecodeParam("look.aim_degrade_sluggish_tau", "look_aim_degrade_sluggish_tau",
+                float, 0.0, graph=False, doc="EMA low-pass on the look delta"),
+    DecodeParam("look.aim_degrade_lag_frames", "look_aim_degrade_lag_frames",
+                scalar_or_impulse_vec, 0.0, graph=False,
+                doc="fractional-frame delay of the turn-delta (RETIRED 7/10)"),
+    DecodeParam("look.aim_degrade_jitter_mag", "look_aim_degrade_jitter_mag",
+                float, 0.0, graph=False, doc="white per-frame angular noise"),
+    # ── move: the a25 segment-COMMITMENT decode ──────────────────────────────
+    DecodeParam("move.commitment", "move_commitment", bool,
+                doc="a25 segment-head (class,duration) commitment decode"),
+    DecodeParam("move.commit_dur_tilt", "move_commit_dur_tilt", _axis_pair, (0.0, 0.0),
+                doc="per-axis duration censoring-bias tilt"),
+    DecodeParam("move.commit_interrupt", "move_commit_interrupt", bool, True,
+                doc="Gate B projectile-interrupt opt-out"),
+    # Re-commit: allow the segment head to re-commit to the held class at expiry
+    # (no forced maximal-run switch), so a run can be sustained across
+    # commitments. False (default) = maximal-run law, bit-identical.
+    DecodeParam("move.commit_recommit", "move_commit_recommit", bool, False,
+                doc="re-commit to the held class at expiry"),
+    # Engagement-gated idle stillness bias: per-axis (fb,lr) additive bias on the
+    # seg head's `none` class, scaled by (1 - engagement) — damps pointless idle
+    # strafing when disengaged, vanishes in combat. base = E when an enemy is
+    # merely present; cooldown = ticks E holds at 1 after combat. (0,0) = off.
+    DecodeParam("move.idle_none_bias", "move_idle_none_bias", _axis_pair, (0.0, 0.0),
+                doc="engagement-gated per-axis idle stillness bias"),
+    DecodeParam("move.idle_engagement_base", "move_idle_engagement_base", float, 0.5,
+                doc="E when an enemy is merely present"),
+    DecodeParam("move.idle_cooldown_ticks", "move_idle_cooldown_ticks", int, 20,
+                doc="ticks E holds at 1 after combat"),
     # Sustained per-tick re-decision prob while an incoming projectile is
     # present (the human-shaped reactivity assist; trim target hazard 1.143)
-    "move.threat_break_hazard": "move_threat_break_hazard",
-    "attack.bias": "attack_bias",  # applied inside the a25 attack_with decode (class-0 offset)
-    # a25 9-way attack-with per-weapon operating point (research/attack-head.md
-    # §11): attack.bias_vec = (8,) per-weapon attack bias applied POST-argmax;
-    # attack.stick_bias = scalar selection hysteresis toward the held weapon.
-    "attack.bias_vec": "attack_bias_vec",
-    "attack.stick_bias": "attack_stick_bias",
+    DecodeParam("move.threat_break_hazard", "move_threat_break_hazard", float, 0.0,
+                doc="per-tick re-decision hazard under incoming threat"),
+    # ── jump ─────────────────────────────────────────────────────────────────
+    # Jump confidence gate (jump.threshold): the movearch jump head's posterior
+    # is diffuse/under-confident (p99 ~0.17 on land frames), so sampling it
+    # AS-IS scatters unmotivated hops across low-confidence frames. A threshold
+    # τ>0 replaces the Bernoulli/argmax jump decode with a DETERMINISTIC gate
+    # (jump iff p_jump > τ) in both the eager act path and the in-graph twin —
+    # only the most-confident (context-motivated) jumps fire, and deploy==offline
+    # (no jump RNG). 0.0 = off (Bernoulli sampled / argmax>0.5, bit-identical to
+    # pre-knob). See runs/head_probe/_jump_calib_a26rc1a.json.
+    DecodeParam("jump.threshold", "jump_threshold", float, 0.0,
+                doc="deterministic jump gate p_jump > τ; 0.0 = AS-IS sampling"),
+    # ── attack / weapon operating point ──────────────────────────────────────
+    DecodeParam("attack.bias", "attack_bias", float, 0.0,
+                doc="class-0 offset inside the a25 attack_with decode"),
+    # Legacy joint vector: retained verbatim so existing a26 artifacts keep
+    # their historical selection+fire meaning. New fits pin this to zero.
+    DecodeParam("attack.bias_vec", "attack_bias_vec", _float_vec_or_none, None,
+                doc="legacy JOINT selection+fire vector (new fits pin to zero)"),
+    # Reconciled explicit vectors: rate fitting and weapon-selection fitting
+    # must not share a control (the a26/a27 branch-drift failure).
+    DecodeParam("attack.fire_bias_vec", "attack_fire_bias_vec", _float_vec_or_none,
+                None, doc="fire-only vector (split_v1)"),
+    DecodeParam("weapon.preference_bias_vec", "weapon_preference_bias_vec",
+                _float_vec_or_none, None, doc="selection-only vector (split_v1)"),
+    # weapon.switch_margin: weapon-switch hysteresis (anti-jitter / anti-camp) —
+    # leave the held weapon only when the ideal weapon's score beats it by this
+    # margin. Replaces the retired attack.stick_bias, which biased selection
+    # toward the held weapon AND perturbed the fire decision (weapon camping).
+    DecodeParam("weapon.switch_margin", "weapon_switch_margin", float, 0.0,
+                doc="weapon-switch hysteresis margin"),
     # a25 discharge-quality gate ("crest-firing"): attack.crest_theta_vec =
     # (8,) per-weapon alignment threshold θ_w in hbw units (≤0 = OFF for that
     # weapon); attack.crest_hold_ticks = shared max hold H in ticks (0 = OFF
     # globally). Both OFF = bit-identical; the countdown latch rides the
     # existing attack_state wire slot (no wire bump). See
     # qnn.model.bench.a25.decode.attack_crest_gate_step.
-    "attack.crest_theta_vec": "attack_crest_theta_vec",
-    "attack.crest_hold_ticks": "attack_crest_hold_ticks",
-}
+    DecodeParam("attack.crest_theta_vec", "attack_crest_theta_vec",
+                _float_vec_or_none, None, doc="(8,) per-weapon crest θ_w (hbw)"),
+    DecodeParam("attack.crest_hold_ticks", "attack_crest_hold_ticks", int, 0,
+                doc="shared max crest hold H (ticks); 0 = gate OFF"),
+)
+
+# Legacy view kept for provenance/tooling: param key -> policy attribute.
+PARAM_TO_KWARG: dict[str, str] = {e.key: e.name for e in DECODE_PARAMS}
+
+_DUPES = [k for k in PARAM_TO_KWARG if
+          sum(1 for e in DECODE_PARAMS if e.key == k) > 1]
+if _DUPES:  # pragma: no cover - import-time structural guard
+    raise RuntimeError(f"DECODE_PARAMS has duplicate keys: {_DUPES}")
 
 
 @dataclass
@@ -171,15 +376,37 @@ class ResolvedDecode:
     look_grid: str | None
     move_hazard: str | None
 
-    def kwargs(self) -> dict[str, Any]:
-        """The subset of params that maps to ExportWrapper/policy kwargs."""
-        out: dict[str, Any] = {}
-        for k, kw in PARAM_TO_KWARG.items():
-            if k in self.params:
-                out[kw] = self.params[k]
-        if "weapon_ban" in self.params:
-            out["weapon_ban"] = tuple(int(x) for x in self.params["weapon_ban"])
-        return out
+    def _value(self, entry: DecodeParam) -> Any:
+        """The normalized value of one registry knob: the config's own value
+        coerced, else the registry default. A knob with NO default (the
+        fail-loud manifest family) raises when the config omits it — no code
+        side substitutes a value."""
+        raw = self.params.get(entry.key, None)
+        if raw is None:
+            if entry.default is NO_DEFAULT:
+                raise KeyError(
+                    f"{self.path}: decode config omits required param "
+                    f"{entry.key!r} (no code-side default — see "
+                    f"REQUIRED_PARAM_KEYS / MODULE_REQUIRED_PARAM_KEYS)")
+            return entry.default
+        try:
+            return entry.coerce(raw)
+        except (TypeError, ValueError, IndexError) as e:
+            raise ValueError(
+                f"{self.path}: decode param {entry.key!r} value {raw!r} is not "
+                f"coercible for policy attribute {entry.name!r}") from e
+
+    def policy_attrs(self) -> dict[str, Any]:
+        """{QNNPolicy attribute -> value} for EVERY registry knob (the eval
+        path's whole decode operating point). Consumed by
+        qnn.eval.run._apply_decode_config_params."""
+        return {e.name: self._value(e) for e in DECODE_PARAMS}
+
+    def export_kwargs(self) -> dict[str, Any]:
+        """{ExportWrapper kwarg -> value} for every registry knob the GRAPH
+        implements. Consumed by tools/export_onnx. graph=False knobs are
+        eval-only laws with no in-graph twin and are deliberately absent."""
+        return {e.kwarg: self._value(e) for e in DECODE_PARAMS if e.graph}
 
     def stamp(self) -> dict[str, str]:
         """Flatten params into stampable entries (provenance). Keys are BARE — the
@@ -225,6 +452,7 @@ def resolve_decode_config(
     decode_mod = importlib.import_module(cfg["decode_module"])
     params = dict(cfg.get("params", {}))
     _validate_required_params(p, params, cfg["decode_module"])
+    _validate_attack_vectors(p, params)
     guard_name = cfg["guard_module"]
     guard_mod = None
     if guard_name and guard_name != "none":

@@ -244,6 +244,7 @@ class ArenaServerProcess(_ArenaPipeProcess):
         ("nails", "-qnn_inv_nails"),
         ("rockets", "-qnn_inv_rockets"),
         ("cells", "-qnn_inv_cells"),
+        ("infinite_ammo", "-qnn_inv_infinite_ammo"),
         ("health", "-qnn_inv_health"),
         ("armor_value", "-qnn_inv_armor"),
         ("armor_type", "-qnn_inv_armor_type"),

@@ -1,7 +1,7 @@
 {
   "decode_version": 1,
   "version": "a25base",
-  "description": "a25-native BASE decode template \u2014 the decode-fit pipeline's emit base (replaces the retired a24rc1q oracle). Names the a25 decode/guard modules and carries ONLY live a25 param keys with neutral placeholder values: look.* (aim gain/alpha/ffwd, turn dampener, hazard-discounted lead caps look.lead_hold_cap_frames/radial=4/5 @20Hz — the a24 deployed operating point, carried so every a25 decode-fit emits them, hold pass-through, tremor demoter), the move.commitment family, the attack_with operating point (attack.bias_vec / attack.stick_bias), weapon_ban (always [] on a25 \u2014 no ban gate in the attack_with decode), and the guard.* Gate B selection. Per-model values are filled by the decode-fit pipeline.",
+  "description": "a25-native BASE decode template for decode-fit. Legacy attack.bias_vec stays zero for artifact reproducibility; split_v1 uses fire-only attack.fire_bias_vec, selection-only weapon.preference_bias_vec, and weapon.switch_margin, all calibrated on final-aim free play before promotion.",
   "decode_module": "qnn.model.bench.a25.decode",
   "guard_module": "qnn.model.bench.a25.guard",
   "look_grid": "config/look_grid.json",
@@ -34,9 +34,30 @@
       0.0,
       0.0
     ],
-    "attack.stick_bias": 0.0,
+    "attack.fire_bias_vec": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "weapon.preference_bias_vec": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "attack.vector_semantics": "split_v1",
     "guard.projectile_release": true,
     "guard.projectile_release_mode": "rocket",
-    "move.threat_break_hazard": 0.0
+    "move.threat_break_hazard": 0.0,
+    "weapon.switch_margin": 0.0
   }
 }

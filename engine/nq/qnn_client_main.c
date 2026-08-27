@@ -46,6 +46,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>   /* acos / atan2 / M_PI for the decoded-action log */
+#include <signal.h>
 
 #define QNN_CLIENT_TICK_HZ 20
 
@@ -55,6 +56,17 @@ static char qnn_client_map_id[QNN_MAX_MAP_ID];
 static FILE *qnn_client_engine_log = NULL;
 static FILE *qnn_client_action_log = NULL;
 static int qnn_client_tick_index = 0;
+
+/* Set from a signal handler on SIGTERM/SIGINT (e.g. `docker stop`) so the
+ * main loop can exit and send a clean clc_disconnect instead of the socket
+ * dying as a silent, still-open connection the server has to time out. */
+static volatile sig_atomic_t qnn_client_shutdown_requested = 0;
+
+static void QNN_Client_HandleShutdownSignal(int sig)
+{
+	(void)sig;
+	qnn_client_shutdown_requested = 1;
+}
 
 /* Console terminal + chat-driven remote console (qnn_client_console.c). */
 void QNN_ClientConsoleInit(void);
@@ -384,6 +396,9 @@ int main(int argc, char **argv)
 	qnn_action_t *next_action = &action_b;
 	qboolean was_ready = false;
 
+	signal(SIGTERM, QNN_Client_HandleShutdownSignal);
+	signal(SIGINT, QNN_Client_HandleShutdownSignal);
+
 	QNN_ClientConsoleInit();
 	QNN_FaultInit("nq_client");
 	QNN_PredictInit();
@@ -435,7 +450,7 @@ int main(int argc, char **argv)
 	Cmd_AddCommand("model", QNN_Cmd_Model_f);
 
 	/* Same timing requirement for the perception cvars: without this,
-	 * `qnn_fov` set from argv or a startup cfg (e.g. nqdev's qnn.cfg) is
+	 * `qnn_fov` set from argv or a startup cfg (e.g. the live share's qnn.cfg) is
 	 * "Unknown command" — silently dropped — because QNN_IOInit only runs
 	 * at the first QNN tick, long after configs exec. */
 	QNN_RegisterPerceptionCvars();
@@ -471,6 +486,9 @@ int main(int argc, char **argv)
 		qboolean ready;
 		qboolean ok;
 		qnn_action_t *swap;
+
+		if (qnn_client_shutdown_requested)
+			break;
 
 		if (qnn_client_next_tick_time > now)
 			QNN_SleepUntil(qnn_client_next_tick_time);
@@ -556,4 +574,8 @@ int main(int argc, char **argv)
 		next_action = swap;
 		was_ready = true;
 	}
+
+	CL_Disconnect();
+	Host_Shutdown();
+	return 0;
 }

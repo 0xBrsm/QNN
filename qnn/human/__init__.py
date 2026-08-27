@@ -75,6 +75,12 @@ class _Artifact:
 _ARTIFACTS: tuple[_Artifact, ...] = (
     _Artifact("intercept", "_aim_intercept_skill.json", "qnn.human.intercept", "both",
               ("--lead-hold-cap-frames", "4.0", "--lead-hold-cap-radial-frames", "5.0")),
+    # window-sampled tracking (the trigger-free aim statistic; same ruler +
+    # lead law as intercept, sampled over ±k windows around discharges) —
+    # the decode-fit LADDER rides this; intercept stays the at-discharge
+    # report card + crest-capture reference (decode-fit-v2 addendum 7/18)
+    _Artifact("tracking", "_aim_tracking_window.json", "qnn.human.tracking", "both",
+              ("--lead-hold-cap-frames", "4.0", "--lead-hold-cap-radial-frames", "5.0")),
     _Artifact("acquisition", "_acq_submovement.json", "qnn.human.acquisition", "both"),
     _Artifact("op_attack", "_op_attack_rate_byweapon.json", "qnn.human.op_attack", "val"),
     _Artifact("range", "_aim_range_byweapon.json", "qnn.human.aim_range", "both"),
@@ -204,19 +210,23 @@ def ensure_collect_tables(
 def _artifact_stale(art: _Artifact, out: Path) -> str | None:
     """Cache-validity check for an existing doc — the reason it must be
     recomputed under the CURRENT schema, or None when the cache is good.
-    v2: the intercept doc must carry the frozen ``placement_anchors`` node at
-    the current ``ANCHORS_VERSION`` (skill-curves §16.3); a pre-anchors doc is
-    stale and recomputed here, never legacy-read (human_refs fails loud)."""
-    if art.key != "intercept":
+    v2: the intercept/tracking docs must carry the frozen
+    ``placement_anchors`` node at the current ``ANCHORS_VERSION``
+    (skill-curves §16.3); a pre-anchors doc is stale and recomputed here,
+    never legacy-read (human_refs fails loud). The tracking doc must also
+    carry the ``spread_of_median`` compat node (reachable_band reads it)."""
+    if art.key not in ("intercept", "tracking"):
         return None
     try:
-        node = json.loads(out.read_text()).get("placement_anchors") or {}
+        doc = json.loads(out.read_text())
     except (OSError, json.JSONDecodeError) as e:
         return f"unreadable ({e.__class__.__name__})"
     from qnn.human.intercept import ANCHORS_VERSION
-    got = node.get("anchors_version")
+    got = (doc.get("placement_anchors") or {}).get("anchors_version")
     if got != ANCHORS_VERSION:
         return f"placement_anchors version {got!r} != {ANCHORS_VERSION}"
+    if art.key == "tracking" and not doc.get("spread_of_median"):
+        return "missing spread_of_median compat node"
     return None
 
 

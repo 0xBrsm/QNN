@@ -69,9 +69,20 @@ switch controller.
 
 The model is assembled from a declarative `GraphSpec` (see `src/docs/model-graph.md`). Every pipeline — BC, bench probes, eval, PPO, and ONNX export — calls `qnn.model.graph.build_network(obs_dim, spec)` as the single factory. Node builders self-register into `qnn.model.node_registry` via `@register_head` / `@register_encoder` / `@register_pointer` / `@register_temporal` decorators declared beside each node class; `build_network` dispatches by the spec's type discriminators. Named base-graph compositions are registered by each model generation's `graphs` module via `register_base_graph`; probes are expressed as override dicts merged onto a base via `qnn.model.graph.merge_overrides`.
 
-Token sequence: `self(1) + spatial(9) + entities(up to 16) = up to 26 tokens`.
+Token sequence: `self(1) + spatial(11) + entities(up to 16) = up to 28 tokens`.
 Invalid entity rows masked via `key_padding_mask`. Action-history tokens are
 parked (templates set `action_history_tokens: 0`; no wire region in v11).
+
+On spatial-v2 (`wire.12`), the eleven spatial attention rows are a
+center-ray depth atlas: elevation bands from −75° to +75° in 15° steps,
+each carrying 24 fifteen-degree yaw cells of 4-bit log-quantized depth
+against the carved hull-1 face set (world plus live-translated movers).
+A row is nibble-packed into 12 bytes on the wire and expanded to 24 depth
+plus 24 hit scalars model-side.
+A learned band-ID embedding identifies each fixed row; row order alone
+is not visible because this transformer has no positional encoding. The
+self token includes view pitch so the model can relate yaw-frame
+geometry to camera aim.
 
 ### BC Loss Notes
 
@@ -149,7 +160,7 @@ The promoted training surface is the FrikBotNex ladder frozen into each run's
 | `qnn/ppo/learner.py` | native recurrent PPO update and trainer-owned value head |
 | `qnn/ppo/train.py` | native PPO orchestration, checkpointing, and telemetry |
 | `qnn/env/reward.py` | PvP reward shaping |
-| `qnn/diag/` | unified trained-policy diagnostics: `analyze` (per-head) and `diagnostic` (checkpoint-based) subcommands; per-head modules `attack`, `look`, `move`, `weapon` consolidate all head-specific analysis scripts |
+| `qnn/diag/` | trained-policy diagnostics plus pre-training spatial-token reconstruction against real-map hull traces |
 | `qnn/labeler/probes/` | standalone target-head probes (causal TCN, GBT) |
 | `qnn/eval/live.py` | live-play entry point (NQ servers) |
 | `engine/common/` | shared C worker: store, oracle, entity, event, io, sound, spatial, fault, watchdog, tick |

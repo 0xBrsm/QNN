@@ -100,16 +100,22 @@ MODALITY_VOCAB_SIZE = 4
 
 MAX_PLAYER_INDICES = 32
 
-SPATIAL_SECTOR_IDS: Dict[str, int] = {
-    "FOV_Center": 0,
-    "FOV_Left": 1,
-    "FOV_Right": 2,
-    "Flank_Left": 3,
-    "Flank_Right": 4,
-    "Rear_Left": 5,
-    "Rear_Right": 6,
-    "Ground_State": 7,
-    "Ceiling_State": 8,
+# Spatial atlas elevation bands (spatial-tokens-v2 rev 8). Band index =
+# wire row = model token row. Names carry the band's center elevation;
+# yaw cells inside a band are positional (cell 0 = view forward,
+# counter-clockwise), not vocabulary.
+SPATIAL_BAND_IDS: Dict[str, int] = {
+    "Elev_n75": 0,
+    "Elev_n60": 1,
+    "Elev_n45": 2,
+    "Elev_n30": 3,
+    "Elev_n15": 4,
+    "Elev_0": 5,
+    "Elev_p15": 6,
+    "Elev_p30": 7,
+    "Elev_p45": 8,
+    "Elev_p60": 9,
+    "Elev_p75": 10,
 }
 
 # Token type tags (wire format)
@@ -183,4 +189,4 @@ def self_weapon_id_to_impulse(weapon_id):
 ENTITY_NAMES = {v: k for k, v in ENTITY_IDS.items()}
 ACTION_NAMES = {v: k for k, v in ACTION_IDS.items()}
 MODALITY_NAMES = {v: k for k, v in MODALITY_IDS.items()}
-SPATIAL_SECTOR_NAMES = {v: k for k, v in SPATIAL_SECTOR_IDS.items()}
+SPATIAL_BAND_NAMES = {v: k for k, v in SPATIAL_BAND_IDS.items()}

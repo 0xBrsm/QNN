@@ -22,6 +22,7 @@ import torch.nn as nn
 
 from qnn.model.graph.spec import (
     GraphSpec, TokenSpec, TOKEN_KIND_CLS, TOKEN_KIND_FIELDS,
+    TOKEN_KIND_SPATIAL,
 )
 from qnn.model.tokens.obs_accessor import ObsAccessor
 from qnn.model.tokens.obs_fields import (
@@ -61,12 +62,18 @@ class GraphObsEmbedding(ObsEmbedding):
         # Ordered self-token names: index i ↔ encoder ``self_block[:, i]`` (CLS at
         # 0). Lets a head read one token as its readout via a ``token.<name>`` edge.
         self.self_token_names = tuple(t.name for t in self_specs)
+        spatial = next(
+            (t for t in spec.tokens if t.kind == TOKEN_KIND_SPATIAL), None
+        )
         super().__init__(
             d_model=spec.encoder.d_model,
             self_weapon_embed_in_self=any(
                 "weapon_id" in t.vocab for t in self_specs if t.kind == TOKEN_KIND_FIELDS
             ),
             include_spatial=spec.has_spatial,
+            spatial_source=spatial.source if spatial is not None else "ego",
+            spatial_k=spatial.k if spatial is not None else 0,
+            probe_bands=spatial.probe_bands if spatial is not None else (),
         )
 
     def _init_self_components(self) -> None:

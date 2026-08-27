@@ -293,13 +293,14 @@ class QNNPolicy:
         # conditioned attack_align gate is a SEPARATE bias (the all-humans cone fix).
         # Set from the decode config (attack.bias). See research/skill-curves.md §5.
         self.attack_bias: float = 0.0
-        # a25 9-way attack-with per-weapon operating point (research/attack-head.md
-        # §11). attack_bias_vec: (8,) per-weapon attack bias applied POST-argmax in
-        # attack_with_decode_step (tunes each weapon's attack rate to its human
-        # cadence; None = no per-weapon knob). attack_stick_bias: scalar selection
-        # hysteresis toward the held weapon (0.0 = plain argmax).
+        # a25 9-way attack-with operating point. attack_bias_vec is the legacy
+        # JOINT vector retained for config compatibility. New fits use explicit
+        # fire-only and selection-only vectors so rate trim cannot silently
+        # steer weapon choice (the a26/a27 branch-drift failure).
         self.attack_bias_vec: "list | None" = None
-        self.attack_stick_bias: float = 0.0
+        self.attack_fire_bias_vec: "list | None" = None
+        self.weapon_preference_bias_vec: "list | None" = None
+        self.weapon_switch_margin: float = 0.0
         # DISCHARGE-QUALITY gate ("crest-firing"): hold a commanded discharge up
         # to H ticks until crosshair→lead alignment crosses the per-weapon θ_w,
         # blind-fire at expiry (never cancel — the head's fire-rate invariant).
@@ -323,12 +324,32 @@ class QNNPolicy:
         # the forced resample may be redundant, and its both-axes k=0
         # changepoint spike (+0.41 vs human +0.03) breaks the rhythm gate.
         self.move_commit_interrupt: bool = True
+        # Re-commit (move.commit_recommit): allow the segment head to re-commit
+        # to the held class at expiry (no forced maximal-run switch), so a run
+        # can be extended (walk/strafe/rest sustained across commitments).
+        # False (default) = the maximal-run law, bit-identical to pre-knob.
+        self.move_commit_recommit: bool = False
+        # Engagement-gated idle stillness bias (move.idle_none_bias): per-axis
+        # (fb,lr) additive bias on the seg head's `none` class, scaled by
+        # (1 - engagement) so it damps pointless idle strafing when disengaged
+        # and vanishes in combat. base = E when an enemy is merely present;
+        # cooldown holds E=1 for N ticks after combat. (0,0) = off, bit-identical.
+        self.move_idle_none_bias: "tuple[float, float]" = (0.0, 0.0)
+        self.move_idle_engagement_base: float = 0.5
+        self.move_idle_cooldown_ticks: int = 20
         # Threat-break hazard (move.threat_break_hazard): while an incoming
         # projectile is present, per-tick RE-DECISION probability λ inside
         # move_commit_step — the sustained human-shaped reactivity assist
         # (human hazard ratio 1.143; the head's own conditioning is ~1.01 —
         # research/move-head.md "Threat reactivity"). 0.0 = off, bit-identical.
         self.move_threat_break_hazard: float = 0.0
+        # Jump confidence gate (jump.threshold): τ>0 replaces the AS-IS jump
+        # posterior decode (Bernoulli sampled / argmax>0.5) with a DETERMINISTIC
+        # gate — jump iff p_jump > τ. The land-jump head's posterior is diffuse
+        # (p99 ~0.17), so sampling it scatters unmotivated hops; the gate fires
+        # only the most-confident, context-motivated frames (and makes
+        # deploy==offline, no jump RNG). 0.0 = off (bit-identical to pre-knob).
+        self.jump_threshold: float = 0.0
         # Aim feed-forward override (rate term; kills the strafe trail).
         # None → the decode facade's AIM_FFWD_GAIN; 0.0 → off.
         self.look_aim_ffwd: float | None = None
@@ -1191,21 +1212,23 @@ class QNNPolicy:
                 _prev_press = (commit_t[:, 7] > 0.5) if commit_t.shape[1] > 7                     else torch.zeros_like(water)
                 jump_ctx = ((_mv_id == MOVEMENT_GROUND)
                             | (_mv_id == MOVEMENT_WATER_LOW)) & ~_prev_press
+            # External (world) signals for the commitment decode. Derived by
+            # the SHARED decode helpers over the dequantized obs — the same
+            # call the ONNX ExportWrapper makes, so eval and deploy read the
+            # identical quantity in the identical units (decode's
+            # projectile_rel_raw has the history of the two divergent copies).
             _threat = None
-            if (self.move_threat_break_hazard > 0.0 and isinstance(obs, Mapping)
-                    and "entity_types" in obs):
-                # rel source by obs form: field-granular (eval/env) carries
-                # entity_rel directly; the packed wire form carries it at
-                # entity_scalars_raw[..., 0:3] (PROJECTILE_FIELDS lead with rel).
-                _rel_src = obs.get("entity_rel")
-                if _rel_src is None and "entity_scalars_raw" in obs:
-                    _rel_src = np.asarray(obs["entity_scalars_raw"])[..., 0:3]
-                if _rel_src is not None:
-                    from qnn.model.bench.a25.decode import incoming_projectile_present
-                    _threat = incoming_projectile_present(
-                        self._tensor(obs["entity_types"], dtype=torch.long
-                                     ).reshape(n_rows, -1),
-                        self._tensor(_rel_src).reshape(n_rows, -1, 3).float())
+            if self.move_threat_break_hazard > 0.0:
+                from qnn.model.bench.a25.decode import move_threat_signal
+                _threat = move_threat_signal(obs_model, n_rows)
+            # Engagement signals (external) for the idle stillness bias.
+            _enemy_present = _engaged_active = None
+            _ammo_pools = _held_impulse = None
+            if self.move_idle_none_bias != (0.0, 0.0):
+                from qnn.model.bench.a25.decode import move_engagement_signals
+                (_enemy_present, _engaged_active,
+                 _ammo_pools, _held_impulse) = move_engagement_signals(
+                    obs_model, n_rows)
             commit_out = move_commit_step(
                 seg_all if _is_movearch else seg_logits, commit_t,
                 release=projectile_release,
@@ -1214,17 +1237,28 @@ class QNNPolicy:
                 dur_tilt=self.move_commit_dur_tilt,
                 water=water,
                 threat=_threat,
-                threat_break_hazard=float(self.move_threat_break_hazard))
+                threat_break_hazard=float(self.move_threat_break_hazard),
+                recommit=bool(self.move_commit_recommit),
+                enemy_present=_enemy_present,
+                engaged_active=_engaged_active,
+                idle_none_bias=self.move_idle_none_bias,
+                idle_engagement_base=float(self.move_idle_engagement_base),
+                idle_cooldown_ticks=int(self.move_idle_cooldown_ticks),
+                ammo_pools=_ammo_pools, held_impulse=_held_impulse)
             fblr = commit_out[:, :2]
             _cs = np.asarray(move_commit_state)
             _cs[...] = commit_t.detach().cpu().numpy().reshape(_cs.shape).astype(_cs.dtype)
             if _is_movearch:
-                # ud: jump head's calibrated posterior sampled AS-IS on jump
-                # context (no rate knob — jump is contextual; the posterior IS
-                # the decode); water-ud commit in deep water; none elsewhere.
+                # ud: jump head's posterior on jump context; water-ud commit in
+                # deep water; none elsewhere. jump.threshold τ>0 replaces the
+                # AS-IS sampled/argmax decode with a DETERMINISTIC confidence
+                # gate (jump iff p_jump > τ) — only the most-confident,
+                # context-motivated frames fire, and deploy==offline (no RNG).
                 jl = logits[JUMP_HEAD].reshape(-1)
                 p_jump = torch.sigmoid(jl)
-                if sample_mode == "greedy":
+                if self.jump_threshold > 0.0:
+                    jump_fire = p_jump > float(self.jump_threshold)
+                elif sample_mode == "greedy":
                     jump_fire = p_jump > 0.5
                 elif row_generators is None:
                     jump_fire = torch.rand_like(p_jump) < p_jump
@@ -1280,6 +1314,7 @@ class QNNPolicy:
         # sampled-look aim block when it runs this tick; the attack block
         # computes it itself otherwise (greedy look / all aim knobs at 0).
         _crest_z_err = None
+        _crest_z_rate = None
         _crest_aim_range = None
 
         # ---- look ----
@@ -1360,6 +1395,7 @@ class QNNPolicy:
                     obs_model, target_logits, mag_bin.shape[0],
                     mag_logits.device, _aim_reset_mask)
                 _crest_z_err = z_aim
+                _crest_z_rate = z_rate
                 if _aim_gain > 0.0 or _aim_ffwd > 0.0:
                     if _gain_rows is not None:
                         # per-LANE override (already (R,1)) — no intent keying.
@@ -1453,6 +1489,13 @@ class QNNPolicy:
             logits9 = _wl_raw.reshape(-1, WEAPON_HEAD_SIZE + 1)
             _bias_vec = (None if self.attack_bias_vec is None
                          else self._tensor(self.attack_bias_vec, dtype=torch.float32).reshape(-1))
+            _fire_bias_vec = (None if self.attack_fire_bias_vec is None
+                              else self._tensor(self.attack_fire_bias_vec,
+                                                dtype=torch.float32).reshape(-1))
+            _preference_bias_vec = (
+                None if self.weapon_preference_bias_vec is None
+                else self._tensor(self.weapon_preference_bias_vec,
+                                  dtype=torch.float32).reshape(-1))
             # ONE shared decode (qnn.model.bench.a25.decode.attack_with_decode) —
             # the SAME call the ONNX ExportWrapper bakes, so the offline and the
             # deployed attack decode (held-impulse + guard align/veto + per-weapon
@@ -1472,10 +1515,13 @@ class QNNPolicy:
                 _move_logits_guard if _is_movearch else logits["move"],
                 guard=self._regime_mod,
                 attack_bias=float(self.attack_bias), bias_vec=_bias_vec,
-                stick_bias=float(self.attack_stick_bias),
+                fire_bias_vec=_fire_bias_vec,
+                preference_bias_vec=_preference_bias_vec,
+                switch_margin=float(self.weapon_switch_margin),
                 crest_theta_vec=_crest_theta,
                 crest_hold_ticks=int(self.attack_crest_hold_ticks or 0),
                 aim_z_err=_crest_z_err, aim_range=_crest_aim_range,
+                aim_z_rate=_crest_z_rate,
                 attack_state=_att_state_t)
             if attack_state is not None and _att_state_out is not None:
                 _as = np.asarray(attack_state)
@@ -3006,6 +3052,13 @@ class QNNPolicy:
         # pre-fix checkpoints that didn't carry the field).
         policy.input_mask = bool(meta.get("input_mask", False))
         policy.attack_op_only = bool(meta.get("attack_op_only", False))
+        # Atlas-width rebuild runs for EVERY load path, including
+        # factory/graph-built (head-probe/bench) modules — unlike the
+        # legacy-Network-only migrations below, this one exists specifically
+        # to keep pre-migration bench checkpoints (the whole rc1 line) loading
+        # under today's narrower SPATIAL_SCALAR_DIM. See its docstring.
+        from qnn.utils.checkpoint_converter import migrate_legacy_spatial_atlas_dim
+        migrate_legacy_spatial_atlas_dim(policy.model, payload["state_dict"])
         if model_factory is None and graph is None:
             from qnn.utils.checkpoint_converter import (
                 migrate_drop_action_history,

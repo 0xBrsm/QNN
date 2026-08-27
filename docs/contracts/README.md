@@ -98,7 +98,7 @@ declared loop-back `in`, or if the `move` action output disagrees with the
 wire-version stamp (decided `move` vs raw `move_logits`). The wire version gates
 **only** that action interpretation — never state carrying.
 
-The current HEAD (`wire.9`) declaration is:
+The current HEAD (`wire.12`, inherited unchanged from `wire.11`) declaration is:
 
 ```
 in=hidden,out=next_hidden,init=zeros,reset=episode;
@@ -169,18 +169,42 @@ support feasibility (below).
 | 0.17 | `token-spec.md` (v11) | **`wire.7`** | **`semantics.1`** | v11 packed | **v17, v22** | **Yes** | **A** |
 | 0.21 | (no doc bump) | `wire.8` | `semantics.1` | native split | — | No (never exported) | A |
 | (a24) | native split + in-graph MOVE decode | `wire.9` | `semantics.1` | `full_4head` | v24 | superseded by `wire.11` | A |
-| HEAD | native split + in-graph MOVE **and ATTACK** decode | **`wire.11`** | **`semantics.1`** | `full_4head` | **v24** | **Yes** | **A** |
+| a24 | native split + in-graph MOVE **and ATTACK** decode | **`wire.11`** | **`semantics.1`** | `full_4head` | **v24** | **Yes** | **A** |
+| a26 | 72×11 **unpacked** spatial depth atlas + learned band IDs | **`wire.12.1`** | **`semantics.1`** | `full_4head` | `20260722-98wtxv` | **Yes** | A |
+| HEAD | 24×11 **packed** spatial depth atlas + learned band IDs | **`wire.12.2`** | **`semantics.1`** | `full_4head` | `20260722-98wtxv` | **Yes** | A |
 
-Distinct contracts across the full history: **9 wire × 5 semantics**. With a
-surviving runnable artifact: **2 wire** (`wire.7`, `wire.11`) **× 1 semantics**
-(`semantics.1`). `wire.8` is a reconstructed id — the native exporter postdates
+Distinct contracts across the full history: **12 wire × 5 semantics**. With a
+surviving runnable artifact: **5 wire** (`wire.7`, `wire.9`, `wire.11`,
+`wire.12.1`, `wire.12.2`) **× 1 semantics** (`semantics.1`) — and all five have a
+registered codec in the bin (`QNN_CODECS` in `src/engine/common/qnn_onnx.c`), so
+one client serves the whole load set. `wire.8` is a reconstructed id — the native exporter postdates
 `look_delta`, so no 43-input graph was ever exported. `wire.11` = `wire.9` (native
 44-obs split + in-graph decided `move`/`weapon` + the move-decode state pair) **+
 the in-graph ATTACK decode** (decided `attack` bit instead of `fire_logit`, plus
 the `attack_state` hold-tail loop-back) — so ALL four actions decode in-graph and
 the engine is decode-agnostic. `wire.11` REPLACES `wire.9` for the a24 gen
 (re-export); `wire.10` stays burned. The legacy `wire.7` logit path is unchanged.
-See [`wire/wire.11.md`](wire/wire.11.md).
+See [`wire/wire.11.md`](wire/wire.11.md). Spatial-v2 replaces the spatial
+observation block with a single center-ray depth atlas. The atlas GRID moved
+once while the line was in flight and BOTH resolutions have deployed artifacts,
+so each is its own contract — see [`wire.12.md`](wire/wire.12.md):
+
+| id | atlas grid | on the wire | line |
+|---|---|---|---|
+| `wire.12.1` | 11 bands × 72 yaw cells | 792 B, one 4-bit code per byte | a26 rc1 |
+| `wire.12.2` | 11 bands × 24 yaw cells | 132 B, two codes per byte | HEAD |
+
+`wire.12.2` is the finalized frontier: it passed a fresh production-engine
+reconstruction gate after the earlier supporting-plane layouts failed.
+
+> **Bare `wire.12` is RETIRED — never re-use it.** Both families were stamped
+> `wire.12` before the frontier was settled, so the id cannot select a codec
+> without inspecting tensor shapes. The bin briefly did exactly that; it now
+> refuses the bare id and names the fix. Re-stamp with
+> `tools/stamp_onnx.py --wire wire.12.1|wire.12.2 --model-version <tier>`.
+> The retired set is `QNN_RETIRED_WIRES` in `qnn_onnx.c`; a parity test
+> (`tests/test_engine_norm_parity.py`) asserts no id is both registered and
+> retired, and that every id Python can stamp has a codec.
 
 > **`wire.9` number reclaimed.** During active a24 development the in-graph
 > move-decode shape was briefly numbered `wire.10`, distinct from an
@@ -203,7 +227,7 @@ hard floor on faithful support:
 
 | Band | Range | Dead fields | Verdict | Codec cost |
 |------|-------|-------------|---------|------------|
-| **A — faithful** | `wire.7`→`wire.9` (v11→HEAD) | none | Fully loadable; covers every surviving artifact (v17, v22, v24, `full_4head`) | 2 wire + 1 semantics (`wire.7`, `wire.9` built; `wire.8` notional) |
+| **A — faithful** | `wire.7`→`wire.12` (v11→HEAD) | none | Covers every surviving artifact plus spatial-v2 HEAD (v17, v22, v24, `full_4head`) | surviving artifacts: `wire.7`, `wire.11`, `wire.12` |
 | **B — approximation** | `wire.4`–`.6` (v8→v10) | recall, action_history (+cluster @ `wire.4`) | Zero-fill only → degraded; no surviving model; converter doesn't recognize pre-v17 | +3 wire, +2 semantics |
 | **C — impossible** | `wire.1`–`.3` (flat + v5–7) | cluster, route, recall, action_history (+ different architecture) | No migration path; flat era is a separate tensor architecture | +3 wire, +2 semantics |
 

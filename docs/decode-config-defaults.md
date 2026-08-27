@@ -31,6 +31,41 @@ decode line lost the a24 hazard-discounted lead caps (`look.lead_hold_cap_frames
   keys was replaced with direct `p[key]` access at the applier sites
   (`qnn.eval.run._apply_decode_config_params`, `tools/export_onnx.main`).
 
+## The param registry (implemented 2026-07-25)
+
+The *mapping* — config key → policy attribute / ExportWrapper kwarg → coercion →
+default — used to be hand-written at **three** sites (`PARAM_TO_KWARG`, the
+`if "key" in p:` chain in `qnn.eval.run`, the `.get(key, default)` block in
+`tools/export_onnx`) and it **drifted**: `attack.crest_theta_vec` /
+`attack.crest_hold_ticks` reached the exporter but were never applied in offline
+eval, so a crest-gated config baked the discharge gate into the ONNX while
+`qnn.eval` ran without it. No pinned config had ever set them, so nothing
+shipped wrong — but the divergence was live in the code.
+
+There is now ONE table, `DECODE_PARAMS` in `src/qnn/model/decode_config.py`:
+
+| field | meaning |
+|---|---|
+| `key` | the decode-config `params.*` key |
+| `name` | the `QNNPolicy` attribute **and** the `ExportWrapper` kwarg (identical by contract) |
+| `coerce` | the raw-JSON → normalized-value function (shared by both consumers) |
+| `default` | the value used when the config omits the key; `NO_DEFAULT` = fail loud |
+| `export_name` | the ExportWrapper kwarg when it differs (only the tremor pair) |
+| `graph` | `False` = eval-only law with no in-graph twin (see below) |
+
+Consumers read it through two accessors and nothing else:
+`ResolvedDecode.policy_attrs()` (eval — one `setattr` loop, raises if the
+attribute does not exist on the policy) and `ResolvedDecode.export_kwargs()`
+(export — splatted straight into `ExportWrapper`). Adding a knob = adding a row.
+`tests/test_decode_param_registry.py` fails if the registry, `QNNPolicy` and
+`ExportWrapper` fall out of step, including on the defaults.
+
+`graph=False` knobs (`look.weapon_pitch_lock`, `look.aim_degrade_sluggish_tau`,
+`look.aim_degrade_lag_frames`, `look.aim_degrade_jitter_mag`) are eval-only by
+design — the retired/research DOWN-band degraders and the `_mode` back-compat
+alias. They are marked in the table rather than merely missing from the export
+block, and the test asserts `ExportWrapper` does **not** accept them.
+
 ### a25 module extras (`MODULE_REQUIRED_PARAM_KEYS["qnn.model.bench.a25.decode"]`)
 
 Promoted 2026-07-13 (this pass): `move.commitment`, `look.hold_passthrough`.
@@ -85,14 +120,64 @@ Both live templates were backfilled so they carry all required keys.
 | `move.commit_interrupt` | `move_commit_interrupt=True` (:298) | `True` | ✓ | ✓ | SILENT |
 | `move.commit_dur_tilt` | `move_commit_dur_tilt=(0.0,0.0)` (:292) | `[0,0]` | ✓ | ✓ | SILENT |
 | `move.threat_break_hazard` | `move_threat_break_hazard=0.0` (:304) | `0.0` | ✓ | ✗ | SILENT |
+| `move.commit_recommit` | `move_commit_recommit=False` (:331) | `False` | ✗ | ✗ | optional — absent/`False` = maximal-run law (no re-commit to the held class before expiry); SILENT |
+| `move.idle_none_bias` | `move_idle_none_bias=(0.0,0.0)` (:337) | `[0.0,0.0]` | ✗ | ✗ | optional — engagement-gated idle stillness; `(0,0)` = off; SILENT. **Fit it with `qnn.decode_fit.move_gates`, and read the a26rc1 values as ~10x too small** — see the ruler note below |
+| `move.idle_engagement_base` | `move_idle_engagement_base=0.5` (:338) | `0.5` | ✗ | ✗ | optional — paired with `idle_none_bias`, inert when that is `(0,0)` | INERT when idle_none_bias off |
+| `move.idle_cooldown_ticks` | `move_idle_cooldown_ticks=20` (:339) | `20` | ✗ | ✗ | optional — paired with `idle_none_bias` | INERT when idle_none_bias off |
 
-## `attack.*` — attack-with operating point (DEFERRED)
+### Fitting the two move gates — and the a26rc1 ruler error
+
+`move.idle_none_bias` and `jump.threshold` are per-checkpoint constants: each
+inverts THIS model's posterior against a human rate, so neither transfers
+between checkpoints (the same rule `move.commit_dur_tilt` follows). Both are fit
+by `qnn.decode_fit.move_gates`, which recovers and replaces the uncommitted
+a26rc1b-era scripts.
+
+**β (`move.idle_none_bias`) — the a26rc1 values are ~10x too small.** The
+original fit scored a move class by SUMMING its ten bucket logits and taking an
+argmax, adding β to each none-bucket logit first — so β entered the none score
+as **+10β**. The decode does something else: it softmaxes the 30-way joint,
+where the same β shifts `none`'s mass by `exp(β)`, i.e. `+β` on its log-sum-exp.
+The fit therefore reached its human target (39.7% out-of-combat stand-still) on
+a ruler ~10x more sensitive than the shipped law. Measured against the real
+decode, `a26rc1b`/`c`/`d`'s `β = 0.31` moves realized stand-still from 19.1% to
+about 21.6% — roughly an eighth of the correction its provenance claims. Fit β
+against the REALIZED occupancy of the decode itself (`move_gates
+--statistic rollout`), never a hand-rolled proxy of it.
+
+**τ (`jump.threshold`) is placed by cut factor, not human parity.** `a26rc1b`'s
+`0.60` is a ~4x cut against that model's OWN sampled posterior rate on
+jump-feasible engaged frames, which lands it ~6.4x BELOW the human rate — the
+human number is a diagnostic, never a target
+(`jump: no rate calibration`). Reproducing the historical numbers needs the
+engaged population loaded WITH `segment_mask={"act.target": {"$ne": 0}}`: masking
+before the forward gives the GRU a spliced sequence and shifts p_jump ~0.1% from
+the same-frames-selected-after convention (which is what the bot experiences in
+play, since it never skips frames).
+
+## `jump.*` — confidence gate
+
+| key | policy attr / default | export default | a25base | a25rc1 | risk |
+|---|---|---|---|---|---|
+| `jump.threshold` | `jump_threshold=0.0` (:352) | `0.0` | ✗ | ✗ | optional — absent/`0.0` = AS-IS decode (no deterministic confidence gate on the up/down jump axis); a hand-derived deploy addition (`a26rc1b`: `0.60`, confident-only jump), not part of the base template | SILENT |
+
+## `attack.*` — attack-with operating point
 
 | key | policy attr / default | export default | a25base | a25rc1 | risk |
 |---|---|---|---|---|---|
 | `attack.bias` | `attack_bias=0.0` (:277) | `0.0` | ✓ | ✓ | SILENT |
-| `attack.bias_vec` | `attack_bias_vec=None` (:283) | `None` | ✓ | ✗ | SILENT |
-| `attack.stick_bias` | `attack_stick_bias=0.0` (:284) | `0.0` | ✓ | ✓ | SILENT |
+| `attack.bias_vec` | `attack_bias_vec=None` | `None` | ✓ (zero) | ✗ | LEGACY JOINT — selection + fire on a26; never emit nonzero with split-v1 |
+| `attack.fire_bias_vec` | `attack_fire_bias_vec=None` | `None` | ✓ (zero) | ✗ | split-v1 fire-only; validated as an 8-vector |
+| `weapon.preference_bias_vec` | `weapon_preference_bias_vec=None` | `None` | ✓ (zero) | ✗ | split-v1 selection-only; validated as an 8-vector |
+| `attack.vector_semantics` | provenance/validation | — | ✓ (`split_v1`) | ✗ | required when either explicit vector is present |
+| `weapon.switch_margin` | `weapon_switch_margin=0.0` | `0.0` | ✓ | ✗ | held-weapon hysteresis; final-combat calibrated |
+| `attack.crest_theta_vec` | `attack_crest_theta_vec=None` | `None` | ✗ | ✗ | discharge-quality gate; (8,) θ per impulse-1, ≤0 = OFF per weapon. **Was export-only until 2026-07-25** (inert in eval); no pinned config sets it | SILENT |
+| `attack.crest_hold_ticks` | `attack_crest_hold_ticks=0` | `0` | ✗ | ✗ | shared max crest hold H; `0` = gate OFF globally. Same export-only drift, same fix | INERT while 0 |
+
+Fresh decode-fit artifacts use `split_v1`. `resolve_decode_config` requires both
+explicit vectors, an all-zero legacy vector, and the semantics marker. Old
+configs without explicit vectors continue to resolve under their historical
+law; the resolver never guesses which branch meaning was intended.
 
 ## `weapon_ban` / `guard.*` (DEFERRED)
 
@@ -119,8 +204,8 @@ live templates, or resolve breaks):
    `true`; promoted as an a25-module required key).
 3. **`look.aim_degrade_tremor_mag` / `_tremor_tau`** — a25base sets them, a25rc1
    omits. Reconcile then promote (tremor is the universal DOWN-band demoter).
-4. **`attack.bias` / `attack.stick_bias`** — both live templates set them; safe
-   to promote.
+4. **`attack.bias`** — both live templates set it; safe to promote. The retired
+   `attack.stick_bias` is not part of the reconciled law.
 5. **`look.weapon_pitch_gain` / `_bias`** — a24 RL feet-aim; **omitted on both a25
    templates.** Confirm feet-aim is intentionally OFF for a25 before either
    promoting (with explicit `[0]*9`) or leaving optional. Do **not** guess.

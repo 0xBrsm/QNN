@@ -248,15 +248,29 @@ void QNN_EventTick(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag
  * with at minimum fraction (1.0 = no obstruction) and endpos. */
 void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace);
 
-/* Mover occlusion cache (qnn_store.c) — solid brush-submodel movers at
- * their live origins, enumerated once per observation frame.  The
- * per-engine QNN_TraceLine refreshes the cache and clips each ray/LOS
- * segment against these so movers occlude like static world geometry.
- * Refresh returns the current mover count; Model/Origin index into the
- * cache (valid until the next refresh). */
+/* Player-clearance trace for the spatial tokens: same mover-aware line
+ * trace as QNN_TraceLine but against clip hull 1 (qbsp pre-expands
+ * hull 1 by the player bbox, so hit distances are exact player-origin
+ * clearance — no learned bbox correction) and carrying the hit plane
+ * through: trace->plane.normal / .dist are valid (world frame) whenever
+ * fraction < 1, including when a solid mover at its live origin is the
+ * nearest hit.  QNN_TraceLine keeps hull-0 point semantics for LOS/VIS
+ * consumers; do not swap one for the other. */
+void QNN_TraceClearance(const vec3_t start, const vec3_t end, trace_t *trace);
+
+/* Brush-occluder cache (qnn_store.c) — every blocking brush submodel at
+ * its last known live origin, enumerated once per observation frame.
+ * The historical Mover names are retained as API names.  Refresh returns
+ * the blocker count; Model/Origin index into the cache until next refresh. */
 int      QNN_TraceMoverCacheRefresh(void);
 model_t *QNN_TraceMoverModel(int index);
 float   *QNN_TraceMoverOrigin(int index);
+
+/* Clip a point trace or player-origin sweep against invisible static bbox
+ * blockers reconstructed from BSP entity metadata (for example a
+ * health-bearing trigger_multiple).  Existing nearer hits are preserved. */
+void QNN_TraceStaticBlockers(const vec3_t start, const vec3_t end,
+	qboolean player_hull, trace_t *trace);
 
 /* Model view-cone aperture (total degrees, [0,360]); read by QNN_InFov,
  * registered via QNN_RegisterPerceptionCvars. See qnn_entity.c. */

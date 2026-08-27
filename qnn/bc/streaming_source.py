@@ -20,7 +20,6 @@ from qnn.bc.train import (
     _NATIVE_TOKEN_INDEXED_OBS_FIELDS,
     _build_indptr,
     _filter_referenced_keys,
-    _inject_view_pitch_from_spatial_dir,
     _mask_target_probs_for_tokens,
     _mask_token_array,
     _shard_segments,
@@ -122,7 +121,6 @@ class StreamingSource:
             key: np.load(self.cache_dir / fname, mmap_mode="r")
             for key, fname in shard["obs"].items()
         }
-        obs = _inject_view_pitch_from_spatial_dir(obs)
         actions = {
             key: np.load(self.cache_dir / fname, mmap_mode="r")
             for key, fname in shard["actions"].items()

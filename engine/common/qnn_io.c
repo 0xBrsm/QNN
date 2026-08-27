@@ -56,17 +56,29 @@ void QNN_IOUpdate(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag)
  * StoreUpdate is now in IOUpdate so it runs before EventTick.  Emit
  * just reads the already-stamped store. */
 
+/* Active spatial obs contract. Default = v2 atlas (the flat obs-buffer /
+ * corpus contract); QNN_OnnxInit overrides it from the loaded model's
+ * codec so inference emits EXACTLY that contract's spatial block. */
+static qnn_spatial_mode_t qnn_io_spatial_mode = QNN_SPATIAL_MODE_ATLAS;
+
+void QNN_IOSetSpatialMode(qnn_spatial_mode_t mode)
+{
+	qnn_io_spatial_mode = mode;
+}
+
 void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
 {
 	memset(out, 0, sizeof(*out));
 
-	/* Compute-gate: skip the expensive entity oracle / spatial raycast
+	/* Compute-gate: skip the expensive entity oracle / spatial atlas
 	 * when their blocks are not selected for this collect.  The memset
-	 * above already zeroed out->entities / out->spatial / out->entity_count,
-	 * so the wire buffer stays valid (entity stream n_tokens=0, spatial
-	 * all-zero) without inventing a new variable-length layout.  Both
-	 * flags default true (set in QNN_HandleCollect), so the full BC
-	 * collect is unchanged. */
+	 * above already zeroed out->entities / out->entity_count (entity
+	 * stream n_tokens=0); a skipped atlas must read all-miss, not
+	 * hit-at-zero, so fill it with the miss code first.  Both flags
+	 * default true (set in QNN_HandleCollect), so the full BC collect
+	 * is unchanged. */
+	memset(out->spatial_atlas, QNN_OBS_ATLAS_MISS_CODE,
+		sizeof(out->spatial_atlas));
 	if (!qnn_runtime.skip_entities)
 	{
 		int player_cluster_id;
@@ -76,7 +88,19 @@ void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
 	}
 	QNN_SelfEmitToken(&out->self, snapshot);
 	if (!qnn_runtime.skip_spatial)
-		QNN_SpatialEmitTokens(snapshot, out->spatial);
+	{
+		/* Codec-driven: emit EXACTLY the loaded model's spatial obs
+		 * block, never both.  The single bin serves both wire.11 (v1
+		 * raycast scalars) and wire.12 (v2 depth atlas); the load path
+		 * set qnn_io_spatial_mode from the selected codec, so only the
+		 * matching emitter runs and the other's compute is skipped. */
+		if (qnn_io_spatial_mode == QNN_SPATIAL_MODE_RAYCAST_V1)
+			QNN_SpatialEmitTokens(snapshot, out->spatial);
+		else
+			QNN_SpatialEmitAtlas(snapshot, out->spatial_atlas,
+				qnn_io_spatial_mode == QNN_SPATIAL_MODE_ATLAS_LEGACY
+					? QNN_OBS_ATLAS_YAWS_LEGACY : QNN_OBS_ATLAS_YAWS);
+	}
 }
 
 /* ── Obs buffer serialization ─────────────────────────────────── */
@@ -101,9 +125,33 @@ static int QNN_PackEventSlots(uint8_t *obs, int pos,
 	return pos;
 }
 
+int QNN_IOPoseTailEnabled(void)
+{
+	static int checked, enabled;
+
+	if (!checked)
+	{
+		const char *flag = getenv("QNN_POSE_TAIL");
+		enabled = (flag != NULL && flag[0] == '1');
+		checked = 1;
+	}
+	return enabled;
+}
+
+void QNN_IOStashPoseTail(uint8_t *obs, const qnn_snapshot_t *snapshot)
+{
+	float pose[4];
+
+	pose[0] = snapshot->player_origin[0];
+	pose[1] = snapshot->player_origin[1];
+	pose[2] = snapshot->player_origin[2];
+	pose[3] = snapshot->player_view_angles[1];
+	memcpy(obs + QNN_POSE_TAIL_OFF, pose, sizeof(pose));
+}
+
 void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 {
-	int i;
+	int i, j;
 	int pos;
 
 	memset(obs, 0, QNN_OBS_BUFFER_SIZE);
@@ -150,44 +198,13 @@ void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_LOOK_DELTA + 4, tok->look_delta[2]);
 	}
 
-	/* ── Spatial block (135 B = field-major across 9 sectors) ─
-	 * Layout: 9 sectors × dir (27 B), 9 × nearest_dist (18 B),
-	 *         9 × mean_dist (18 B), then 8 × (9 × u8) for the
-	 *         clamped [0, 1] fractions.  Matches qnn/wire.py's
-	 *         _unpack_native_spatial. */
-	{
-		int p = QNN_OBS_OFF_SPATIAL;
-		/* spatial_dir [9, 3] i8 */
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i)
-		{
-			const qnn_spatial_token_t *tok = &r->spatial[i];
-			QNN_BufWriteI8(obs, p++, QNN_QuantizeI8(tok->dir[0]));
-			QNN_BufWriteI8(obs, p++, QNN_QuantizeI8(tok->dir[1]));
-			QNN_BufWriteI8(obs, p++, QNN_QuantizeI8(tok->dir[2]));
-		}
-		/* spatial_nearest_dist [9] u16 */
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i)
-		{
-			QNN_BufWriteU16(obs, p, QNN_QuantizeU16Saturating(r->spatial[i].nearest_dist));
-			p += 2;
-		}
-		/* spatial_mean_dist [9] u16 */
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i)
-		{
-			QNN_BufWriteU16(obs, p, QNN_QuantizeU16Saturating(r->spatial[i].mean_dist));
-			p += 2;
-		}
-		/* 8 × (9 × u8) — openness, clearance, traversable, dropoff,
-		 * solid_frac, water_frac, slime_frac, lava_frac. */
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].openness);
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].clearance);
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].traversable);
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].dropoff);
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].solid_frac);
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].water_frac);
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].slime_frac);
-		for (i = 0; i < QNN_OBS_SPATIAL_COUNT; ++i) obs[p++] = QNN_QuantizeU8Unit(r->spatial[i].lava_frac);
-	}
+	/* ── Spatial block (132 B — 24x11 depth-atlas codes, nibble-packed).
+	 * Low nibble = even yaw cell; high nibble = odd yaw cell. Matches
+	 * qnn/wire.py's _unpack_native_spatial and the ONNX scratch packer. */
+	for (i = 0; i < QNN_OBS_ATLAS_ELEVS; ++i)
+		QNN_AtlasPackRow(
+			&obs[QNN_OBS_OFF_SPATIAL + i * QNN_OBS_ATLAS_PACKED_BYTES],
+			r->spatial_atlas[i]);
 
 	/* ── Entity stream (variable-length, native widths) ──────── */
 	{

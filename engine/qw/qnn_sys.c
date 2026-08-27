@@ -255,7 +255,7 @@ void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
 	trace->fraction = pm.fraction;
 	VectorCopy(pm.endpos, trace->endpos);
 
-	/* Clip against solid movers at their live origins so movers occlude
+	/* Clip against blocking brushes at their live origins so entities occlude
 	 * like static world geometry (spatial rays shorten at a door face; an
 	 * enemy behind a closed door drops from SIGHT).  The mover set is
 	 * cached once per observation frame (QNN_TraceMoverCacheRefresh), so
@@ -291,4 +291,76 @@ void QNN_TraceLine(const vec3_t start, const vec3_t end, trace_t *trace)
 			VectorMA(start, mpm.fraction, delta, trace->endpos);
 		}
 	}
+	QNN_TraceStaticBlockers(start, end, false, trace);
+}
+
+/* QNN_TraceClearance (QW) — hull-1 line trace carrying the hit plane.
+ * Contract in qnn_object.h.  Structure mirrors QNN_TraceLine; deltas:
+ * clip hull 1 instead of hull 0 (start at hull->firstclipnode, not
+ * node 0), pm.plane copied out, and mover hits translate the
+ * mover-local plane to world (dist' = dist + n·origin). */
+void QNN_TraceClearance(const vec3_t start, const vec3_t end, trace_t *trace)
+{
+	pmtrace_t pm;
+	hull_t *hull;
+	int mover_count;
+	int i;
+
+	if (trace == NULL)
+		return;
+	memset(trace, 0, sizeof(*trace));
+	if (cl.worldmodel == NULL)
+	{
+		trace->fraction = 1.0f;
+		VectorCopy(end, trace->endpos);
+		return;
+	}
+	memset(&pm, 0, sizeof(pm));
+	pm.fraction = 1.0f;
+	hull = &cl.worldmodel->hulls[1];
+	if (hull->clipnodes == NULL || hull->planes == NULL)
+		hull = &cl.worldmodel->hulls[0]; /* degenerate map — point fallback */
+	PM_RecursiveHullCheck(hull, hull->firstclipnode, 0, 1,
+		(float *)start, (float *)end, &pm);
+	trace->allsolid = pm.allsolid;
+	trace->startsolid = pm.startsolid;
+	trace->fraction = pm.fraction;
+	VectorCopy(pm.endpos, trace->endpos);
+	VectorCopy(pm.plane.normal, trace->plane.normal);
+	trace->plane.dist = pm.plane.dist;
+
+	mover_count = QNN_TraceMoverCacheRefresh();
+	for (i = 0; i < mover_count; i++)
+	{
+		model_t *m = QNN_TraceMoverModel(i);
+		float *origin = QNN_TraceMoverOrigin(i);
+		hull_t *mh;
+		pmtrace_t mpm;
+		vec3_t start_l, end_l;
+
+		if (m == NULL)
+			continue;
+		mh = &m->hulls[1];
+		if (mh->clipnodes == NULL || mh->planes == NULL)
+			mh = &m->hulls[0];
+		VectorSubtract(start, origin, start_l);
+		VectorSubtract(end, origin, end_l);
+		memset(&mpm, 0, sizeof(mpm));
+		mpm.fraction = 1.0f;
+		PM_RecursiveHullCheck(mh, mh->firstclipnode, 0, 1,
+			start_l, end_l, &mpm);
+		if (mpm.fraction < trace->fraction)
+		{
+			vec3_t delta;
+			trace->fraction = mpm.fraction;
+			trace->allsolid = mpm.allsolid;
+			trace->startsolid = mpm.startsolid;
+			VectorSubtract(end, start, delta);
+			VectorMA(start, mpm.fraction, delta, trace->endpos);
+			VectorCopy(mpm.plane.normal, trace->plane.normal);
+			trace->plane.dist = mpm.plane.dist
+				+ DotProduct(mpm.plane.normal, origin);
+		}
+	}
+	QNN_TraceStaticBlockers(start, end, true, trace);
 }

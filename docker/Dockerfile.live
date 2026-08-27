@@ -1,7 +1,7 @@
-FROM --platform=linux/arm64 cgr.dev/chainguard/wolfi-base:latest
+FROM cgr.dev/chainguard/wolfi-base:latest
 
 ARG ORT_VERSION=1.26.0
-ARG ORT_URL=https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-aarch64-${ORT_VERSION}.tgz
+ARG ORT_URL=https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz
 
 RUN apk add --no-cache \
         glibc \
@@ -13,9 +13,9 @@ RUN apk add --no-cache \
     && curl -fsSL -o /tmp/ort.tgz "${ORT_URL}" \
     && mkdir -p /opt/onnxruntime \
     && tar -xzf /tmp/ort.tgz -C /tmp \
-    && cp -r /tmp/onnxruntime-linux-aarch64-${ORT_VERSION}/include /opt/onnxruntime/ \
-    && cp -r /tmp/onnxruntime-linux-aarch64-${ORT_VERSION}/lib     /opt/onnxruntime/ \
-    && rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-aarch64-${ORT_VERSION} \
+    && cp -r /tmp/onnxruntime-linux-x64-${ORT_VERSION}/include /opt/onnxruntime/ \
+    && cp -r /tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib     /opt/onnxruntime/ \
+    && rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-x64-${ORT_VERSION} \
     && apk del curl busybox
 
 ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib

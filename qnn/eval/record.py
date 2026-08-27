@@ -205,29 +205,32 @@ def main() -> None:
     print(f"  Dmg (self):   {result['dmg_self']:.0f}")
     print(f"  Demo:         {demo_path}")
 
-    # Copy demo to pi for review.
+    # Copy demo to the live share for review.
     if demo_path.exists():
-        _copy_to_pi(demo_path, f"{demo_stem}.dem")
+        _copy_to_live(demo_path, f"{demo_stem}.dem")
 
 
-_NAS_DEMOS = r"\\pi.local\nqdev\game\id1\common"
+# The live-play share's mod dir on g4 — where the bot's own demos already sit, so
+# a review client started with `-game arena` finds these alongside them.
+_LIVE_DEMOS = r"\\10.10.10.10\stacks\qnn\game\arena"
+_LIVE_HOST = "10.10.10.10"
 
 
-def _copy_to_pi(local_path: Path, filename: str) -> None:
+def _copy_to_live(local_path: Path, filename: str) -> None:
     try:
         import smbclient
         smbclient.ClientConfig(username="guest", password="", require_secure_negotiate=False)
         smbclient.register_session(
-            "pi.local", username="guest", password="",
+            _LIVE_HOST, username="guest", password="",
             auth_protocol="ntlm", require_signing=False,
         )
-        smbclient.makedirs(_NAS_DEMOS, exist_ok=True)
-        remote = _NAS_DEMOS + "\\" + filename
+        smbclient.makedirs(_LIVE_DEMOS, exist_ok=True)
+        remote = _LIVE_DEMOS + "\\" + filename
         with open(local_path, "rb") as src, smbclient.open_file(remote, mode="wb") as dst:
             dst.write(src.read())
         print(f"  Copied to:    {remote}")
     except Exception as exc:
-        print(f"  Pi copy failed: {exc}")
+        print(f"  Live-share copy failed: {exc}")
 
 
 if __name__ == "__main__":

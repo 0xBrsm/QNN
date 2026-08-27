@@ -19,8 +19,10 @@ arbitrary reweighting; density statements do not — skill-curves §16). The
 old pooled-event ladder (every shot one sample) is retired as a
 coordinate — its p90 was the top-10% of individual shots, a level no human
 sustains; it survives only as report context via ``interception_pctiles``.
-Coordinates NEVER pool across weapons. The frontier still rides ``max(fit
-floor upper-CI, elite anchor)``; since p100 = the elite anchor exactly,
+SG/SSG and NG/SNG pool within their same-physics calibration families; the
+family coordinate is copied onto both impulses. Coordinates never pool across
+those families or with LG/RL. The frontier still rides ``max(fit floor
+upper-CI, elite anchor)``; since p100 = the elite anchor exactly,
 refusals are now always model-floor refusals, never dishonest-target
 refusals.
 
@@ -44,7 +46,9 @@ from typing import Any
 
 import numpy as np
 
-from qnn.decode_fit.context import INTERCEPT_WEAPONS
+from qnn.decode_fit.context import (CALIBRATION_FAMILIES,
+                                    CALIBRATION_FAMILY_KEY,
+                                    INTERCEPT_WEAPONS)
 
 # Display knots the band ladder is sampled at for reports (interpolation is
 # exact log-linear between the two anchors regardless of knots).
@@ -91,36 +95,19 @@ def placement_anchors(intercept_path: Path) -> dict[str, Any]:
     return node
 
 
-def support_elite_bounds(intercept_path: Path) -> dict[str, float]:
-    """``{abbr: raw_elite_hbw}`` — the OBSERVED-support elite boundary per
-    weapon: the un-shrunk anchor value (``elite_hbw − shrinkage_gap_elite``;
-    equal to the anchor when reliability never shrank it). Two-boundary rule
-    (§16.3, Brian 2026-07-17): the SHRUNK anchors define the coordinate and
-    the targets (defensible sustained-elite estimates); the RAW extremes are
-    the support boundary — forced degradation and "super-human" verdicts may
-    only fire on placements TIGHTER than what humans observably posted.
-    Between the two lies the flag zone: claim-limited, never destroyed."""
-    wnode = placement_anchors(intercept_path)["weapons"]
-    out: dict[str, float] = {}
-    for abbr, e in wnode.items():
-        elite = e.get("elite_hbw")
-        if elite is None:
-            continue
-        gap = float(e.get("shrinkage_gap_elite") or 0.0)
-        out[abbr] = float(elite) - gap
-    return out
-
 
 def perweapon_human_ladder(intercept_path: Path) -> dict[str, dict[float, float]]:
-    """``{abbr: {band_pct: hbw}}`` — each weapon's SKILL-COORDINATE ladder:
-    log-hbw-linear between the validated sustained-band anchors (p0 =
+    """``{abbr: {band_pct: hbw}}`` — each calibration family's skill ladder,
+    copied onto its member impulses and log-hbw-linear between the validated
+    sustained-band anchors (p0 =
     ``placement_anchors`` floor, p100 = elite), sampled at the display knots.
     Raises if the artifact or its ``placement_anchors`` node is missing (no
     fallback; rebuild via ``python -m qnn.human <collect> --force``)."""
     wnode = placement_anchors(intercept_path)["weapons"]
     out: dict[str, dict[float, float]] = {}
     for abbr in INTERCEPT_WEAPONS:
-        e = wnode.get(abbr) or {}
+        family = CALIBRATION_FAMILY_KEY.get(abbr, abbr)
+        e = wnode.get(family) or {}
         elite, worst = e.get("elite_hbw"), e.get("floor_hbw")
         if elite is None or worst is None or not (0 < elite < worst):
             continue
@@ -131,7 +118,8 @@ def perweapon_human_ladder(intercept_path: Path) -> dict[str, dict[float, float]
     if missing:
         raise ValueError(
             f"validated placement anchors missing weapons {missing} in "
-            f"{intercept_path} (placement_anchors.weapons.<w> elite_hbw/floor_hbw)"
+            f"{intercept_path} (placement_anchors.weapons.<family> "
+            "elite_hbw/floor_hbw)"
             " — rebuild via `python -m qnn.human <collect> --force`")
     return out
 
@@ -164,8 +152,9 @@ def reachable_band(intercept_path: Path) -> dict[str, tuple[float, float]]:
     sm = _read(Path(intercept_path)).get("spread_of_median") or {}
     out: dict[str, tuple[float, float]] = {}
     for w in INTERCEPT_WEAPONS:
-        elite = (wnode.get(w) or {}).get("elite_hbw")
-        p50 = (sm.get(f"norm:{w}") or {}).get("median_p50")
+        family = CALIBRATION_FAMILY_KEY.get(w, w)
+        elite = (wnode.get(family) or {}).get("elite_hbw")
+        p50 = (sm.get(f"norm:{family}") or {}).get("median_p50")
         if elite is not None and p50 is not None:
             out[w] = (float(elite), float(p50))
     return out
@@ -242,6 +231,54 @@ def range_pin_weights(range_path: Path) -> dict[str, dict[str, float]]:
     if not p.exists():
         return {}
     doc = _read(p)
-    return {str(w): {str(k): float(v) for k, v in blk["pin_weights"].items()}
-            for w, blk in (doc.get("weapons") or {}).items()
-            if isinstance(blk, dict) and blk.get("pin_weights")}
+    nodes = doc.get("weapons") or {}
+    out = {str(w): {str(k): float(v) for k, v in blk["pin_weights"].items()}
+           for w, blk in nodes.items()
+           if isinstance(blk, dict) and blk.get("pin_weights")}
+    # Pool underlying frame mass, not normalized member weights, so the
+    # calibration curve rides the actual human family range mixture.
+    for source, members in (("SG", ("SG", "SSG")),
+                            ("SNG", ("NG", "SNG"))):
+        mass: dict[str, float] = {}
+        for member in members:
+            blk = nodes.get(member) or {}
+            n = float(blk.get("n_frames") or 0.0)
+            for pin, weight in (blk.get("pin_weights") or {}).items():
+                mass[str(pin)] = mass.get(str(pin), 0.0) + n * float(weight)
+        total = sum(mass.values())
+        if total > 0.0:
+            family_weights = {pin: value / total for pin, value in mass.items()}
+            for member in members:
+                out[member] = dict(family_weights)
+            out[source] = dict(family_weights)
+    return out
+
+
+def family_attack_rates(op_attack_path: Path) -> dict[str, float]:
+    """Human conditional fire rate for each forced-weapon representative.
+
+    Same-physics members are pooled by human engaged-LOS mass. Missing family
+    evidence is fatal: the four-pin cadence fit may not silently substitute a
+    singleton or skip a family.
+    """
+    p = Path(op_attack_path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"op-attack targets missing: {p} — rebuild the collect's "
+            "decode-fit human baselines (python -m qnn.human <collect_dir>)")
+    weapons = (_read(p).get("weapons") or {})
+    out: dict[str, float] = {}
+    for source, members in CALIBRATION_FAMILIES.items():
+        rows = []
+        for member in members:
+            row = weapons.get(member) or {}
+            if row.get("rate_per_s") is not None:
+                rows.append((float(row["rate_per_s"]),
+                             float(row.get("engaged_los_ticks") or 1.0)))
+        if not rows:
+            raise ValueError(
+                f"op-attack targets {p} lack cadence evidence for "
+                f"{'+'.join(members)}")
+        out[source] = sum(rate * weight for rate, weight in rows) / sum(
+            weight for _, weight in rows)
+    return out

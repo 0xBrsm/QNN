@@ -795,11 +795,7 @@ _NATIVE_ROW_INDEXED_OBS_FIELDS = frozenset({
     "ammo_shells", "ammo_nails", "ammo_rockets", "ammo_cells",
     "vel", "attack_finished",
     "self_weapon_id", "self_movement_id", "self_items",
-    "spatial_dir",
-    "spatial_nearest_dist", "spatial_mean_dist",
-    "spatial_openness", "spatial_clearance", "spatial_traversable",
-    "spatial_dropoff", "spatial_solid_frac", "spatial_water_frac",
-    "spatial_slime_frac", "spatial_lava_frac",
+    "spatial_atlas",
     "entity_count",
 })
 
@@ -812,45 +808,6 @@ _NATIVE_TOKEN_INDEXED_OBS_FIELDS = frozenset({
     "entity_facing", "entity_team", "entity_score",
     "entity_amount", "entity_regen", "entity_state",
 })
-
-# GROUND sector index in spatial_dir's (T, 9, 3) layout — set in
-# qnn.vocab.SPATIAL_SECTOR_IDS as "Ground_State". The C-side
-# QNN_BuildGroundSpatial projects world-down (0,0,-1) into the view
-# frame, which by AngleVectors math is exactly (sin(pitch), 0,
-# -cos(pitch)) — see src/engine/common/qnn_spatial.c:175-181. So the
-# i8 spatial_dir[:, 7, 0] column already encodes sin(view_pitch).
-_GROUND_SECTOR_IDX = 7
-
-
-def _inject_view_pitch_from_spatial_dir(
-    obs_arrays: dict[str, "np.ndarray"],
-) -> dict[str, "np.ndarray"]:
-    """Backfill view_pitch from spatial_dir for legacy shards.
-
-    Pre-self-split corpora don't carry a dedicated view_pitch field.
-    Recover it from spatial_dir[GROUND, 0] = sin(pitch) (i8 quant
-    against 127), reproject to the (deg / 90) × 127 i8 quantization
-    that the new wire emits and the SelfDequantizer consumes. Cheap
-    enough to do once at shard open — engine clamps pitch to ±70°, so
-    sin → arcsin round-trip stays inside the i8 range with sub-degree
-    error.
-
-    Idempotent: if the shard already has view_pitch (fresh collect with
-    the new emit), pass through unchanged.
-    """
-    if "view_pitch" in obs_arrays:
-        return obs_arrays
-    spatial_dir = obs_arrays.get("spatial_dir")
-    if spatial_dir is None:
-        return obs_arrays  # nothing to derive from; defer to caller's error
-    sin_p = np.asarray(spatial_dir[:, _GROUND_SECTOR_IDX, 0], dtype=np.float32) / 127.0
-    np.clip(sin_p, -1.0, 1.0, out=sin_p)
-    # arcsin → normalize by π/2 (equivalent to deg / 90) → i8 quant.
-    pitch_norm = np.arcsin(sin_p) * (2.0 / np.pi)
-    view_pitch = np.round(pitch_norm * 127.0).clip(-127, 127).astype(np.int8)
-    out = dict(obs_arrays)
-    out["view_pitch"] = view_pitch
-    return out
 
 # Sentinel for empty entity indices in the padded (T, MAX_TOKEN_OBJECTS,
 # ...) materialization. -1 in entity_types matches the ObsEmbedding's

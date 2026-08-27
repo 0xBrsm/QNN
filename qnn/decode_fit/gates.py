@@ -1,34 +1,16 @@
-"""Gates — confirmation, secant correction, style gate, attack trim.
+"""Gates — placement (fit-CI), placement measurement, style gate, attack trim.
 
-Plan §P3 (decode-fit-v2.md): stage 6 splits into two honest halves.
-
-* CONFIRMATION (gated, corrective): one batched eval on the SAME botpin
-  instrument at the planned operating point. PASS per weapon = the measured
-  percentile CI overlaps the promised percentile ±5 (decision 3; refused
-  plans promised the FRONTIER, so they confirm against ``frontier_pct``).
-  On a miss: ONE damped secant correction off the fitted curve's local
-  slope, then the caller re-confirms once.
-* DEPLOYMENT REPORT (world-gated, style-flagged): free-play arena eval.
-  Gated arms = world-results invariants ONLY (op-attack ruler,
-  threat-reactivity hazard, weapon-switch rate). Fitted-vs-native style
-  spend on band-v5 anchored ratios is FLAGGED (training-target register,
-  stamped into promoted provenance), never gating — skill placement is
-  never capped for style (Brian 2026-07-16). Band MEMBERSHIP never gates
-  either (research/human-band.md axioms: it is the research tracker).
-  Per-weapon free-play hbw is a REPORT CARD, never gated (decision 4 /
-  skill-curves §1.7b) — the fit→free-play domain gap is tracked as a
-  ``transfer_coeff`` per weapon instead of manufacturing FAILs.
-
-Everything here is PURE decision logic: no eval is ever launched from this
-module. ``attack_trim`` takes a ``launch_eval`` callback injected by the CLI
-(instruments.py owns launching); the other gates score artifacts they are
-handed. The world-results / band / intercept readers are ported from the v1
-pipeline (``qnn.eval.decode_fit_pipeline``) with their line references cited
-inline — v1 is deleted in the same change that lands this package (Phase 3).
-"""
+The gating confirmation round is GONE (Brian 2026-07-18): a confirm on the
+fit's own substrate passes by construction, and one on a different substrate
+fails whenever the fit is unrepresentative — so the fit must BE
+representative (all four opponent pins, human range-mix weighting, per-wave
+content-derived seeds) and is adjudicated on its own bootstrap CIs by
+``placement_gate``. ``measure_placement`` remains as the report-only scorer
+for ``--seed-replicates`` (refused plans promised the FRONTIER, so they
+score against ``frontier_pct``). The style gate + attack trim run on free
+play as before (a different estimand: natural play)."""
 from __future__ import annotations
 
-import dataclasses
 import json
 import math
 from pathlib import Path
@@ -36,27 +18,32 @@ from typing import Any, Callable
 
 import numpy as np
 
-from qnn.decode_fit.context import (INSTRUMENT_WEAPONS, MODELNAME_TO_ABBR,
-                                    TRANSFER_ALIAS, WEAPON_IMPULSE, read_json)
+from qnn.decode_fit.context import (CALIBRATION_FAMILY_KEY, IMPULSE_NAME,
+                                    INSTRUMENT_WEAPONS, MODELNAME_TO_ABBR,
+                                    TRANSFER_ALIAS, calibration_members,
+                                    read_json)
 from qnn.decode_fit.events import EventTable
 from qnn.decode_fit.human_refs import hbw_to_pct
-from qnn.decode_fit.response import (AlphaResponse, GainResponse, WeaponPlan)
+from qnn.decode_fit.occupancy import (RC1B_REFIRE_SEC,  # noqa: F401
+                                      selection_profile as _selection_profile)
+from qnn.decode_fit.response import GainResponse, WeaponPlan
 
-# the 4 weapons the botpin instrument measures directly (SSG/SNG confirm
-# transitively through their alias — same response, own ladder).
+# the 4 family representatives the botpin instrument measures directly.
 INSTRUMENT_ABBRS = tuple(MODELNAME_TO_ABBR[w] for w in INSTRUMENT_WEAPONS)
 
-# Below this effective discharge mass a confirmation card is ``low_n``:
+# Below this effective discharge mass a measurement card is ``low_n``:
 # neither pass nor fail, counted separately and flagged loud (spec: the
 # gate must never adjudicate a weapon it barely observed).
 CONFIRM_MIN_DISCHARGES = 50
 
 # ── attack-trim constants (ported verbatim from v1 decode_fit_pipeline.py
 # ~995-1011; semantics unchanged — see that file's comments for derivations) ──
-TRIM_MAX_ITERS = 6                 # 3 knobs (attack, stick, threat-break)
+# rc1b used 8 rounds for occupancy at a fixed switch margin. The reconciled
+# controller fits fire, selection, switch, and threat-break jointly; preference
+# corrections can perturb switching and therefore need verification headroom.
+TRIM_MAX_ITERS = 12
 TRIM_DAMPING = 0.6                 # step = damping × log-ratio (anti-oscillation)
 TRIM_TOL = 0.15
-TRIM_ATT_STEP_CLAMP = (-0.75, 0.75)
 # Threat-break hazard trim: additive step toward the human reactivity hazard;
 # Δratio→λ slope ≈ 0.35. Tolerance is on the LIFT (ratio − 1), NOT the ratio
 # (±15% of a 1.143 ratio contains "no reactivity at all" — the v1 it0 bug).
@@ -65,11 +52,26 @@ TRIM_REACT_STEP_CLAMP = (-0.03, 0.03)
 TRIM_REACT_HAZARD_MAX = 0.15
 TRIM_REACT_LIFT_TOL = 0.25
 TRIM_STICK_STEP_CLAMP = (-0.75, 1.0)
-# Per-weapon attack trim (a25rc3c redesign): each weapon's bias_vec entry
-# steps toward ITS human rate; below the tick floor a weapon's per-eval rate
-# is too noisy to step on (it stays on the aggregate ruler only).
-TRIM_VEC_STEP_CLAMP = (-0.75, 0.75)
-TRIM_PERWEAPON_MIN_TICKS = 2000
+# Conditional family cadence is owned by the four forced-weapon pin fit.
+# Natural free play cannot identify a family the selector does not choose.
+# Selection calibration: switch hysteresis is allowed to reduce jitter, but it
+# may not rewrite the model's learned final-aim active-fire weapon mix. The
+# zero-margin profile is measured per fit with the fixed a26rc1b estimator:
+# operative discharges weighted by each weapon's refire duration. This avoids
+# treating human weapon-script holds as genuine occupancy. A selection-only
+# vector restores the reference. Shares below 1% on both sides are too noisy
+# to steer; the 0.3% floor and 0.25 log tolerance are the rc1b values.
+TRIM_PREF_STEP_CLAMP = (-0.75, 0.75)
+TRIM_SELECTION_MIN_SHARE = 0.01
+TRIM_SELECTION_SHARE_FLOOR = 0.003
+TRIM_SELECTION_LOG_TOL = 0.25
+
+# Frozen a26rc1b active-fire dwell weights (raw weapon id 1..8) and the
+# occupancy estimand they weight. Provenance: the a26rc1b hand repair
+# (awposw seed43) established both; they live in ``qnn.decode_fit.occupancy``
+# beside the bias controllers that produced the rc1b config and are re-exported
+# here for the trim and the style gate. Re-exported, never re-declared — the
+# gate and the controllers must never drift into two occupancy rulers.
 
 # Pinned human threat-reactivity reference (own-fire-gated, skill-stable
 # all-humans pin) — ported from v1 decode_fit_pipeline.py:1256.
@@ -83,15 +85,14 @@ HUMAN_REACTIVITY_HAZARD = 1.143
 # exist.
 STYLE_REGRESSION_MARGIN = 0.05
 
-_IMPULSE_NAME = {1: "Axe", 2: "SG", 3: "SSG", 4: "NG", 5: "SNG",
-                 6: "GL", 7: "RL", 8: "LG"}
+_IMPULSE_NAME = IMPULSE_NAME
 
 
 def _log(msg: str) -> None:
     print(f"[decode-fit] {msg}", flush=True)
 
 
-# ══ 1. confirmation gate (decision 3) ═════════════════════════════════════════
+# ══ 1. placement measurement (report-only) ═════════════════════════════════════════
 
 def _median_ci(hbw: np.ndarray, clusters: np.ndarray, n_boot: int,
                rng: np.random.Generator) -> tuple[float, tuple[float, float]]:
@@ -121,23 +122,23 @@ def _pct_interval(hbw_ci: tuple[float, float],
     return (min(a, b), max(a, b))
 
 
-def confirmation_gate(table: EventTable, plans: dict[str, WeaponPlan],
+def measure_placement(table: EventTable, plans: dict[str, WeaponPlan],
                       ladder: dict[str, dict[float, float]], *,
                       tol_pct: float = 5.0, n_boot: int = 2000,
                       seed: int = 0) -> dict[str, Any]:
-    """Score the confirmation waves (plan §P3, decision 3).
+    """Score placement waves against the plans — MEASUREMENT ONLY.
 
-    Per instrument weapon: measured median hbw + cluster-bootstrap CI, mapped
-    through the weapon's OWN human ladder to a percentile CI. PASS = that CI
-    overlaps [center − tol_pct, center + tol_pct] where center is the plan's
-    ``target_pct`` — or ``frontier_pct`` for refused plans (the plan promised
-    the frontier, so the frontier is what must be confirmed). Weapons under
-    ``CONFIRM_MIN_DISCHARGES`` effective discharges are ``low_n`` (neither
-    pass nor fail; listed separately, flagged loud). SSG/SNG confirm
-    transitively via their alias and are reported with their OWN ladder
-    placement of the alias's measured hbw. Also reports ``fit_calibration``
-    per weapon: did the fit predict itself (measured median inside
-    ``plan.pred_hbw_ci``)?"""
+    The gating confirmation round is gone (a confirm on the fit's own
+    substrate passes by construction; the gate is now
+    ``placement_gate`` on the fit's own CIs). This scorer remains for the
+    report-only ``--seed-replicates`` re-measurement: per instrument weapon,
+    measured median hbw + cluster-bootstrap CI mapped through the weapon's
+    calibration-family human ladder; ``status``/verdicts are informational.
+    Weapons under
+    ``CONFIRM_MIN_DISCHARGES`` effective discharges are ``low_n``. SSG/NG
+    ride the identical SG/SNG family plan. ``fit_calibration`` reports
+    whether the fit predicted the measurement (measured median inside
+    ``plan.pred_hbw_ci``)."""
     rng = np.random.default_rng(seed)
     cards: dict[str, dict[str, Any]] = {}
     ladders_out: dict[str, dict[float, float]] = {}
@@ -151,7 +152,7 @@ def confirmation_gate(table: EventTable, plans: dict[str, WeaponPlan],
             continue
         lad = ladder.get(abbr)
         if not lad:
-            raise ValueError(f"confirmation_gate: no human ladder for {abbr}")
+            raise ValueError(f"measure_placement: no human ladder for {abbr}")
         ladders_out[abbr] = dict(lad)
         rows = table.where(weapon=abbr) if len(table) else table
         n_eff = float(rows["weight"].sum()) if len(rows) else 0.0
@@ -167,7 +168,7 @@ def confirmation_gate(table: EventTable, plans: dict[str, WeaponPlan],
             card["verdict"] = "low_n"
             card["note"] = (f"only {int(n_eff)} effective discharges "
                             f"(< {CONFIRM_MIN_DISCHARGES}) — neither pass nor "
-                            "fail; extend the confirmation wave")
+                            "fail; extend the placement wave")
             cards[abbr] = card
             low_n.append(abbr)
             continue
@@ -198,7 +199,7 @@ def confirmation_gate(table: EventTable, plans: dict[str, WeaponPlan],
         measured[abbr] = {"median": med, "ci": hbw_ci, "tms": tms}
         (passed if overlap else failed).append(abbr)
 
-    # ── transitive weapons (SSG/SNG ride SG/NG; own ladder placement) ─────
+    # ── transitive weapons (SSG/NG ride SG/SNG; own ladder placement) ─────
     for abbr, plan in plans.items():
         if abbr in cards:
             continue
@@ -245,347 +246,110 @@ def confirmation_gate(table: EventTable, plans: dict[str, WeaponPlan],
         "weapons": cards,
         "passed": passed, "failed": failed, "low_n": low_n,
         "transitive": transitive,
-        # ladders travel with the gate so secant_correction can re-place
-        # corrected predictions without re-reading the human baseline.
         "ladders": ladders_out,
     }
     if low_n:
         out["note"] = (f"LOW-N (loud): {low_n} under {CONFIRM_MIN_DISCHARGES} "
-                       "effective discharges — unadjudicated; the confirmation "
+                       "effective discharges — unadjudicated; the placement "
                        "wave must be extended before these placements are trusted")
     return out
 
 
-# ══ 2. one damped secant correction (plan §P3) ════════════════════════════════
+# ══ 2. placement gate — the fit adjudicates itself (no confirm round) ═════════
 
-def secant_correction(plans: dict[str, WeaponPlan], gate: dict[str, Any],
-                      gain_fits: dict[str, GainResponse],
-                      alpha_fits: dict[str, AlphaResponse | None], *,
-                      tremor_fit=None, support_elite: dict[str, float] | None = None,
-                      damping: float = 0.5) -> dict[str, WeaponPlan] | None:
-    """One damped secant step for every FAILed confirmation weapon, off the
-    fitted curve's local slope: Δ = target_hbw_effective − measured;
-    new_lever = lever + damping·Δ/grad (grad ≤ 0, so a too-loose measurement
-    — Δ < 0 — RAISES the lever). Gain is clipped to [0, knee(0.95)·1.5];
-    super-band plans correct α instead via ``alpha_grad`` (same clip form on
-    the α ray).
+# a plan CI narrower than this relative width is DEGENERATE — some code path
+# recorded a point promise as certainty (the a26 first-fit RL/SG/NG class)
+DEGENERATE_CI_REL = 1e-6
+# a representative fit needs this much effective discharge mass per weapon
+PLACEMENT_MIN_EVENTS = 400
 
-    TOO-GOOD + UNTRUSTED-FIT routing (the a25rc3c RL failure class): when the
-    weapon measured BETTER than the target (Δ > 0) and the measurement fell
-    outside the fit's prediction CI (the local curve is wrong there — a
-    degenerate zero-width CI counts), walking the gain/α lever off that curve
-    is extrapolating a model reality just falsified. Instead the correction
-    routes through the TREMOR down band, anchored on the MEASURED value:
-    ``mag = ln(target/measured) / slope`` — performance must come back inside
-    the human band, and tremor is the designed degradation lever (skill-curves
-    §15.4). Returns the FULL plan dict with corrected entries, or None when
-    nothing failed. ONE correction only — the caller re-confirms once."""
-    cards = gate.get("weapons") or {}
-    failed = [w for w, c in cards.items() if c.get("verdict") == "fail"]
-    if not failed:
-        return None
-    out = dict(plans)
-    for abbr in failed:
-        plan = plans[abbr]
-        card = cards[abbr]
-        measured = float(card["measured_hbw_median"])
-        tms = card.get("tms")
-        # refused plans promised the frontier — correct toward it, never the wish
-        eff_target = max(plan.target_hbw, plan.frontier_hbw)
-        delta = eff_target - measured
+
+def placement_gate(plans: dict[str, WeaponPlan],
+                   gain_fits: dict[str, GainResponse],
+                   ladder: dict[str, dict[float, float]], *,
+                   tol_pct: float = 5.0) -> dict[str, Any]:
+    """Gate the placement on the FIT'S OWN uncertainty (Brian 2026-07-18:
+    a confirmation round on the fit's substrate passes by construction, one
+    on a different substrate fails whenever the fit is unrepresentative —
+    the fix is a representative multi-seed fit whose CIs are trustworthy,
+    gated here).
+
+    Per plan (aliases included — their plans carry real CIs from the alias
+    response on their calibration-family ladder): the prediction CI mapped to
+    percentile
+    must overlap [center − tol, center + tol] (center = ``frontier_pct`` for
+    refused plans). HARD failures, loud, per weapon:
+
+    * degenerate prediction CI (relative width < ``DEGENERATE_CI_REL``) —
+      a point promise is never gate-able;
+    * knee undetermined on the source gain fit after the extension round —
+      the curve cannot place anything;
+    * effective discharge mass under ``PLACEMENT_MIN_EVENTS`` — the fit is
+      not the representative sample the gate's trust rests on.
+    """
+    cards: dict[str, dict[str, Any]] = {}
+    passed, failed = [], []
+    for abbr, plan in sorted(plans.items()):
+        lad = ladder.get(abbr)
+        if not lad:
+            raise ValueError(f"placement_gate: no human ladder for {abbr}")
         src = plan.alias_of or abbr
-        lad_raw = (gate.get("ladders") or {}).get(abbr) or {}
-        lad = {float(k): float(v) for k, v in lad_raw.items()}
-
-        fit_cal = card.get("fit_calibration") or {}
-        _ci = fit_cal.get("pred_hbw_ci") or plan.pred_hbw_ci or (None, None)
-        _degenerate = (_ci[0] is not None and _ci[1] is not None
-                       and abs(float(_ci[1]) - float(_ci[0])) < 1e-9)
-        fit_untrusted = (fit_cal.get("measured_in_pred_ci") is False
-                         or _degenerate)
-
-        if plan.band == "frontier-measured":
-            # a measured-frontier promise came from ≤2-pin cell evidence; the
-            # 4-pin confirmation is the better instrument in BOTH directions —
-            # re-promise at its measurement, levers untouched (walking a curve
-            # the cells already refuted is never an option here)
-            pct = round(hbw_to_pct(measured, lad), 1) if lad \
-                else plan.achieved_pct
-            out[abbr] = dataclasses.replace(
-                plan, pred_hbw=round(measured, 4),
-                pred_hbw_ci=(round(measured, 4), round(measured, 4)),
-                frontier_hbw=round(measured, 4), frontier_pct=pct,
-                achieved_pct=pct,
-                refused=bool(measured > plan.target_hbw),
-                notes=(plan.notes + f"; frontier-measured re-promise: 4-pin "
-                       f"confirmation measured {measured:.3f} vs promised "
-                       f"{plan.pred_hbw:.3f} — the confirm instrument wins "
-                       "both directions").lstrip("; "))
-            continue
-        if delta > 0 and fit_untrusted:
-            # Measured TIGHTER than promised with the local fit falsified.
-            # Two distinct cases (the a25rc3c SG mis-route): beating a REFUSED
-            # plan's frontier while still short of the wish is GOOD NEWS about
-            # a wrong frontier — re-promise at the measurement, never degrade
-            # real capability toward a falsified pessimistic prediction. Only
-            # overshooting the WISH (the human-band placement itself) warrants
-            # the tremor DOWN band.
-            if plan.refused and measured > plan.target_hbw:
-                pct = round(hbw_to_pct(measured, lad), 1) if lad \
-                    else plan.frontier_pct
-                out[abbr] = dataclasses.replace(
-                    plan, band="frontier-corrected",
-                    pred_hbw=round(measured, 4),
-                    pred_hbw_ci=(round(measured, 4), round(measured, 4)),
-                    frontier_hbw=round(measured, 4), frontier_pct=pct,
-                    achieved_pct=pct,
-                    notes=(plan.notes + f"; frontier correction: measured "
-                           f"{measured:.3f} beats the fitted frontier "
-                           f"{plan.frontier_hbw:.3f} (fit falsified) while "
-                           f"short of the {plan.target_hbw:.3f} wish — "
-                           "re-promising at the measurement; levers untouched"
-                           ).lstrip("; "))
-                continue
-            sup = (support_elite or {}).get(plan.alias_of or abbr)
-            if sup is not None and measured >= sup - 1e-9:
-                # TWO-BOUNDARY RULE (§16.3): the measurement beat the wish but
-                # sits INSIDE observed human support (looser than the raw
-                # un-shrunk elite) — degradation may not fire. The plan becomes
-                # a REFUSAL-TO-DEGRADE: it re-promises at the measurement as
-                # its frontier (confirmation then centers there), flagged for
-                # the report as beyond-defensible-band / within-support.
-                pct = round(hbw_to_pct(measured, lad), 1) if lad \
-                    else plan.achieved_pct
-                out[abbr] = dataclasses.replace(
-                    plan, refused=True, band="support-refused",
-                    pred_hbw=round(measured, 4),
-                    pred_hbw_ci=(round(measured, 4), round(measured, 4)),
-                    frontier_hbw=round(measured, 4), frontier_pct=pct,
-                    achieved_pct=pct,
-                    notes=(plan.notes + f"; refusal-to-degrade: measured "
-                           f"{measured:.3f} beats the {plan.target_hbw:.3f} "
-                           f"wish but is within observed human support "
-                           f"(raw elite {sup:.3f}) — placement rides the "
-                           "measurement, FLAGGED beyond the defensible "
-                           "sustained band, no degradation"
-                           ).lstrip("; "))
-                continue
-            back_target = plan.target_hbw if measured < plan.target_hbw \
-                else eff_target
-            # LEVER-CHANNEL correction first (Brian 2026-07-17): a hot gain/α
-            # is corrected on its OWN ray, never masked with tremor — stacking
-            # a degradation lever on a mis-set skill lever leaves two opposing
-            # knobs at the operating point. The falsified fit is not walked:
-            # the step rides the MEASURED ray — (0, ray base) → (lever,
-            # measured) are both world evidence (the base is pinned by the
-            # lever-0 sweep cells), same conditioning guard as the empirical
-            # correction.
-            lever = "alpha" if plan.band == "super" else "gain"
-            lev_val = float(getattr(plan, lever))
-            ray_base = lev_cap = None
-            if lever == "gain":
-                _gf = gain_fits.get(src)
-                if _gf is not None:
-                    ray_base = float(_gf.native_at(tms))
-                    lev_cap = _gf.knee(0.95)[0] * 1.5
-            else:
-                _af = alpha_fits.get(src)
-                if _af is not None:
-                    ray_base = float(_af.start)
-                    lev_cap = _af.k * math.log(1.0 / (1.0 - 0.95)) * 1.5
-            if lev_val > 1e-9 and ray_base is not None and ray_base > 0:
-                ray_dlog = math.log(measured / ray_base)
-                s_emp = ray_dlog / lev_val
-                if s_emp < -1e-9 and abs(ray_dlog) >= EMPIRICAL_MIN_DLOG:
-                    new_lev = float(np.clip(
-                        lev_val + damping * math.log(back_target
-                                                     / max(measured, 1e-9))
-                        / s_emp,
-                        0.0, lev_cap))
-                    pred = float(measured * math.exp(s_emp * (new_lev - lev_val)))
-                    out[abbr] = dataclasses.replace(
-                        plan, **{lever: round(new_lev, 4)},
-                        pred_hbw=round(pred, 4),
-                        pred_hbw_ci=(round(pred, 4), round(pred, 4)),
-                        achieved_pct=(round(hbw_to_pct(pred, lad), 1) if lad
-                                      else plan.achieved_pct),
-                        notes=(plan.notes + f"; empirical lever correction: "
-                               f"{lever} {lev_val}→{round(new_lev, 4)} on the "
-                               f"measured ray (base {ray_base:.3f} → "
-                               f"{measured:.3f} at {lever} {lev_val}, realized "
-                               f"slope {s_emp:.3f}) toward {back_target:.3f} — "
-                               "a hot lever corrects in its own channel, "
-                               "never via tremor").lstrip("; "))
-                    continue
-            if tremor_fit is not None:
-                # BEYOND LEVER REACH ONLY: the lever is already at 0 or its
-                # measured ray is flat/ill-conditioned (the lever cannot
-                # express the placement) while the model still beats the wish
-                # from outside human support — tremor is the designed
-                # degradation channel for exactly this class.
-                slope = float(getattr(tremor_fit, "slope", 0.0))
-                if slope > 1e-9:
-                    mag = float(np.clip(
-                        damping * math.log(back_target / max(measured, 1e-9))
-                        / slope,
-                        0.0, getattr(tremor_fit, "mag_max", 1.0)))
-                    pred = float(measured * math.exp(slope * mag))
-                    out[abbr] = dataclasses.replace(
-                        plan, tremor=round(mag, 4), band="down-corrected",
-                        pred_hbw=round(pred, 4),
-                        pred_hbw_ci=(round(pred, 4), round(pred, 4)),
-                        achieved_pct=(round(hbw_to_pct(pred, lad), 1) if lad
-                                      else plan.achieved_pct),
-                        notes=(plan.notes + f"; tremor correction: measured "
-                               f"{measured:.3f} < target {back_target:.3f} "
-                               f"with the local {plan.band}-band fit falsified "
-                               "(measured outside pred CI) — degrading via the "
-                               "DOWN band from the measured baseline, "
-                               f"mag={round(mag, 4)}").lstrip("; "))
-                    continue
-
-        if plan.band == "super":
-            afit = alpha_fits.get(src)
-            if afit is None:
-                out[abbr] = dataclasses.replace(
-                    plan, notes=(plan.notes + "; secant correction skipped: "
-                                 "super-band plan with no α fit").lstrip("; "))
-                continue
-            # (empirical follow-up lives in empirical_correction — this path
-            # remains the curve-based first correction)
-            grad = afit.alpha_grad(plan.alpha)
-            if grad >= -1e-12:
-                out[abbr] = dataclasses.replace(
-                    plan, notes=(plan.notes + "; secant correction skipped: "
-                                 "flat α gradient at the operating point").lstrip("; "))
-                continue
-            cap = afit.k * math.log(1.0 / (1.0 - 0.95)) * 1.5
-            new_alpha = float(np.clip(plan.alpha + damping * delta / grad, 0.0, cap))
-            pred = afit.predict_hbw(new_alpha)
-            ci = (pred, pred)
-            new = dataclasses.replace(
-                plan, alpha=round(new_alpha, 4), pred_hbw=round(pred, 4),
-                pred_hbw_ci=(round(ci[0], 4), round(ci[1], 4)),
-                achieved_pct=(round(hbw_to_pct(pred, lad), 1) if lad
-                              else plan.achieved_pct),
-                notes=(plan.notes + f"; secant correction: alpha {plan.alpha}"
-                       f"→{round(new_alpha, 4)} (measured {measured:.3f} hbw vs "
-                       f"target {eff_target:.3f})").lstrip("; "))
+        fit = gain_fits.get(src)
+        center = float(plan.frontier_pct if plan.refused else plan.target_pct)
+        lo, hi = float(plan.pred_hbw_ci[0]), float(plan.pred_hbw_ci[1])
+        pct_ci = _pct_interval((lo, hi), lad)
+        overlap = (pct_ci[0] <= center + tol_pct) and \
+                  (pct_ci[1] >= center - tol_pct)
+        reasons: list[str] = []
+        if (hi - lo) < DEGENERATE_CI_REL * max(abs(plan.pred_hbw), 1e-9):
+            reasons.append(
+                f"degenerate prediction CI [{lo}, {hi}] — a point promise "
+                "reached the gate (fix the CI path, never widen the tol)")
+        if fit is None:
+            reasons.append(f"no gain response for source {src!r}")
         else:
-            fit = gain_fits[src]
-            grad = fit.gain_grad(plan.gain, tms)      # d hbw / d gain, ≤ 0
-            if grad >= -1e-12:
-                out[abbr] = dataclasses.replace(
-                    plan, notes=(plan.notes + "; secant correction skipped: "
-                                 "flat gain gradient at the operating point").lstrip("; "))
-                continue
-            # Δ/grad: Δ<0 (too loose) over grad<0 → positive step (more gain);
-            # Δ>0 (too tight) → negative step. Moves TOWARD the target.
-            cap = fit.knee(0.95)[0] * 1.5
-            new_gain = float(np.clip(plan.gain + damping * delta / grad, 0.0, cap))
-            pred = fit.predict_hbw(new_gain, tms)
-            ci = fit.predict_ci(new_gain, tms)
-            new = dataclasses.replace(
-                plan, gain=round(new_gain, 4), pred_hbw=round(pred, 4),
-                pred_hbw_ci=(round(ci[0], 4), round(ci[1], 4)),
-                achieved_pct=(round(hbw_to_pct(pred, lad), 1) if lad
-                              else plan.achieved_pct),
-                notes=(plan.notes + f"; secant correction: gain {plan.gain}"
-                       f"→{round(new_gain, 4)} (measured {measured:.3f} hbw vs "
-                       f"target {eff_target:.3f})").lstrip("; "))
-        out[abbr] = new
-    return out
-
-
-EMPIRICAL_MIN_DLOG = 0.05    # two points closer than ~5% in log-hbw carry no slope
-
-
-def empirical_correction(prev_plans: dict[str, WeaponPlan],
-                         prev_gate: dict[str, Any],
-                         plans: dict[str, WeaponPlan],
-                         gate: dict[str, Any], *,
-                         tremor_fit=None) -> dict[str, WeaponPlan] | None:
-    """A TRUE secant step from two MEASURED points — no fitted-curve trust.
-
-    After the one curve-based correction, a weapon can fail re-confirmation
-    because the fitted response slope mispredicts the correction's effect
-    (the a25rc3c RL case: fitted tremor slope 3× the realized one, so the
-    half-step landed short and the re-measure failed against the wish).
-    At that point the ray holds two measurements: (lever₁, m₁) from the
-    first confirmation and (lever₂, m₂) from the second. The realized slope
-    ``s = ln(m₂/m₁)/(lever₂−lever₁)`` supports one evidence-based full step
-    ``lever₃ = lever₂ + ln(target/m₂)/s`` — extrapolating the WORLD, not a
-    falsified fit. Applies to whichever single lever the first correction
-    moved (tremor, α, or gain).
-
-    CONDITIONING (the a25rc3c RL overshoot, tremor 0.176 → 5.72 hbw): a
-    slope from two points closer than ``EMPIRICAL_MIN_DLOG`` in log-hbw is
-    noise, not evidence — RL's pair (3.120, 3.244) implied slope 1.32 while
-    the fitted 3.95 was correct at range. An ill-conditioned TREMOR pair
-    falls back to the FITTED slope anchored at the latest measurement with
-    a FULL (undamped) step; other levers without conditioning refuse.
-    Returns the corrected FULL plan dict, or None when any failed weapon
-    lacks a usable step (no lever moved, ill-conditioned with no fallback,
-    or slope with the wrong sign) — a third attempt would deterministically
-    re-fail, so the caller must stop."""
-    cards = gate.get("weapons") or {}
-    prev_cards = prev_gate.get("weapons") or {}
-    failed = [w for w, c in cards.items() if c.get("verdict") == "fail"]
-    if not failed:
-        return None
-    out = dict(plans)
-    for abbr in failed:
-        p1, p2 = prev_plans.get(abbr), plans[abbr]
-        c1, c2 = prev_cards.get(abbr) or {}, cards[abbr]
-        m1, m2 = c1.get("measured_hbw_median"), c2.get("measured_hbw_median")
-        if p1 is None or m1 is None or m2 is None:
-            return None
-        moved = [(lv, getattr(p1, lv), getattr(p2, lv))
-                 for lv in ("tremor", "alpha", "gain")
-                 if abs(getattr(p2, lv) - getattr(p1, lv)) > 1e-9]
-        if len(moved) != 1:                  # none or ambiguous — no clean ray
-            return None
-        lever, l1, l2 = moved[0]
-        m1, m2 = float(m1), float(m2)
-        dlog = math.log(m2 / m1)
-        s = dlog / (l2 - l1)
-        note_slope = f"realized slope {s:.3f}"
-        if abs(dlog) < EMPIRICAL_MIN_DLOG:
-            # pair too close — the slope is noise. Tremor rays fall back to
-            # the FITTED slope anchored at the latest measurement (full step);
-            # anything else has no trustworthy step.
-            if lever == "tremor" and tremor_fit is not None \
-                    and float(getattr(tremor_fit, "slope", 0.0)) > 1e-9:
-                s = float(tremor_fit.slope)
-                note_slope = (f"pair ill-conditioned (|Δlog|={abs(dlog):.3f} < "
-                              f"{EMPIRICAL_MIN_DLOG}) — fitted slope {s:.3f} "
-                              "anchored at the measurement")
-            else:
-                return None
-        # sanity: tremor/α loosen (s>0 along +lever), gain tightens (s<0)
-        if lever == "gain":
-            ok_dir = s < -1e-6
-        else:
-            ok_dir = s > 1e-6
-        if not ok_dir:
-            return None
-        eff_target = max(p2.target_hbw, p2.frontier_hbw) if p2.refused \
-            else p2.target_hbw
-        l3 = max(0.0, l2 + math.log(eff_target / max(m2, 1e-9)) / s)
-        pred = float(m2 * math.exp(s * (l3 - l2)))
-        lad_raw = (gate.get("ladders") or {}).get(abbr) or {}
-        lad = {float(k): float(v) for k, v in lad_raw.items()}
-        out[abbr] = dataclasses.replace(
-            p2, **{lever: round(l3, 4)},
-            pred_hbw=round(pred, 4),
-            pred_hbw_ci=(round(pred, 4), round(pred, 4)),
-            achieved_pct=(round(hbw_to_pct(pred, lad), 1) if lad
-                          else p2.achieved_pct),
-            notes=(p2.notes + f"; empirical correction: {lever} "
-                   f"{round(l2, 4)}→{round(l3, 4)} off the MEASURED ray "
-                   f"({round(l1, 4)}:{m1:.3f} → {round(l2, 4)}:{m2:.3f}, "
-                   f"{note_slope}) toward {eff_target:.3f}").lstrip("; "))
-    return out
+            if fit.knee_undetermined:
+                reasons.append("knee undetermined after the extension round "
+                               "— the curve cannot place a target")
+            if fit.n_events < PLACEMENT_MIN_EVENTS:
+                reasons.append(
+                    f"fit mass {fit.n_events} < {PLACEMENT_MIN_EVENTS} "
+                    "effective discharges — not a representative sample")
+        if not overlap and not reasons:
+            reasons.append(
+                f"predicted placement p{pct_ci[0]:.1f}..p{pct_ci[1]:.1f} "
+                f"misses the promise band "
+                f"p{center - tol_pct:g}..p{center + tol_pct:g}")
+        verdict = "pass" if (overlap and not reasons) else "fail"
+        cards[abbr] = {
+            "verdict": verdict,
+            "target_pct": float(plan.target_pct),
+            "refused": bool(plan.refused),
+            "center_pct": center,
+            "tol_band_pct": [round(center - tol_pct, 2),
+                             round(center + tol_pct, 2)],
+            "band": plan.band,
+            "alias_of": plan.alias_of,
+            "pred_hbw": plan.pred_hbw,
+            "pred_hbw_ci": [round(lo, 4), round(hi, 4)],
+            "pred_pct_ci": [round(pct_ci[0], 1), round(pct_ci[1], 1)],
+            **({"fit_mass": fit.n_events, "fit_clusters": fit.n_clusters,
+                "n_boot_ok": (fit.diagnostics or {}).get("n_boot_ok")}
+               if fit is not None else {}),
+            **({"fail_reasons": reasons} if reasons else {}),
+        }
+        (passed if verdict == "pass" else failed).append(abbr)
+    return {
+        "status": "PASS" if not failed else "FAIL",
+        "criterion": (f"fit-CI placement at ±{tol_pct:g}: the plan's own "
+                      "prediction CI must land in the promise band; "
+                      "degenerate CI / undetermined knee / thin mass fail "
+                      "hard (no confirmation round — the fit adjudicates "
+                      "itself, so its uncertainty must be honest)"),
+        "tol_pct": float(tol_pct),
+        "weapons": cards,
+        "passed": passed, "failed": failed,
+    }
 
 
 # ══ world-results / free-play readers (ported from v1) ════════════════════════
@@ -603,19 +367,19 @@ def _load_op_attack_targets(op_attack_path: Path) -> dict[str, Any]:
 
 
 def _op_shot_rates(npz: Path,
-                   targets: dict[str, Any] | None = None,
-                   op_attack_path: Path | None = None) -> dict[str, Any] | None:
+                   targets: dict[str, Any]) -> dict[str, Any] | None:
     """WORLD-RESULTS attack pair for the trim/gate (owner directive: match
     what firing delivers, not button hygiene). Port of v1
     decode_fit_pipeline.py:1202, semantics unchanged.
 
     Bot: attack pulses per engaged second per held weapon from the eval action
     streams (a25 attack is single-tick, so pulses ARE shots at decision
-    granularity). Human: corpus op-attack rate per held weapon evaluated at
-    the BOT's weapon mix, so weapon preference cannot confound the attack
-    trim. Weapons without human coverage drop out of both sides (shares
-    renormalized over the covered mass). Returns {h_att, b_att} in fires/s
-    plus per-weapon detail, or None when the npz is unreadable."""
+    granularity). SG/SSG and NG/SNG are pooled before rate and coverage
+    decisions. Human: corpus op-attack rate per calibration family evaluated
+    at the BOT's family mix, so weapon preference cannot confound the attack
+    trim. Weapons without human coverage drop out of both sides. Returns
+    {h_att, b_att} in fires/s plus descriptive per-weapon and load-bearing
+    per-family detail, or None when the npz is unreadable."""
     try:
         z = np.load(npz)
         hz = float(z["tick_hz"][0])
@@ -624,9 +388,10 @@ def _op_shot_rates(npz: Path,
         keep = z["keep"].astype(bool)
     except Exception:
         return None
-    t = (targets or _load_op_attack_targets(op_attack_path))["weapons"]
+    t = targets["weapons"]
     per: dict[str, Any] = {}
-    eng_tot = fire_tot = h_weighted = covered = all_eng = 0.0
+    family_obs: dict[str, dict[str, Any]] = {}
+    all_eng = 0.0
     for w in range(1, 9):
         m = keep & (wpn == w)
         n = float(m.sum())
@@ -639,28 +404,82 @@ def _op_shot_rates(npz: Path,
         per[name] = {"engaged_ticks": int(n),
                      "bot_fire_per_s": round(f / n * hz, 3),
                      "human_fire_per_s": h_rate}
+        family = CALIBRATION_FAMILY_KEY.get(name, name)
+        acc = family_obs.setdefault(
+            family, {"engaged_ticks": 0.0, "fires": 0.0, "members": []})
+        acc["engaged_ticks"] += n
+        acc["fires"] += f
+        acc["members"].append(name)
+
+    per_family: dict[str, Any] = {}
+    eng_tot = fire_tot = h_weighted = covered = 0.0
+    for family, obs in family_obs.items():
+        members = calibration_members(family)
+        human_rows = [(t.get(member) or {}) for member in members]
+        weighted = [(float(row["rate_per_s"]),
+                     float(row.get("engaged_los_ticks") or 1.0))
+                    for row in human_rows if row.get("rate_per_s") is not None]
+        h_rate = (sum(rate * weight for rate, weight in weighted)
+                  / sum(weight for _, weight in weighted)) if weighted else None
+        n = float(obs["engaged_ticks"])
+        f = float(obs["fires"])
+        per_family[family] = {
+            "members": list(members),
+            "engaged_ticks": int(n),
+            "bot_fire_per_s": round(f / n * hz, 3),
+            "human_fire_per_s": round(h_rate, 4) if h_rate is not None else None,
+        }
         if h_rate is not None:
             eng_tot += n
             fire_tot += f
-            h_weighted += n * float(h_rate)
+            h_weighted += n * h_rate
             covered += n
     if not eng_tot:
         return None
     return {"h_att": h_weighted / eng_tot, "b_att": fire_tot / eng_tot * hz,
-            "per_weapon": per, "engaged_ticks": int(eng_tot),
+            "per_weapon": per, "per_family": per_family,
+            "engaged_ticks": int(eng_tot),
             "coverage": round(covered / max(all_eng, 1.0), 3),
-            "units": "fires/s while engaged, bot-mix-weighted human target"}
+            "units": ("fires/s while engaged, bot-family-mix-weighted human "
+                      "target; SG+SSG and NG+SNG pooled")}
 
 
-def _reactivity_hazard(npz: Path) -> dict[str, Any] | None:
+def _selection_log_ratios(target_shares: dict[str, float],
+                          observed_shares: dict[str, float]) -> dict[str, float]:
+    """rc1b log-ratio ruler for dynamically meaningful weapons."""
+    return {
+        w: math.log(max(float(target_shares.get(w, 0.0)),
+                        TRIM_SELECTION_SHARE_FLOOR)
+                    / max(float(observed_shares.get(w, 0.0)),
+                          TRIM_SELECTION_SHARE_FLOOR))
+        for w in target_shares
+        if max(float(target_shares.get(w, 0.0)),
+               float(observed_shares.get(w, 0.0)))
+        >= TRIM_SELECTION_MIN_SHARE
+    }
+
+
+def _reactivity_hazard(npz: Path, *, n_boot: int = 0,
+                       seed: int = 0) -> dict[str, Any] | None:
     """Closed-loop threat reactivity vs the pinned human hazard, from the
     per-episode streams (threat_trace bit2). None on pre-bit2 streams.
-    Port of v1 decode_fit_pipeline.py:1259."""
+    Port of v1 decode_fit_pipeline.py:1259.
+
+    ``n_boot`` > 0 adds a cluster-bootstrap CI on ``hazard_ratio`` (episodes
+    are the independence unit — ticks within one episode's threat/calm
+    windows are correlated). Off by default: the attack-trim loop calls
+    this every iteration and doesn't consult the CI, so it stays cheap;
+    ``style_gate``'s GATED measurement turns it on. Motivated by a real
+    awposw-3 case (2026-07-19): one FROZEN style config measured
+    hazard_ratio 1.083-1.144 across separately-launched freeplay waves —
+    noise wider than TRIM_REACT_LIFT_TOL — so a bare point estimate at the
+    gate boundary is not trustworthy (the same single-wave-noise failure
+    mode the no-confirm redesign already fixed for placement_gate)."""
     try:
         z = np.load(npz)
     except Exception:
         return None
-    cp_t = n_t = cp_c = n_c = 0
+    ep_counts: list[tuple[int, int, int, int]] = []
     for key in z.files:
         if not key.startswith("ep_"):
             continue
@@ -674,15 +493,34 @@ def _reactivity_hazard(npz: Path) -> dict[str, Any] | None:
         cp = np.zeros(len(mv), bool)
         cp[1:] = (mv[1:, 0] != mv[:-1, 0]) | (mv[1:, 1] != mv[:-1, 1])
         threat = (th & 4).astype(bool)
-        cp_t += int(cp[threat].sum()); n_t += int(threat.sum())
-        cp_c += int(cp[~threat].sum()); n_c += int((~threat).sum())
+        ep_counts.append((int(cp[threat].sum()), int(threat.sum()),
+                          int(cp[~threat].sum()), int((~threat).sum())))
+    n_t = sum(c[1] for c in ep_counts)
     if n_t < 500:
         return None
+    cp_t = sum(c[0] for c in ep_counts)
+    cp_c = sum(c[2] for c in ep_counts)
+    n_c = sum(c[3] for c in ep_counts)
     rt, rc_ = cp_t / n_t, cp_c / max(n_c, 1)
-    return {"cp_rate_threat": round(rt, 4), "cp_rate_calm": round(rc_, 4),
-            "hazard_ratio": round(rt / max(rc_, 1e-9), 4),
-            "human_ref": HUMAN_REACTIVITY_HAZARD,
-            "threat_frames": n_t}
+    result = {"cp_rate_threat": round(rt, 4), "cp_rate_calm": round(rc_, 4),
+              "hazard_ratio": round(rt / max(rc_, 1e-9), 4),
+              "human_ref": HUMAN_REACTIVITY_HAZARD,
+              "threat_frames": n_t}
+    if n_boot > 0 and len(ep_counts) >= 4:
+        arr = np.array(ep_counts, dtype=np.float64)   # (E, 4): cp_t/n_t/cp_c/n_c
+        rng = np.random.default_rng(seed)
+        n_ep = len(arr)
+        boots = np.empty(n_boot)
+        for b in range(n_boot):
+            pick = rng.integers(0, n_ep, size=n_ep)
+            s = arr[pick].sum(axis=0)
+            b_rt = s[0] / s[1] if s[1] > 0 else 0.0
+            b_rc = s[2] / max(s[3], 1)
+            boots[b] = b_rt / max(b_rc, 1e-9)
+        result["hazard_ratio_ci"] = [round(float(np.percentile(boots, 2.5)), 4),
+                                      round(float(np.percentile(boots, 97.5)), 4)]
+        result["n_episodes"] = int(n_ep)
+    return result
 
 
 def _rc_rates(ctx, npz: Path,
@@ -839,7 +677,8 @@ def _weapon_switch_diag(ctx, npz: Path) -> dict[str, Any]:
 
 def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
                rel_tol: float = 0.25,
-               native_npz: Path | None = None) -> dict[str, Any]:
+               native_npz: Path | None = None,
+               selection_target: dict[str, Any] | None = None) -> dict[str, Any]:
     """The free-play DEPLOYMENT report (plan §P3, decision 4; band-v5 axioms).
 
     GATED arms — world-results invariants only (ALL must be True for PASS;
@@ -851,7 +690,10 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
       * threat-reactivity hazard — the LIFT criterion the trim converged on,
         re-checked at the deployable operating point.
       * weapon-switch rate — per-second both sides via rc_humanlikeness,
-        rel-delta ≤ ``rel_tol`` (the LG-park detector).
+        rel-delta ≤ ``rel_tol``;
+      * rc1b active-fire occupancy (operative discharges weighted by refire
+        duration) remains within the rc1b log tolerance per meaningful weapon
+        of the model's own zero-margin final-aim reference.
 
     FLAGGED, never gating (doctrine, Brian 2026-07-16: skill placement is
     never capped for style — style spend is the TRAINING-TARGET register):
@@ -903,13 +745,19 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
             "human_fire_per_s": round(op["h_att"], 4),
             "rel_delta": round(rel, 3) if np.isfinite(rel) else None,
             "rel_tol": float(rel_tol),
+            "per_family": op.get("per_family", op["per_weapon"]),
             "per_weapon": op["per_weapon"],
             "coverage": op["coverage"],
             "units": op["units"],
         }
 
     # ── GATED arm 2: threat-reactivity hazard at the operating point ──────
-    react = _reactivity_hazard(npz)
+    # CI, not a bare point estimate: a frozen config's hazard_ratio swung
+    # 1.083-1.144 across separately-launched freeplay waves (awposw-3,
+    # 2026-07-19) — noise wider than the tolerance band below. Verdict is
+    # CI-overlap (placement_gate's pattern), same estimand the trim loop's
+    # own iterations already show is this noisy.
+    react = _reactivity_hazard(npz, n_boot=2000)
     if react is None:
         react_ok: bool | None = None
         report["reactivity"] = {
@@ -920,10 +768,17 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
         }
     else:
         _h_lift = HUMAN_REACTIVITY_HAZARD - 1.0
-        _lift = float(react["hazard_ratio"]) - 1.0
-        react_ok = bool(abs(_lift - _h_lift) <= TRIM_REACT_LIFT_TOL * _h_lift)
+        _lift_lo = _h_lift - TRIM_REACT_LIFT_TOL * _h_lift
+        _lift_hi = _h_lift + TRIM_REACT_LIFT_TOL * _h_lift
+        ci = react.get("hazard_ratio_ci")
+        if ci is not None:
+            react_ok = bool((ci[1] - 1.0) >= _lift_lo and (ci[0] - 1.0) <= _lift_hi)
+        else:
+            _lift = float(react["hazard_ratio"]) - 1.0
+            react_ok = bool(_lift_lo <= _lift <= _lift_hi)
         report["reactivity"] = {"ok": react_ok, **react,
-                                "lift_tol": TRIM_REACT_LIFT_TOL}
+                                "lift_tol": TRIM_REACT_LIFT_TOL,
+                                "lift_band": [round(_lift_lo, 4), round(_lift_hi, 4)]}
 
     # ── GATED arm 3: weapon-switch rate (the LG-park detector) ────────────
     wsw = _weapon_switch_diag(ctx, npz)
@@ -939,6 +794,32 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
         report["weapon_switch_per_sec"] = {
             **wsw, "ok": wsw_ok,
             "rel_delta": round(_rel, 3), "rel_tol": float(rel_tol),
+        }
+
+    # ── GATED arm 4: hysteresis may not rewrite learned weapon occupancy ──
+    selection = _selection_profile(npz)
+    if selection is None or selection_target is None:
+        selection_ok: bool | None = None
+        report["weapon_occupancy"] = {
+            "ok": None,
+            "note": "selection profile/reference unmeasurable — cannot PASS",
+        }
+    else:
+        target_shares = selection_target.get("shares") or {}
+        observed_shares = selection.get("shares") or {}
+        ratios = _selection_log_ratios(target_shares, observed_shares)
+        worst = max((abs(v) for v in ratios.values()), default=0.0)
+        selection_ok = bool(worst <= TRIM_SELECTION_LOG_TOL)
+        report["weapon_occupancy"] = {
+            "ok": selection_ok,
+            "metric": "refire-weighted operative-discharge share (a26rc1b)",
+            "target_shares": {w: round(float(v), 4)
+                              for w, v in target_shares.items()},
+            "observed_shares": {w: round(float(v), 4)
+                                for w, v in observed_shares.items()},
+            "log_ratio": {w: round(v, 3) for w, v in ratios.items()},
+            "max_abs_log_ratio": round(worst, 3),
+            "tol": round(TRIM_SELECTION_LOG_TOL, 4),
         }
 
     # ── FLAGGED (never gates): fitted-vs-native style spend (Axiom 3) ─────
@@ -1034,12 +915,12 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
     report["aggregate_intercept"] = agg_row
 
     gated = {"opattack_ok": opattack_ok, "reactivity_ok": react_ok,
-             "wsw_ok": wsw_ok}
+             "wsw_ok": wsw_ok, "selection_ok": selection_ok}
     report["gated"] = gated
     report["status"] = ("PASS" if all(v is True for v in gated.values())
                         else "FAIL")
     if style_flags and report["status"] == "PASS":
-        report["status"] = "PASS"          # flags never demote the verdict
+        # flags never demote the verdict; they only annotate it
         report["status_note"] = f"PASS with style flags: {style_flags}"
     return report
 
@@ -1049,27 +930,25 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
 def attack_trim(ctx, config_path: Path,
                 launch_eval: Callable[[Path, str], Path | None], *,
                 max_iters: int = TRIM_MAX_ITERS) -> dict[str, Any]:
-    """Closed-loop attack-rate trim, redesigned after the a25rc3c gate FAILs
-    (per-weapon imbalance + native→fitted transfer breach). Eval launch is
-    injected: ``launch_eval(config_path, tag) → npz path | None``.
+    """Closed-loop final-behavior calibration at the deployable aim point.
 
-    MEASURED AT THE DEPLOYABLE OPERATING POINT. The v1 directive ("two fits,
-    not one" — trim style at native so a style knob can't absorb a skill
-    effect) is preserved in ORDER, not in venue: skill is placed and LOCKED
-    by the confirmation gate before this trim runs, so there is no co-fit
-    circularity — and the a25rc3c evidence killed the invariance premise
-    (a native-converged trim measured 0.632 off on the fitted config; wsw
-    collapsed 5× native→fitted under α-heavy aim). The gate scores the
-    deployable, so the trim measures the deployable. One aim-zeroed eval at
-    the converged style values is launched at the END as the NATIVE
-    reference for the style-spend flags.
+    The a26/a27 reconciliation gives each estimand one explicit control:
 
-    PER-WEAPON: the attack ruler steps each weapon's ``attack.bias_vec``
-    entry toward ITS human rate (the global ``attack.bias`` knob is not
-    touched — a global step just moves the LG/SG imbalance around, the
-    rc3d failure). Weapons under ``TRIM_PERWEAPON_MIN_TICKS`` engaged ticks
-    ride the aggregate criterion only. ``attack.stick_bias`` (weapon-switch)
-    and ``move.threat_break_hazard`` (reactivity) step as before.
+    * ``attack.fire_bias_vec`` is fixed by the forced-family cadence pins and
+      is never rewritten from selection-starved free play;
+    * ``weapon.switch_margin`` fits human switch rate;
+    * ``weapon.preference_bias_vec`` restores the model's own zero-margin,
+      final-aim refire-weighted discharge occupancy after hysteresis is added;
+    * ``move.threat_break_hazard`` fits threat reactivity.
+
+    A mandatory reference wave measures that active-fire occupancy before the
+    loop with rc1b's discharge×refire estimator. This operationalizes the
+    successful rc1b hand repair, avoids the human weapon-scripting confound,
+    and prevents
+    rate correction from becoming an LG/RL preference optimizer. All controls
+    are then iterated jointly because changing the selected weapon legitimately
+    changes its conditional fire response. Eval launch is injected as
+    ``launch_eval(config_path, tag) → npz path | None``.
 
     BACKTRACKING: every knob keeps a step scale that HALVES when its
     measured log-ratio flips sign (overshoot) — the stick_bias cliff:
@@ -1081,9 +960,40 @@ def attack_trim(ctx, config_path: Path,
     report: dict[str, Any] = {
         "config": str(config_path),
         "tol": TRIM_TOL, "max_iters": int(max_iters),
-        "measured_at": ("deployable operating point (skill locked by the "
-                        "confirmation gate; per-weapon bias_vec + backtracking)"),
+        "measured_at": ("deployable final-aim operating point; forced-pin "
+                        "cadence fixed, selection/switch/reactivity backtracking"),
     }
+    requested = read_json(config_path)
+    p0 = requested.get("params") or {}
+    legacy = [float(x) for x in (p0.get("attack.bias_vec") or [0.0] * 8)]
+    if p0.get("attack.vector_semantics") != "split_v1" or any(abs(x) > 1e-9 for x in legacy):
+        report.update(
+            status="INVALID-SEMANTICS", converged=False,
+            note=("reconciled trim requires attack.vector_semantics=split_v1 "
+                  "and zero legacy attack.bias_vec; refusing to reinterpret an "
+                  "a26/a27 artifact whose vector had branch-specific meaning"))
+        return report
+
+    # Reference = this model at its FINAL aim operating point, with selection
+    # controls neutral. Fire pins stay active because they are part of the
+    # observable substrate whose learned weapon mix we are preserving.
+    reference_cfg = Path(str(config_path) + ".selectionref.json")
+    ref = json.loads(json.dumps(requested))
+    ref["params"]["weapon.switch_margin"] = 0.0
+    ref["params"]["weapon.preference_bias_vec"] = [0.0] * 8
+    reference_cfg.write_text(json.dumps(ref, indent=2) + "\n")
+    reference_npz = launch_eval(reference_cfg, "selectionref")
+    reference_cfg.unlink(missing_ok=True)
+    selection_target = (_selection_profile(Path(reference_npz))
+                        if reference_npz is not None else None)
+    if selection_target is None:
+        report.update(
+            status="EVAL-FAILED", converged=False,
+            selection_reference_npz=(str(reference_npz) if reference_npz else None),
+            note="zero-margin rc1b discharge-occupancy reference was unmeasurable")
+        return report
+    report["selection_reference_npz"] = str(reference_npz)
+    report["selection_target"] = selection_target
     # working clone at the REQUESTED operating point (aim knobs kept)
     style_cfg = Path(str(config_path) + ".styletrim.json")
     style_cfg.write_text(json.dumps(read_json(config_path), indent=2) + "\n")
@@ -1133,25 +1043,46 @@ def attack_trim(ctx, config_path: Path,
         att_ratio = rates["h_att"] / max(rates["b_att"], 1e-6)
         wsw_ratio = rates["b_wsw"] / max(rates["h_wsw"], 1e-6)
         react = _reactivity_hazard(npz)
-        # per-weapon ratios (human/bot, > 1 ⇒ under-firing) on the same ruler
-        per_w = op.get("per_weapon") or {}
+        selection = _selection_profile(npz)
+        if selection is None:
+            report.update(status="EVAL-FAILED", iterations=iters,
+                          note=(f"iteration {it} lacks the rc1b operative-"
+                                "discharge occupancy stream"))
+            return report
+        target_shares = selection_target["shares"]
+        observed_shares = selection["shares"]
+        selection_log_ratio = _selection_log_ratios(
+            target_shares, observed_shares)
+        selection_max_log = max((abs(v) for v in selection_log_ratio.values()),
+                                default=0.0)
+        # Per-family ratios are report-only here. The four forced-weapon pins
+        # own conditional cadence because natural selection can starve a family.
+        per_w = op.get("per_family") or op.get("per_weapon") or {}
         w_ratio = {
             w: float(v["human_fire_per_s"]) / max(float(v["bot_fire_per_s"]), 1e-6)
             for w, v in per_w.items()
-            if int(v.get("engaged_ticks", 0)) >= TRIM_PERWEAPON_MIN_TICKS
-            and v.get("human_fire_per_s") and w in WEAPON_IMPULSE}
+            if int(v.get("engaged_ticks", 0)) > 0 and v.get("human_fire_per_s")}
         _tol_log = float(np.log(1.0 + TRIM_TOL))
-        w_off = {w: r for w, r in w_ratio.items()
-                 if abs(math.log(r)) > _tol_log}
+        aggregate_att_ok = abs(float(np.log(att_ratio))) <= _tol_log
         row = {"iter": it, **{k: round(v, 5) for k, v in rates.items()},
                "att_ratio": round(att_ratio, 3), "wsw_ratio": round(wsw_ratio, 3),
-               "att_ratio_per_weapon": {w: round(r, 3) for w, r in w_ratio.items()},
+               "att_ratio_per_family": {w: round(r, 3) for w, r in w_ratio.items()},
+               "aggregate_attack_gate_ok": aggregate_att_ok,
                "reactivity": react,
-               "att_units": op["units"], "att_per_weapon": op["per_weapon"],
+               "selection_shares": {w: round(v, 4)
+                                    for w, v in observed_shares.items()},
+               "selection_target_shares": {w: round(v, 4)
+                                           for w, v in target_shares.items()},
+               "selection_log_ratio": {w: round(v, 3)
+                                       for w, v in selection_log_ratio.items()},
+               "selection_max_abs_log_ratio": round(selection_max_log, 3),
+               "att_units": op["units"],
+               "att_per_family": op.get("per_family", per_w),
+               "att_per_weapon": op["per_weapon"],
                "att_transitions_diag": {"h": round(rc_pair["h_att"], 5),
                                         "b": round(rc_pair["b_att"], 5)}}
-        att_ok = (abs(float(np.log(att_ratio))) <= _tol_log) and not w_off
         wsw_ok = abs(float(np.log(wsw_ratio))) <= _tol_log
+        selection_ok = selection_max_log <= TRIM_SELECTION_LOG_TOL
         react_ok = True
         r_meas = None
         if react is not None:
@@ -1159,32 +1090,40 @@ def attack_trim(ctx, config_path: Path,
             _h_lift = HUMAN_REACTIVITY_HAZARD - 1.0
             react_ok = (abs((r_meas - 1.0) - _h_lift)
                         <= TRIM_REACT_LIFT_TOL * _h_lift)
-        if att_ok and wsw_ok and react_ok:
+        if wsw_ok and selection_ok and react_ok:
             iters.append({**row, "action": "converged"})
             converged = True
             break
         cfg = read_json(style_cfg)
         p = cfg["params"]
         updates: dict[str, Any] = {}
-        if w_off:
-            vec = list(p.get("attack.bias_vec") or [0.0] * 8)
-            stepped: dict[str, float] = {}
-            for w, r in sorted(w_off.items()):
-                idx = WEAPON_IMPULSE[w] - 1
-                if not 0 <= idx < len(vec):
-                    continue
-                d = _step(f"bias_vec.{w}", math.log(r), TRIM_VEC_STEP_CLAMP)
-                vec[idx] = round(float(vec[idx]) + d, 4)
-                stepped[w] = vec[idx]
-            if stepped:
-                p["attack.bias_vec"] = vec
-                updates["attack.bias_vec"] = stepped
         if not wsw_ok:
-            d = _step("stick_bias", float(np.log(wsw_ratio)),
+            d = _step("switch_margin", float(np.log(wsw_ratio)),
                       TRIM_STICK_STEP_CLAMP)
-            p["attack.stick_bias"] = round(
-                max(0.0, float(p.get("attack.stick_bias", 0.0)) + d), 4)
-            updates["attack.stick_bias"] = p["attack.stick_bias"]
+            p["weapon.switch_margin"] = round(
+                max(0.0, float(p.get("weapon.switch_margin", 0.0)) + d), 4)
+            updates["weapon.switch_margin"] = p["weapon.switch_margin"]
+        if not selection_ok:
+            pref = list(p.get("weapon.preference_bias_vec") or [0.0] * 8)
+            stepped_pref: dict[str, float] = {}
+            for w, raw in sorted(selection_log_ratio.items()):
+                impulse = next((i for i, name in _IMPULSE_NAME.items()
+                                if name == w), None)
+                if impulse is None:
+                    continue
+                d = _step(f"preference_bias_vec.{w}", raw,
+                          TRIM_PREF_STEP_CLAMP)
+                pref[impulse - 1] = float(pref[impulse - 1]) + d
+            # A constant offset is selection-invariant; center it so the vector
+            # has a unique, auditable representation and clip runaway attractors.
+            center = float(np.mean(pref))
+            pref = [round(float(np.clip(v - center, -8.0, 8.0)), 4)
+                    for v in pref]
+            for impulse, name in _IMPULSE_NAME.items():
+                if name in selection_log_ratio:
+                    stepped_pref[name] = pref[impulse - 1]
+            p["weapon.preference_bias_vec"] = pref
+            updates["weapon.preference_bias_vec"] = stepped_pref
         if react is not None and not react_ok:
             d = _step("threat_break",
                       (HUMAN_REACTIVITY_HAZARD - r_meas) * TRIM_REACT_STEP_SLOPE,
@@ -1212,7 +1151,8 @@ def attack_trim(ctx, config_path: Path,
     # freeze the trimmed style values into the deployable config
     _style = read_json(style_cfg)["params"]
     cfg = read_json(config_path)
-    for k in ("attack.bias_vec", "attack.stick_bias",
+    for k in ("attack.fire_bias_vec", "weapon.preference_bias_vec",
+              "weapon.switch_margin",
               "move.threat_break_hazard"):
         if k in _style:
             cfg["params"][k] = _style[k]
@@ -1224,7 +1164,9 @@ def attack_trim(ctx, config_path: Path,
         "iterations": iters,
         "converged": converged,
         "style_values": {k: cfg["params"].get(k)
-                         for k in ("attack.bias_vec", "attack.stick_bias",
+                         for k in ("attack.fire_bias_vec",
+                                   "weapon.preference_bias_vec",
+                                   "weapon.switch_margin",
                                    "move.threat_break_hazard")},
     })
     # NATIVE reference (aim knobs zeroed, converged style values) for the

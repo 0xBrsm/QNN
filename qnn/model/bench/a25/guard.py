@@ -22,7 +22,11 @@ The kept functions are wired into the :func:`make_guard` adapter the a25 policy 
 ONNX export consume. The self-splash veto is the ONLY OR-in in
 :func:`guard_attack_logit_for_export`; the a25 ``attack_with_decode`` reads that
 veto via its zeros-probe (align_bias is then always zero for a25). BIT-IDENTICAL
-to the a24 originals for the two kept vetoes.
+to the a24 originals for Gate B; the self-splash veto's wall/floor terms now go
+through :func:`_atlas_conservative_depth` (2026-07-22 fix for the atlas's
+nearest-rounding quantization letting truly-close surfaces read as safe — see
+its docstring), so it is a deliberate behavior change from the a24 original,
+not a clone.
 """
 
 from __future__ import annotations
@@ -36,13 +40,19 @@ import torch
 from qnn.actions import MOVE_AXES
 from qnn import engine_norm as en
 from qnn.bc.weapon_physics import WEAPON_PHYSICS
-from qnn.vocab import ENTITY_IDS, SPATIAL_SECTOR_IDS, TOKEN_ACTOR, TOKEN_PROJECTILE
+from qnn.vocab import ENTITY_IDS, SPATIAL_BAND_IDS, TOKEN_ACTOR, TOKEN_PROJECTILE
 
 
-# Spatial sector / column indices (dequantized spatial_scalars layout).
-_FOV_CENTER_IDX: int = SPATIAL_SECTOR_IDS["FOV_Center"]
-_GROUND_SECTOR_IDX: int = SPATIAL_SECTOR_IDS["Ground_State"]
-_SP_NEAREST_DIST: int = 3
+# Spatial band / column indices (dequantized spatial_scalars layout).
+# Atlas: per band [depth_norm x 24, hit x 24]; yaw cell 0 = forward.
+# "Ground" approximates the vertical column via the -75deg band's forward
+# cell (radial x sin75). This guard is a25-pinned (a25 models predate
+# wire.12); thresholds NOT re-fit — the v2 arch gets its own
+# decode-fit + guards.
+_LEVEL_BAND_IDX: int = SPATIAL_BAND_IDS["Elev_0"]
+_DOWN_BAND_IDX: int = SPATIAL_BAND_IDS["Elev_n75"]
+_SP_FWD_DEPTH: int = 0
+_ATLAS_SIN75: float = 0.9659258262890683
 _ACTOR_DIST: int = 6
 _ACTOR_REL_FWD: int = 3   # ACTOR_REL_OFFSET; view-frame rel x = forward component
 
@@ -183,16 +193,60 @@ def projectile_release_mask_any(
 
 
 # ── RL EHR-scaled self-splash veto ───────────────────────────────────────────
-# Rocket radius damage 120; findradius(damage+40)=160u; attacker branch halves
-# self-damage → self-splash at surface distance d is 0.5*(120 - 0.5*d) for d < 160u.
+# Rocket radius damage 120 (WEAPON_PHYSICS[7]["splash"] — the single source of
+# truth also used by _subject_radius_u above; NOT re-hardcoded here so the two
+# can't drift); findradius(damage+40)=160u; attacker branch halves self-damage
+# → self-splash at surface distance d is 0.5*(120 - 0.5*d) for d < 160u.
 # Max self-splash = 60 at d=0. Lethal standoff: d_safe = 4*(60 - EHR + margin), clamped
 # to [0, 160]. EHR = health + effective_armor (HP).
 _RL_LAUNCHER_ID: int = ENTITY_IDS["ROCKET_LAUNCHER"]
-_RL_SPLASH_MAX_SELF: float = 60.0     # 0.5 * 120 (point-blank attacker damage)
-_RL_SPLASH_FINDRADIUS: float = 160.0  # damage + 40; splash = 0 beyond this
+_RL_IMPULSE: int = 7   # WEAPON_PHYSICS' impulse-keyed table (weapon_physics.py)
+_RL_SPLASH_DAMAGE: float = float(WEAPON_PHYSICS[_RL_IMPULSE]["splash"])  # 120.0
+_RL_SPLASH_MAX_SELF: float = 0.5 * _RL_SPLASH_DAMAGE      # 60.0 (point-blank attacker damage)
+_RL_SPLASH_FINDRADIUS: float = _RL_SPLASH_DAMAGE + 40.0   # 160.0; splash = 0 beyond this
 ROCKET_EHR_SAFETY_MARGIN_HP: float = 10.0   # hold fire if it would leave < this HP
 ROCKET_FLOOR_MIN_PITCH_DEG: float = 12.0    # below this downward pitch, skip the floor test
 _DEG2RAD: float = 3.141592653589793 / 180.0
+
+# ── Atlas depth quantization safety margin ───────────────────────────────────
+# QNN_AtlasQuantizeDepth (src/engine/common/qnn_io.h) rounds a raw trace distance
+# to the NEAREST of engine_norm.ATLAS_DEPTH_LEVELS — a true distance in the
+# upper half of a bin rounds UP, so the reported depth can overestimate the
+# true distance by up to half that bin's width (e.g. true 95u -> reported
+# 100u). For a "is anything closer than X" veto, trusting the nominal ladder
+# value verbatim can read a genuinely-too-close wall/floor as falsely safe —
+# the guard's own d_safe operates exactly in the 60-160u range where bin gaps
+# run 14-48u. _atlas_conservative_depth subtracts the local bin's half-width
+# before the comparison, so a close surface can never round its way past the
+# veto. Derived from en.ATLAS_DEPTH_LEVELS (not re-hardcoded) so it can't
+# drift from the engine's actual quantization ladder. Normalized by DIST_SCALE
+# to match spatial_scalars' domain (SpatialDequantizer divides atlas depths by
+# DIST_SCALE before exposing them — see dequant.py's SpatialDequantizer
+# docstring), so it can be subtracted directly from `wall`/`ground` below.
+_ATLAS_LEVELS: torch.Tensor = (
+    torch.tensor(en.ATLAS_DEPTH_LEVELS, dtype=torch.float32) / en.DIST_SCALE)
+
+
+def _atlas_conservative_depth(depth: torch.Tensor) -> torch.Tensor:
+    """Reconstruct a dequantized (DIST_SCALE-normalized) atlas depth reading
+    as the LOWEST true distance nearest-rounding quantization could have
+    produced it from — i.e. the midpoint to the ladder level just below the
+    one `depth` nominally reports (0 for the lowest level, which has no lower
+    bin to round up from). Trace-safe (static lookup table, no
+    data-dependent control flow)."""
+    levels = _ATLAS_LEVELS.to(device=depth.device, dtype=depth.dtype)
+    n = levels.numel()
+    # levels[idx-1] < depth <= levels[idx]: the ladder level `depth` reports.
+    idx = torch.bucketize(depth, levels, right=False).clamp(0, n - 1)
+    idx_prev = (idx - 1).clamp(min=0)
+    lower_bound = 0.5 * (levels[idx_prev] + levels[idx])
+    # Never exceed the input itself: `depth` is only ever an exact ladder
+    # level or a band-limit-clamped value BELOW one (SpatialDequantizer's
+    # torch.minimum(levels[codes], limits)) in the real pipeline, where
+    # lower_bound <= depth always holds. This clamp just makes that
+    # invariant explicit instead of assumed, so an off-ladder input can
+    # never read as a farther (less safe) surface than it started as.
+    return torch.minimum(depth, lower_bound)
 
 
 def rocket_self_splash_guard_mask(
@@ -242,14 +296,17 @@ def rocket_self_splash_guard_mask(
     )
     d_safe = d_safe_u / en.DIST_SCALE                                          # (B,)
 
-    # Horizontal wall in the yaw aim direction (already normalized).
-    wall = spatial[:, _FOV_CENTER_IDX, _SP_NEAREST_DIST]                       # (B,)
+    # Horizontal wall in the yaw aim direction (already normalized). Discounted
+    # by the atlas's nearest-rounding quantization error (_atlas_conservative_depth)
+    # so a truly-close wall can't round its way past the veto.
+    wall = _atlas_conservative_depth(spatial[:, _LEVEL_BAND_IDX, _SP_FWD_DEPTH])   # (B,)
 
     # Floor under a downward aim. view_pitch is deg/90, positive = looking down.
     pitch_deg = motion[:, 3] * 90.0                                           # (B,)
     aiming_down = pitch_deg > ROCKET_FLOOR_MIN_PITCH_DEG
     sin_pitch = torch.sin(pitch_deg.clamp(min=0.0) * _DEG2RAD)
-    ground = spatial[:, _GROUND_SECTOR_IDX, _SP_NEAREST_DIST]                  # (B,)
+    ground = _atlas_conservative_depth(
+        spatial[:, _DOWN_BAND_IDX, _SP_FWD_DEPTH]) * _ATLAS_SIN75              # (B,)
     # Slant distance to the floor impact; +inf where not aiming down.
     floor_slant = ground / sin_pitch.clamp(min=1e-3)
     inf = torch.full_like(floor_slant, float("inf"))

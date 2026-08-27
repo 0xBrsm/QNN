@@ -134,6 +134,7 @@ CUSTOM_CXX_SOURCES=(
   "${ENGINE_DIR}/common/qnn_link.cpp"
   "${ENGINE_DIR}/common/qnn_cluster.cpp"
   "${ENGINE_DIR}/common/qnn_route.cpp"
+  "${ENGINE_DIR}/common/qnn_hull_carve.cpp"
 )
 
 NAV_CXX_SOURCES=(

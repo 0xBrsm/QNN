@@ -9,7 +9,9 @@
  */
 
 #include "qnn.h"
+#include "qnn_object.h"  /* QNN_TraceClearance — per-poly ceiling clearance */
 #include "qnn_route.h"
+#include "qnn_io.h"      /* QNN_SpatialCarveProbeAtlas — probe_atlas dump */
 
 #include <ctype.h>
 #include <math.h>
@@ -381,6 +383,35 @@ void QNN_WriteError(const char *message)
 
 /* ── shared nav query handler ───────────────────────────────────── */
 
+typedef struct
+{
+	unsigned long long poly_ref;
+	vec3_t point;
+} qnn_probe_sample_t;
+
+static int QNN_ProbeSampleAppend(qnn_probe_sample_t **samples,
+	int *count, int *capacity, unsigned long long poly_ref,
+	const float point[3])
+{
+	qnn_probe_sample_t *grown;
+	int next_capacity;
+
+	if (*count >= *capacity)
+	{
+		next_capacity = *capacity > 0 ? *capacity * 2 : 512;
+		grown = (qnn_probe_sample_t *)realloc(*samples,
+			(size_t)next_capacity * sizeof(**samples));
+		if (grown == NULL)
+			return 0;
+		*samples = grown;
+		*capacity = next_capacity;
+	}
+	(*samples)[*count].poly_ref = poly_ref;
+	VectorCopy(point, (*samples)[*count].point);
+	*count += 1;
+	return 1;
+}
+
 int QNN_HandleNavQuery(const char *line)
 {
 	char kind[32];
@@ -420,6 +451,290 @@ int QNN_HandleNavQuery(const char *line)
 		qnn_navmesh_write_nearest_json(stdout, &result);
 		fprintf(stdout, "}\n");
 		fflush(stdout);
+		return 0;
+	}
+
+	if (!strcmp(kind, "polys"))
+	{
+		/* Bulk walkable-poly dump for offline near-field studies +
+		 * probe placement: every Detour poly's ref/center/bounds/
+		 * neighbors plus a per-poly ceiling clearance (upward hull-1
+		 * trace from the poly center — the mesh itself has no ceiling
+		 * concept). */
+		qnn_navmesh_poly_record_t *records;
+		int record_count;
+		int i;
+		int j;
+
+		if (!qnn_navmesh_collect_polys(qnn_map_state.navmesh, &records, &record_count, error, sizeof(error)))
+		{
+			QNN_WriteError(error[0] ? error : "Poly enumeration failed");
+			return 0;
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"polys\",\"result\":{\"count\":%d,\"polys\":[", record_count);
+		for (i = 0; i < record_count; ++i)
+		{
+			const qnn_navmesh_poly_record_t *rec = &records[i];
+			vec3_t up_start;
+			vec3_t up_end;
+			trace_t up_trace;
+			float clearance;
+
+			VectorCopy(rec->center, up_start);
+			up_start[2] += 2.0f;
+			VectorCopy(up_start, up_end);
+			up_end[2] += 2048.0f;
+			memset(&up_trace, 0, sizeof(up_trace));
+			QNN_TraceClearance(up_start, up_end, &up_trace);
+			clearance = (up_trace.fraction < 1.0f)
+				? (up_trace.endpos[2] - up_start[2])
+				: 2048.0f;
+
+			fprintf(stdout, "%s{\"ref\":%llu,\"center\":[%.2f,%.2f,%.2f],"
+				"\"bmin\":[%.2f,%.2f,%.2f],\"bmax\":[%.2f,%.2f,%.2f],"
+				"\"ceiling\":%.2f,\"neighbors\":[",
+				i ? "," : "",
+				rec->poly_ref,
+				rec->center[0], rec->center[1], rec->center[2],
+				rec->bounds_min[0], rec->bounds_min[1], rec->bounds_min[2],
+				rec->bounds_max[0], rec->bounds_max[1], rec->bounds_max[2],
+				clearance);
+			for (j = 0; j < rec->neighbor_count; ++j)
+				fprintf(stdout, "%s%llu", j ? "," : "", rec->neighbor_refs[j]);
+			fprintf(stdout, "]}");
+		}
+		fprintf(stdout, "]}}\n");
+		fflush(stdout);
+		free(records);
+		return 0;
+	}
+
+	if (!strcmp(kind, "hull_faces"))
+	{
+		/* Exact static hull-1 boundary, built once at map load.  This is a
+		 * diagnostic export for static-memory experiments, never an
+		 * observation payload. */
+		if (QNN_SpatialWorldFaceCount() <= 0)
+		{
+			QNN_WriteError("Static hull-1 face carve is unavailable");
+			return 0;
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"hull_faces\",\"result\":");
+		QNN_SpatialWriteWorldFacesJson(stdout);
+		fprintf(stdout, "}\n");
+		fflush(stdout);
+		return 0;
+	}
+
+	if (!strcmp(kind, "atlas_bench"))
+	{
+		vec3_t origin;
+		int yaw_count = QNN_JsonExtractInt(line, "\"yaw_count\"", 72);
+		int iterations = QNN_JsonExtractInt(line, "\"iterations\"", 2000);
+		double microseconds_per_atlas;
+		double nanoseconds_per_ray;
+		unsigned int checksum;
+
+		origin[0] = QNN_JsonExtractFloat(line, "\"x\"", 0.0f);
+		origin[1] = QNN_JsonExtractFloat(line, "\"y\"", 0.0f);
+		origin[2] = QNN_JsonExtractFloat(line, "\"z\"", 0.0f);
+		if (iterations < 10 || iterations > 100000)
+		{
+			QNN_WriteError("atlas_bench iterations must be 10..100000");
+			return 0;
+		}
+		if (!QNN_SpatialBenchmarkWorldAtlas(origin, yaw_count, iterations,
+			&microseconds_per_atlas, &nanoseconds_per_ray, &checksum))
+		{
+			QNN_WriteError("atlas_bench requires yaw_count 72, 36, or 24 and a loaded world");
+			return 0;
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"atlas_bench\",\"result\":{"
+			"\"yaw_count\":%d,\"elev_count\":%d,\"rays\":%d,"
+			"\"iterations\":%d,\"microseconds_per_atlas\":%.6f,"
+			"\"nanoseconds_per_ray\":%.6f,\"checksum\":%u}}\n",
+			yaw_count, QNN_OBS_ATLAS_ELEVS,
+			yaw_count * QNN_OBS_ATLAS_ELEVS, iterations,
+			microseconds_per_atlas, nanoseconds_per_ray, checksum);
+		fflush(stdout);
+		return 0;
+	}
+
+	if (!strcmp(kind, "hull_cells"))
+	{
+		/* Exact non-solid hull-1 convex cells and their solid/portal face
+		 * fragments.  Diagnostic-only: this exposes the intermediate that
+		 * the load-time hull carve already builds and normally discards. */
+		fprintf(stdout, "{\"ok\":true,\"query\":\"hull_cells\",\"result\":");
+		if (!QNN_SpatialWriteWorldCellsJson(stdout))
+		{
+			fprintf(stdout, "null}\n");
+			fflush(stdout);
+			return 0;
+		}
+		fprintf(stdout, "}\n");
+		fflush(stdout);
+		return 0;
+	}
+
+	if (!strcmp(kind, "probe_atlas"))
+	{
+		/* Load-time probe table: carve the world-anchored panoramic
+		 * atlas at every walkable poly center or a world-grid sampled
+		 * inside those polys (raised to player-origin
+		 * height — a standing player's origin rests ~24u above the
+		 * navmesh floor surface, the hull mins offset) against the
+		 * static world only. Payload per poly is the 11x24 4-bit code
+		 * grid emitted as 264 hex nibbles in (elev,yaw) row-major order.
+		 * Consumed by qnn.bc.probe_grid to build the mesh-based probe
+		 * table.  The z offset is overridable via "z_offset" for
+		 * calibration sweeps (default 24). */
+		static const char hexd[] = "0123456789abcdef";
+		qnn_navmesh_poly_record_t *records;
+		qnn_probe_sample_t *samples;
+		int record_count;
+		int sample_count;
+		int sample_capacity;
+		int base_sample_count;
+		int i, ei, yi, p;
+		float z_offset = QNN_JsonExtractFloat(line, "\"z_offset\"", 24.0f);
+		float spacing = QNN_JsonExtractFloat(line, "\"spacing\"", 0.0f);
+		float z_spacing = QNN_JsonExtractFloat(line, "\"z_spacing\"", 0.0f);
+
+		if (spacing != 0.0f && (spacing < 8.0f || spacing > 512.0f))
+		{
+			QNN_WriteError("probe_atlas spacing must be 0 or 8..512 units");
+			return 0;
+		}
+		if (z_spacing != 0.0f && (z_spacing < 8.0f || z_spacing > 512.0f))
+		{
+			QNN_WriteError("probe_atlas z_spacing must be 0 or 8..512 units");
+			return 0;
+		}
+
+		if (!qnn_navmesh_collect_polys(qnn_map_state.navmesh, &records, &record_count, error, sizeof(error)))
+		{
+			QNN_WriteError(error[0] ? error : "Poly enumeration failed");
+			return 0;
+		}
+		samples = NULL;
+		sample_count = 0;
+		sample_capacity = 0;
+		for (i = 0; i < record_count; ++i)
+		{
+			const qnn_navmesh_poly_record_t *rec = &records[i];
+			int added = 0;
+
+			if (spacing > 0.0f)
+			{
+				float x_start = ceilf(rec->bounds_min[0] / spacing) * spacing;
+				float y_start = ceilf(rec->bounds_min[1] / spacing) * spacing;
+				float x, y;
+
+				for (x = x_start; x <= rec->bounds_max[0] + 0.01f; x += spacing)
+					for (y = y_start; y <= rec->bounds_max[1] + 0.01f; y += spacing)
+					{
+						vec3_t candidate;
+						qnn_navmesh_nearest_result_t nearest;
+
+						candidate[0] = x;
+						candidate[1] = y;
+						candidate[2] = rec->center[2];
+						memset(&nearest, 0, sizeof(nearest));
+						memset(error, 0, sizeof(error));
+						if (qnn_navmesh_find_nearest(qnn_map_state.navmesh,
+							candidate, &nearest, error, sizeof(error))
+							&& nearest.found && nearest.is_over_poly
+							&& nearest.poly_ref == rec->poly_ref)
+						{
+							if (!QNN_ProbeSampleAppend(&samples, &sample_count,
+								&sample_capacity, rec->poly_ref,
+								nearest.nearest_point))
+							{
+								free(samples);
+								free(records);
+								QNN_WriteError("Out of memory while sampling probe grid");
+								return 0;
+							}
+							added += 1;
+						}
+					}
+			}
+			if (!added && !QNN_ProbeSampleAppend(&samples, &sample_count,
+				&sample_capacity, rec->poly_ref, rec->center))
+			{
+				free(samples);
+				free(records);
+				QNN_WriteError("Out of memory while sampling probe centers");
+				return 0;
+			}
+		}
+		base_sample_count = sample_count;
+		if (z_spacing > 0.0f)
+		{
+			for (i = 0; i < base_sample_count; ++i)
+			{
+				vec3_t up_start;
+				vec3_t up_end;
+				trace_t up_trace;
+				float clearance;
+				float z;
+
+				VectorCopy(samples[i].point, up_start);
+				up_start[2] += z_offset;
+				VectorCopy(up_start, up_end);
+				up_end[2] += 2048.0f;
+				memset(&up_trace, 0, sizeof(up_trace));
+				QNN_TraceClearance(up_start, up_end, &up_trace);
+				clearance = up_trace.fraction < 1.0f
+					? up_trace.endpos[2] - up_start[2] : 2048.0f;
+				for (z = z_spacing; z + 8.0f < clearance; z += z_spacing)
+				{
+					vec3_t elevated;
+
+					VectorCopy(samples[i].point, elevated);
+					elevated[2] += z;
+					if (!QNN_ProbeSampleAppend(&samples, &sample_count,
+						&sample_capacity, samples[i].poly_ref, elevated))
+					{
+						free(samples);
+						free(records);
+						QNN_WriteError("Out of memory while sampling probe heights");
+						return 0;
+					}
+				}
+			}
+		}
+		fprintf(stdout, "{\"ok\":true,\"query\":\"probe_atlas\",\"result\":{"
+			"\"count\":%d,\"elevs\":%d,\"yaws\":%d,\"z_offset\":%.1f,"
+			"\"spacing\":%.1f,\"z_spacing\":%.1f,\"polys\":[",
+			sample_count, QNN_OBS_ATLAS_ELEVS, QNN_OBS_ATLAS_YAWS,
+			z_offset, spacing, z_spacing);
+		for (i = 0; i < sample_count; ++i)
+		{
+			const qnn_probe_sample_t *sample = &samples[i];
+			uint8_t atlas[QNN_OBS_ATLAS_ELEVS][QNN_OBS_ATLAS_YAWS];
+			char hex[QNN_OBS_ATLAS_ELEVS * QNN_OBS_ATLAS_YAWS + 1];
+			vec3_t probe_origin;
+
+			VectorCopy(sample->point, probe_origin);
+			probe_origin[2] += z_offset;
+			QNN_SpatialCarveProbeAtlas(probe_origin, 0.0f, atlas);
+
+			p = 0;
+			for (ei = 0; ei < QNN_OBS_ATLAS_ELEVS; ++ei)
+				for (yi = 0; yi < QNN_OBS_ATLAS_YAWS; ++yi)
+					hex[p++] = hexd[atlas[ei][yi] & 0x0f];
+			hex[p] = 0;
+
+			fprintf(stdout, "%s{\"ref\":%llu,\"center\":[%.2f,%.2f,%.2f],\"atlas\":\"%s\"}",
+				i ? "," : "", sample->poly_ref,
+				sample->point[0], sample->point[1], sample->point[2], hex);
+		}
+		fprintf(stdout, "]}}\n");
+		fflush(stdout);
+		free(samples);
+		free(records);
 		return 0;
 	}
 

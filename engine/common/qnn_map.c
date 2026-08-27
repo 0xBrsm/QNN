@@ -135,7 +135,7 @@ int QNN_MapParseEntities(qnn_raw_entity_t *out, int max)
 		char model_name[QNN_MAX_MODEL_NAME];
 		vec3_t origin, angles;
 		int spawnflags;
-		qboolean has_origin, has_angles, has_model;
+		qboolean has_origin, origin_is_explicit, has_angles, has_model;
 		qnn_property_t props[QNN_MAX_STATIC_PROPERTIES];
 		int prop_count;
 
@@ -155,6 +155,7 @@ int QNN_MapParseEntities(qnn_raw_entity_t *out, int max)
 		VectorCopy(vec3_origin, angles);
 		spawnflags = 0;
 		has_origin = false;
+		origin_is_explicit = false;
 		has_angles = false;
 		has_model = false;
 		prop_count = 0;
@@ -194,6 +195,7 @@ int QNN_MapParseEntities(qnn_raw_entity_t *out, int max)
 			else if (!strcmp(key, "origin"))
 			{
 				has_origin = QNN_ParseOriginStr(value, origin);
+				origin_is_explicit = has_origin;
 			}
 			else if (!strcmp(key, "angles"))
 			{
@@ -277,6 +279,7 @@ int QNN_MapParseEntities(qnn_raw_entity_t *out, int max)
 		VectorCopy(angles, out[count].angles);
 		out[count].spawnflags = spawnflags;
 		out[count].has_origin = has_origin;
+		out[count].origin_is_explicit = origin_is_explicit;
 		out[count].has_model = has_model;
 		out[count].property_count = prop_count;
 		if (prop_count > 0)

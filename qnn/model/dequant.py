@@ -6,8 +6,8 @@ int tensors the existing ObsEmbedding + heads consume:
 
 - ``SelfDequantizer``    — health, armor, ammo, velocity, items
                             bitfield, attack cooldown.
-- ``SpatialDequantizer`` — 9 sector tokens with dir, distances,
-                            clearance / openness / fractions.
+- ``SpatialDequantizer`` — 11 nibble-packed depth-atlas rows, expanded to
+                            24 depth and 24 hit scalars per row.
 - ``EntityDequantizer``  — variable-length entity tokens (per-type
                             scalars: actor / projectile / item / mover).
                             Added in a follow-up commit.
@@ -15,10 +15,10 @@ int tensors the existing ObsEmbedding + heads consume:
 Each owns the per-field normalization (``/QNN_MAX_HEALTH``,
 ``/QNN_VELOCITY_SCALE``, ``/QNN_TIME_SCALE``, ``/QNN_DIST_SCALE``,
 ``/127`` for i8 unit vectors, ``/255`` for u8 [0, 1] fractions) and
-any bit / index demuxing. Output dict keys feed the ObsEmbedding's
-existing per-type projections and embedding lookups, so trained
-checkpoints load and run unchanged once the dataloader produces
-native-format obs dicts.
+any bit / index demuxing. Output dict keys feed the ObsEmbedding's per-type
+projections and embedding lookups. A changed model-facing width still requires
+a coordinated checkpoint and wire contract, even when the adapter owns the
+native conversion.
 
 Native obs is the ONLY input contract — there is no legacy
 passthrough. Reading older f16 caches happens in a dedicated
@@ -74,11 +74,11 @@ WEAPON_SUBJECT_IDS = (
 _WEAPON_SUBJECT_IDS = WEAPON_SUBJECT_IDS
 _N_WEAPONS = len(WEAPON_SUBJECT_IDS)
 
-# Canonical 17-wide self_scalars layout. The production ObsEmbedding projects
+# Canonical 18-wide self_scalars layout. The production ObsEmbedding projects
 # this full bundle through TokenBuilder's monolithic self ScalarGroup, and
 # downstream ablation heads / feature registry entries / labeler probes still
 # index it by these positions. Do not reorder without an architectural retrain.
-_SELF_SCALAR_DIM = 17
+_SELF_SCALAR_DIM = 18
 # Public — bench heads + the obs-field catalog read these indices off
 # self_scalars directly; keep the source-of-truth here so an obs-layout
 # change can't drift between the dequantizer that writes them and the bench
@@ -100,6 +100,7 @@ IDX_VEL_X            = 13
 IDX_VEL_Y            = 14
 IDX_VEL_Z            = 15
 IDX_ATTACK_FINISHED  = 16
+IDX_VIEW_PITCH       = 17
 # Back-compat private aliases for the dequantizer's internal writes.
 _IDX_HEALTH          = IDX_HEALTH
 _IDX_ARMOR           = IDX_ARMOR
@@ -112,6 +113,7 @@ _IDX_AMMO_CELLS      = IDX_AMMO_CELLS
 _IDX_VEL_X           = IDX_VEL_X
 _IDX_VEL_Z           = IDX_VEL_Z
 _IDX_ATTACK_FINISHED = IDX_ATTACK_FINISHED
+_IDX_VIEW_PITCH      = IDX_VIEW_PITCH
 
 # Self subtoken scalar widths, consumed by the three projections in
 # ObsEmbedding (`self_proj_state`, `self_proj_arsenal`, `self_proj_motion`).
@@ -125,7 +127,7 @@ class SelfDequantizer(nn.Module):
 
     Emits three subtoken scalar tensors (state / arsenal / motion), a
     per-weapon readiness vector, and powerup IDs grouped by which
-    subtoken they route into. The legacy 17-wide ``self_scalars`` tensor
+    subtoken they route into. The flat 18-wide ``self_scalars`` tensor
     is kept alongside for feature-registry / labeler-probe consumers
     that still index it by idx position.
     """
@@ -216,6 +218,7 @@ class SelfDequantizer(nn.Module):
         scalars[:, _IDX_AMMO_CELLS]   = ammo_ce_f
         scalars[:, _IDX_VEL_X:_IDX_VEL_Z + 1] = vel_f
         scalars[:, _IDX_ATTACK_FINISHED] = af_f
+        scalars[:, _IDX_VIEW_PITCH] = pitch_f
 
         items_i64 = items.to(torch.int64)
         # 7 ammo-using weapon-owned bits in legacy idx order (SG..LG).
@@ -331,80 +334,107 @@ class SelfDequantizer(nn.Module):
 
 # ── SpatialDequantizer ───────────────────────────────────────────
 
-# spatial_scalars idx layout — mirrors qnn_onnx.c:374-386. The
-# ObsEmbedding's spatial_proj is nn.Linear(13, d_model); trained
-# checkpoints have weights indexed by these positions, so reordering
-# requires retraining.
-_SPATIAL_SCALAR_DIM   = 13
-_SP_DIR_X             = 0
-_SP_DIR_Y             = 1
-_SP_DIR_Z             = 2
-_SP_NEAREST_DIST      = 3
-_SP_MEAN_DIST         = 4
-_SP_OPENNESS          = 5
-_SP_CLEARANCE         = 6
-_SP_TRAVERSABLE       = 7
-_SP_DROPOFF           = 8
-_SP_SOLID_FRAC        = 9
-_SP_WATER_FRAC        = 10
-_SP_SLIME_FRAC        = 11
-_SP_LAVA_FRAC         = 12
+# spatial_scalars idx layout (rev-8 depth atlas) — per band token,
+# field-major: [depth_norm × ATLAS_YAWS | hit × ATLAS_YAWS], i.e. the
+# first half of the last axis is depth, the second half is the hit flag,
+# both in yaw-cell order. _decode below builds it with that cat; every
+# consumer that slices at ATLAS_YAWS (spatial_pool.SectorPool9,
+# transformer's near-field ring, env.sim) depends on this order.
+
+
+def pack_atlas_codes(atlas: torch.Tensor) -> torch.Tensor:
+    """Nibble-pack atlas codes (…, 24) u8 → wire rows (…, 12) u8.
+
+    Two 4-bit codes per byte, low nibble = even yaw cell. Resident
+    storage, streaming gathers, flat wire, and ONNX use this packed form;
+    SpatialDequantizer also accepts unpacked rows for diagnostics/tests.
+    Codes are ≤ 15 by construction (4-bit ladder + miss sentinel).
+    """
+    if int(atlas.shape[-1]) != en.ATLAS_YAWS:
+        raise ValueError(
+            f"pack_atlas_codes: last dim {int(atlas.shape[-1])} != {en.ATLAS_YAWS}"
+        )
+    return atlas[..., 0::2] | (atlas[..., 1::2] << 4)
 
 
 class SpatialDequantizer(nn.Module):
     """Engine-native spatial block → ObsEmbedding-ready ``spatial_scalars``.
 
-    Input: per-field native-typed tensors (per qnn.engine_norm.SPATIAL_FIELDS).
-    Output: ``spatial_scalars`` (B, 9, 13) float32 in the layout the
-    ObsEmbedding's ``spatial_proj`` consumes.
+    Input: ``spatial_atlas`` (B, 11, 12) packed u8 bytes (per
+    qnn.engine_norm.SPATIAL_FIELDS), expanding to 24 depth codes where
+    0..14 index ATLAS_DEPTH_LEVELS and 15 is miss. Output:
+    ``spatial_scalars`` (B, 11, 48) float32 — per elevation band,
+    24 depths normalized by DIST_SCALE then 24 hit
+    flags. Decoded depth is clamped to the band's range limit, and a
+    miss decodes to exactly that limit with hit = 0, so quantization
+    can never place a phantom surface past the instrument's range.
     """
 
     def __init__(self) -> None:
         super().__init__()
+        # Level 15 (the miss code) decodes via the band-limit override
+        # below; the ladder entry only keeps the gather in range.
+        levels = torch.tensor(
+            list(en.ATLAS_DEPTH_LEVELS) + [0.0], dtype=torch.float32,
+        )
+        limits = torch.tensor(en.ATLAS_BAND_LIMIT, dtype=torch.float32)
+        self.register_buffer("_levels", levels, persistent=False)
+        self.register_buffer("_band_limits", limits, persistent=False)
+
+    def _decode(self, atlas: torch.Tensor) -> torch.Tensor:
+        """(…, 11, 24|12) u8 codes → (…, 11, 48) f32 scalars.
+
+        Leading dims are free: the ego atlas is (B, 11, 12) and the
+        probe-grid stack is (B, K, 11, 24|12); band limits broadcast at
+        dim -2 either way.
+        """
+        # Codes are integers, but the inference/training obs-prep floats
+        # every non-id/mask field (policy._obs_tensors_dequant defaults to
+        # f32), and the nibble unpack below needs an integer dtype — cast
+        # up front. Exact: codes/packed bytes are <= 255, representable in
+        # f32 without loss, and the depth gather downstream needs long.
+        atlas = atlas.to(torch.long)
+        last = int(atlas.shape[-1])
+        if last * 2 == en.ATLAS_YAWS:
+            # Wire/storage nibble packing (two 4-bit codes per byte;
+            # low nibble = even yaw cell — see pack_atlas_codes).
+            lo = atlas & 0x0F
+            hi = (atlas >> 4) & 0x0F
+            atlas = torch.stack((lo, hi), dim=-1).reshape(
+                *atlas.shape[:-1], en.ATLAS_YAWS,
+            )
+        elif last in (en.ATLAS_YAWS, en.ATLAS_YAWS_LEGACY):
+            # Already-unpacked codes: current width, or the pre-wire.12
+            # rc1-line atlas (72 yaw cells, never nibble-packed) — the
+            # depth/hit math below is yaw-count-agnostic, so no other
+            # change is needed to decode a legacy-width cache.
+            pass
+        else:
+            raise ValueError(
+                f"atlas codes last dim {last}: expected "
+                f"{en.ATLAS_YAWS // 2} (packed wire), {en.ATLAS_YAWS} "
+                f"(unpacked codes), or {en.ATLAS_YAWS_LEGACY} (legacy "
+                "rc1-line unpacked atlas)"
+            )
+        codes = atlas
+        hit = codes.ne(en.ATLAS_MISS_CODE)
+        limits = self._band_limits.view(1, -1, 1)
+        depth = torch.minimum(self._levels[codes], limits)
+        depth = torch.where(hit, depth, limits.expand_as(depth))
+        return torch.cat(
+            [depth / en.DIST_SCALE, hit.to(torch.float32)], dim=-1,
+        )
 
     def forward(
         self, obs: Mapping[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        # Idempotent: if obs already has the dequantized
-        # ``spatial_scalars`` (preload ran the dequant), pass through.
-        if "spatial_scalars" in obs:
-            return dict(obs)
+        # Idempotent: dequantized keys already present pass through
+        # (preload ran the dequant).
         out: dict[str, torch.Tensor] = dict(obs)
-
-        d         = obs["spatial_dir"]            # (B, 9, 3) i8
-        nearest   = obs["spatial_nearest_dist"]   # (B, 9) u16
-        mean      = obs["spatial_mean_dist"]      # (B, 9) u16
-        openness  = obs["spatial_openness"]       # (B, 9) u8
-        clearance = obs["spatial_clearance"]      # (B, 9) u8
-        trav      = obs["spatial_traversable"]    # (B, 9) u8
-        dropoff   = obs["spatial_dropoff"]        # (B, 9) u8
-        solid     = obs["spatial_solid_frac"]     # (B, 9) u8
-        water     = obs["spatial_water_frac"]     # (B, 9) u8
-        slime     = obs["spatial_slime_frac"]     # (B, 9) u8
-        lava      = obs["spatial_lava_frac"]      # (B, 9) u8
-
-        batch = d.shape[0]
-        scalars = torch.zeros(
-            batch, en.SPATIAL_TOKEN_COUNT, _SPATIAL_SCALAR_DIM,
-            device=d.device, dtype=torch.float32,
-        )
-        # i8 unit vector → float in [-1, 1] via /127.
-        scalars[:, :, _SP_DIR_X:_SP_DIR_Z + 1] = d.to(torch.float32) / 127.0
-        # Raw Quake unit distances → [0, 1]-ish via /DIST_SCALE.
-        scalars[:, :, _SP_NEAREST_DIST] = nearest.to(torch.float32) / en.DIST_SCALE
-        scalars[:, :, _SP_MEAN_DIST]    = mean.to(torch.float32)    / en.DIST_SCALE
-        # u8 [0, 1] floats — re-divide by 255 to recover the
-        # already-clamped [0, 1] float values qnn_spatial.c emitted.
-        scalars[:, :, _SP_OPENNESS]    = openness.to(torch.float32)  / 255.0
-        scalars[:, :, _SP_CLEARANCE]   = clearance.to(torch.float32) / 255.0
-        scalars[:, :, _SP_TRAVERSABLE] = trav.to(torch.float32)      / 255.0
-        scalars[:, :, _SP_DROPOFF]     = dropoff.to(torch.float32)   / 255.0
-        scalars[:, :, _SP_SOLID_FRAC]  = solid.to(torch.float32)     / 255.0
-        scalars[:, :, _SP_WATER_FRAC]  = water.to(torch.float32)     / 255.0
-        scalars[:, :, _SP_SLIME_FRAC]  = slime.to(torch.float32)     / 255.0
-        scalars[:, :, _SP_LAVA_FRAC]   = lava.to(torch.float32)      / 255.0
-
-        out["spatial_scalars"] = scalars
+        if "spatial_scalars" not in out and "spatial_atlas" in out:
+            out["spatial_scalars"] = self._decode(out["spatial_atlas"])
+        if "probe_scalars" not in out and "probe_atlas" in out:
+            out["probe_scalars"] = self._decode(out["probe_atlas"])
         return out
 
 

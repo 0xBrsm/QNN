@@ -29,7 +29,7 @@ from qnn.vocab import (
 MAX_ENTITY_SCALAR_DIM = ACTOR_SCALAR_DIM  # largest per-type scalar count
 MAX_ENTITY_ID_DIM = ACTOR_ID_DIM          # largest per-type ID count
 
-OBS_BUFFER_SIZE = 4096
+OBS_BUFFER_SIZE = 864
 # sizeof(qnn_action_t) — move (press byte) + weapon + input_mask +
 # op_input + look[3]. The press byte mirrors the input_mask bit layout
 # (attack at bit 0, fb/lr/ud neg/pos in bits 1-6, jump at bit 7) so the
@@ -106,9 +106,9 @@ def parse_mlob_frame(raw: bytes) -> dict:
 # express the model-facing dense layout after the dequantizers run;
 # the wire itself no longer emits these (the native parser produces
 # per-field arrays at native widths instead).
-SELF_SCALAR_DIM = 17
-SPATIAL_TOKEN_COUNT = 9
-SPATIAL_SCALAR_DIM = 13  # dir[3] + 10 measurement scalars
+SELF_SCALAR_DIM = 18
+SPATIAL_TOKEN_COUNT = 11  # depth-atlas elevation bands (rev 8)
+SPATIAL_SCALAR_DIM = 48  # per band: depth x 24 + hit x 24
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -130,18 +130,9 @@ SPATIAL_SCALAR_DIM = 13  # dir[3] + 10 measurement scalars
 #    16    self_items               u32         ()             4
 #    20    view_pitch               i8          ()             1  (deg / 90)
 #    21    look_delta               f16         (3,)           6
-#    27    spatial_dir              i8          (9, 3)        27
-#    53    spatial_nearest_dist     u16         (9,)          18
-#    65    spatial_mean_dist        u16         (9,)          18
-#    83    spatial_openness         u8          (9,)           9
-#    92    spatial_clearance        u8          (9,)           9
-#   101    spatial_traversable      u8          (9,)           9
-#   110    spatial_dropoff          u8          (9,)           9
-#   119    spatial_solid_frac       u8          (9,)           9
-#   128    spatial_water_frac       u8          (9,)           9
-#   137    spatial_slime_frac       u8          (9,)           9
-#   146    spatial_lava_frac        u8          (9,)           9
-#   155    entity_stream            variable
+#    27    spatial_atlas            u8          (11, 12)     132  (two packed
+#                                                                 4-bit codes/byte)
+#   159    entity_stream            variable
 #
 # Entity stream per frame:
 #   u8  n_tokens
@@ -171,8 +162,18 @@ NATIVE_SELF_OFFSET           = 0
 NATIVE_SELF_BYTES            = 27   # 21 + look_delta (f16 × 3)
 
 NATIVE_SPATIAL_OFFSET        = NATIVE_SELF_OFFSET + NATIVE_SELF_BYTES   # 27
-NATIVE_SPATIAL_BYTES         = 135                                      # 9 sectors × 15 B
-NATIVE_ENTITY_STREAM_OFFSET  = NATIVE_SPATIAL_OFFSET + NATIVE_SPATIAL_BYTES  # 162
+NATIVE_SPATIAL_BYTES         = 132                                      # 11 bands × 12 packed bytes
+NATIVE_ENTITY_STREAM_OFFSET  = NATIVE_SPATIAL_OFFSET + NATIVE_SPATIAL_BYTES  # 159
+
+# Fixed-frame proof. Actor is the widest possible entity row:
+# type + subject/modality/player + event count + four event pairs + 30 scalars.
+NATIVE_MAX_ACTOR_ROW_BYTES = 1 + 3 + 1 + 2 * MAX_ENTITY_EVENTS + 30  # 43
+NATIVE_MAX_PAYLOAD_BYTES = (
+    NATIVE_ENTITY_STREAM_OFFSET + 1
+    + MAX_TOKEN_OBJECTS * NATIVE_MAX_ACTOR_ROW_BYTES
+)  # 848
+POSE_TAIL_OFFSET = OBS_BUFFER_SIZE - 16
+assert NATIVE_MAX_PAYLOAD_BYTES <= POSE_TAIL_OFFSET
 
 # Token-type tags on the wire — mirror qnn.vocab TOKEN_* constants.
 _TOK_PROJECTILE = TOKEN_PROJECTILE
@@ -214,30 +215,13 @@ def _unpack_native_self(raw: bytes) -> dict[str, np.ndarray]:
 
 
 def _unpack_native_spatial(raw: bytes) -> dict[str, np.ndarray]:
-    o = NATIVE_SPATIAL_OFFSET
-    # Layout per-field-stride: 9 sectors, fields packed contiguously.
-    # i.e. all 9 dirs first (9 × 3 × 1 B), then all 9 nearest_dist
-    # (9 × 2 B), etc. Mirrors how engine_norm.SPATIAL_FIELDS lays out
-    # per-sector data when packed by sector-major in qnn_io.c.
-    #
-    # Position tracker for byte offsets per field, building forward:
-    p = o
-    out: dict[str, np.ndarray] = {}
-    out["spatial_dir"]          = _read_array(raw, p, np.int8,    SPATIAL_TOKEN_COUNT * 3).reshape(SPATIAL_TOKEN_COUNT, 3); p += SPATIAL_TOKEN_COUNT * 3
-    out["spatial_nearest_dist"] = _read_array(raw, p, np.uint16,  SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT * 2
-    out["spatial_mean_dist"]    = _read_array(raw, p, np.uint16,  SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT * 2
-    out["spatial_openness"]     = _read_array(raw, p, np.uint8,   SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT
-    out["spatial_clearance"]    = _read_array(raw, p, np.uint8,   SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT
-    out["spatial_traversable"]  = _read_array(raw, p, np.uint8,   SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT
-    out["spatial_dropoff"]      = _read_array(raw, p, np.uint8,   SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT
-    out["spatial_solid_frac"]   = _read_array(raw, p, np.uint8,   SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT
-    out["spatial_water_frac"]   = _read_array(raw, p, np.uint8,   SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT
-    out["spatial_slime_frac"]   = _read_array(raw, p, np.uint8,   SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT
-    out["spatial_lava_frac"]    = _read_array(raw, p, np.uint8,   SPATIAL_TOKEN_COUNT); p += SPATIAL_TOKEN_COUNT
-    assert p - o == NATIVE_SPATIAL_BYTES, (
-        f"spatial block consumed {p - o} B, expected {NATIVE_SPATIAL_BYTES}"
-    )
-    return out
+    # Final wire.12 atlas: elevation-major (11, 12) packed u8 bytes.
+    # Each byte stores two yaw codes, low nibble first. SpatialDequantizer
+    # expands them to 24 codes per row.
+    atlas = _read_array(
+        raw, NATIVE_SPATIAL_OFFSET, np.uint8, NATIVE_SPATIAL_BYTES,
+    ).reshape(SPATIAL_TOKEN_COUNT, NATIVE_SPATIAL_BYTES // SPATIAL_TOKEN_COUNT)
+    return {"spatial_atlas": atlas}
 
 
 def _unpack_native_entity_stream(
@@ -455,16 +439,10 @@ def unpack_obs_buffer_native_batch(raws: np.ndarray) -> dict[str, np.ndarray]:
     out["view_pitch"]       = col(o + 20, 1, np.int8)
     out["look_delta"]       = col(o + 21, 6, np.float16, (3,))
 
-    p = NATIVE_SPATIAL_OFFSET
-    S = SPATIAL_TOKEN_COUNT
-    out["spatial_dir"]          = col(p, S * 3, np.int8, (S, 3)); p += S * 3
-    out["spatial_nearest_dist"] = col(p, S * 2, np.uint16, (S,)); p += S * 2
-    out["spatial_mean_dist"]    = col(p, S * 2, np.uint16, (S,)); p += S * 2
-    for _name in ("spatial_openness", "spatial_clearance",
-                  "spatial_traversable", "spatial_dropoff",
-                  "spatial_solid_frac", "spatial_water_frac",
-                  "spatial_slime_frac", "spatial_lava_frac"):
-        out[_name] = col(p, S, np.uint8, (S,)); p += S
+    out["spatial_atlas"] = col(
+        NATIVE_SPATIAL_OFFSET, NATIVE_SPATIAL_BYTES, np.uint8,
+        (SPATIAL_TOKEN_COUNT, NATIVE_SPATIAL_BYTES // SPATIAL_TOKEN_COUNT),
+    )
 
     M = MAX_TOKEN_OBJECTS
     for name, dtype, tail, fill in _ENTITY_BATCH_FIELDS:
