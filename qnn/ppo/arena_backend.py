@@ -94,8 +94,10 @@ class ArenaGridBackend:
         weapon_config: Mapping[str, object] | None = None,
         declarations: Sequence[object] | None = None,
     ) -> None:
-        if int(fixed_tick_hz) != 20:
-            raise ValueError("arena_grid currently requires fixed_tick_hz=20")
+        if int(fixed_tick_hz) not in (10, 20):
+            raise ValueError(
+                "arena_grid currently requires fixed_tick_hz in (10, 20) — "
+                f"the only rates with fitted decode/bin tables, got {fixed_tick_hz!r}")
         self.topology = ArenaTopology.build(
             num_lanes=int(num_lanes),
             matches_per_server=int(matches_per_server),
@@ -177,6 +179,7 @@ class ArenaGridBackend:
                 env=process_env,
                 workdir=workdir,
                 weapon_config=weapon_config,
+                fixed_tick_hz=int(fixed_tick_hz),
                 declarations=(
                     None if self._declarations is None
                     else [self._declarations[int(env_id)] for env_id in env_ids]
@@ -210,6 +213,13 @@ class ArenaGridBackend:
         ]
         self._episode_ids = np.full(self.num_lanes, -1, dtype=np.int64)
 
+        # Pre-step obs + alignment kernel for the rung-3 trigger objective.
+        # The p_fire denominator is scored on the state the DECISION was made
+        # from, so the post-step obs this backend returns is one tick too late.
+        from qnn.ppo.align_hbw import AlignHbw
+        self._align = AlignHbw()
+        self._prev_obs: dict | None = None
+
     def reset_timings(self) -> None:
         self._timings.clear()
 
@@ -223,6 +233,24 @@ class ArenaGridBackend:
         layout = self._lane_layouts[int(lane)]
         return int(layout.frame_bytes) if layout is not None else (
             self._frame_bytes if not self._hetero else OBS_BUFFER_SIZE)
+
+    def _align_all_los(self, obs) -> np.ndarray:
+        """Per-lane all-LOS alignment hbw over EITHER obs materialization:
+        the dense field-major dict (homogeneous seats — one vectorized call)
+        or the per-lane dict list (heterogeneous seats, the cross-arch H2H
+        path: lanes can differ in entity slot counts and percept columns,
+        so each lane scores as its own batch-1 call)."""
+        if not isinstance(obs, list):
+            return self._align.all_los(
+                obs, np.ones(self.num_lanes, dtype=bool))
+        one = np.ones(1, dtype=bool)
+        out = np.full(self.num_lanes, np.nan, dtype=np.float32)
+        for lane, row in enumerate(obs):
+            if not isinstance(row, Mapping) or "entity_types" not in row:
+                continue
+            batched = {k: np.asarray(v)[None] for k, v in row.items()}
+            out[lane] = self._align.all_los(batched, one)[0]
+        return out
 
     def _raw_batch(self, raws: "np.ndarray | list[bytes]"):
         """Materialize obs: dense field-major dict (homogeneous) or one dict
@@ -321,7 +349,9 @@ class ArenaGridBackend:
             state.return_value = 0.0
         self._episode_ids += 1
         self._time_add("reset_s", started)
-        return self._raw_batch(raws)
+        obs = self._raw_batch(raws)
+        self._prev_obs = obs
+        return obs
 
     def reset_lanes(self, env_ids: Sequence[int]) -> dict[str, np.ndarray]:
         """Reset the matches owning ``env_ids`` and return the dense live state.
@@ -448,6 +478,13 @@ class ArenaGridBackend:
 
         started = time.perf_counter()
         obs = self._raw_batch(raws)
+        # scored on the PRE-step obs, then rotate
+        align_hbw = (
+            self._align_all_los(self._prev_obs)
+            if self._prev_obs is not None
+            else np.full(self.num_lanes, np.nan, dtype=np.float32)
+        )
+        self._prev_obs = obs
         self._latest_raws = list(raws)
         final_obs_rows = [
             (env_id, self._unpack_row(raw, env_id))
@@ -492,6 +529,7 @@ class ArenaGridBackend:
             final_obs_rows=final_obs_rows,
             episodes=episodes,
             infos=infos,
+            align_hbw=align_hbw,
         )
 
     def close(self) -> None:

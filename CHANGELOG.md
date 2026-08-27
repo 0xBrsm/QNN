@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.31.0
+
+### Added
+
+- `attack.hold_tail_sec`: a per-model decode-config key, stamped `decode.attack.hold_tail_sec` into ONNX metadata, gating the continuous-weapon (NG/SNG/LG) fire hold-tail per model instead of as a binary-wide engine constant. Every fresh export stamps its resolved value unconditionally (`0.0` = off, the new default); a model exported before this key existed carries no stamp and keeps the historical 0.25s tail unchanged, so no archived artifact's behavior moves.
+- `weapon.af_lockout` / `weapon.af_lockout_cap` decode-config keys: a weapon-switch lockout keyed off the engine's own observed per-weapon `attack_finished` cooldown (a multiplier on the real cooldown, `0` = none) with an optional ceiling in seconds on the extension, replacing the static per-weapon `weapon.switch_lockout_mult` / `weapon.switch_lockout_cap_ticks` table with a value derived from the real refire state already in the observation.
+
+### Changed
+
+- The model graph is one `core` base with explicit edges: `qnn/model/graph/bases/` holds a single `core.json` (the `full_4head` / `full_5head` bases are gone) and every head declares its own inputs instead of receiving a polymorphic `readout`, which removes the last implicit edge, `weapon_ctx`. The dedicated weapon head goes with it — weapon selection is the 9-way attack-with head's own argmax, so `HEAD_TYPES` no longer offers a `weapon` head and `attack` has exactly one type, `attack_with`. `model/weapon_head.py` and the a25 bench head modules (`bench/heads.py`, `bench/cls_heads.py`, `bench/look_head_polar.py`) are deleted.
+- `weapon.switch_margin` is a same-tick confidence gate on the network's own raw weapon pick, not an anchor against a held weapon: the a28 observation contract carries no equip state, so the anchor it originally gated could only ever be this tick's own argmax. `0.0` (unset) is a provable no-op, so every config fitted under the previous anchor-based law resolves unchanged.
+- `guard.lg_range` is a single required range-in-Quake-units value (`0` = off) that marks LG infeasible past range so the network picks a reachable weapon; it no longer takes a separate alignment cone or a veto/selection-mode switch. `guard.projectile_release` absorbs the retired `guard.projectile_release_mode` flag as one required mode string (`"off"` / `"rocket"` / `"any"`) instead of two keys that could disagree.
+- Every decode-config key must now resolve to a working implementation (a `DECODE_PARAMS` registry row or an explicit engine/guard-applied key) or the config is refused at load, naming the offending key — there is no longer a way for a key to be silently ignored.
+
+### Removed
+
+- The post-a26 weapon-selection and attack-decode surface: the human weapon-transition/continuation law (`weapon.continue_prob_vec`, `weapon.continue_bias_vec`, `weapon.choice_prob_matrix`, `weapon.choice_temperature`), the SPRT switch-evidence accumulator (`weapon.switch_evidence_decay`), the static per-weapon switch-lockout table (`weapon.switch_lockout_mult`, `weapon.switch_lockout_cap_ticks`), the choice-gathered fire test (`attack.fire_gather`), the legacy joint attack vector and its selector (`attack.bias`, `attack.bias_vec`, `attack.vector_semantics`, `attack.stick_bias`), the a25 discharge-quality ("crest") gate (`attack.crest_theta_vec`, `attack.crest_hold_ticks`), the LG guard's alignment cone and veto/mask mode (`guard.lg_range_u`, `guard.lg_align_half_angle_deg`, `guard.lg_range_mode`, `guard.lg_veto_unseen`), the RL feet-aim pitch family and the DOWN-band research degraders (`look.weapon_pitch_gain`/`_bias`/`_mode`/`_shift_strength`/`_lock`, `look.aim_degrade_sluggish_tau`/`_lag_frames`/`_jitter_mag`, `look.hold_drift_eps`), and the legacy move-commit knobs (`move.commit_interrupt`, `move.commit_recommit`). A decode config naming any of these no longer loads. Weapon selection stays the network's own; the removed laws measurably overrode it on the live venue (the transition sampler discarded the network's own choice on over half of firing ticks).
+- `move.commitment` as a declared decode-config key: whether the segment-commitment move decode runs is now derived from the checkpoint's own head structure, never from the config, since the config value could never actually override it.
+
 ## 0.30.0
 
 ### Added

@@ -532,6 +532,15 @@ _WORKER_COMPUTE_GATE: tuple[bool, bool] = (False, False)
 
 _WORKER_DEMO_STDERR_FILE = None
 _WORKER_DEMO_STDERR_PATH: Path | None = None
+# Perception regime (qnn_los_clearance, qnn_fov) resolved by THIS pool-
+# worker process's demo-worker subprocess, read from its hello response.
+# None until a worker with the "perception" hello field has connected
+# (pre-E6 binaries never send it). Folded into every per-demo result dict
+# (see _run_per_demo_collect / _collect_demo_multiplayer) so run_collect
+# can verify every worker process agreed before baking it into the
+# collection fingerprint — see qnn.collection_fingerprint and
+# agents/plans/a26-superiority-decomposition.md E6.
+_WORKER_PERCEPTION_REGIME: tuple[int, float] | None = None
 _ACTION_RECORD_DTYPE = np.dtype(
     {
         "names": list(_ACTION_FIELDS_LAYOUT.keys()),
@@ -565,8 +574,35 @@ def _open_worker_stderr() -> tuple[object, Path]:
     return os.fdopen(fd, "w+b"), Path(path)
 
 
+def _parse_hello_perception(resp: bytes) -> tuple[int, float] | None:
+    """Extract the resolved perception regime from a worker's hello
+    response line, if present.
+
+    A worker built before the E6 provenance fix sends no ``"perception"``
+    field at all — that's a normal, expected case (an old prebuilt
+    binary), not a parse error, and must come back as ``None`` so the
+    caller records "unreported" rather than falling back to a guess from
+    the launcher's env (the exact ambient-env failure mode this fix
+    closes; see agents/plans/a26-superiority-decomposition.md E6). """
+    try:
+        hello = json.loads(resp)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(hello, dict):
+        return None
+    perception = hello.get("perception")
+    if not isinstance(perception, dict):
+        return None
+    if "los_clearance" not in perception or "fov" not in perception:
+        return None
+    try:
+        return (int(perception["los_clearance"]), float(perception["fov"]))
+    except (TypeError, ValueError):
+        return None
+
+
 def _start_worker(demo_worker: str, asset_root: str, tick_hz: int, game_dir: str) -> subprocess.Popen:
-    global _WORKER_DEMO_STDERR_FILE, _WORKER_DEMO_STDERR_PATH
+    global _WORKER_DEMO_STDERR_FILE, _WORKER_DEMO_STDERR_PATH, _WORKER_PERCEPTION_REGIME
     env = {**os.environ, "QUAKE_BASEDIR": str(Path(asset_root).resolve())}
     _cleanup_worker_stderr()
     stderr_file, stderr_path = _open_worker_stderr()
@@ -585,7 +621,53 @@ def _start_worker(demo_worker: str, asset_root: str, tick_hz: int, game_dir: str
         err = _worker_stderr_tail(proc, limit=500)
         _cleanup_worker_stderr()
         raise RuntimeError(f"Demo worker hello failed: {err}")
+    regime = _parse_hello_perception(resp)
+    if regime is not None:
+        # Env is fixed for a pool-worker process's whole lifetime, so this
+        # worker subprocess reporting a DIFFERENT resolved regime than an
+        # earlier hello in the same process (the worker subprocess is
+        # restarted once per demo — see _run_per_demo_collect) means the
+        # worker binary itself is inconsistent, not a legitimate change.
+        # Fail loud rather than silently trust either value (E6).
+        if _WORKER_PERCEPTION_REGIME is not None and _WORKER_PERCEPTION_REGIME != regime:
+            _cleanup_worker_stderr()
+            raise RuntimeError(
+                "Demo worker perception regime changed within one worker "
+                f"process: was {_WORKER_PERCEPTION_REGIME}, now {regime}. "
+                "QNN_LOS_CLEARANCE/qnn_fov are resolved once from a fixed "
+                "process environment, so this should be impossible."
+            )
+        _WORKER_PERCEPTION_REGIME = regime
     return proc
+
+
+def _resolve_worker_perception_regime(
+    regimes,
+) -> tuple[int, float] | None:
+    """Reduce every collect task's reported ``"perception"`` value (see
+    ``_run_per_demo_collect``) to the single regime baked into the
+    fingerprint.
+
+    ``regimes`` is any iterable of ``tuple[int, float] | None`` — one
+    entry per completed task.  ``None`` entries (worker predates the E6
+    hello field, or the task never reached a hello) are dropped.  If the
+    remaining values all agree, that's the answer.  If none reported
+    anything, the regime is "unreported" (``None``) — never guessed from
+    the launcher's env.  If they DISAGREE across worker processes, fail
+    loud: a mixed-regime corpus silently recorded as one regime is
+    exactly the E6 confusion this module exists to prevent. """
+    from qnn.collection_fingerprint import PerceptionRegimeMismatch
+
+    distinct = {r for r in regimes if r is not None}
+    if len(distinct) > 1:
+        raise PerceptionRegimeMismatch(
+            "collect worker perception regime disagreement across worker "
+            f"processes: {sorted(distinct)!r}. QNN_LOS_CLEARANCE/qnn_fov "
+            "must resolve identically for every worker in one collect "
+            "(see agents/plans/a26-superiority-decomposition.md E6) — "
+            "refusing to write a fingerprint for a mixed-regime corpus."
+        )
+    return next(iter(distinct), None)
 
 
 def _shutdown_worker() -> None:
@@ -1606,7 +1688,13 @@ def _run_per_demo_collect(
     engine state (oldrealtime, cl_maxfps, cls.latency, ...) leaks
     across demos and truncates the second demo's detected tick rate, so
     a fresh process is the only reliable way to start clean.  Cost is
-    ~50 ms per demo, dwarfed by demo I/O. """
+    ~50 ms per demo, dwarfed by demo I/O.
+
+    Every returned dict carries ``"perception"`` — this pool-worker
+    process's resolved qnn_los_clearance/qnn_fov regime (or None if no
+    worker hello has reported one yet) — so ``run_collect`` can check
+    every worker agreed before it's folded into the collection
+    fingerprint (E6 provenance fix). """
     proc = None
     try:
         proc = _get_collect_worker()
@@ -1615,7 +1703,8 @@ def _run_per_demo_collect(
         err_tail = _worker_stderr_tail(proc)
         _shutdown_worker()
         msg = f"{exc}\n{err_tail}" if err_tail else str(exc)
-        return {"demo": demo_name, "status": "error", "msg": msg[-4000:]}
+        return {"demo": demo_name, "status": "error", "msg": msg[-4000:],
+                "perception": _WORKER_PERCEPTION_REGIME}
 
     if ticks is None:
         err_tail = _worker_stderr_tail(proc)
@@ -1623,14 +1712,17 @@ def _run_per_demo_collect(
         _shutdown_worker()
         if rc == _WATCHDOG_EXIT_CODE:
             return {"demo": demo_name, "status": "error",
-                    "msg": f"watchdog stall\n{err_tail}"[-4000:]}
+                    "msg": f"watchdog stall\n{err_tail}"[-4000:],
+                    "perception": _WORKER_PERCEPTION_REGIME}
         return {"demo": demo_name, "status": "crash",
-                "msg": err_tail or "worker crash"}
+                "msg": err_tail or "worker crash",
+                "perception": _WORKER_PERCEPTION_REGIME}
 
     _shutdown_worker()
 
     if len(ticks) < min_ticks:
-        return {"demo": demo_name, "status": "skipped", "ticks": len(ticks)}
+        return {"demo": demo_name, "status": "skipped", "ticks": len(ticks),
+                "perception": _WORKER_PERCEPTION_REGIME}
 
     episodes = unpack_fn(ticks)
     # Drop empty sub-episodes; preserve order so episode_idx is
@@ -1639,11 +1731,13 @@ def _run_per_demo_collect(
              for obs, act in episodes]
     sized = [(obs, act, rows) for obs, act, rows in sized if rows > 0]
     if not sized:
-        return {"demo": demo_name, "status": "skipped", "ticks": len(ticks)}
+        return {"demo": demo_name, "status": "skipped", "ticks": len(ticks),
+                "perception": _WORKER_PERCEPTION_REGIME}
     return {
         "demo": demo_name, "status": "ok", "ticks": len(ticks),
         "episodes": [{"obs": obs, "actions": act, "rows": rows}
                      for obs, act, rows in sized],
+        "perception": _WORKER_PERCEPTION_REGIME,
     }
 
 
@@ -1695,11 +1789,13 @@ def _collect_demo_multiplayer(args: tuple) -> dict:
         err_tail = _worker_stderr_tail(proc)
         _shutdown_worker()
         msg = f"{exc}\n{err_tail}" if err_tail else str(exc)
-        return {"demo": demo_name, "status": "error", "msg": msg[-4000:]}
+        return {"demo": demo_name, "status": "error", "msg": msg[-4000:],
+                "perception": _WORKER_PERCEPTION_REGIME}
     _shutdown_worker()
 
     if not slots:
-        return {"demo": demo_name, "status": "skipped", "ticks": 0}
+        return {"demo": demo_name, "status": "skipped", "ticks": 0,
+                "perception": _WORKER_PERCEPTION_REGIME}
 
     episodes: list[dict] = []
     total_ticks = 0
@@ -1723,10 +1819,12 @@ def _collect_demo_multiplayer(args: tuple) -> dict:
             total_ticks += int(res.get("ticks", 0))
 
     if not episodes:
-        return {"demo": demo_name, "status": "skipped", "ticks": total_ticks}
+        return {"demo": demo_name, "status": "skipped", "ticks": total_ticks,
+                "perception": _WORKER_PERCEPTION_REGIME}
     return {
         "demo": demo_name, "status": "ok", "ticks": total_ticks,
         "episodes": episodes,
+        "perception": _WORKER_PERCEPTION_REGIME,
     }
 
 
@@ -1996,6 +2094,14 @@ def run_collect(
     # cost.
     splits = [_split_for_demo(w[0], train_ratio, seed) for w in work]
 
+    # Every completed task's resolved perception regime (qnn_los_clearance,
+    # qnn_fov), or None for tasks that never got as far as a worker hello.
+    # Reduced to a single value (or a loud failure on disagreement) by
+    # _resolve_worker_perception_regime after the pool below finishes, then
+    # folded into the collection fingerprint. See _run_per_demo_collect and
+    # agents/plans/a26-superiority-decomposition.md E6.
+    perception_regimes: set[tuple[int, float] | None] = set()
+
     def _consume(idx: int, payload: object) -> None:
         nonlocal collected, skipped, errors, total_ticks
         work_item = work[idx]
@@ -2005,6 +2111,7 @@ def run_collect(
             errors += 1
             return
         result = payload  # type: ignore[assignment]
+        perception_regimes.add(result.get("perception"))
         status = result["status"]
         if status == "ok":
             writer = train_writer if splits[idx] == "train" else val_writer
@@ -2074,6 +2181,11 @@ def run_collect(
                           f"{total_ticks/1e6:.1f}M ticks total, "
                           f"queue={len(pending)}, ETA {eta}")
 
+    # Reduce every task's reported perception regime to the single value
+    # (or unreported/None) that goes into the fingerprint below. Raises
+    # loudly on cross-worker disagreement, before any output is finalized.
+    perception_regime = _resolve_worker_perception_regime(perception_regimes)
+
     train_writer.write_manifest()
     val_writer.write_manifest()
 
@@ -2112,7 +2224,8 @@ def run_collect(
     ensure_collect_tables(output)
 
     # Deterministic identity fingerprint of every input that influenced
-    # what's on disk (filter, manifest, done log, worker, code).  The
+    # what's on disk (filter, manifest, done log, worker, code, and the
+    # RESOLVED perception regime the workers actually ran under).  The
     # trainer reads this to verify it's loading the exact collection it
     # was configured against.
     from qnn import collection_fingerprint
@@ -2123,6 +2236,7 @@ def run_collect(
         worker_binary_path=Path(demo_worker),
         data_dir=output,
         repo_root=Path(__file__).resolve().parents[3],
+        perception_regime=perception_regime,
     )
     collection_fingerprint.write(fp, output)
 

@@ -455,7 +455,7 @@ def fire_offset_distribution(
     Zero     ⇒ exact match.
 
     The operative filter ``op = input_mask & 1`` plus ``weapon > 0`` are
-    applied by construction (frames with no weapon held are excluded).
+    applied by construction (frames with no weapon selected are excluded).
 
     Parameters
     ----------

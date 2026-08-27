@@ -19,9 +19,10 @@ graph, the training/collect pipeline, decode-fit, or a checkpoint. They are comp
 per collect and cached: compute once, adopt, never change retroactively.
 
 Artifact sinks, all per-collect:
-  * the four corpus-walk baselines (intercept / acquisition / range / op_attack) →
-    standalone docs under ``<collect_dir>/human_baseline/<name>.json`` + a
-    ``human_baseline`` provenance block (schema + git + per-file sha256) in
+  * the corpus-walk baselines (intercept / tracking / acquisition / range /
+    op_attack / blind_fire) → standalone docs under
+    ``<collect_dir>/human_baseline/<name>.json`` + a ``human_baseline``
+    provenance block (schema + git + per-file sha256) in
     ``collect_metadata.json`` (``_ARTIFACTS``);
   * the two cheap decode TABLES (look_grid / move_hazard) → top-level
     blocks in ``collect_metadata.json``, the keys ``run.init`` pins into a run's config
@@ -33,9 +34,9 @@ scorer (``qnn.eval.humanlikeness.human_band``), so it is not in ``_ARTIFACTS`` /
 
   from qnn.human import ensure_from_collect, ensure_collect_tables
   ensure_collect_tables(collect_dir)                # cheap: the 3 decode tables (collect calls this)
-  paths = ensure_from_collect(collect_dir)          # all 7; compute-if-missing, cheap when cached
+  paths = ensure_from_collect(collect_dir)          # all 8; compute-if-missing, cheap when cached
 
-  PYTHONPATH=src python -m qnn.human artifacts/collect/qwd [--force]   # backfill CLI (all 7)
+  PYTHONPATH=src python -m qnn.human artifacts/collect/qwd [--force]   # backfill CLI (all 8)
 """
 from __future__ import annotations
 
@@ -83,6 +84,10 @@ _ARTIFACTS: tuple[_Artifact, ...] = (
     _Artifact("acquisition", "_acq_submovement.json", "qnn.human.acquisition", "both"),
     _Artifact("op_attack", "_op_attack_rate_byweapon.json", "qnn.human.op_attack", "val"),
     _Artifact("range", "_aim_range_byweapon.json", "qnn.human.aim_range", "both"),
+    # pure-LOS (no target_probs label) discharge/blind counts — the
+    # population qnn.ppo.learner._fire_occupancy_loss's mask actually scores,
+    # NOT op_attack's narrower LOS+labeled-engaged one (blind-fire-cadence.md).
+    _Artifact("blind_fire", "_blind_fire_byweapon.json", "qnn.human.blind_fire", "val"),
 )
 
 
@@ -235,7 +240,7 @@ def ensure_from_collect(
     """Compute-if-missing ALL corpus-derived human baselines for a collect and return the
     ``human_baseline/`` doc paths. Cheap when already cached (existence check + skip).
     ``force`` recomputes every artifact. Produces the three decode tables
-    (``include_tables``; into collect_metadata.json) then the four corpus-walk baselines
+    (``include_tables``; into collect_metadata.json) then the corpus-walk baselines
     (into human_baseline/). The decode-fit pipeline's stage-0 entry point and the
     ``python -m qnn.human`` backfill CLI both land here — runs once per collect and every
     subsequent model fit reuses the cache."""

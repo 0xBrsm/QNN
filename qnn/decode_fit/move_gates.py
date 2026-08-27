@@ -122,13 +122,24 @@ def collect_gate_rows(policy, source, *, device=None) -> dict[str, np.ndarray]:
     for bi, batch in enumerate(batches):
         B = len(batch)
         Tmax = int(max(lengths[ei] for ei in batch))
+        # gather(), not raw obs slicing: the resident source stores entity
+        # tokens PACKED (tok_indptr side structure) — entity_types /
+        # entity_scalars_raw (and every other entity_* field the a28 combat
+        # declaration adds) only exist per-frame after gather's expansion,
+        # exactly as qnn.eval.move_commit_fit.collect_events documents. A
+        # bare `source.obs[k][lo:hi]` silently drops every packed field, which
+        # is invisible for movearch (no entity reads) but starves a28 combat's
+        # move_engagement_signals / move_threat_signal of entity_types.
+        #
         # Dequant boundary: the resident cache may hold a packed spatial atlas
         # and _forward_tensors bypasses act()'s dequant (idempotent — the same
         # call qnn.eval.move_commit_fit relies on).
-        lanes = [policy._obs_tensors_dequant(
-                    {k: v[int(offsets[ei]):int(offsets[ei + 1])]
-                     for k, v in source.obs.items()})
-                 for ei in batch]
+        lanes = []
+        for ei in batch:
+            idx = torch.arange(int(offsets[ei]), int(offsets[ei + 1]),
+                               device=source.device, dtype=torch.int64)
+            obs_ep, _ = source.gather(idx)
+            lanes.append(policy._obs_tensors_dequant(obs_ep))
         obs_seq = {
             k: torch.zeros((Tmax, B, *lanes[0][k].shape[1:]),
                            dtype=lanes[0][k].dtype, device=device)
@@ -305,7 +316,7 @@ def _standstill_at(cls_logits: np.ndarray, prev_lr: np.ndarray, beta: float,
 
 
 def rollout_standstill(rows: dict[str, np.ndarray], no_enemy: np.ndarray,
-                       beta: float, *, dur_tilt=(0.0, 0.0), recommit: bool = False,
+                       beta: float, *, dur_tilt=(0.0, 0.0),
                        threat_break_hazard: float = 0.0,
                        idle_engagement_base: float = 0.5,
                        idle_cooldown_ticks: int = 20, seed: int = 0,
@@ -429,7 +440,6 @@ def rollout_standstill(rows: dict[str, np.ndarray], no_enemy: np.ndarray,
             seg[:n_live], commit[:n_live], greedy=False, dur_tilt=tuple(dur_tilt),
             threat=threat_t.index_select(0, r),
             threat_break_hazard=float(threat_break_hazard),
-            recommit=bool(recommit),
             enemy_present=enemy_t.index_select(0, r),
             engaged_active=active_t.index_select(0, r),
             idle_none_bias=(0.0, float(beta)),
@@ -748,8 +758,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dur-tilt", type=float, nargs=2, default=(0.0, 0.0),
                     metavar=("FB", "LR"),
                     help="the base config's move.commit_dur_tilt (rollout ruler)")
-    ap.add_argument("--recommit", action="store_true",
-                    help="roll out with move.commit_recommit enabled")
     ap.add_argument("--threat-break-hazard", type=float, default=0.0,
                     help="the base config's move.threat_break_hazard")
     ap.add_argument("--sample-episodes", type=float, default=None,
@@ -772,7 +780,7 @@ def main(argv: list[str] | None = None) -> int:
         a.run_dir, a.cache_dir, cut=a.cut, statistic=a.statistic,
         mask_held=not a.no_mask_held, out_path=a.out,
         rows_cache=a.rows_cache,
-        decode_kw={"dur_tilt": tuple(a.dur_tilt), "recommit": a.recommit,
+        decode_kw={"dur_tilt": tuple(a.dur_tilt), 
                    "threat_break_hazard": a.threat_break_hazard,
                    "sample_episodes": a.sample_episodes})
     j = report["jump"]["engaged"]

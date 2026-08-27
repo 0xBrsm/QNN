@@ -104,7 +104,8 @@ static void QNN_WriteObservation(const qnn_action_t *previous_action, qboolean r
 {
 	QNN_ArenaObserverWrite(stdout,
 		qnn_arena_seat_has_plan ? &qnn_arena_seat_plan : NULL,
-		previous_action, qnn_arena_tick, qnn_arena_steps, reset_flag);
+		previous_action, qnn_arena_tick, qnn_arena_steps, reset_flag,
+		qnn_arena_dt);
 }
 
 static void QNN_ReceiveServerFrame(const qnn_action_t *previous_action)

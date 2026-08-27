@@ -58,6 +58,11 @@ class RolloutBuffer:
             for h in heads
         }
 
+        # Per-tick alignment hbw (NaN off-LOS) — input to the trigger
+        # objective's p_fire matching term. NaN, not 0, so "no LOS actor"
+        # cannot be confused with "perfectly aligned".
+        self.align_hbw = torch.full(
+            (T, B), float("nan"), dtype=torch.float32, device=self.device)
         self.values = torch.zeros((T, B), dtype=torch.float32, device=self.device)
         self.rewards = torch.zeros((T, B), dtype=torch.float32, device=self.device)
         self.terminal = torch.zeros((T, B), dtype=torch.bool, device=self.device)
@@ -163,6 +168,7 @@ class RolloutBuffer:
                 target.copy_(source_group[key])
 
         for name in (
+            "align_hbw",
             "values",
             "rewards",
             "terminal",

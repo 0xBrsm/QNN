@@ -22,7 +22,7 @@ _V2_EXTENSION_SIZE = struct.calcsize(_V2_EXTENSION_FORMAT)
 
 # Version 3 appends 8 floats after the v2 extension: the nearest in-LOS actor's
 # view-frame rel pos (3, raw u), view-frame ABSOLUTE world velocity (3, raw u/s),
-# the currently-held weapon id, and a validity flag (1.0 when an actor was found).
+# the currently-equipped weapon id, and a validity flag (1.0 when an actor was found).
 # Lead-aim geometry for the lead-referenced intercept (discharge-alignment, hbw) eval metric.
 _V3_EXTENSION_FORMAT = "<8f"
 _V3_EXTENSION_SIZE = struct.calcsize(_V3_EXTENSION_FORMAT)
@@ -124,7 +124,7 @@ class TrustedTrainingExtrasV1:
     damage_dealt_self: float = 0.0
     # Version 3 extension: lead-aim geometry for the nearest in-LOS actor
     # (0.0 / lead_valid=0.0 for v1/v2 frames). rel/vel are view-frame raw Quake
-    # units; lead_weapon_id is the currently-held raw weapon id (1..8).
+    # units; lead_weapon_id is the currently-equipped raw weapon id (1..8).
     lead_rel: tuple[float, float, float] = (0.0, 0.0, 0.0)
     lead_vel: tuple[float, float, float] = (0.0, 0.0, 0.0)
     lead_weapon_id: int = 0

@@ -59,37 +59,42 @@ ACTOR_HALFW_U: float = 16.0
 
 def _lead_aim_angle_deg_live(
     rel: np.ndarray,     # (M, N, 3) view-frame rel pos, /DIST_SCALE (forward=+x)
-    vel: np.ndarray,     # (M, N, 3) view-frame ABSOLUTE actor vel, /VEL_SCALE
+    vel: np.ndarray,     # (M, N, 3) ACCEPTED FOR SIGNATURE COMPAT — see below
     imp: np.ndarray,     # (M,)      action-weapon context, impulse 0..8
     weapon_physics: np.ndarray, # (9, 7) build_model_weapon_scalars
-    lead_hold_cap: "float | None" = None,         # TANGENTIAL hold cap (MODULE units); None = OFF
-    lead_hold_cap_radial: "float | None" = None,  # RADIAL hold cap (MODULE units); None = OFF
+    lead_hold_cap: "float | None" = None,         # INERT under the current-position anchor
+    lead_hold_cap_radial: "float | None" = None,  # INERT under the current-position anchor
 ) -> np.ndarray:
-    """Crosshair→lead-point angle (degrees), (M, N), via the LIVE aim prior.
+    """Crosshair→discharge-anchor angle (degrees), (M, N).
 
-    Calls ``qnn.model.lead_aim.weapon_trajectory`` (which applies
-    the hitscan ×100 boost so instant-fire weapons fabricate no lead) and
-    ``compute_lead_aim`` (the intercept quadratic + per-weapon z-anchor). The
-    only thing computed here is the trivial forward-axis angle to the aim point —
-    the physics is owned by lead_aim.py so the deployed and measured geometry
-    cannot drift. Runs torch-CPU; aim_skill is per-shard multiprocessed analysis,
-    NOT the torch-free collect/move_hazard path.
+    DISCHARGE LAW ANCHOR = the target's CURRENT POSITION with the per-weapon
+    ballistic z-drop applied over the flight time TO that position (rev E,
+    2026-08-06). Velocity lead is deliberately ZEROED: measured on the
+    corpus, humans do not aim at the moving intercept on ANY projectile
+    family at ANY range — the current-position anchor beats linear AND
+    hazard-capped lead in median angular error at every range band
+    (runs/head_probe/_human_lead_distribution.json, _human_lead_hazard_match
+    .json, _human_lead_by_range.json). The ``vel`` param is accepted so the
+    28 corpus/eval consumers keep their signatures, but only ``rel`` shapes
+    the aim point; the hold caps are consequently inert here (they cap a
+    velocity term that is now zero — the deployed LOOK decode's aim prior
+    keeps them, see qnn.model.lead_aim.aim_prior_tangent_ffwd).
 
-    ``lead_hold_cap`` / ``lead_hold_cap_radial`` are the hazard-discounted lead caps
-    in MODULE time units (frames × ``_TICK_DT_MODULE``); default None = full linear
-    lead (bit-identical to the un-capped call). Pass them to measure alignment
-    against the SAME dwell-capped lead point the deployed decode uses.
+    Physics still owned by lead_aim.py (``weapon_trajectory`` keeps the
+    hitscan ×100 boost — SG/SSG/LG are bit-identical under either anchor;
+    ``compute_lead_aim`` supplies flight time + z-anchor). Runs torch-CPU.
     """
     import torch
     from qnn.model.lead_aim import compute_lead_aim, weapon_trajectory
 
+    del vel  # current-position anchor: the target's motion never enters.
     rel_t = torch.from_numpy(np.ascontiguousarray(rel, dtype=np.float32))   # (M,N,3)
-    vel_t = torch.from_numpy(np.ascontiguousarray(vel, dtype=np.float32))   # (M,N,3)
     ws_t  = torch.from_numpy(np.ascontiguousarray(weapon_physics, dtype=np.float32))
     imp_t = torch.from_numpy(np.ascontiguousarray(imp, dtype=np.int64))     # (M,)
 
     v_horiz, drop_const, drop_rate = weapon_trajectory(ws_t, imp_t)         # (M,) each
-    aim = compute_lead_aim(rel_t, vel_t, v_horiz, drop_const, drop_rate,
+    aim = compute_lead_aim(rel_t, torch.zeros_like(rel_t), v_horiz,
+                           drop_const, drop_rate,
                            lead_hold_cap, lead_hold_cap_radial)             # (M,N,3)
 
     norms = aim.norm(dim=-1).clamp_min(1e-9)

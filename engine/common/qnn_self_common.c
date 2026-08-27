@@ -24,6 +24,17 @@ int QNN_WeaponId(void)
 	int active;
 
 	active = cl.stats[STAT_ACTIVEWEAPON];
+	/* NetQuake transmits STAT_ACTIVEWEAPON as one byte.  Every ordinary
+	 * IT_* weapon bit survives that encoding, but IT_AXE (4096) truncates
+	 * to zero.  For a live player who owns the axe, zero therefore names
+	 * the axe rather than NONE.  This matters outside the HUD: the emitted
+	 * self_weapon_id is the physical-discharge attribution used by eval and
+	 * decode fitting.  Without the recovery below every axe discharge was
+	 * silently recorded as weapon 0.  QW normally sends the full item bit;
+	 * the same inference is harmless for its only valid alive/armed zero
+	 * state. */
+	if (active == 0 && cl.stats[STAT_HEALTH] > 0 && (cl.items & IT_AXE))
+		return 1;
 	if (active > 0)
 	{
 		if (active == IT_AXE) return 1;

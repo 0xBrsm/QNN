@@ -45,8 +45,12 @@ def collect_events(policy, source):
         s, e = int(offsets[i]), int(offsets[i + 1])
         if e - s < 3:
             continue
-        obs = {k: v[s:e] for k, v in source.obs.items()}
-        act = {k: v[s:e] for k, v in source.actions.items()}
+        # gather(), not raw obs slicing: the resident source stores entity
+        # tokens PACKED (tok_indptr side structure) — entity_types/
+        # entity_scalars_raw only exist per-frame after gather's expansion.
+        idx = torch.arange(s, e, device=source.obs[
+            next(iter(source.obs))].device)
+        obs, act = source.gather(idx)
         # Tensorize through the policy's inference dequant (idempotent):
         # resident/collect obs may carry packed spatial_atlas, and the raw
         # forward path below bypasses act()'s dequant boundary.
@@ -127,7 +131,8 @@ def fit_dur_tilt(run_dir: Path, cache_dir: Path | str,
     policy, _probe = load_policy(run_dir, device="cpu")
     # same checkpoint-resolution order as load_policy (provenance stamp)
     cks = (sorted((run_dir / "checkpoints").glob("best_*.pth"))
-           or sorted((run_dir / "checkpoints").glob("bc_best_model.pth")))
+           or sorted((run_dir / "checkpoints").glob("bc_best_model.pth"))
+           or sorted((run_dir / "checkpoints" / "best").glob("best_model.pth")))
     source = make_resident_source_from_cache(
         Path(cache_dir) / "precomputed_val", torch.device("cpu"),
         segment_mask={"act.target": {"$ne": 0}})

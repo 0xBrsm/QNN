@@ -97,6 +97,51 @@ def _git_sha() -> str:
         return ""
 
 
+def _checkpoint_source_run(source: str, owner: Path) -> Path:
+    """Resolve a checkpoint_source to the run directory that owns it."""
+    source_path = Path(str(source))
+    if not source_path.is_absolute():
+        source_path = _REPO / source_path
+    candidates = (source_path, *source_path.parents) if source_path.is_dir() \
+        else source_path.parents
+    for candidate in candidates:
+        if (candidate / "config" / "machine.json").is_file():
+            return candidate
+        if candidate == _REPO:
+            break
+    raise KeyError(
+        f"{owner / 'run.json'} checkpoint_source {source!r} does not belong "
+        "to a run with config/machine.json"
+    )
+
+
+def _resolve_corpus_lineage(run_dir: Path) -> tuple[Path, dict]:
+    """Follow PPO-to-PPO checkpoint ancestry until a BC corpus is found."""
+    lineage_run = run_dir
+    visited: set[Path] = set()
+    while True:
+        resolved = lineage_run.resolve()
+        if resolved in visited:
+            chain = " -> ".join(str(x) for x in (*visited, resolved))
+            raise RuntimeError(f"checkpoint_source lineage cycle: {chain}")
+        visited.add(resolved)
+
+        machine_path = lineage_run / "config" / "machine.json"
+        machine = read_json(machine_path)
+        if "bc_data_dir" in machine:
+            return lineage_run, machine
+
+        run_path = lineage_run / "run.json"
+        run_doc = read_json(run_path) if run_path.exists() else {}
+        source = run_doc.get("checkpoint_source")
+        if not source:
+            raise KeyError(
+                f"{machine_path} has no bc_data_dir and {run_path} has no "
+                "checkpoint_source corpus lineage"
+            )
+        lineage_run = _checkpoint_source_run(str(source), lineage_run)
+
+
 @dataclass
 class FitContext:
     run_dir: Path
@@ -114,6 +159,17 @@ class FitContext:
     acq_path: Path
     op_attack_path: Path
     range_path: Path
+    # pure-LOS (no target_probs label) discharge/blind counts — the
+    # population qnn.ppo.pfire_target.FireOccupancyTarget must be fit
+    # against, distinct from op_attack_path's narrower population
+    # (blind-fire-cadence.md).
+    blind_fire_path: Path
+    # Fixed repo-wide artifact (NOT collect-keyed, unlike every path above):
+    # the corrected-events crest baseline (runs/head_probe/), the sole
+    # source for the continuous-weapon (NG/SNG/LG) ONSET-rate targets
+    # (qnn.decode_fit.human_refs.family_onset_rates_los; the crest fine-tune
+    # prep, agents/plans/crest-finetune-allweapons.md "The objective").
+    corrected_events_path: Path
 
     # ── artifact locations ────────────────────────────────────────────────
     @property
@@ -138,24 +194,37 @@ class FitContext:
 
 
 def resolve_fit_context(run_dir: Path) -> FitContext:
-    """Resolve checkpoint, corpus, fingerprint, and the PINNED look-grid from a
-    bench run-dir. The look-grid is the run's own ``config/look_grid.json`` —
-    never the code default (the corpus-fit look-grid trap)."""
+    """Resolve checkpoint, corpus, fingerprint, and the PINNED look-grid.
+
+    BC runs own their corpus directly. PPO runs retain that lineage through
+    ``run.json.checkpoint_source`` and store their selected model under
+    ``checkpoints/best/best_model.pth``. The look-grid is always the fitted
+    run's own ``config/look_grid.json`` — never the code default (the
+    corpus-fit look-grid trap).
+    """
     run_dir = Path(run_dir)
     if not run_dir.is_dir():
         raise FileNotFoundError(f"run-dir not found: {run_dir}")
-    machine = read_json(run_dir / "config" / "machine.json")
-    corpus_dir = (_REPO / machine["bc_data_dir"]) if not Path(
-        machine["bc_data_dir"]).is_absolute() else Path(machine["bc_data_dir"])
+    run_doc = read_json(run_dir / "run.json") \
+        if (run_dir / "run.json").exists() else {}
+    lineage_run, machine = _resolve_corpus_lineage(run_dir)
+
+    corpus_spec = Path(machine["bc_data_dir"])
+    corpus_dir = corpus_spec if corpus_spec.is_absolute() else _REPO / corpus_spec
 
     from qnn.utils.artifacts import find_best_model
     ckpt = find_best_model(run_dir / "checkpoints")
     if ckpt is None:
+        ppo_best = run_dir / "checkpoints" / "best" / "best_model.pth"
+        if ppo_best.exists():
+            ckpt = ppo_best
+    if ckpt is None:
         raise FileNotFoundError(
             f"no best checkpoint in {run_dir / 'checkpoints'} "
-            f"(best_<run_id>.pth or legacy bc_best_model.pth)")
+            f"(best_<run_id>.pth, checkpoints/best/best_model.pth, or "
+            "legacy bc_best_model.pth)")
 
-    summary = run_dir / "checkpoints" / "bc_summary.json"
+    summary = lineage_run / "checkpoints" / "bc_summary.json"
     fingerprint = ""
     if summary.exists():
         fingerprint = str(read_json(summary).get("collection_fingerprint", ""))
@@ -167,8 +236,8 @@ def resolve_fit_context(run_dir: Path) -> FitContext:
             "the run MUST pin its own grid)")
 
     git_commit = _git_sha()
-    if (run_dir / "run.json").exists():
-        git_commit = str(read_json(run_dir / "run.json").get("git_commit", git_commit))
+    if run_doc:
+        git_commit = str(run_doc.get("git_commit", git_commit))
 
     from qnn.human import baseline_paths
     bp = baseline_paths(corpus_dir)
@@ -181,4 +250,9 @@ def resolve_fit_context(run_dir: Path) -> FitContext:
         intercept_path=bp["intercept"], tracking_path=bp["tracking"],
         acq_path=bp["acquisition"],
         op_attack_path=bp["op_attack"], range_path=bp["range"],
+        blind_fire_path=bp["blind_fire"],
+        corrected_events_path=(
+            _REPO / "runs" / "head_probe"
+            / "_human_crest_by_skill_corrected_events.json"
+        ),
     )

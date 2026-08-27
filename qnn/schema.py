@@ -68,7 +68,45 @@ SELF_SCALAR_DIM = 18  # flat layout: legacy 17 + view_pitch at idx 17
 # `turn_deg == 0` records. Bump on ANY field change: eval caches (e.g.
 # decode-fit freeplay waves) key on it so stale-schema npz are re-produced,
 # not silently reused.
-GATE_STREAM_SCHEMA_VERSION = 4
+# 5 = per-tick HELD weapon impulse `weapon_held` (int8, 0 = none/unknown, from
+# obs self_weapon_id). The attack-with era made `weapon`/`weapon_imp`
+# events-only (attack CLASS, 0 off fire ticks), which silently starved every
+# held-weapon denominator: gates.py's op-shot ruler read fires/held ≡ tick_hz
+# for every weapon and rc.py's weapon dwell/switch measured the fire toggle —
+# the a28rc1 trim stall.
+# 6 = the "held weapon" CONCEPT is retired (weapon scripting churns equip
+# state without expressing choice — Brian 2026-08-09). `weapon_held` is
+# renamed `self_weapon_id` (raw engine equip, impulse-coded: the op-shot
+# denominator and equip-churn diagnostic, never a behavioral signal) and
+# three additions serve the weapon-PREFERENCE ruler (core.preference_pairs):
+# `weapon_pref` (int8, equipped impulse at DISCHARGE ticks, 0 elsewhere —
+# the bot-side analog of the corpus attack class), `weapon_feas` (uint8
+# bitmask, bit imp−1 = weapon in the DECISION SPACE per
+# engine_norm.weapon_feasibility_bits — the ownership/ammo half of the
+# model's own attack-with choice-set predicate), and `health` (int16 raw).
+# The ruler invalidates preference carry on stationary-menu violations
+# (feas change / death in the pair window) by the SAME rule on both sides.
+# (Amended same-day from a raw ammo-column draft before any artifact was
+# produced at 6 — feasibility is read as the model's own quantity instead
+# of reconstructed from raw pools.)
+GATE_STREAM_SCHEMA_VERSION = 6
+
+# ONNX graph-input name → native obs-dict key (the export naming convention;
+# shared by tools/export_onnx.py and the ORT h2h side driver — one table).
+ONNX_OBS_KEY_REMAP = {
+    "self_health":          "health",
+    "self_effective_armor": "effective_armor",
+    "self_ammo_shells":     "ammo_shells",
+    "self_ammo_nails":      "ammo_nails",
+    "self_ammo_rockets":    "ammo_rockets",
+    "self_ammo_cells":      "ammo_cells",
+    "self_vel":             "vel",
+    "self_attack_finished": "attack_finished",
+    "view_pitch":           "view_pitch",
+    "self_movement_id":     "self_movement_id",
+    "self_items":           "self_items",
+    "look_delta":           "look_delta",
+}
 
 # Self-subtoken widths consumed by the three ObsEmbedding projections
 # (self_proj_state / self_proj_arsenal / self_proj_motion).

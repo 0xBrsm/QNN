@@ -1,0 +1,161 @@
+--- sv_phys.c
++++ sv_phys.c
+@@ -1498,6 +1498,71 @@
+ 
+ //============================================================================
+ 
++// QNN: fixed edict-index order gives the lower client slot a systematic
++// same-frame edge over higher slots (it moves/fires first every tick, and
++// can silence a higher slot's return fire on a mid-frame kill).  SV_Physics
++// below walks client edicts in a freshly shuffled order each frame instead.
++//
++// xorshift32, not rand()/random(): the QC random() builtin drains the same
++// libc rand() stream, and this runs every server frame regardless of QC
++// activity, so pulling from rand() here would perturb random()'s sequence
++// out from under gameplay scripts.
++#define QNN_SHUFFLE_MAX 64
++
++static unsigned int qnn_shuffle_rng_state = 0x9e3779b9u;
++
++static unsigned int QNN_ShuffleRandom (void)
++{
++	unsigned int x = qnn_shuffle_rng_state;
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	qnn_shuffle_rng_state = x;
++	return x;
++}
++
++// Fisher-Yates over order[0..n-1].
++static void QNN_ShuffleClientOrder (int *order, int n)
++{
++	int i, j, tmp;
++
++	for (i = n - 1; i > 0; i--)
++	{
++		j = (int)(QNN_ShuffleRandom () % (unsigned int)(i + 1));
++		tmp = order[i];
++		order[i] = order[j];
++		order[j] = tmp;
++	}
++}
++
++// Stock non-client movetype dispatch, shared verbatim by the world edict
++// (pass A) and the post-client edicts (pass C).
++static void QNN_Physics_NonClient (edict_t *ent)
++{
++	if (ent->v.movetype == MOVETYPE_PUSH)
++		SV_Physics_Pusher (ent);
++	else if (ent->v.movetype == MOVETYPE_NONE)
++		SV_Physics_None (ent);
++#ifdef QUAKE2
++	else if (ent->v.movetype == MOVETYPE_FOLLOW)
++		SV_Physics_Follow (ent);
++#endif
++	else if (ent->v.movetype == MOVETYPE_NOCLIP)
++		SV_Physics_Noclip (ent);
++	else if (ent->v.movetype == MOVETYPE_STEP)
++		SV_Physics_Step (ent);
++	else if (ent->v.movetype == MOVETYPE_TOSS
++	|| ent->v.movetype == MOVETYPE_BOUNCE
++#ifdef QUAKE2
++	|| ent->v.movetype == MOVETYPE_BOUNCEMISSILE
++#endif
++	|| ent->v.movetype == MOVETYPE_FLY
++	|| ent->v.movetype == MOVETYPE_FLYMISSILE)
++		SV_Physics_Toss (ent);
++	else
++		Sys_Error ("SV_Physics: bad movetype %i", (int)ent->v.movetype);
++}
++
+ /*
+ ================
+ SV_Physics
+@@ -1520,9 +1585,47 @@
+ //
+ // treat each object in turn
+ //
++
++// QNN pass A: world (edict 0), exact stock body.
+ 	ent = sv.edicts;
+-	for (i=0 ; i<sv.num_edicts ; i++, ent = NEXT_EDICT(ent))
++	if (!ent->free)
+ 	{
++		if (pr_global_struct->force_retouch)
++			SV_LinkEdict (ent, true);	// force retouch even for stationary
++
++		QNN_Physics_NonClient (ent);
++	}
++
++// QNN pass B: client edicts, per-frame shuffled order (qnn_client_shuffle 0
++// falls back to stock ascending order for A/B debugging).
++	{
++		int order[QNN_SHUFFLE_MAX];
++		int n = svs.maxclients;
++
++		if (n > QNN_SHUFFLE_MAX)
++			Sys_Error ("SV_Physics: maxclients %i > QNN_SHUFFLE_MAX", n);
++		for (i = 0; i < n; i++)
++			order[i] = i + 1;
++		if (Cvar_VariableValue ("qnn_client_shuffle") != 0)
++			QNN_ShuffleClientOrder (order, n);
++
++		for (i = 0; i < n; i++)
++		{
++			ent = EDICT_NUM(order[i]);
++			if (ent->free)
++				continue;
++
++			if (pr_global_struct->force_retouch)
++				SV_LinkEdict (ent, true);	// force retouch even for stationary
++
++			SV_Physics_Client (ent, order[i]);
++		}
++	}
++
++// QNN pass C: everything past the client range, stock index order.
++	for (i = svs.maxclients+1 ; i<sv.num_edicts ; i++)
++	{
++		ent = EDICT_NUM(i);
+ 		if (ent->free)
+ 			continue;
+ 
+@@ -1531,34 +1634,11 @@
+ 			SV_LinkEdict (ent, true);	// force retouch even for stationary
+ 		}
+ 
+-		if (i > 0 && i <= svs.maxclients)
+-			SV_Physics_Client (ent, i);
+-		else if (ent->v.movetype == MOVETYPE_PUSH)
+-			SV_Physics_Pusher (ent);
+-		else if (ent->v.movetype == MOVETYPE_NONE)
+-			SV_Physics_None (ent);
+-#ifdef QUAKE2
+-		else if (ent->v.movetype == MOVETYPE_FOLLOW)
+-			SV_Physics_Follow (ent);
+-#endif
+-		else if (ent->v.movetype == MOVETYPE_NOCLIP)
+-			SV_Physics_Noclip (ent);
+-		else if (ent->v.movetype == MOVETYPE_STEP)
+-			SV_Physics_Step (ent);
+-		else if (ent->v.movetype == MOVETYPE_TOSS 
+-		|| ent->v.movetype == MOVETYPE_BOUNCE
+-#ifdef QUAKE2
+-		|| ent->v.movetype == MOVETYPE_BOUNCEMISSILE
+-#endif
+-		|| ent->v.movetype == MOVETYPE_FLY
+-		|| ent->v.movetype == MOVETYPE_FLYMISSILE)
+-			SV_Physics_Toss (ent);
+-		else
+-			Sys_Error ("SV_Physics: bad movetype %i", (int)ent->v.movetype);			
++		QNN_Physics_NonClient (ent);
+ 	}
+-	
++
+ 	if (pr_global_struct->force_retouch)
+-		pr_global_struct->force_retouch--;	
++		pr_global_struct->force_retouch--;
+ 
+ 	sv.time += host_frametime;
+ }

@@ -108,41 +108,6 @@ ATTACK_V1 = _row(LabelContract(
     generations=("a27",),
 ))
 
-#: A25/A26.  The class comes from `act_weapon` — de-scripted deliberate
-#: SELECT-intent, carried forward across frames — gated to frames where
-#: `act_attack > 0`.  Frames whose intent weapon cannot fire are
-#: self-healed to the held weapon when the arsenal obs is available.
-#: Wire-shim only for new work; a25/a26 checkpoints require it.
-WEAPON_V2 = _row(LabelContract(
-    name="weapon.v2", family="weapon",
-    label="A25/A26 carried select-intent attack-with (act_weapon gated by act_attack)",
-    classes=9, columns=("weapon", "attack"), selector=True,
-    generations=("a25", "a26"),
-))
-
-#: Pre-A25.  The 8-class HELD-weapon head: `act_weapon` is the raw engine
-#: weapon byte every frame (1..8 → class 0..7); no-weapon frames are
-#: dropped.  Not a discharge label at all — it predicts what is equipped.
-WEAPON_V1 = _row(LabelContract(
-    name="weapon.v1", family="weapon",
-    label="pre-A25 held-weapon 8-class (act_weapon is the equipped byte)",
-    classes=8, columns=("weapon",), selector=True,
-    generations=("a22", "a23", "a24"),
-))
-
-#: The binary attack head — `act_attack` read as a float BCE target with
-#: the distance-shoulder weighting.  Registered so a graph can name it
-#: and so the epoch-1 guard knows its column; its derive still lives
-#: inline in QNNPolicy (it carries the shoulder/precompute machinery and
-#: is not a categorical selector).
-ATTACK_V0 = _row(LabelContract(
-    name="attack.v0", family="attack",
-    label="binary attack (act_attack as a BCE target with distance shoulder)",
-    classes=0, columns=("attack",), selector=False,
-    generations=("a22", "a23", "a24", "a25", "a26"),
-))
-
-
 # ── Derive registration ─────────────────────────────────────────────
 
 _DERIVES: dict[str, LabelDerive] = {}

@@ -282,3 +282,106 @@ def family_attack_rates(op_attack_path: Path) -> dict[str, float]:
         out[source] = sum(rate * weight for rate, weight in rows) / sum(
             weight for _, weight in rows)
     return out
+
+
+# Corpus tick rate the corrected-events artifact was measured at (confirmed
+# empirically, its own `_meta.corpus_gotchas`; identical convention to
+# `qnn.human.blind_fire.HZ`) — used only to convert its per-CORPUS-TICK
+# onset probabilities into the repo's standard per-second rate units.
+_CORRECTED_EVENTS_HZ = 20.0
+# NG/SNG/LG measured SEPARATELY in the corrected-events artifact (813/967/
+# 1197 ranked demos respectively) — never pooled, unlike the forced-cadence
+# bias fit's SG+SSG / NG+SNG grouping.
+_ONSET_GATED_WEAPONS = ("NG", "SNG", "LG")
+
+
+def family_onset_rates_los(corrected_events_path: Path) -> dict[str, float]:
+    """Human hold-train ONSET rate (fires/second) per pure-LOS engaged tick,
+    for each continuous-fire weapon (NG, SNG, LG) — the family event
+    correction's cadence target (agents/plans/crest-finetune-allweapons.md
+    "The objective"): a continuous weapon's fire-occupancy target must match
+    how often humans START a new trigger-pull, not how often the think-chain
+    streams a bolt.
+
+    Sourced from ``runs/head_probe/_human_crest_by_skill_corrected_events.json``
+    (``families.<W>.pooled_onset_rate_per_engaged_los_tick``, a per-CORPUS-TICK
+    probability over ALL pure-LOS engaged ticks for that weapon — the SAME
+    population ``family_aimed_rates_los`` reads for the discrete families),
+    converted to a per-second rate by the corpus's confirmed tick rate so
+    this reader hands back the same units as every other ``_rate_per_s``
+    target in this module. NG and SNG are read separately: the
+    corrected-events artifact measured each with its own real evidence, so
+    there is no reason to borrow one for the other the way the forced-
+    cadence bias fit does.
+
+    FAILS LOUD (missing artifact, missing family, wrong event class, or
+    missing field) — no silent fallback, and the numbers are never
+    hand-typed: re-run the corrected-events pass
+    (scripts/analysis/human_crest_lg_onset.py's family sweep, or its
+    successor) before fitting onset-rate targets against a new corpus.
+    """
+    p = Path(corrected_events_path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"corrected-events onset baseline not found: {p} — rebuild it "
+            "(the family event-class crest/onset-rate sweep) before fitting "
+            "continuous-weapon onset-rate targets")
+    doc = _read(p)
+    families = doc.get("families") or {}
+    out: dict[str, float] = {}
+    for abbr in _ONSET_GATED_WEAPONS:
+        fam = families.get(abbr)
+        if not isinstance(fam, dict) or fam.get("event_class") != "train_onset_only":
+            raise ValueError(
+                f"{p}: no train_onset_only family {abbr!r} — expected "
+                f"families.{abbr}.pooled_onset_rate_per_engaged_los_tick")
+        rate_per_tick = fam.get("pooled_onset_rate_per_engaged_los_tick")
+        if rate_per_tick is None:
+            raise ValueError(
+                f"{p}: families.{abbr} has no "
+                "pooled_onset_rate_per_engaged_los_tick")
+        out[abbr] = float(rate_per_tick) * _CORRECTED_EVENTS_HZ
+    return out
+
+
+def family_aimed_rates_los(blind_fire_path: Path) -> dict[str, float]:
+    """Human AIMED fire rate (discharges minus blind) per PURE-LOS engaged
+    tick, for each forced-weapon representative — the population
+    ``qnn.ppo.learner._fire_occupancy_loss``'s mask
+    (``torch.isfinite(align_hbw) & decision_mask``, i.e. every LOS tick, no
+    ``target_probs`` engagement label) actually scores.
+
+    DELIBERATELY NOT ``family_attack_rates``: that reader's ``rate_per_s`` is
+    conditioned on LOS *and* a ``target_probs``-labeled engagement — a
+    strictly narrower population (1.72x smaller on SG+SSG,
+    agents/plans/blind-fire-cadence.md §3) that belongs to the live-pins
+    forced-cadence fit, whose own bot-side mask shares that narrower scope.
+    Handing that number to a consumer whose mask is pure-LOS overstates the
+    target by the same ~1.72x the denominators differ by. This reader sources
+    ``qnn.human.blind_fire``'s ``aimed_rate_per_s`` / ``engaged_los_ticks``
+    instead, which carry no such condition.
+
+    Same-physics members are pooled by human pure-LOS-engaged mass. Missing
+    family evidence is fatal — no silent singleton substitution.
+    """
+    p = Path(blind_fire_path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"blind-fire targets missing: {p} — rebuild the collect's "
+            "decode-fit human baselines (python -m qnn.human <collect_dir>)")
+    weapons = (_read(p).get("weapons") or {})
+    out: dict[str, float] = {}
+    for source, members in CALIBRATION_FAMILIES.items():
+        rows = []
+        for member in members:
+            row = weapons.get(member) or {}
+            if row.get("aimed_rate_per_s") is not None:
+                rows.append((float(row["aimed_rate_per_s"]),
+                             float(row.get("engaged_los_ticks") or 1.0)))
+        if not rows:
+            raise ValueError(
+                f"blind-fire targets {p} lack pure-LOS cadence evidence for "
+                f"{'+'.join(members)}")
+        out[source] = sum(rate * weight for rate, weight in rows) / sum(
+            weight for _, weight in rows)
+    return out

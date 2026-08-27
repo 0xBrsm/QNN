@@ -25,7 +25,7 @@ int QNN_ArenaVirtualAssignSeats(void);
 qboolean QNN_ArenaVirtualReady(void);
 void QNN_ArenaVirtualPrepare(void);
 void QNN_ArenaVirtualStageActions(const qnn_action_t *actions, int action_count);
-void QNN_ArenaVirtualWriteInitial(FILE *out);
+void QNN_ArenaVirtualWriteInitial(FILE *out, float dt);
 void QNN_ArenaVirtualReceive(FILE *out, float dt, qboolean reset_receive);
 void QNN_ArenaVirtualShutdown(void);
 

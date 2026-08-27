@@ -1,7 +1,7 @@
 {
   "decode_version": 1,
   "version": "a25base",
-  "description": "a25-native BASE decode template for decode-fit. Legacy attack.bias_vec stays zero for artifact reproducibility; split_v1 uses fire-only attack.fire_bias_vec, selection-only weapon.preference_bias_vec, and weapon.switch_margin, all calibrated on final-aim free play before promotion.",
+  "description": "a25-native BASE decode template for decode-fit. Fire and selection are SEPARATE levers: fire-only attack.fire_bias_vec and selection-only weapon.preference_bias_vec, both calibrated on final-aim free play before promotion. (The legacy JOINT attack.bias_vec and its attack.vector_semantics selector were removed 2026-08-26 and now FAIL LOUD; there is no split_v1 to declare because there is nothing left to disambiguate.)",
   "decode_module": "qnn.model.decode_actions",
   "guard_module": "qnn.model.guard",
   "look_grid": "config/look_grid.json",
@@ -13,24 +13,10 @@
     "look.lead_hold_cap_frames": 4.0,
     "look.lead_hold_cap_radial_frames": 5.0,
     "look.hold_passthrough": true,
-    "look.aim_degrade_lag_frames": 0.0,
     "look.aim_degrade_tremor_mag": 0.0,
     "look.aim_degrade_tremor_tau": 5.0,
     "weapon_ban": [],
-    "move.commitment": true,
-    "move.commit_interrupt": false,
     "move.commit_dur_tilt": [
-      0.0,
-      0.0
-    ],
-    "attack.bias": 0.0,
-    "attack.bias_vec": [
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
       0.0,
       0.0
     ],
@@ -54,10 +40,15 @@
       0.0,
       0.0
     ],
-    "attack.vector_semantics": "split_v1",
-    "guard.projectile_release": true,
-    "guard.projectile_release_mode": "rocket",
+    "guard.projectile_release": "rocket",
     "move.threat_break_hazard": 0.0,
-    "weapon.switch_margin": 0.0
+    "guard.lg_range": 0,
+    "move.idle_none_bias": [
+      0.0,
+      0.0
+    ],
+    "move.idle_engagement_base": 0.5,
+    "move.idle_cooldown_ticks": 20,
+    "attack.hold_tail_sec": 0.0
   }
 }

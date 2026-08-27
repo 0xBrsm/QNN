@@ -169,7 +169,7 @@ def parse(path, target, with_times=False, with_stats=False):
     # every 0.1s) into W_Attack trigger events. Only filled when with_times.
     sound_times = {}
     # [(demotime, IT_flag), ...] — the self player's STAT_ACTIVEWEAPON broadcast
-    # timeline (server-authoritative held weapon). Only filled when with_stats.
+    # timeline (server-authoritative equipped weapon). Only filled when with_stats.
     stat_aw = []
 
     while pos + 5 <= n:

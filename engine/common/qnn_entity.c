@@ -354,18 +354,43 @@ cvar_t qnn_fov = {"qnn_fov", "120"};
  * a hull-1 clearance probe, so the RA-map "invisible viewing barrier"
  * geometry stops reading as visible.  0 = pre-dd8e6b8b, shot ray only.
  *
- * Gated because the veto's blast radius is far wider than the RA geometry
- * it targets: on stock id1 maps (dm3 / e1m2) it removes 17.3% of in-LOS
- * actor frames, which reproduces the whole a26-vs-a27 in-LOS gap
- * (24.16% -> 19.98% of frames; corpora measure 24.58% -> 19.17%).  Its own
- * comment anticipates the failure mode — "an ordinary small window also
- * blocks hull 1 because the player bbox catches its frame, and must remain
- * shootable" — so QNN_ClearanceHitHasShotSurface is very likely
- * false-negative on ordinary apertures.
+ * ORIGINAL DEFECT (dd8e6b8b, 17.3%): the veto's blast radius was far wider
+ * than the RA geometry it targets — on stock id1 maps (dm3 / e1m2) it
+ * removed 17.3% of true in-LOS actor frames, all false negatives, which
+ * reproduced the whole a26-vs-a27 in-LOS gap (24.16% -> 19.98% of frames;
+ * corpora measured 24.58% -> 19.17%).  Root cause (elevation defect
+ * decomposition, agents/plans/a26-superiority-decomposition.md WS1):
+ * QNN_InFov sampled a single point (the target's bbox-center origin, well
+ * below head height) for both the shot ray and the hull-1 sweep, and
+ * QNN_ClearanceHitHasShotSurface's rescue was a single ±4u point-probe
+ * along the hit normal at one reconstructed contact point — exactly the
+ * geometry an upward hull-1 sweep toward a ledge lip, thin frame, or
+ * brush-seam gap produces false negatives on.
  *
- * Default stays ON: the veto fixed a real defect (models targeting actors
+ * FIX (this change): (1) QNN_InFov now retries at an upper-body point
+ * (target + 0.8*target_half_z, still inside the target's own bbox) when
+ * the center-point check fails — mirrors a human checking a second point
+ * when the torso line is grazed but the target is plainly visible above
+ * it; visible if EITHER point clears the full shot+clearance pipeline.
+ * (2) QNN_ClearanceHitHasShotSurface's rescue probe is widened
+ * (QNN_SHOT_SURFACE_PROBE_REACH, 4u -> 12u) and sampled at the contact
+ * point AND four lateral (tangent-plane) offsets, not one — real geometry
+ * near a corner/seam is now caught even when the single-normal-line probe
+ * would miss it. Content-based restriction (playerclip/sky only) was not
+ * pursued: this vanilla-derived trace_t carries no contents field to test
+ * at hit time, so hull-0 presence *is* the operative substitute for "is
+ * this really solid" — hence repairing that probe rather than trying to
+ * bypass it. The veto's true-positive case (a large, free-standing
+ * playerclip-only barrier with no real geometry anywhere nearby) is
+ * unaffected: neither widening (12u) nor the lateral jitter (6u) reaches
+ * unrelated real geometry for that shape of barrier, and the upper-body
+ * retry still traces through the same barrier's hull-1 geometry.
+ * Re-measurement of the 17.3%/gap figures above is the eval harness's
+ * job, not asserted here.
+ *
+ * Default stays ON: the veto fixes a real defect (models targeting actors
  * through invisible walls) and is not being given up on a hypothesis.  The
- * gate exists so a collect can be run both ways and the attack-skill
+ * gate still exists so a collect can be run both ways and any residual
  * regression attributed or cleared by measurement. */
 cvar_t qnn_los_clearance = {"qnn_los_clearance", "1"};
 
@@ -376,7 +401,18 @@ cvar_t qnn_los_clearance = {"qnn_los_clearance", "1"};
 void QNN_RegisterPerceptionCvars(void)
 {
 	if (Cvar_FindVar("qnn_fov") == NULL)
+	{
+		const char *fov_env;
 		Cvar_RegisterVariable(&qnn_fov);
+		/* Same env-seed contract as qnn_los_clearance below: applied once,
+		 * at first registration only, so a later console set still wins. */
+		fov_env = getenv("QNN_FOV");
+		if (fov_env != NULL && fov_env[0] != '\0')
+		{
+			Cvar_Set("qnn_fov", (char *)fov_env);
+			fprintf(stderr, "[qnn] qnn_fov=%s (from env)\n", fov_env);
+		}
+	}
 	if (Cvar_FindVar("qnn_los_clearance") == NULL)
 	{
 		const char *env;
@@ -401,6 +437,17 @@ static qboolean QNN_LosClearanceEnabled(void)
 	if (cv == NULL)
 		return true;
 	return (cv->value != 0.0f) ? true : false;
+}
+
+/* Public wrapper over QNN_LosClearanceEnabled — lets the collect worker's
+ * hello response report the REGIME THAT ACTUALLY RESOLVED (post fail-open
+ * getenv logic) rather than have a caller outside this file re-derive the
+ * fail-open semantics from the raw cvar. See
+ * agents/plans/a26-superiority-decomposition.md E6: a collect's veto
+ * regime was previously ambient env only, invisible to the fingerprint. */
+qboolean QNN_LosClearanceResolved(void)
+{
+	return QNN_LosClearanceEnabled();
 }
 
 /*
@@ -439,11 +486,72 @@ static float QNN_EmitFovDeg(void)
 	return cv->value;
 }
 
+/* Public wrapper over QNN_EmitFovDeg — same rationale as
+ * QNN_LosClearanceResolved above: report the resolved cvar value, not a
+ * re-derivation of the unregistered-default fallback. */
+float QNN_FovResolved(void)
+{
+	return QNN_EmitFovDeg();
+}
+
+/* Reach along the plane normal for the shot-surface rescue probe.  Was a
+ * fixed 4.0f (dd8e6b8b) — widened because real-geometry contacts (ledge
+ * lips, thin window frames, brush-seam gaps) can sit farther than 4u from
+ * the reconstructed hull-1 contact point once corner/bevel-plane precision
+ * is accounted for.  Kept well short of a "large" free-standing playerclip
+ * barrier's typical clearance from any real geometry, so the true-positive
+ * case (dd8e6b8b's original target) is not reopened. */
+#define QNN_SHOT_SURFACE_PROBE_REACH 12.0f
+
+/* Lateral (tangent-plane) offset for the extra probe samples below. */
+#define QNN_SHOT_SURFACE_LATERAL_STEP 6.0f
+
+/* Any two vectors spanning the plane perpendicular to normal — exact
+ * orthonormality doesn't matter, only that both are nonzero and not
+ * parallel to normal, which the axis-swap guard guarantees. */
+static void QNN_PerpendicularBasis(const vec3_t normal, vec3_t tangent1, vec3_t tangent2)
+{
+	vec3_t helper = {0.0f, 0.0f, 1.0f};
+
+	if (fabsf(normal[2]) > 0.9f)
+	{
+		helper[0] = 1.0f;
+		helper[1] = 0.0f;
+		helper[2] = 0.0f;
+	}
+	CrossProduct((float *)normal, helper, tangent1);
+	VectorNormalize(tangent1);
+	CrossProduct((float *)normal, tangent1, tangent2);
+	VectorNormalize(tangent2);
+}
+
+/* Point-probe at `point` along `normal`, ±QNN_SHOT_SURFACE_PROBE_REACH.
+ * True iff hull-0 (real, renderable/solid) geometry is struck. */
+static qboolean QNN_ProbeShotSurfaceAt(const vec3_t point, const vec3_t normal)
+{
+	vec3_t probe_start, probe_end;
+	trace_t point_trace;
+
+	VectorMA((float *)point, QNN_SHOT_SURFACE_PROBE_REACH, (float *)normal, probe_start);
+	VectorMA((float *)point, -QNN_SHOT_SURFACE_PROBE_REACH, (float *)normal, probe_end);
+	memset(&point_trace, 0, sizeof(point_trace));
+	QNN_TraceLine(probe_start, probe_end, &point_trace);
+	return point_trace.startsolid || point_trace.fraction < 1.0f;
+}
+
 /* A clear point ray can still cross a clip-hull-only wall.  Conversely, an
  * ordinary small window also blocks hull 1 because the player bbox catches
  * its frame, and must remain shootable.  Probe the hull-0 contact implied by
  * the clearance plane: a real frame has point-solid geometry there; a pure
- * playerclip barrier does not. */
+ * playerclip barrier does not.
+ *
+ * Widened + multi-sampled (see the two #defines above) versus dd8e6b8b's
+ * original single ±4u probe: the reconstructed contact point is exact for
+ * a face-on hit, but hull-1 bevel/corner clipnodes and ordinary brush-seam
+ * gaps can put real hull-0 geometry a little off that single line — the
+ * canonical failure being an upward hull-1 sweep grazing a ledge lip.
+ * Sample the contact point and four lateral offsets (tangent to the plane)
+ * before concluding "no real surface here". */
 static qboolean QNN_ClearanceHitHasShotSurface(const trace_t *clearance)
 {
 	const float mins[3] = {
@@ -452,8 +560,7 @@ static qboolean QNN_ClearanceHitHasShotSurface(const trace_t *clearance)
 	const float maxs[3] = {
 		QNN_PLAYER_MAXS_X, QNN_PLAYER_MAXS_Y, QNN_PLAYER_MAXS_Z
 	};
-	vec3_t contact, probe_start, probe_end;
-	trace_t point_trace;
+	vec3_t contact, tangent1, tangent2, probe_point;
 	float normal_length_sq;
 	int axis;
 
@@ -468,14 +575,29 @@ static qboolean QNN_ClearanceHitHasShotSurface(const trace_t *clearance)
 		else if (clearance->plane.normal[axis] < 0.0f)
 			contact[axis] += maxs[axis];
 	}
-	VectorMA(contact, 4.0f, clearance->plane.normal, probe_start);
-	VectorMA(contact, -4.0f, clearance->plane.normal, probe_end);
-	memset(&point_trace, 0, sizeof(point_trace));
-	QNN_TraceLine(probe_start, probe_end, &point_trace);
-	return point_trace.startsolid || point_trace.fraction < 1.0f;
+
+	if (QNN_ProbeShotSurfaceAt(contact, clearance->plane.normal))
+		return true;
+
+	QNN_PerpendicularBasis(clearance->plane.normal, tangent1, tangent2);
+	VectorMA(contact, QNN_SHOT_SURFACE_LATERAL_STEP, tangent1, probe_point);
+	if (QNN_ProbeShotSurfaceAt(probe_point, clearance->plane.normal))
+		return true;
+	VectorMA(contact, -QNN_SHOT_SURFACE_LATERAL_STEP, tangent1, probe_point);
+	if (QNN_ProbeShotSurfaceAt(probe_point, clearance->plane.normal))
+		return true;
+	VectorMA(contact, QNN_SHOT_SURFACE_LATERAL_STEP, tangent2, probe_point);
+	if (QNN_ProbeShotSurfaceAt(probe_point, clearance->plane.normal))
+		return true;
+	VectorMA(contact, -QNN_SHOT_SURFACE_LATERAL_STEP, tangent2, probe_point);
+	return QNN_ProbeShotSurfaceAt(probe_point, clearance->plane.normal);
 }
 
-qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target)
+/* Single-point visibility check: FOV cone + shot ray + (gated) hull-1
+ * clearance veto.  Factored out of QNN_InFov so it can be evaluated at
+ * more than one point on the target — see QNN_InFov's elevation-rescue
+ * retry below. */
+static qboolean QNN_PointInFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t point)
 {
 	vec3_t forward;
 	vec3_t right;
@@ -494,7 +616,7 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 		return false; /* qnn_fov 0 -> no SIGHT, ever (before the close-range path) */
 
 	AngleVectors(view_angles, forward, right, up);
-	VectorSubtract(target, player_origin, delta);
+	VectorSubtract(point, player_origin, delta);
 	dist = QNN_VecLength(delta);
 	if (dist < 1.0f)
 		return true;
@@ -509,7 +631,7 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 	VectorCopy(player_origin, eye);
 	eye[2] += QNN_VIEW_OFS_Z;
 	memset(&shot_trace, 0, sizeof(shot_trace));
-	QNN_TraceLine(eye, target, &shot_trace);
+	QNN_TraceLine(eye, point, &shot_trace);
 	if (shot_trace.fraction < 1.0f)
 		return false;
 
@@ -521,10 +643,41 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 	if (!QNN_LosClearanceEnabled())
 		return true;
 	memset(&clearance_trace, 0, sizeof(clearance_trace));
-	QNN_TraceClearance(player_origin, target, &clearance_trace);
+	QNN_TraceClearance(player_origin, point, &clearance_trace);
 	if (clearance_trace.fraction >= 1.0f)
 		return true;
 	return QNN_ClearanceHitHasShotSurface(&clearance_trace);
+}
+
+/* Fraction of target_half_z used for the elevation-rescue retry point.
+ * 0.8 keeps the probe comfortably inside the target's own bbox (never
+ * pokes above its true top) while landing close to head/shoulder height
+ * for a standard player (anchor is bbox-center; 0.8 * half-height lands
+ * ~80% of the way from center to the top of the model). */
+#define QNN_ELEVATION_RESCUE_FRACTION 0.8f
+
+qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target, float target_half_z)
+{
+	vec3_t upper_target;
+	float upper_offset;
+
+	if (QNN_PointInFov(player_origin, view_angles, target))
+		return true;
+
+	/* Elevation false-negative rescue (a26-superiority-decomposition.md
+	 * WS1/E3): `target` is the geometric CENTER of the entity's bbox
+	 * (QNN_EntityAnchorFromModel's center_adjust), which for a standing
+	 * player sits near hip height — well below head height. A ledge lip
+	 * (or any partial occluder near torso height) can graze that single
+	 * center-point ray/sweep while the target's upper body is plainly
+	 * visible above it. Retry at an upper-body point and accept the
+	 * target as visible if EITHER point clears — mirrors a human who
+	 * checks a second point when the first line of sight is grazed. */
+	upper_offset = (target_half_z > 0.0f) ? target_half_z : (QNN_PLAYER_MAXS_Z - QNN_PLAYER_MINS_Z) * 0.5f;
+	upper_offset *= QNN_ELEVATION_RESCUE_FRACTION;
+	VectorCopy(target, upper_target);
+	upper_target[2] += upper_offset;
+	return QNN_PointInFov(player_origin, view_angles, upper_target);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -793,7 +946,7 @@ int QNN_EntityClassifyKnown(const qnn_snapshot_t *snapshot,
 
 		is_item = (!is_brush && QNN_SubjectIsItem(subject_id));
 		QNN_EntityAnchorFromModel(entity_num, entity->origin, anchor_origin, half_extents);
-		in_fov = QNN_InFov(snapshot->player_origin, snapshot->player_view_angles, anchor_origin);
+		in_fov = QNN_InFov(snapshot->player_origin, snapshot->player_view_angles, anchor_origin, half_extents[2]);
 
 		/* Cull entities outside the viewer's PVS. */
 		if (apply_pvs && !QNN_EntityInPvs(snapshot->player_origin, anchor_origin))

@@ -12,6 +12,7 @@ represents.
 | Run name | `head_probe_atlas_awposw_seed43` | A trained base checkpoint, candidacy undecided | Training completed |
 | `a<T>rc<N>` | `a26rc2` | Release-candidate base model N of tier T | Decode fit passed its gates |
 | `a<T>rc<N><letter>` | `a26rc2a` | A deployed decode config of that base model | Actually deployed to the live share (g4) |
+| `a<T>rc<N>base` | `a25rc3base` | The rc's raw base checkpoint, deployed uncalibrated (native/eval decode regime, no fitted config) for live base-model testing | Base checkpoint pushed to the live share |
 | `a<T>rc<N>` (alias) | `a26rc2` | Best deployed letter of the rc family | Letter promoted, drops the letter |
 | `a<T>` (bare) | `a25` | The generation's released model | Best rc of the line, promoted at line close |
 
@@ -52,7 +53,19 @@ represents.
   checkpoint, new decode/guard params → same numeral, letter territory.
 - **Letters = deploys.** No letter until the config ships. Undeployed
   refits re-emit under the same letter they replace.
+- **Deployed base models are suffixed `base`.** A raw checkpoint pushed to
+  the live share for testing (no fitted decode config) ships as
+  `a<T>rc<N>base` (`a25rc3base`, `a28rc1base`) — never a bare numeral and
+  never a letter, both of which stay earned by the fit and the calibrated
+  deploy respectively.
 - **Failed fits burn nothing.** The numeral is only consumed on gate pass.
+- **Burned names are never redefined.** A version that has entered live
+  records (g4 elo brackets, match DB) under a wrong config keeps that
+  meaning forever; the corrected artifact takes the next suffix numeral
+  instead (`a28rc1base` was exported 2026-08-09 with a borrowed fitted
+  config, so the true uncalibrated base ships as `a28rc1base2`). The
+  export BASE-SEMANTICS gate (`tools/export_onnx.py`) enforces neutrality
+  for `base` and all `baseN` successors.
 - **Aliases are promotions, not synonyms.** Bare `rcN` and bare `aT` are
   earned by being the settled best of their family/line, not shorthand for
   the latest attempt.
@@ -115,9 +128,17 @@ The rules are enforced by `qnn.decode_fit`, not convention:
   that family; `a26rc1b` is the `--force`-promoted config (reactivity gate
   FAIL judged inside measurement noise — see the `--force` rule above);
   `a26rc1c` is a hand-derived, byte-identical-params re-emit of `a26rc1b`
-  documenting same-day engine/decode riders (continuous-fire hold-tail, RL
-  self-splash atlas-quantization fix, ammo-lockout override, dormant
-  convergence-gated crest hold) in its provenance.
+  documenting same-day engine/decode riders (continuous-fire hold-tail — at
+  the time an unconditional engine-wide constant, not yet the per-model
+  `decode.attack.hold_tail_sec` stamp introduced 2026-08-26, see
+  [contracts/README.md](contracts/README.md#decode-config--the-decodeguard-layer) —,
+  RL self-splash atlas-quantization fix, ammo-lockout override, dormant
+  convergence-gated crest hold) in its provenance. The crest hold named here
+  does not survive to HEAD (deleted 2026-08-26 with the rest of the a25
+  discharge-quality gate) — see
+  [decode-config-defaults.md](decode-config-defaults.md#removed-decode-laws--the-2026-08-26-decode-surface-purge).
+  The ammo-lockout override is the `move.idle_none_bias` engagement gate's
+  stillness trigger (unrelated to `weapon.af_lockout`) and is still live.
 - `a26rc2` = `head_probe_atlas24x11_awposw_seed43` (checkpoint
   `best_20260722-98wtxv`, the finalized 24×11 packed atlas) — a distinct
   checkpoint from `a26rc1`, hence the new numeral. `a26rc2a` is its first

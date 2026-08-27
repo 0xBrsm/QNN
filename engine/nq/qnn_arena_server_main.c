@@ -37,6 +37,10 @@ static cvar_t qnn_bot_weapon_pin_cvar = {"qnn_bot_weapon_pin", "0", false, false
 /* Per-frame QuakeC ammo top-up (qnn_infinite_ammo_frame): pin waves set 1 so
    90s pinned episodes never run the measured weapon dry. Default off. */
 static cvar_t qnn_inv_infinite_ammo_cvar = {"qnn_inv_infinite_ammo", "0", false, false};
+/* SV_Physics (sv_phys.c.patch) shuffles client edict processing order each
+   frame to remove the fixed-index same-frame slot advantage. 0 = stock
+   ascending order, for A/B debugging. */
+static cvar_t qnn_client_shuffle_cvar = {"qnn_client_shuffle", "1", false, false};
 
 static int QNN_ArgInt(const char *name, int fallback)
 {
@@ -72,16 +76,27 @@ static int QNN_ArenaWeaponBit(const char *name)
 	return 0;
 }
 
-/* Apply the single-weapon arena inventory (model weapon + bot pin + ammo/armor/
-   health) from CLI args onto the qnn_inv_ and qnn_bot_weapon_pin cvars BEFORE the
-   map loads and matches spawn, so every match respawn reads the pinned loadout.
-   Each arg is optional; absent args leave the registered default untouched. The
-   Python side (ArenaServerProcess) only emits the args the scenario specifies. */
+/* Apply the arena inventory (owned weapons + bot pin + ammo/armor/health)
+   from CLI args onto the qnn_inv_ and qnn_bot_weapon_pin cvars BEFORE the
+   map loads and matches spawn, so every match respawn reads the pinned
+   loadout. Each arg is optional; absent args leave the registered default
+   untouched. The Python side (ArenaServerProcess) only emits the args the
+   scenario specifies.
+
+   Two ways to own weapons, both optional and combinable:
+   -qnn_inv_selected NAME   single weapon; also becomes the owned mask
+                            (the historical single-weapon arena cell).
+   -qnn_inv_weapons_mask N  raw multi-weapon owned mask (OR of engine_norm's
+                            IT_ bits, e.g. a full-arsenal RA loadout) — wins
+                            over -qnn_inv_selected's mask derivation when
+                            both are given, so a selected weapon can still
+                            name the STARTING weapon inside a wider owned set. */
 static void QNN_ArenaApplyInventory(void)
 {
 	const char *model_weapon = QNN_ArgString("-qnn_inv_selected", NULL);
 	const char *bot_pin = QNN_ArgString("-qnn_bot_weapon_pin", NULL);
 	const char *armor_type = QNN_ArgString("-qnn_inv_armor_type", NULL);
+	const char *weapons_mask = QNN_ArgString("-qnn_inv_weapons_mask", NULL);
 	struct { const char *arg; const char *cvar; } ints[] = {
 		{"-qnn_inv_shells", "qnn_inv_shells"},
 		{"-qnn_inv_nails", "qnn_inv_nails"},
@@ -99,8 +114,11 @@ static void QNN_ArenaApplyInventory(void)
 		int bit = QNN_ArenaWeaponBit(model_weapon);
 		snprintf(buf, sizeof(buf), "%d", bit);
 		Cvar_Set("qnn_inv_selected", buf);
-		/* Single-weapon arena: the owned mask is exactly the selected weapon. */
-		Cvar_Set("qnn_inv_weapons", buf);
+		if (!weapons_mask)
+		{
+			/* Single-weapon arena: the owned mask is exactly the selected weapon. */
+			Cvar_Set("qnn_inv_weapons", buf);
+		}
 	}
 	if (bot_pin)
 	{
@@ -115,6 +133,10 @@ static void QNN_ArenaApplyInventory(void)
 	}
 	if (armor_type)
 		Cvar_Set("qnn_inv_armor_type", (char *)armor_type);
+	if (weapons_mask)
+		/* Multi-weapon loadout (e.g. RA full arsenal): explicit owned mask
+		   overrides the single-weapon derivation above. */
+		Cvar_Set("qnn_inv_weapons", (char *)weapons_mask);
 }
 
 static void QNN_RegisterArenaCvars(void)
@@ -134,6 +156,7 @@ static void QNN_RegisterArenaCvars(void)
 	Cvar_RegisterVariable(&qnn_inv_selected_cvar);
 	Cvar_RegisterVariable(&qnn_bot_weapon_pin_cvar);
 	Cvar_RegisterVariable(&qnn_inv_infinite_ammo_cvar);
+	Cvar_RegisterVariable(&qnn_client_shuffle_cvar);
 }
 
 static void QNN_ServerFrame(float dt)
@@ -285,8 +308,9 @@ int main(int argc, char **argv)
 	int shadow_clients;
 	int bot_skill;
 	int port;
+	int tick_hz;
 	int frame;
-	float dt = 1.0f / 20.0f;
+	float dt;
 	char command[256];
 	double deadline;
 
@@ -315,6 +339,10 @@ int main(int argc, char **argv)
 	bot_skill = QNN_ArgInt("-qnn_bot_skill", 3);
 	port = QNN_ArgInt("-port", 26000);
 	map_id = QNN_ArgString("-qnn_map", "qnn_arena8");
+	tick_hz = QNN_ArgInt("-qnn_tick_hz", 20);
+	if (tick_hz <= 0)
+		Sys_Error("-qnn_tick_hz must be positive, got %d", tick_hz);
+	dt = 1.0f / (float)tick_hz;
 
 	Host_Init(&parms);
 	QNN_TickRegister();
@@ -322,7 +350,7 @@ int main(int argc, char **argv)
 	Cvar_SetValue("qnn_train", 1.0f);
 	Cvar_SetValue("qnn_arena_selfplay", (float)selfplay);
 	Cvar_SetValue("qnn_arena_ready", 0.0f);
-	Cvar_SetValue("qnn_tick_hz", 20.0f);
+	Cvar_SetValue("qnn_tick_hz", (float)tick_hz);
 	QNN_ArenaApplyInventory();
 	QNN_ArenaConfigureActionSeats(selfplay ? true : false);
 
@@ -407,7 +435,7 @@ int main(int argc, char **argv)
 		QNN_ArenaVirtualPrepare();
 	QNN_WriteState("ready", port);
 	if (virtual_clients || shadow_clients)
-		QNN_ArenaVirtualWriteInitial(stdout);
+		QNN_ArenaVirtualWriteInitial(stdout, dt);
 
 	for (;;)
 	{

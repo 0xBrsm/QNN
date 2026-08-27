@@ -513,7 +513,19 @@ static void QNN_WriteHelloResponse(void)
 	QNN_WriteJsonString(stdout, QNN_WORKER_PROTOCOL);
 	fprintf(stdout, ",\"server\":");
 	QNN_WriteJsonString(stdout, QNN_WORKER_SERVER_NAME);
-	fprintf(stdout, ",\"tick_hz\":%d,\"worker_build\":{\"basedir\":", qnn_runtime.fixed_tick_hz);
+	/* Resolved perception regime (E6 provenance fix): report what
+	 * actually resolved after the qnn_los_clearance getenv/fail-open
+	 * logic and the qnn_fov clamp ran, not what the launcher's env
+	 * intended — collect.py folds this into the collection fingerprint
+	 * so the veto regime a corpus was collected under is on record
+	 * instead of ambient. See agents/plans/a26-superiority-decomposition.md
+	 * E6 and qnn_entity.c's QNN_LosClearanceResolved/QNN_FovResolved. */
+	fprintf(stdout,
+		",\"tick_hz\":%d,\"perception\":{\"los_clearance\":%d,\"fov\":%.6g},"
+		"\"worker_build\":{\"basedir\":",
+		qnn_runtime.fixed_tick_hz,
+		QNN_LosClearanceResolved() ? 1 : 0,
+		(double)QNN_FovResolved());
 	QNN_WriteJsonString(stdout, basedir);
 	fprintf(stdout, ",\"upstream_commit\":");
 	QNN_WriteJsonString(stdout, QNN_WORKER_UPSTREAM_COMMIT);
@@ -556,6 +568,16 @@ static int QNN_HandleHello(const char *line)
 		QNN_WriteError(error);
 		return 0;
 	}
+
+	/* Resolve the perception cvars (qnn_fov / qnn_los_clearance,
+	 * including the QNN_LOS_CLEARANCE env fail-open seed) HERE, before
+	 * reporting them below — QNN_IOInit (which normally performs this
+	 * registration) doesn't run until the first demo's reset, which is
+	 * too late for the hello response to reflect the real regime.
+	 * Idempotent: a later QNN_IOInit call is then a no-op for these two
+	 * cvars (guarded by Cvar_FindVar == NULL), so per-demo behavior is
+	 * unchanged. See agents/plans/a26-superiority-decomposition.md E6. */
+	QNN_RegisterPerceptionCvars();
 
 	QNN_WriteHelloResponse();
 	return 0;

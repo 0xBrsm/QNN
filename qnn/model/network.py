@@ -1,8 +1,17 @@
 """Combat-objective BC network.
 
 This is the ``nn.Module`` compute graph for the model — the encoder,
-temporal (recurrence), target pointer, and the four output heads (move,
-look, attack, weapon). It is the "model" in the SL sense.
+temporal (recurrence), target pointer, and the canonical a28 heads
+(look, attack selector, move_seg, jump; look_seg / attack_future are
+bench-probe slots). It is the "model" in the SL sense.
+
+a28 invariant: every head consumes EXACTLY its declared graph inputs.
+There is one shared feature cat — (readout | target_feat [| intent]) —
+and heads prefix-slice it to their declared width. Nothing is appended
+past the declared edges (weapon_ctx, the one historical implicit input,
+is gone; the selector emits logits only). The attack selector composes
+its OWN cat from its declared edges, optionally with the realized-
+alignment tail (``aim``) — also declared, also nothing implicit.
 
 The training-time wrapper (optimizers, loss shaping, sampling,
 checkpoint I/O) lives in :mod:`qnn.model.policy` as ``QNNPolicy``.
@@ -29,34 +38,21 @@ import torch
 from torch import nn
 
 from qnn.actions import MOVE_AXES, MOVE_AXIS_CLASSES
-from qnn.model.attack_head import AttackHead, AttackHeadInput, AttackSelectorInput
-from qnn.model.look_head import LookHead, LookHeadInput
-from qnn.model.move_head import MoveHead, MoveHeadInput
+from qnn.model.attack_with_head import AttackSelectorInput
 from qnn.model.target import TargetPointer, TargetPointerInput
 from qnn.model.temporal import Temporal, TemporalInput
-from qnn.model.tokens.obs_fields import SCALAR_FIELDS
 from qnn.model.transformer import ObsEmbedding, TransformerEncoder
-from qnn.model.weapon_head import WeaponHead
 from qnn.vocab import TOKEN_ACTOR
 
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    """Canonical model architecture config — sole source of truth for arch.
+    """Flat policy-layer bridge of the graph spec's node parameters.
 
-    All fields are required; defaults live only in model.json. The
-    dataclass is frozen so a constructed config can't drift from its
-    serialized form. ``head_activation`` is "none" or "gelu" (ReLU was
-    removed). Per-action-head MLP intermediate widths are explicit
-    scalars (``d_move`` etc.); ``0`` disables the intermediate
-    layer for that head.
-
-    The target pointer is the MLP variant — see
-    :mod:`qnn.model.target`. ``d_target`` is its MLP hidden width and
-    the only architectural knob. Legacy attention-style variants
-    (cls/GRU query, weapon-id query shift, hard-argmax / gt-dist /
-    prev-target probes, learnable idx prior) live exclusively in
-    :mod:`qnn.model.bench` for ablation.
+    a28: the graph spec (``qnn.model.graph``) is the sole author of the
+    architecture; this dataclass carries the handful of scalars the
+    policy layer and Network internals still read. All fields required,
+    no legacy aliases, no migration — a pre-a28 model.json fails loud.
     """
     d_model: int
     n_heads: int
@@ -65,72 +61,24 @@ class ModelConfig:
     attn_dropout: float
     use_gru: bool
     d_gru: int
-    use_weapon_head: bool
-    # Weapon-selector input composition as an ordered edge list, not bools.
-    # Each member names a source the selector cat is built from, in order:
-    #   "gru"          — temporal hidden (contributes only when a temporal
-    #                     slot is active; silently dropped otherwise).
-    #   "self_readout" — encoder self/CLS readout.
-    #   "target_feat"  — pointer-blended target feature (zeros when the
-    #                     target slot is off, but still occupies its width).
-    # Canonical is ("gru", "self_readout", "target_feat"). At least one of
-    # {"gru", "self_readout"} must be present — target_feat alone is too thin.
+    # Selector input composition as an ordered edge list (from the attack
+    # selector's declared graph inputs): "gru" / "self_readout" /
+    # "target_feat". Empty when no selector head is present.
     weapon_sources: tuple[str, ...]
-    look_bypass_gru: bool
     d_target: int
-    d_move: int
-    d_look: int
-    d_attack: int
-    d_weapon: int
     head_activation: str
 
     @classmethod
     def from_dict(cls, raw: "Mapping[str, Any]") -> "ModelConfig":
-        """Build from a model.json-style mapping.
-
-        Strips the legacy ``encoder_hidden`` alias of ``d_model``. Any
-        other unknown key or any missing required field raises
-        TypeError — every architectural flag must be set explicitly in
-        model.json.
-        """
+        """Build from a model.json-style mapping. Unknown keys or missing
+        required fields raise TypeError — every field is explicit."""
         data = dict(raw)
-        data.pop("encoder_hidden", None)
-        data["weapon_sources"] = cls._resolve_weapon_sources(data)
+        data["weapon_sources"] = tuple(data.get("weapon_sources", ()))
         if data.get("head_activation") not in ("none", "gelu", "relu"):
             raise ValueError(
                 f"head_activation must be 'none', 'gelu', or 'relu', got {data.get('head_activation')!r}"
             )
         return cls(**data)
-
-    @staticmethod
-    def _resolve_weapon_sources(data: "dict[str, Any]") -> "tuple[str, ...]":
-        """Pop weapon-source keys from ``data`` and return the source tuple.
-
-        New configs carry ``weapon_sources`` directly. Pre-rename configs
-        (the 396 serialized run model.json) carry the old
-        ``weapon_use_gru`` / ``weapon_use_self_readout`` bools (with the
-        even-older ``weapon_use_cls_readout`` alias of the latter) — those
-        are migrated to the ordered edge list here so existing checkpoints
-        keep loading. Legacy keys are always stripped so they never reach
-        the dataclass constructor.
-        """
-        legacy_gru = data.pop("weapon_use_gru", None)
-        legacy_self = data.pop("weapon_use_self_readout", None)
-        legacy_cls = data.pop("weapon_use_cls_readout", None)
-        if "weapon_sources" in data:
-            return tuple(data["weapon_sources"])
-        # Migrate from bools. Historical defaults were both True (canonical
-        # [gru, self_readout, target_feat]); only an explicit False drops a source.
-        use_gru = True if legacy_gru is None else bool(legacy_gru)
-        self_val = legacy_self if legacy_self is not None else legacy_cls
-        use_self = True if self_val is None else bool(self_val)
-        sources = []
-        if use_gru:
-            sources.append("gru")
-        if use_self:
-            sources.append("self_readout")
-        sources.append("target_feat")
-        return tuple(sources)
 
     @classmethod
     def from_flat_dict(cls, raw: "Mapping[str, Any]") -> "ModelConfig":
@@ -138,10 +86,7 @@ class ModelConfig:
         flat config dict (e.g. a PPO config that merges train + model
         keys). Missing required model fields still raise TypeError.
         """
-        keys = {f.name for f in fields(cls)} | {
-            "encoder_hidden",
-            "weapon_use_gru", "weapon_use_self_readout", "weapon_use_cls_readout",
-        }
+        keys = {f.name for f in fields(cls)}
         subset = {k: v for k, v in raw.items() if k in keys}
         return cls.from_dict(subset)
 
@@ -150,21 +95,25 @@ class ModelConfig:
 
 
 # Logits-dict keys — string identifiers used to address each head's
-# output across the BC/PPO/eval call sites.
+# output across the BC/PPO/eval call sites. MOVE_HEAD survives as the
+# ACTION-STREAM key only (act_move labels feed move_seg target derivation
+# and the decode state); there is no per-tick move head.
 MOVE_HEAD = "move"
 LOOK_HEAD = "look"
 ATTACK_HEAD = "attack"
-WEAPON_HEAD = "weapon"
-MOVE_HAZARD_HEAD = "move_hazard"  # a25 WHEN/termination head (opt-in)
-MOVE_SEG_HEAD = "move_seg"        # a25 segment (class x duration) head (opt-in)
-LOOK_SEG_HEAD = "look_seg"        # a25 look segment (onset-class x duration) head (opt-in)
-JUMP_HEAD = "jump"                # a25 2-class land-jump head (opt-in)
-ATTACK_FUTURE_HEAD = "attack_future"  # a27 MTP aux head (training-only, opt-in)
+ATTACK_FIRE_BIAS = "_attack_fire_bias"  # model-owned fire-only intercept (8,)
+MOVE_SEG_HEAD = "move_seg"        # a25 segment (class x duration) head
+LOOK_SEG_HEAD = "look_seg"        # a25 look segment head (bench slot)
+JUMP_HEAD = "jump"                # a25 2-class land-jump head
+ATTACK_FUTURE_HEAD = "attack_future"  # a27 MTP aux head (training-only, bench slot)
+MOVE_TICK_HEAD = "move_tick"      # BENCH: revived per-tick move head (cell C3 of
+                                  # agents/plans/seg-vs-frame-decision.md). Distinct
+                                  # from MOVE_HEAD, which is the action-stream key.
 
 # Output sizes, exported for callers that build padded buffers or
 # downstream layers against these sizes. Heads define their own
 # OUT_DIM internally; these are the public face.
-MOVE_HEAD_SIZE = MOVE_AXES * MOVE_AXIS_CLASSES  # 9 logits
+MOVE_HEAD_SIZE = MOVE_AXES * MOVE_AXIS_CLASSES  # 9 move-class logits (action space)
 LOOK_HEAD_SIZE = 3  # 3D direction vector
 ATTACK_HEAD_SIZE = 9  # categorical no-attack + Quake impulses 1..8
 
@@ -177,6 +126,59 @@ _ACTOR_REL_OFFSET = 3
 # for the target pointer.
 _ACTOR_TEAM_OFFSET = 16
 _TEAM_TEAMMATE_VALUE = 1.0
+
+# Realized-alignment block width — the spec's AIM_DIM, restated here because the
+# model layer must not import the graph layer (build.py owns the crossing and a
+# unit test pins the two equal).
+AIM_BLOCK_DIM = 17
+
+# A″ forward-projected alignment tail (EDGE_AIM2) — restated from the spec's
+# AIM2_HORIZONS_TICKS / AIM2_DIM for the same layering reason (a unit test
+# pins the two equal; see qnn.model.graph.spec for the full rationale).
+AIM2_HORIZONS_TICKS: tuple[int, ...] = (2, 5, 10, 16)
+AIM2_EXTRA_DIM = 8 * len(AIM2_HORIZONS_TICKS)
+AIM2_BLOCK_DIM = AIM_BLOCK_DIM + AIM2_EXTRA_DIM
+
+
+@torch.no_grad()
+def alignment_edge_block(
+    alignment: torch.Tensor,        # (R, 8) per-weapon expected crest payout
+    alignment_prev: torch.Tensor,   # (R, 8) previous tick's alignment (zeros = none)
+    has_target: torch.Tensor,       # (R,)  1.0 when an enemy actor is perceived
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """``(R, 17)`` alignment feature block (EDGE_AIM, rung-3 A′ form).
+
+    Columns, in order:
+
+    0..7   ``alignment[k]`` — expected crest payout of firing weapon k this
+           tick (``lead_aim.weapon_alignment``: per-enemy lead-law hbw →
+           ``exp(−ALIGNMENT_GAMMA·hbw)``, pooled by the detached target
+           pointer's belief). The reward's own state variable, per weapon.
+    8..15  ``Δalignment[k]`` — realized one-tick backward difference, zeroed
+           when EITHER endpoint had no target (payouts are strictly positive
+           with a target, so all-zero rows are unambiguous) — the trend that
+           makes fire-at-the-trough legible: fire when alignment is high and
+           Δ has stopped improving.
+    16     ``has_target`` — explicit gate bit (zero-disambiguation insurance).
+
+    Previous-tick threading: the SEQ path derives ``alignment_prev`` by
+    shifting within the window (reset rows zeroed); the flat/act path reads
+    caller state (``prepare_act_state``'s ``alignment_prev`` lanes, updated
+    in place from the ``_alignment`` aux logit each tick).
+
+    GRADIENT ISOLATION unchanged from the original aim edge: no_grad
+    computation off detached pointer logits — the selector MLP's own
+    parameters are the only ones that learn through this edge.
+    """
+    valid = (
+        (alignment_prev.amax(dim=-1, keepdim=True) > 0)
+        & (alignment.amax(dim=-1, keepdim=True) > 0)
+    ).to(alignment.dtype)
+    delta = (alignment - alignment_prev) * valid
+    return torch.cat(
+        [alignment, delta, has_target.reshape(-1, 1)], dim=-1,
+    ).to(dtype)
 
 
 class _Off:
@@ -250,21 +252,17 @@ def _restore_outputs(
 def _weapon_source_dim(
     source: str, *, d_model: int, d_gru: int, has_temporal: bool,
 ) -> int:
-    """Width one weapon-selector source contributes to the selector cat.
+    """Width one selector source contributes to the selector cat.
 
-    ``gru`` contributes ``d_gru`` only when a temporal slot is active (and 0
-    otherwise — it's silently dropped from the cat); ``self_readout`` and
+    ``gru`` requires an active temporal slot (the spec forbids a dangling
+    gru edge, so a graph-built model never hits the 0 branch — it exists
+    for direct Network construction in tests); ``self_readout`` and
     ``target_feat`` are each ``d_model`` wide.
     """
     if source == "gru":
         return int(d_gru) if has_temporal else 0
-    if source in ("self_readout", "target_feat") or source.startswith("token:"):
-        # a token:<name> source reads one encoder self-token output (d_model wide)
+    if source in ("self_readout", "target_feat"):
         return int(d_model)
-    if source.startswith("scalar:"):
-        # a scalar:<name> source concatenates the raw obs scalar field straight
-        # into the selector cat (its dequantized width, e.g. attack_finished → 1).
-        return int(SCALAR_FIELDS[source[len("scalar:"):]].width)
     raise ValueError(f"unknown weapon source {source!r}")
 
 
@@ -274,9 +272,9 @@ def slot_dims(
     d_gru: int,
     has_temporal: bool,
     has_target_pointer: bool,
-    has_weapon_head: bool,
-    weapon_sources: "tuple[str, ...]",
+    weapon_sources: "tuple[str, ...]" = (),
     intent_dim: int = 0,
+    aim_dim: int = 0,
 ) -> dict[str, int]:
     """Single authority for the dim contract Network's slots are built with.
 
@@ -287,38 +285,47 @@ def slot_dims(
     dim source of truth; bench builders that must size an override head before
     constructing Network call it with their config-derived widths.
 
-    ``has_target_pointer`` controls whether the motor feature vector carries the
+    The shared feature cat is (readout | target_feat [| intent]) and that is
+    ALL of it — heads prefix-slice to their declared width, and nothing is
+    appended past the declared edges (a28 removed weapon_ctx, the one
+    historical undeclared block).
+
+    ``has_target_pointer`` controls whether the feature cat carries the
     pointer's ``target_feat`` (``d_model`` wide). When the pointer slot is Off
     there is no target — the block is dropped entirely rather than fed as a
-    ``d_model``-wide zeros pad the heads have to learn to ignore (and which, with
-    a weapon head present, sits *between* the readout and weapon_context where no
-    prefix slice can drop it). "If target is off, it's off."
+    ``d_model``-wide zeros pad the heads have to learn to ignore.
+    "If target is off, it's off."
 
-    ``intent_dim`` > 0 splices a shared ATTACK-INTENT block into the motor
-    feature vector, between the base features and ``weapon_context``. It sits
-    there deliberately, not at the end: heads prefix-slice to their declared
-    ``in_dim``, so a block appended last would be silently sliced OFF by exactly
-    the canonical heads (look_seg / move_seg / jump) this block exists to reach.
-    The same reasoning the ``target_dim`` note above records.
+    ``intent_dim`` > 0 splices a shared ATTACK-INTENT block onto the end of
+    the feature cat (coordination program hook; 0 in the canonical graph).
+    A head that declares intent must also declare target.feat when the
+    pointer exists — the prefix slice can only drop the tail.
 
     Keys:
       base_features_dim  — pre-intent features. The intent PRODUCER reads this
-                           (it cannot consume its own output), as does any head
-                           that predates the coordination block.
-      coord_features_dim — base + intent. What the coordinated heads read.
-      motor_in           — input to MoveHead / LookHead / AttackHead.
-      weapon_in          — input to WeaponHead's classifier.
+                           (it cannot consume its own output).
+      coord_features_dim — base + intent. What intent CONSUMERS read; equal to
+                           base_features_dim in the canonical graph.
+      motor_in           — alias of coord_features_dim (the full shared cat).
+      weapon_in          — the attack selector's DECLARED-EDGE cat (pre-aim).
+      weapon_coord_in    — weapon_in + aim_dim. What a selector declaring the
+                           realized-alignment edge reads; equal to weapon_in in
+                           the canonical graph.
       intent_dim         — width of the shared intent block (0 = off).
+      aim_dim            — width of the selector's alignment tail (0 = off).
+
+    ``aim_dim`` > 0 splices the realized-alignment block onto the END of the
+    SELECTOR's cat only (not the shared motor cat) — see EDGE_AIM and
+    :func:`aim_alignment_block`.
     """
     d_gru = int(d_gru) if has_temporal else 0
     d_model = int(d_model)
     intent_dim = max(0, int(intent_dim))
-    weapon_ctx_dim = d_model if has_weapon_head else 0
+    aim_dim = max(0, int(aim_dim))
     readout_dim = d_gru if has_temporal else d_model
     target_dim = d_model if has_target_pointer else 0
     base_features_dim = readout_dim + target_dim
     coord_features_dim = base_features_dim + intent_dim
-    motor_in = coord_features_dim + weapon_ctx_dim
     weapon_in = sum(
         _weapon_source_dim(src, d_model=d_model, d_gru=d_gru, has_temporal=has_temporal)
         for src in weapon_sources
@@ -329,8 +336,10 @@ def slot_dims(
         "base_features_dim": base_features_dim,
         "coord_features_dim": coord_features_dim,
         "intent_dim": intent_dim,
-        "motor_in": motor_in,
+        "aim_dim": aim_dim,
+        "motor_in": coord_features_dim,
         "weapon_in": weapon_in,
+        "weapon_coord_in": weapon_in + aim_dim,
     }
 
 
@@ -342,19 +351,17 @@ class Network(nn.Module):
 
     Per-slot overrides
     ------------------
-    Each of ``obs_embedding``, ``encoder``, ``temporal``, ``target_pointer``,
-    ``move_head``, ``look_head``, ``attack_head``, ``weapon_head`` accepts:
+    ``obs_embedding`` / ``encoder`` / ``temporal`` / ``target_pointer``
+    accept ``None`` (build the canonical component from ``ModelConfig``),
+    an ``nn.Module`` (use as-is; size overrides with ``slot_dims``), or
+    ``Off`` (slot disabled; ``obs_embedding``/``encoder`` cannot be Off).
 
-      * ``None`` (default) — Network builds the canonical component from
-        ``ModelConfig`` (respecting the existing ``use_gru`` / ``use_weapon_head``
-        flags for backward compatibility).
-      * An ``nn.Module`` instance — Network uses it as-is. Use
-        ``slot_dims(...)`` (passing the override's ``out_dim``) to size the
-        override correctly.
-      * ``Off`` (sentinel defined below) — slot disabled. ``Network.forward``
-        substitutes zero tensors where the slot's output would have fed
-        downstream, and (for head slots) omits the slot's logits-dict entry.
-        ``obs_embedding`` and ``encoder`` cannot be ``Off``.
+    Head slots (``look_head``, ``attack_head``, ``move_seg_head``,
+    ``look_seg_head``, ``jump_head``, ``attack_future_head``,
+    ``move_tick_head``) take an
+    ``nn.Module`` built by ``qnn.model.graph.build_network`` or ``Off``
+    (default) — there are no canonical in-Network head fallbacks; the
+    graph spec is the sole author of head construction.
 
     ObsEmbedding vs encoder
     -----------------------
@@ -375,15 +382,16 @@ class Network(nn.Module):
         encoder: nn.Module | None = None,
         temporal: "nn.Module | Off | None" = None,
         target_pointer: "nn.Module | Off | None" = None,
-        move_head: "nn.Module | Off | None" = None,
-        look_head: "nn.Module | Off | None" = None,
-        attack_head: "nn.Module | Off | None" = None,
-        weapon_head: "nn.Module | Off | None" = None,
-        move_hazard_head: "nn.Module | Off | None" = Off,
-        move_seg_head: "nn.Module | Off | None" = Off,
-        look_seg_head: "nn.Module | Off | None" = Off,
-        jump_head: "nn.Module | Off | None" = Off,
-        attack_future_head: "nn.Module | Off | None" = Off,
+        look_head: "nn.Module | Off" = Off,
+        attack_head: "nn.Module | Off" = Off,
+        move_seg_head: "nn.Module | Off" = Off,
+        look_seg_head: "nn.Module | Off" = Off,
+        jump_head: "nn.Module | Off" = Off,
+        attack_future_head: "nn.Module | Off" = Off,
+        move_tick_head: "nn.Module | Off" = Off,
+        intent_source: str | None = None,
+        aim_edge: bool = False,
+        aim2_edge: bool = False,
     ) -> None:
         super().__init__()
         if obs_embedding is Off:
@@ -409,91 +417,69 @@ class Network(nn.Module):
         # declares no out_dim, so fall back to the obs-embedding's width.
         self.d_model = int(getattr(self.encoder, "out_dim", None) or self.obs_embedding.out_dim)
         self.use_gru = bool(model.use_gru and model.d_gru > 0)
-        self.use_weapon_head = bool(model.use_weapon_head)
-        # look_bypass_gru is a v17-fidelity load-time flag.  v20+ always sets
-        # this False — when True (only via QNNPolicy.load on a v17 checkpoint)
-        # the look head is fed cat(self_readout, target_feat) instead of
-        # cat(gru_flat, target_feat), matching the features it was trained on.
-        self.look_bypass_gru = bool(model.look_bypass_gru and self.use_gru)
-        # Weapon-selector composition is an ordered edge list (see
-        # ModelConfig.weapon_sources). The "gru" source contributes only when
-        # a temporal slot is active; the others always contribute their width.
+        # Selector composition is an ordered edge list from the attack
+        # selector's declared graph inputs (see ModelConfig.weapon_sources).
         self.weapon_sources = tuple(model.weapon_sources)
-        # A token:<name> source reads one encoder self-token output as the readout;
-        # resolve names → self_block indices from the obs embedding's token order.
-        self._self_token_index = {
-            n: i for i, n in enumerate(getattr(self.obs_embedding, "self_token_names", ()))
-        }
         _valid_sources = {"gru", "self_readout", "target_feat"}
-        _bad = [
-            s for s in self.weapon_sources
-            if s not in _valid_sources
-            and not s.startswith("token:") and not s.startswith("scalar:")
-        ]
+        _bad = [s for s in self.weapon_sources if s not in _valid_sources]
         if _bad:
             raise ValueError(
                 f"weapon_sources contains unknown source(s) {_bad}; valid sources are "
-                f"{sorted(_valid_sources)} or 'token:<name>' / 'scalar:<name>'"
-            )
-        for s in self.weapon_sources:
-            if s.startswith("token:") and s[len("token:"):] not in self._self_token_index:
-                raise ValueError(
-                    f"weapon source {s!r} → unknown self-token; obs embedding has "
-                    f"{list(self._self_token_index)}"
-                )
-        # A scalar:<name> source reads the dequantized obs scalar field straight
-        # into the selector cat — precompute (obs_key, start, stop) slices so the
-        # per-step forward stays a dict lookup, not a catalog resolve.
-        self._weapon_scalar_slices: dict[str, tuple[str, int, int]] = {}
-        for s in self.weapon_sources:
-            if s.startswith("scalar:"):
-                spec = SCALAR_FIELDS[s[len("scalar:"):]]
-                self._weapon_scalar_slices[s] = (spec.slice_key, spec.start, spec.stop)
-        if not ({"gru", "self_readout"} & set(self.weapon_sources)) and not any(
-            s.startswith("token:") for s in self.weapon_sources
-        ):
-            raise ValueError(
-                "weapon head needs a readout — 'gru' / 'self_readout' or a "
-                f"'token:<name>' source; got {self.weapon_sources!r} "
-                "(target_feat alone is too thin)"
+                f"{sorted(_valid_sources)}"
             )
         self.d_target = int(model.d_target)
-        self.d_move = int(model.d_move)
-        self.d_look = int(model.d_look)
-        self.d_attack = int(model.d_attack)
-        self.d_weapon = int(model.d_weapon)
         self.head_activation = model.head_activation
+        # Gradient-isolated attack-intent block (spec intent node;
+        # agents/plans/attack-intent-feedforward.md). "sg_softmax" detaches
+        # the selector softmax; "prev_attack" one-hots the teacher-forced
+        # previous-tick attack class from obs["attack_intent_prev"]. Both
+        # append a 9-wide tail to the shared feature cat for the heads that
+        # DECLARE the intent edge; non-declaring heads prefix-slice it off.
+        if intent_source is not None and intent_source not in ("sg_softmax", "prev_attack"):
+            raise ValueError(f"unknown intent_source {intent_source!r}")
+        self.intent_source = intent_source
+        # Realized-alignment edge into the SELECTOR (EDGE_AIM;
+        # agents/plans/coordination-objective-probes.md §B-i). Appends
+        # aim_alignment_block to the selector's own input cat. Gradient-isolated
+        # by construction — see that function.
+        self.aim_edge = bool(aim_edge)
+        # A″ forward-projected extension (EDGE_AIM2; crest-ceiling-handoff.md
+        # "Candidate next steps" §3). Appends AIM2_EXTRA_DIM more columns
+        # after the base alignment_edge_block — see forward(). Requires
+        # aim_edge (the base block) to also be on; build_network always sets
+        # both together (spec.aim_edge is true whenever spec.aim2_edge is),
+        # this is a defensive check for direct Network construction (tests).
+        self.aim2_edge = bool(aim2_edge)
+        if self.aim2_edge and not self.aim_edge:
+            raise ValueError("aim2_edge requires aim_edge (it extends the base block)")
 
         # Resolve slot activation FIRST so dim computation reflects what
         # downstream consumers will actually receive. Off explicitly disables;
-        # None defers to the canonical config flag (use_gru / use_weapon_head);
-        # an nn.Module override always activates the slot.
+        # None defers to the canonical config flag (use_gru); an nn.Module
+        # override always activates the slot. Heads are opt-in modules only —
+        # build_network is the sole author of head construction.
         self._has_temporal = (temporal is not Off) and (temporal is not None or self.use_gru)
         self._has_target_pointer = target_pointer is not Off
-        self._has_weapon_head = (weapon_head is not Off) and (weapon_head is not None or self.use_weapon_head)
-        self._has_move_head = move_head is not Off
-        self._has_look_head = look_head is not Off
-        self._has_attack_head = attack_head is not Off
-        self._has_attack_selector = (
-            isinstance(attack_head, nn.Module)
-            and hasattr(attack_head, "attack_loss")
-        )
-        if self._has_attack_selector and self._has_weapon_head:
-            raise ValueError("categorical attack_head cannot coexist with a weapon_head")
-        # a25 hazard head: opt-in only (no canonical fallback). Present iff
-        # build_network passed a real module — default Off keeps every existing
-        # Network construction (which never passes it) hazard-free.
-        self._has_move_hazard_head = isinstance(move_hazard_head, nn.Module)
+        self._has_look_head = isinstance(look_head, nn.Module)
+        self._has_attack_head = isinstance(attack_head, nn.Module)
+        if self._has_attack_head and not hasattr(attack_head, "attack_loss"):
+            raise ValueError(
+                "attack_head must be a categorical selector module owning its "
+                "attack_loss (qnn.model.attack_with_head)")
+        if self.intent_source == "sg_softmax" and not self._has_attack_head:
+            raise ValueError("intent_source 'sg_softmax' requires an attack selector head")
+        if self.aim_edge and not self._has_attack_head:
+            raise ValueError("aim_edge requires an attack selector head")
         self._has_move_seg_head = isinstance(move_seg_head, nn.Module)
         self._has_look_seg_head = isinstance(look_seg_head, nn.Module)
         self._has_jump_head = isinstance(jump_head, nn.Module)
         self._has_attack_future_head = isinstance(attack_future_head, nn.Module)
+        self._has_move_tick_head = isinstance(move_tick_head, nn.Module)
         # a27 MTP aux head switch (agents/plans/mtp-attack-future-probe.md).
         # A PLAIN attribute, not a buffer: it must never enter the state dict
         # (a checkpoint would then carry an export-time value into training)
         # and it must be flippable on a loaded model. Export sets it False so
-        # the aux MLP is never traced into the ONNX graph — the move_hazard
-        # precedent, minus the derived-input coincidence.
+        # the aux MLP is never traced into the ONNX graph.
         self.aux_training_heads: bool = True
 
         # Build the upstream slots (temporal, target pointer) FIRST so the
@@ -519,63 +505,16 @@ class Network(nn.Module):
             else:
                 self.target_pointer = target_pointer
 
-        # Effective dim contract — single authority in slot_dims, fed the
-        # resolved node widths (d_model from encoder, d_gru from temporal slot).
-        dims = slot_dims(
-            d_model=self.d_model,
-            d_gru=self.d_gru,
-            has_temporal=self._has_temporal,
-            has_target_pointer=self._has_target_pointer,
-            has_weapon_head=self._has_weapon_head or self._has_attack_selector,
-            weapon_sources=self.weapon_sources,
-        )
-        motor_in = dims["motor_in"]
-        weapon_in = dims["weapon_in"]
-
-        if self._has_weapon_head:
-            if weapon_head is None:
-                self.weapon_head = WeaponHead(
-                    selector_dim=weapon_in,
-                    d_model=self.d_model,
-                    d_hidden=self.d_weapon,
-                    activation=self.head_activation,
-                )
-            else:
-                self.weapon_head = weapon_head
-
-        if self._has_move_head:
-            self.move_head = (
-                MoveHead(in_dim=motor_in, d_hidden=self.d_move, activation=self.head_activation)
-                if move_head is None else move_head
-            )
         if self._has_look_head:
-            self.look_head = (
-                LookHead(in_dim=motor_in, d_hidden=self.d_look, activation=self.head_activation)
-                if look_head is None else look_head
-            )
+            self.look_head = look_head
         if self._has_attack_head:
-            self.attack_head = (
-                AttackHead(
-                    in_dim=motor_in,
-                    d_hidden=self.d_attack,
-                    activation=self.head_activation,
-                )
-                if attack_head is None else attack_head
-            )
-
+            self.attack_head = attack_head
         if self._has_move_seg_head:
             self.move_seg_head = move_seg_head
         if self._has_look_seg_head:
-            # a25 look segment head: opt-in passenger, same contract as
-            # move_seg (reads the shared motor feature vector).
             self.look_seg_head = look_seg_head
         if self._has_jump_head:
-            # a25 land-jump head: opt-in only, same passenger contract as
-            # move_seg (reads the shared motor feature vector).
             self.jump_head = jump_head
-        if self._has_move_hazard_head:
-            # No canonical fallback — always an override built by build_network.
-            self.move_hazard_head = move_hazard_head
         if self._has_attack_future_head:
             # ASSIGNED LAST, and this ordering is load-bearing: _init_weights
             # walks self.modules() in registration order, so appending the aux
@@ -588,8 +527,42 @@ class Network(nn.Module):
             # (attack_future_head._build_attack_future). Both are pinned by
             # tests/model/test_attack_future_head.py.
             self.attack_future_head = attack_future_head
+        if self._has_move_tick_head:
+            # ASSIGNED AFTER EVERY OTHER HEAD, same reason as the aux head
+            # above: _init_weights walks self.modules() in registration order,
+            # so a bench head appended at the end leaves every other module's
+            # xavier draw bit-identical to the control arm at the same seed.
+            # Its builder also restores the RNG across its nn.Linear
+            # constructor draw (move_tick_head._build_move_tick). Both halves
+            # are pinned by tests/model/test_move_tick_arm.py.
+            self.move_tick_head = move_tick_head
+
+        if self.aim_edge:
+            # Static weapon-trajectory table for the alignment block. A
+            # NON-PERSISTENT buffer: it carries no learned state, so it must
+            # never enter the state dict (a checkpoint would then pin a
+            # physics table that qnn.bc.weapon_physics owns), but it must
+            # follow .to(device)/.to(dtype) with the module. Registering a
+            # buffer draws no RNG, so arms stay init-comparable.
+            from qnn.bc.weapon_physics import build_model_weapon_scalars
+            self.register_buffer(
+                "_aim_weapon_physics",
+                torch.from_numpy(build_model_weapon_scalars()).float(),
+                persistent=False,
+            )
 
         self._init_weights()
+
+    @property
+    def wants_prev_attack(self) -> bool:
+        """True when the graph needs ``obs['attack_intent_prev']``.
+
+        Sole remaining consumer: the ``prev_attack`` intent node. (The
+        alignment edge computed per-weapon since the rung-3 A′ redesign, so
+        its old prev-attack weapon key — and the one-tick staleness that came
+        with it — is gone.) QNNPolicy teacher-forces the column at train/val.
+        """
+        return self.intent_source == "prev_attack"
 
     def _init_weights(self) -> None:
         for module in self.modules():
@@ -597,15 +570,6 @@ class Network(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-
-    @staticmethod
-    def _with_weapon_context(
-        features: torch.Tensor,
-        weapon_context: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if weapon_context is None:
-            return features
-        return torch.cat([features, weapon_context], dim=-1)
 
     # P1 feasibility mask (agents/plans/attack-finished-masking-refactor.md):
     # owned+ammo (readiness > 0.1; the 0.1 floor marks owned-but-empty) AND the
@@ -682,18 +646,17 @@ class Network(nn.Module):
             target_logits = torch.zeros((batch_flat, n_entities), **zero_kw)
             target_feat = torch.zeros((batch_flat, self.d_model), **zero_kw)
 
-        # Motor feature base = readout (+ target_feat only when a pointer exists).
+        # The shared feature cat = readout (+ target_feat only when a pointer
+        # exists). This is the WHOLE of it — every non-selector head reads a
+        # prefix of exactly this tensor (a28: nothing undeclared is appended).
         readout_flat = gru_flat if self._has_temporal else self_readout
         if self._has_target_pointer:
             features_base_flat = torch.cat([readout_flat, target_feat], dim=-1)
         else:
             features_base_flat = readout_flat
 
-        entity_scalars_flat = flat_obs["entity_scalars_raw"]
-        entity_rel_flat = entity_scalars_flat[..., _ACTOR_REL_OFFSET:_ACTOR_REL_OFFSET + 3]
-
         selector_out = None
-        if self._has_weapon_head or self._has_attack_selector:
+        if self._has_attack_head:
             # Selector cat — assembled by iterating weapon_sources in declared
             # order. The "gru" source only exists when temporal is on; it's
             # dropped from the cat otherwise (matching its 0-width dim).
@@ -703,171 +666,164 @@ class Network(nn.Module):
             }
             if self._has_temporal:
                 _ws_available["gru"] = gru_flat
-            for _src in self.weapon_sources:
-                if _src.startswith("token:"):
-                    if enc_out.self_block is None:
-                        raise ValueError(
-                            f"weapon source {_src!r} needs per-token encoder outputs, "
-                            "but the encoder did not emit self_block"
-                        )
-                    _ws_available[_src] = enc_out.self_block[
-                        :, self._self_token_index[_src[len("token:"):]], :
-                    ]
-                elif _src.startswith("scalar:"):
-                    _key, _start, _stop = self._weapon_scalar_slices[_src]
-                    if _key not in flat_obs:
-                        raise ValueError(
-                            f"weapon source {_src!r} needs dequantized obs field "
-                            f"{_key!r}, absent from obs — the model must run on "
-                            "dequantized obs (compact_dequantized resident source)"
-                        )
-                    _ws_available[_src] = flat_obs[_key][..., _start:_stop]
-            weapon_selector_flat = torch.cat(
-                [_ws_available[src] for src in self.weapon_sources if src in _ws_available],
-                dim=-1,
-            )
-            selector_head = (
-                self.attack_head if self._has_attack_selector else self.weapon_head
-            )
+            _selector_parts = [
+                _ws_available[src] for src in self.weapon_sources if src in _ws_available
+            ]
+            if self.aim_edge:
+                # Alignment TAIL block (rung-3 A′): per-weapon expected crest
+                # payout + realized trend. Computed for ALL 8 weapons, so no
+                # intent keying is needed (the old block's prev-attack key and
+                # its one-tick staleness are gone).
+                from qnn.model.lead_aim import weapon_alignment
+                _alignment_flat, _has_t = weapon_alignment(
+                    flat_obs["entity_scalars_raw"],
+                    flat_obs["entity_types"],
+                    # STOP-GRADIENT on the pointer (the intent-edge discipline).
+                    target_logits.detach(),
+                    self._aim_weapon_physics,
+                )
+                if seq_shape is not None:
+                    # In-window shift: prev row per lane, zeroed at t=0 and on
+                    # episode-start rows (reset_mask True ⇒ the previous tick
+                    # belongs to a different episode).
+                    _T, _B = seq_shape
+                    _a_seq = _alignment_flat.reshape(_T, _B, 8)
+                    _prev = torch.cat(
+                        [torch.zeros_like(_a_seq[:1]), _a_seq[:-1]], dim=0)
+                    if reset_mask is not None:
+                        _rm = reset_mask.reshape(_T, _B, 1).to(_prev.dtype)
+                        _prev = _prev * (1.0 - _rm)
+                    _alignment_prev = _prev.reshape(-1, 8)
+                else:
+                    _ap = flat_obs.get("alignment_prev")
+                    _alignment_prev = (
+                        _ap.reshape(-1, 8).to(_alignment_flat.dtype)
+                        if _ap is not None
+                        else torch.zeros_like(_alignment_flat)
+                    )
+                _selector_parts.append(alignment_edge_block(
+                    _alignment_flat, _alignment_prev, _has_t,
+                    readout_flat.dtype,
+                ))
+                if self.aim2_edge:
+                    # Forward-projected tail (EDGE_AIM2): per-weapon crest
+                    # payout predicted at +k ticks, constant-velocity
+                    # extrapolated from the SAME current-position-anchor law
+                    # (qnn.model.lead_aim.weapon_alignment_projected — no
+                    # second geometry). Stateless (no prev-tick carry needed,
+                    # unlike the backward delta above), so no act()-time
+                    # loopback field is required beyond what EDGE_AIM already
+                    # threads.
+                    from qnn.model.lead_aim import weapon_alignment_projected
+                    _self_vel_flat = flat_obs["self_motion_scalars"][..., 0:3]
+                    _projected_flat = weapon_alignment_projected(
+                        flat_obs["entity_scalars_raw"],
+                        flat_obs["entity_types"],
+                        _self_vel_flat,
+                        target_logits.detach(),
+                        self._aim_weapon_physics,
+                        AIM2_HORIZONS_TICKS,
+                    )
+                    _selector_parts.append(_projected_flat.to(readout_flat.dtype))
+            weapon_selector_flat = torch.cat(_selector_parts, dim=-1)
             _feas_mask = (
                 self._weapon_feasibility_mask(flat_obs)
-                if getattr(selector_head, "wants_feasibility_mask", False)
+                if getattr(self.attack_head, "wants_feasibility_mask", False)
                 else None
             )
-            selector_out = selector_head(AttackSelectorInput(
+            selector_out = self.attack_head(AttackSelectorInput(
                 selector=weapon_selector_flat,
                 feasibility_mask=_feas_mask,
             ))
-        weapon_context = selector_out.context if selector_out is not None else None
 
-        move_features_flat = self._with_weapon_context(features_base_flat, weapon_context)
-        move_out = self.move_head(MoveHeadInput(features=move_features_flat)) if self._has_move_head else None
+        # Gradient-isolated attack-intent tail (spec intent node). Appended
+        # AFTER (readout | target_feat) so non-declaring heads prefix-slice
+        # it off; both sources carry NO gradient path to the attack head.
+        if self.intent_source == "sg_softmax":
+            intent_flat = torch.softmax(
+                selector_out.logits.detach().to(features_base_flat.dtype), dim=-1)
+            features_coord_flat = torch.cat([features_base_flat, intent_flat], dim=-1)
+        elif self.intent_source == "prev_attack":
+            prev = flat_obs.get("attack_intent_prev")
+            if prev is None:
+                raise ValueError(
+                    "intent_source 'prev_attack' needs obs['attack_intent_prev'] "
+                    "(teacher-forced shifted act_attack at train/val; the bot's "
+                    "own previous attack class at act time)")
+            intent_flat = torch.nn.functional.one_hot(
+                prev.reshape(-1).long().clamp(0, 8), num_classes=9,
+            ).to(features_base_flat.dtype)
+            features_coord_flat = torch.cat([features_base_flat, intent_flat], dim=-1)
+        else:
+            features_coord_flat = features_base_flat
 
-        # a25 hazard head (opt-in): reads the SAME motor feature vector as the
-        # move head plus the semi-Markov decode state (held_class/dwell_age),
-        # which arrive as flat_obs fields (train: precomputed act_move columns;
-        # deploy: threaded from the engine's move-decode state). Local import
-        # keeps the canonical Network module free of a top-level bench dependency.
+        # Heads. Every non-selector head reads the shared feature cat and
+        # prefix-slices to its declared inputs.
+        look_out = self.look_head(features_coord_flat) if self._has_look_head else None
+
         move_seg_out = None
         if self._has_move_seg_head:
-            # a25 segment head (passenger): reads the SAME motor feature vector
-            # as the move head; the module prefix-slices to its declared inputs.
-            move_seg_out = self.move_seg_head(move_features_flat)
+            move_seg_out = self.move_seg_head(features_coord_flat)
 
         look_seg_out = None
         if self._has_look_seg_head:
-            # a25 look segment head (passenger): reads the SAME motor feature
-            # vector as the move/look heads; the module prefix-slices to its
-            # declared inputs.
-            look_seg_out = self.look_seg_head(move_features_flat)
+            look_seg_out = self.look_seg_head(features_coord_flat)
 
         jump_out = None
         if self._has_jump_head:
-            # a25 land-jump head (passenger): same motor feature vector; the
-            # module prefix-slices to its declared inputs.
-            jump_out = self.jump_head(move_features_flat)
+            jump_out = self.jump_head(features_coord_flat)
+
+        move_tick_out = None
+        if self._has_move_tick_head:
+            move_tick_out = self.move_tick_head(features_coord_flat)
 
         attack_future_out = None
         if self._has_attack_future_head and self.aux_training_heads:
-            # a27 MTP aux head: reads features_base_flat, NOT move_features_flat.
-            # The motor vector carries weapon_context = softmax(attack_logits) @
-            # embed, so feeding it would route this head's gradient into the
-            # attack head — exactly the attack marginal the probe holds fixed.
-            # Skipped entirely when aux_training_heads is off (export).
-            attack_future_out = self.attack_future_head(features_base_flat)
-
-        move_hazard_out = None
-        # The move-hazard (a25 WHEN-law) head is a TRAINING auxiliary: it consumes
-        # move_held_class / move_dwell_age, which the BC loader derives from
-        # act_move and exist only at train time. It is never a deploy head — the
-        # exported/live move decode uses the tabulated semi-Markov hazard, and the
-        # deploy graph is 5-head (see tools/export_onnx CORE_OUTPUT_NAMES). So run
-        # it only when its derived inputs are present; absent (export / live
-        # inference) it is cleanly skipped, letting a full_6head checkpoint export
-        # as a 5-head deploy graph.
-        if self._has_move_hazard_head and "move_held_class" in flat_obs:
-            move_hazard_out = self.move_hazard_head(self.move_hazard_head.Input(
-                cls_feat=move_features_flat,
-                held_class=flat_obs["move_held_class"],
-                dwell_age=flat_obs["move_dwell_age"],
-            ))
-
-        # Look = target-anchored prior + learned residual. v17 checkpoints
-        # set look_bypass_gru=True so the look head sees the same features
-        # it was trained on (cat(self_readout, target_feat)).
-        if self._has_temporal and self.look_bypass_gru:
-            bypass_base = (
-                torch.cat([self_readout, target_feat], dim=-1)
-                if self._has_target_pointer else self_readout
-            )
-            look_features_flat = self._with_weapon_context(bypass_base, weapon_context)
-        else:
-            look_features_flat = self._with_weapon_context(features_base_flat, weapon_context)
-        if self._has_look_head:
-            look_out = self.look_head(LookHeadInput(
-                features=look_features_flat,
-                target_logits=target_logits,
-                entity_rel=entity_rel_flat,
-                actor_mask=actor_mask_flat,
-            ))
-        else:
-            look_out = None
-        # look_prior is consumed by prior-style attack-head variants;
-        # canonical AttackHead ignores it. Substitute zeros when look is off.
-        look_prior_for_attack = (
-            look_out.look_prior if look_out is not None
-            else torch.zeros((batch_flat, 3), dtype=self_readout.dtype, device=self_readout.device)
-        )
-
-        attack_features_flat = self._with_weapon_context(features_base_flat, weapon_context)
-        if self._has_attack_head and not self._has_attack_selector:
-            attack_out = self.attack_head(AttackHeadInput(
-                features=attack_features_flat,
-                look_prior=look_prior_for_attack,
-                target_logits=target_logits,
-                entity_scalars=entity_scalars_flat,
-                actor_mask=actor_mask_flat,
-                self_scalars=flat_obs.get("self_scalars"),
-            ))
-        else:
-            attack_out = None
+            # a27 MTP aux head. Skipped entirely when aux_training_heads is
+            # off (export) so the aux MLP is never traced into the ONNX graph.
+            attack_future_out = self.attack_future_head(features_coord_flat)
 
         logits_flat: Dict[str, torch.Tensor] = {}
-        if move_out is not None:
-            logits_flat[MOVE_HEAD] = move_out.logits
         if move_seg_out is not None:
             logits_flat[MOVE_SEG_HEAD] = move_seg_out
+        if move_tick_out is not None:
+            logits_flat[MOVE_TICK_HEAD] = move_tick_out
         if look_seg_out is not None:
             logits_flat[LOOK_SEG_HEAD] = look_seg_out
         if jump_out is not None:
             logits_flat[JUMP_HEAD] = jump_out
         if attack_future_out is not None:
             logits_flat[ATTACK_FUTURE_HEAD] = attack_future_out
-        if move_hazard_out is not None:
-            # Per-axis release-hazard logits — consumed by the loss (phase 3) and
-            # the move WHEN-decode; not an argmax-sampled action vector.
-            logits_flat[MOVE_HAZARD_HEAD] = move_hazard_out.hazard_logits
         if look_out is not None:
             logits_flat[LOOK_HEAD] = look_out.look_predict
             # Underscored keys are loss-only; not used for inference / sampling.
-            logits_flat["_look_prior"] = look_out.look_prior
-            logits_flat["_look_delta"] = look_out.look_delta
-            # Distributional head outputs (binned / polar) forwarded
-            # generically so a new look head's LOSS can live with the head:
-            # QNNPolicy dispatches to look_head.look_loss, which reads these.
-            for _f in ("look_bins", "look_mag_logits", "look_dir_logits"):
+            # Distributional head outputs (polar mag/dir) forwarded generically
+            # so the look head's LOSS lives with the head: QNNPolicy dispatches
+            # to look_head.look_loss, which reads these.
+            # look_hold_logit / look_features are the XM head's (look_head_xm):
+            # its loss hook re-forwards the turn MLP with K noise draws, so the
+            # head's own SLICED features ride the same generic channel.
+            for _f in ("look_bins", "look_mag_logits", "look_dir_logits",
+                       "look_hold_logit", "look_features"):
                 _v = getattr(look_out, _f, None)
                 if _v is not None:
                     logits_flat["_" + _f] = _v
-        if attack_out is not None:
-            logits_flat["_attack_prior"] = attack_out.prior_logit
-            logits_flat["_attack_delta"] = attack_out.delta_attack
-            logits_flat[ATTACK_HEAD] = attack_out.attack_logit
         if selector_out is not None:
-            selector_key = ATTACK_HEAD if self._has_attack_selector else WEAPON_HEAD
-            logits_flat[selector_key] = selector_out.logits
+            logits_flat[ATTACK_HEAD] = selector_out.logits
+            # Expand rather than bake this into selector_out.logits: selection
+            # must remain a function of the raw nine-way head only.  Publishing
+            # it in the output mapping also makes collect-policy replicas and
+            # learner recomputation consume their own synchronized parameter.
+            logits_flat[ATTACK_FIRE_BIAS] = self.attack_head.fire_bias.to(
+                selector_out.logits.dtype,
+            ).reshape(1, -1).expand(batch_flat, -1)
+            if self.aim_edge:
+                # Aux (underscored = never sampled): this tick's alignment
+                # vector, read back by QNNPolicy.act to update the caller's
+                # alignment_prev state lanes in place.
+                logits_flat["_alignment"] = _alignment_flat
 
-        features_flat = move_features_flat  # downstream consumers ignore the weapon-ctx dim
+        features_flat = features_coord_flat
         values_flat = torch.zeros((batch_flat,), dtype=sample.dtype, device=sample.device)
 
         if seq_shape is None:

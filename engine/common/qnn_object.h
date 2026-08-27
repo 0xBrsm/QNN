@@ -278,7 +278,20 @@ extern cvar_t qnn_fov;
 extern cvar_t qnn_los_clearance;
 void QNN_RegisterPerceptionCvars(void);
 
-qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target);
+/* Resolved (post fail-open / clamp) perception cvar values — for a demo
+ * worker to report its ACTUAL regime in the hello response, so a collect's
+ * fingerprint records the resolved regime rather than the launcher's env
+ * guess. See qnn_entity.c and
+ * agents/plans/a26-superiority-decomposition.md E6. */
+qboolean QNN_LosClearanceResolved(void);
+float    QNN_FovResolved(void);
+
+/* target_half_z: half the target's full bounding-box height (out_half[2]
+ * from QNN_EntityAnchorFromModel — every current caller already has this
+ * on hand).  0 = unknown, falls back to the standard player hull.  Used
+ * only to size the elevation rescue probe (qnn_entity.c) — target itself
+ * stays the caller's anchor point (bbox center), never re-anchored. */
+qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target, float target_half_z);
 qboolean QNN_EntityInPvs(const vec3_t viewer, const vec3_t target);
 
 /* Forward declaration — full definition in qnn_map.h */

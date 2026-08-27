@@ -155,8 +155,15 @@ _AMP_BY_CLASS_BY_HZ: dict[int, np.ndarray] = {
     for hz in _HZ_TABLE
 }
 # Direction categorical is hz-independent (uniform bins over [0, 2pi)).
-_DIR_CENTERS = np.array([2 * np.pi * k / N_LOOK_DIR for k in range(N_LOOK_DIR)],
-                        dtype=np.float32)
+# BIN MIDPOINTS, not left edges: the label rule (look_seg_head) FLOOR-bins
+# phi into [k, k+1)*2pi/N, so the decode must emit (k+0.5)*2pi/N or every
+# stroke carries a systematic -11.25 deg bias — measured as pitch-coupled
+# strokes (right strokes pitch down / left up) and cardinal stroke modes
+# split across adjacent bins, invisible to eager<->ONNX parity because
+# look_commit_step_graph reads this same constant. The deployed a27rc1a
+# artifact predates this fix (its line exports from its own branch).
+_DIR_CENTERS = np.array([2 * np.pi * (k + 0.5) / N_LOOK_DIR
+                         for k in range(N_LOOK_DIR)], dtype=np.float32)
 
 
 def look_commit_step(seg_logits, commit_state, *, hz: int, greedy=True, generator=None,

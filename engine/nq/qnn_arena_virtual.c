@@ -442,7 +442,7 @@ void QNN_ArenaVirtualStageActions(const qnn_action_t *actions, int action_count)
 	}
 }
 
-void QNN_ArenaVirtualWriteInitial(FILE *out)
+void QNN_ArenaVirtualWriteInitial(FILE *out, float dt)
 {
 	int action_index;
 
@@ -456,7 +456,7 @@ void QNN_ArenaVirtualWriteInitial(FILE *out)
 		QNN_ArenaActivate(client);
 		QNN_ArenaObserverWrite(out, QNN_ArenaVirtualSeatPlan(action_index),
 			&client->previous_action,
-			client->tick, client->steps, true);
+			client->tick, client->steps, true, dt);
 		QNN_ArenaDeactivate();
 	}
 }
@@ -490,7 +490,7 @@ void QNN_ArenaVirtualReceive(FILE *out, float dt, qboolean reset_receive)
 		reset_flag = QNN_TrainingNetworkRoundReset();
 		QNN_ArenaObserverWrite(out, QNN_ArenaVirtualSeatPlan(action_index),
 			&client->previous_action,
-			client->tick, client->steps, reset_flag);
+			client->tick, client->steps, reset_flag, dt);
 		if (reset_flag)
 			client->steps = 0;
 		QNN_ArenaDeactivate();

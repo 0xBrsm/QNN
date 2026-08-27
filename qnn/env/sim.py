@@ -5,8 +5,10 @@ a full production-shape obs dict for the described scene, and trains the look
 head via REINFORCE — no engine, no SF, no docker.
 
 Each tick:
-  1. Model emits look action (move/fire/switch held at no-op).
-  2. Action → pitch/yaw deltas via atan2 (mirrors src/engine/nq/qnn_input.c).
+  1. Model emits look action (move/fire/switch anchored at no-op).
+  2. Action -> new ABSOLUTE (pitch, yaw) via the exact inverse of the collect
+     label projection (mirrors src/engine/nq/qnn_input.c QNN_ApplyActionLook,
+     post-fix — see ``_apply_action_look``).
   3. Every kind="entity" token's rel/dist is recomputed in the new view frame,
      keeping the world position frozen.
   4. Reward = cos(view_forward, unit_rel_to_target), matching QNN_TrackingCosine.
@@ -14,6 +16,18 @@ Each tick:
 
 Target defaults to the nearest actor-type entity (same rule as QNN_TrackingCosine),
 or you can mark one actor token with ``"target": true`` in the scene JSON.
+
+NOTE: this module used to apply the look action via a per-axis atan2
+decomposition, then accumulate the recovered angles as INCREMENTS onto the
+current view. That mirrored a buggy engine law — atan2 for pitch (E9) reused
+the yaw denominator and blew up on mixed yaw+pitch turns, and treating the
+recovered angles as increments (E10) was only valid from a level view because
+the label's basis is tilted by the current pitch. Both bugs were fixed in the
+engine by commits 8b359ae5 (E9) and 04ee17de (E10); see
+agents/plans/a26-superiority-decomposition.md. ``_apply_action_look`` below
+ports the fixed law. Any sim results produced before this change (including
+those cited in research/sim-findings.md) were generated under the old buggy
+law and should not be trusted for anything involving mixed or non-level turns.
 
 Usage:
     python -m qnn.env.sim --tokens path/to/tokens.json --episodes 3000
@@ -118,13 +132,53 @@ def _angle_basis(pitch_deg: float, yaw_deg: float) -> np.ndarray:
     return np.stack([forward, right, up], axis=0)
 
 
-def _action_to_angle_delta(look: np.ndarray) -> Tuple[float, float]:
-    fwd        = float(np.clip(look[0], -1.0, 1.0))
-    yaw_comp   = float(np.clip(look[1], -1.0, 1.0))
-    pitch_comp = float(np.clip(-look[2], -1.0, 1.0))
-    yaw_deg   = float(np.degrees(np.arctan2(yaw_comp,   fwd)))
-    pitch_deg = float(np.degrees(np.arctan2(pitch_comp, fwd)))
-    return pitch_deg, yaw_deg
+def _apply_action_look(
+    pitch_deg: float, yaw_deg: float, look: np.ndarray,
+) -> Tuple[float, float]:
+    """Apply a look action, returning the NEW ABSOLUTE (pitch_deg, yaw_deg).
+
+    Ports src/engine/nq/qnn_input.c QNN_ApplyActionLook (post-E9/E10 fix).
+    ``look`` is the new forward direction expressed in the CURRENT view basis
+    — a unit vector (dot·forward, dot·right, dot·up), exactly as the collector
+    builds the training label. The only exact inverse is to undo that
+    projection against the SAME basis, then read the angles off the resulting
+    world-space direction:
+
+        new_fwd = look[0]*forward + look[1]*right + look[2]*up
+        yaw     = atan2(new_fwd[1], new_fwd[0])
+        pitch   = asin(-new_fwd[2])          (Quake: forward[2] = -sin(pitch))
+
+    and to SET the angles absolutely rather than accumulate them as deltas —
+    the label's basis is tilted by the current pitch, so treating the
+    recovered angles as increments is only valid from a level view (E10).
+    Guards, in order: (1) clamp each look component to [-1, 1]; (2) a hold is
+    look == (>=1, 0, 0) — return the view unchanged; (3) normalize, and return
+    unchanged if the vector is degenerate (length < 1e-6).
+    """
+    lx = float(np.clip(look[0], -1.0, 1.0))
+    ly = float(np.clip(look[1], -1.0, 1.0))
+    lz = float(np.clip(look[2], -1.0, 1.0))
+
+    if lx >= 1.0 and ly == 0.0 and lz == 0.0:
+        return pitch_deg, yaw_deg  # hold — view unchanged
+
+    length = float(np.sqrt(lx * lx + ly * ly + lz * lz))
+    if length < 1e-6:
+        return pitch_deg, yaw_deg  # degenerate: no direction to aim at
+    lx /= length
+    ly /= length
+    lz /= length
+
+    forward, right, up = _angle_basis(pitch_deg, yaw_deg)
+    new_fwd = lx * forward + ly * right + lz * up
+
+    new_yaw_deg = float(np.degrees(np.arctan2(new_fwd[1], new_fwd[0])))
+    new_pitch_deg = float(np.degrees(np.arcsin(np.clip(-new_fwd[2], -1.0, 1.0))))
+
+    # anglemod: quantize yaw to 360/65536 deg steps, matching the engine.
+    new_yaw_deg = (360.0 / 65536) * (int(new_yaw_deg * (65536 / 360.0)) & 65535)
+    new_pitch_deg = float(np.clip(new_pitch_deg, -70.0, 80.0))
+    return new_pitch_deg, new_yaw_deg
 
 
 # ── Obs builder ──────────────────────────────────────────────────────
@@ -479,9 +533,9 @@ def _run_episode(
         entropy = dist.entropy().sum(dim=-1)           # (1,)
 
         look = sampled[0].detach().cpu().numpy()
-        pitch_d, yaw_d = _action_to_angle_delta(look)
-        view_angles[1] = (view_angles[1] - yaw_d) % 360.0
-        view_angles[0] = max(-70.0, min(80.0, view_angles[0] + pitch_d))
+        view_angles[0], view_angles[1] = _apply_action_look(
+            view_angles[0], view_angles[1], look,
+        )
         rewards.append(_tracking_cos(tuple(view_angles), target_world))
         log_probs.append(log_prob[0])
         values.append(values_t.reshape(-1)[0])
@@ -567,9 +621,9 @@ def run_target_probe(
         else:
             _, logits, _, _, _ = policy._forward_tensors(obs_batch)
             look_np = F.normalize(logits["look"], dim=-1)[0].detach().cpu().numpy()
-        pitch_d, yaw_d = _action_to_angle_delta(look_np)
-        view_angles[1] = (view_angles[1] - yaw_d) % 360.0
-        view_angles[0] = max(-70.0, min(80.0, view_angles[0] + pitch_d))
+        view_angles[0], view_angles[1] = _apply_action_look(
+            view_angles[0], view_angles[1], look_np,
+        )
 
     print(
         f"target probe summary: acc={correct / max(steps, 1):.3f} "
@@ -689,15 +743,14 @@ def run_oracle(
             print("oracle: rel is near zero, aligned", flush=True)
             return
         unit_rel = rel_view / rel_norm
-        pitch_d, yaw_d = _action_to_angle_delta(unit_rel)
-        view_angles[1] = (view_angles[1] - yaw_d) % 360.0
-        view_angles[0] = max(-70.0, min(80.0, view_angles[0] + pitch_d))
+        view_angles[0], view_angles[1] = _apply_action_look(
+            view_angles[0], view_angles[1], unit_rel,
+        )
         cos = _tracking_cos(tuple(view_angles), target_world)
         if step % log_every == 0 or step == steps - 1:
             print(
                 f"step {step:3d}  view=({view_angles[0]:+7.2f}, {view_angles[1]:+7.2f})  "
                 f"unit_rel={unit_rel.round(4).tolist()}  "
-                f"yaw_d={yaw_d:+7.2f}  pitch_d={pitch_d:+7.2f}  "
                 f"cos={cos:+.6f}",
                 flush=True,
             )
@@ -716,8 +769,9 @@ def train_sl_episodic(
 
     At each tick: compute rel_view for the target under current view angles, use
     its unit vector as the supervised target for look.  Model's own (deterministic,
-    normalized) output is applied via atan2 to update the view for the next tick —
-    so the obs distribution is on-policy, but supervision is oracle.
+    normalized) output is applied via ``_apply_action_look`` to update the view
+    for the next tick — so the obs distribution is on-policy, but supervision
+    is oracle.
     """
     policy.model.train()
     optimizer = torch.optim.Adam(policy.model.parameters(), lr=lr)
@@ -758,9 +812,9 @@ def train_sl_episodic(
                 look_np = target_unit.detach().cpu().numpy()
             else:
                 look_np = pred.detach().cpu().numpy()
-            pitch_d, yaw_d = _action_to_angle_delta(look_np)
-            view_angles[1] = (view_angles[1] - yaw_d) % 360.0
-            view_angles[0] = max(-70.0, min(80.0, view_angles[0] + pitch_d))
+            view_angles[0], view_angles[1] = _apply_action_look(
+                view_angles[0], view_angles[1], look_np,
+            )
 
         loss_acc = loss_acc / steps_per_episode
         loss_acc.backward()
@@ -867,7 +921,8 @@ def main() -> int:
              "target-probe= inspect TargetPointer predictions on a static scene. "
              "target-sl   = supervised CE training on TargetPointer logits. "
              "sl-episodic = on-policy SL: model drives view each tick, oracle supervises. "
-             "rl          = REINFORCE with atan2 action → viewangle dynamics.",
+             "rl          = REINFORCE with the fixed look-action law (absolute "
+             "angles via the real inverse, not atan2 increments).",
     )
     ap.add_argument("--steps", type=int, default=400,
                     help="SL mode: number of SGD steps.")
@@ -934,14 +989,8 @@ def main() -> int:
         attn_dropout=0.0,
         use_gru=args.use_gru,
         d_gru=args.d_gru,
-        use_weapon_head=False,
-        weapon_sources=("self_readout", "target_feat"),
-        look_bypass_gru=False,
+        weapon_sources=(),
         d_target=args.d_model,
-        d_move=0,
-        d_look=0,
-        d_attack=0,
-        d_weapon=0,
         head_activation="none",
     )
     policy = QNNPolicy(

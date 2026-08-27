@@ -59,6 +59,11 @@ class EnvStepBatch:
     valid: np.ndarray
     final_obs_rows: FinalObsRows
     episodes: list[EpisodeResult]
+    # Per-lane alignment hbw on the PRE-step obs for EVERY LOS lane (NaN
+    # where no LOS actor resolves) — the p_fire denominator the rung-3 trigger
+    # objective is fit against. Computed rollout-side by qnn.ppo.align_hbw so
+    # the learner never re-derives the law. None = backend does not supply it.
+    align_hbw: np.ndarray | None = None
     infos: list[dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -68,6 +73,8 @@ class EnvStepBatch:
         self.terminal = np.asarray(self.terminal, dtype=bool)
         self.truncated = np.asarray(self.truncated, dtype=bool)
         self.valid = np.asarray(self.valid, dtype=bool)
+        if self.align_hbw is not None:
+            self.align_hbw = np.asarray(self.align_hbw, dtype=np.float32)
 
         if self.env_ids.ndim != 1:
             raise ValueError("env_ids must be a 1-D array")
@@ -78,7 +85,7 @@ class EnvStepBatch:
             ("terminal", self.terminal),
             ("truncated", self.truncated),
             ("valid", self.valid),
-        ):
+        ) + ((("align_hbw", self.align_hbw),) if self.align_hbw is not None else ()):
             if values.shape != (count,):
                 raise ValueError(
                     f"{name} must have shape ({count},), got {values.shape}"

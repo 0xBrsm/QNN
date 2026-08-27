@@ -284,7 +284,7 @@ class NativeWorldEnv:
             "tracking_cos": float(te.tracking_cos) if te is not None else 0.0,
             # v3 lead-aim geometry (QTRN v3): view-frame rel pos + ABSOLUTE world
             # velocity (raw u / u·s⁻¹) of the SAME nearest in-LOS actor that
-            # tracking_cos selects, plus the currently-held weapon id and a valid
+            # tracking_cos selects, plus the currently-equipped weapon id and a valid
             # flag. The eval recomputes a LEAD-POINT-referenced aim cosine from
             # these via the shared lead kernel (lead_aim.compute_lead_aim).
             "lead_rel": tuple(te.lead_rel) if te is not None else (0.0, 0.0, 0.0),

@@ -7,11 +7,11 @@ deterministic output.
 
 Pattern:
 
-    from qnn.model.testing import make_look_head_input
-    from qnn.model.look_head import LookHead
+    from qnn.model.testing import make_head_features
+    from qnn.model.look_head import PurePolarLookHead
 
-    inp = make_look_head_input(batch=8, in_dim=192)
-    out = LookHead(in_dim=192, d_hidden=128, activation="gelu")(inp)
+    feats = make_head_features(batch=8, in_dim=128)
+    out = PurePolarLookHead(128, 64, "gelu")(feats)
     assert out.look_predict.shape == (8, 3)
 
 The builders intentionally produce *valid* inputs (e.g. actor masks have
@@ -24,13 +24,10 @@ from __future__ import annotations
 
 import torch
 
-from qnn.model.attack_head import AttackHeadInput
-from qnn.model.look_head import LookHeadInput
-from qnn.model.move_head import MoveHeadInput
+from qnn.model.attack_with_head import AttackSelectorInput
 from qnn.model.target import TargetPointerInput
 from qnn.model.temporal import TemporalInput
 from qnn.model.transformer import EncoderInput, ObsEmbedding
-from qnn.model.weapon_head import WeaponHeadInput
 from qnn.schema import (
     ACTOR_SCALAR_DIM,
     SELF_SCALAR_DIM,
@@ -172,57 +169,19 @@ def make_temporal_input(
     )
 
 
-def make_move_head_input(batch: int = 4, *, in_dim: int = 192, seed: int = 0) -> MoveHeadInput:
-    return MoveHeadInput(features=torch.randn(batch, in_dim, generator=_gen(seed)))
+def make_head_features(batch: int = 4, *, in_dim: int = 128, seed: int = 0) -> torch.Tensor:
+    """The shared feature cat every non-selector head consumes (a28)."""
+    return torch.randn(batch, in_dim, generator=_gen(seed))
 
 
-def make_look_head_input(
+def make_attack_selector_input(
     batch: int = 4,
     *,
-    in_dim: int = 192,
-    n_entities: int = MAX_TOKEN_OBJECTS,
+    selector_dim: int = 128,
     seed: int = 0,
-) -> LookHeadInput:
+) -> AttackSelectorInput:
     gen = _gen(seed)
-    actor_mask = _actor_mask(batch, n_entities, gen)
-    return LookHeadInput(
-        features=torch.randn(batch, in_dim, generator=gen),
-        target_logits=_masked_logits(batch, n_entities, actor_mask, gen),
-        entity_rel=torch.randn(batch, n_entities, 3, generator=gen),
-        actor_mask=actor_mask,
-    )
-
-
-def make_attack_head_input(
-    batch: int = 4,
-    *,
-    in_dim: int = 192,
-    n_entities: int = MAX_TOKEN_OBJECTS,
-    actor_scalar_dim: int = ACTOR_SCALAR_DIM,
-    seed: int = 0,
-) -> AttackHeadInput:
-    gen = _gen(seed)
-    actor_mask = _actor_mask(batch, n_entities, gen)
-    look_prior = torch.randn(batch, 3, generator=gen)
-    look_prior = look_prior / look_prior.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    return AttackHeadInput(
-        features=torch.randn(batch, in_dim, generator=gen),
-        look_prior=look_prior,
-        target_logits=_masked_logits(batch, n_entities, actor_mask, gen),
-        entity_scalars=torch.randn(batch, n_entities, actor_scalar_dim, generator=gen) * 0.1,
-        actor_mask=actor_mask,
-        self_scalars=torch.randn(batch, SELF_SCALAR_DIM, generator=gen) * 0.1,
-    )
-
-
-def make_weapon_head_input(
-    batch: int = 4,
-    *,
-    selector_dim: int = 192,
-    seed: int = 0,
-) -> WeaponHeadInput:
-    gen = _gen(seed)
-    return WeaponHeadInput(
+    return AttackSelectorInput(
         selector=torch.randn(batch, selector_dim, generator=gen),
     )
 
@@ -232,8 +191,6 @@ __all__ = [
     "make_encoder_input",
     "make_target_pointer_input",
     "make_temporal_input",
-    "make_move_head_input",
-    "make_look_head_input",
-    "make_attack_head_input",
-    "make_weapon_head_input",
+    "make_head_features",
+    "make_attack_selector_input",
 ]

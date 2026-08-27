@@ -242,6 +242,7 @@ class ArenaServerProcess(_ArenaPipeProcess):
         reward_json: str = "",
         weapon_config: Mapping[str, object] | None = None,
         observer_declarations: Sequence[object] | None = None,
+        fixed_tick_hz: int = 20,
     ) -> None:
         self.port = int(port)
         if observer_mode not in {"external", "virtual", "shadow"}:
@@ -287,6 +288,7 @@ class ArenaServerProcess(_ArenaPipeProcess):
                 "-qnn_bots", str(int(bot_count)),
                 "-qnn_bot_skill", str(int(bot_skill)),
                 "-qnn_selfplay", "1" if self_play else "0",
+                "-qnn_tick_hz", str(int(fixed_tick_hz)),
                 *observer_args,
                 *self._weapon_args(weapon_config),
                 *extra_args,
@@ -298,8 +300,15 @@ class ArenaServerProcess(_ArenaPipeProcess):
     # Scenario inventory key -> arena-server CLI flag. Weapon names are resolved
     # to IT_ bits inside the engine (QNN_ArenaWeaponBit), so the encoding stays
     # authoritative in one place; ammo/armor/health flow through as-is.
+    # ``weapons_mask`` is the one raw (already-OR'd) exception: a multi-weapon
+    # owned-items bitmask for full-arsenal loadouts (e.g. the real-map RA
+    # venue) that the single-weapon ``model_weapon`` flag can't express — see
+    # qnn.eval.h2h._inventory_weapon_config and
+    # QNN_ArenaApplyInventory/-qnn_inv_weapons_mask in
+    # qnn_arena_server_main.c.
     _WEAPON_ARG_FLAGS: tuple[tuple[str, str], ...] = (
         ("model_weapon", "-qnn_inv_selected"),
+        ("weapons_mask", "-qnn_inv_weapons_mask"),
         ("bot_weapon_pin", "-qnn_bot_weapon_pin"),
         ("shells", "-qnn_inv_shells"),
         ("nails", "-qnn_inv_nails"),
@@ -561,6 +570,7 @@ class ArenaGroupProcess:
         workdir: str | Path | None = None,
         weapon_config: Mapping[str, object] | None = None,
         declarations: Sequence[object] | None = None,
+        fixed_tick_hz: int = 20,
     ) -> None:
         seats = tuple((int(match_id), int(seat_id)) for match_id, seat_id in external_seats)
         if observer_mode not in {"external", "virtual", "shadow"}:
@@ -596,6 +606,7 @@ class ArenaGroupProcess:
             reward_json=reward_json,
             weapon_config=weapon_config,
             observer_declarations=declarations,
+            fixed_tick_hz=fixed_tick_hz,
         )
         self.clients = tuple(
             ArenaClientProcess(

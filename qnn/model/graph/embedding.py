@@ -59,8 +59,7 @@ class GraphObsEmbedding(ObsEmbedding):
         # _init_self_components, which needs the token specs.
         self._self_token_specs = self_specs
         self._N_SELF_TOKENS = len(self_specs)
-        # Ordered self-token names: index i ↔ encoder ``self_block[:, i]`` (CLS at
-        # 0). Lets a head read one token as its readout via a ``token.<name>`` edge.
+        # Ordered self-token names (CLS at 0) — introspection only.
         self.self_token_names = tuple(t.name for t in self_specs)
         spatial = next(
             (t for t in spec.tokens if t.kind == TOKEN_KIND_SPATIAL), None

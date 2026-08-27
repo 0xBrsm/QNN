@@ -167,7 +167,6 @@ def stage_decode_config(ctx, plans: dict[str, WeaponPlan],
     p["look.aim_degrade_tremor_mag"] = tremor
     if vectors.get("tremor_tau") is not None:
         p["look.aim_degrade_tremor_tau"] = float(vectors["tremor_tau"])
-    p.pop("look.aim_degrade_lag_frames", None)
     # the dampener the gains were fit ON — the per-model substrate, NOT the
     # template pin (the cross-arch carryover bug class; v1:2341-2346).
     p["look.turn_mag_scale"] = float(tms)
@@ -213,8 +212,7 @@ def stage_decode_config(ctx, plans: dict[str, WeaponPlan],
     return out
 
 
-_STYLE_KEYS = ("weapon.preference_bias_vec", "weapon.switch_margin",
-               "move.threat_break_hazard")
+_STYLE_KEYS = ("weapon.preference_bias_vec", "move.threat_break_hazard")
 
 
 def warm_start_style(ctx, staged: Path) -> Path | None:
@@ -381,6 +379,15 @@ def assign_rc(source: Path, rc: str, *, replace: bool = False,
         **({"replaced_unshipped": True} if replaced else {}),
         **({"rc_forced": True} if force else {}),
     }
+    # ``rc_assigned`` marks a SOURCE as having been promoted (stamped below);
+    # it is never correct on the rc artifact itself, which IS the rc. Drop any
+    # value inherited through the provenance dict — a hand-tuned probe chain
+    # copies its ancestor's block wholesale, so a config descended from an
+    # already-assigned config carries a stale letter. Caught 2026-08-21: the
+    # a28rc1g candidate arrived claiming rc_assigned="a28rc1f" (inherited from
+    # decode.prov-…-SGp100_NGp90_RLp90_LGp90.json via the lockout probe chain),
+    # which would have shipped an artifact naming itself the PREVIOUS deploy.
+    out["provenance"].pop("rc_assigned", None)
     target.write_text(json.dumps(out, indent=2) + "\n")
     cfg.setdefault("provenance", {})["rc_assigned"] = rc
     source.write_text(json.dumps(cfg, indent=2) + "\n")

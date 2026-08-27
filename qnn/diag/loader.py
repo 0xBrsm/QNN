@@ -54,7 +54,23 @@ def resolve_decode_module(run_dir: Path, policy: QNNPolicy | None = None):
     if probe_path.exists():
         try:
             probe = json.loads(probe_path.read_text())
-            heads = (probe.get("overrides") or {}).get("heads") or {}
+            overrides = probe.get("overrides") or {}
+            base = str(probe.get("base", "") or "")
+            heads = overrides.get("heads") or {}
+            if base:
+                # a28 probes are base-graph deltas ({"base": "core", …}) —
+                # the head set lives in the MERGED graph, not the overrides.
+                # Legacy base names no longer in the registry fall back to
+                # the overrides-only read (their heads were all overrides).
+                from qnn.model.graph import (
+                    GraphSpecError, base_graph_dict, merge_overrides,
+                )
+                try:
+                    heads = merge_overrides(
+                        base_graph_dict(base), overrides,
+                    ).get("heads") or {}
+                except GraphSpecError:
+                    pass
         except (ValueError, OSError):
             heads = {}
     is_a25 = bool(heads.get("move_seg")) or (
@@ -97,17 +113,22 @@ def load_policy(
         installed.  ``probe`` is the raw ``probe.json`` dict.
     """
     run_dir = Path(run_dir)
-    probe = json.loads((run_dir / "config" / "probe.json").read_text())
     # Probes are self-describing: the merged GraphSpec is persisted in checkpoint
     # meta ("model_graph") and QNNPolicy.load rebuilds from it. No model_factory.
+    # probe.json exists only on bench/head-probe runs — PPO runs carry the
+    # graph exclusively in the checkpoint, so a missing file is an empty
+    # probe dict, not an error.
+    probe_path = run_dir / "config" / "probe.json"
+    probe = json.loads(probe_path.read_text()) if probe_path.exists() else {}
     factory = None
 
     cks = (sorted((run_dir / "checkpoints").glob("best_*.pth"))
-           or sorted((run_dir / "checkpoints").glob("bc_best_model.pth")))
+           or sorted((run_dir / "checkpoints").glob("bc_best_model.pth"))
+           or sorted((run_dir / "checkpoints" / "best").glob("best_model.pth")))
     if not cks:
         raise FileNotFoundError(
             f"No checkpoint found in {run_dir / 'checkpoints'} "
-            f"(tried best_*.pth and bc_best_model.pth)"
+            f"(tried best_*.pth, bc_best_model.pth, and best/best_model.pth)"
         )
 
     payload = torch.load(cks[0], map_location="cpu", weights_only=False)

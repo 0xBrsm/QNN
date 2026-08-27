@@ -380,6 +380,17 @@ def build_run_ppo_eval_config(
         "scenario_config_path": str(surface["scenario_config_path"]),
         "reward_json_path": str(run_cfg["config_paths"]["reward"]),
         "parallel_policy_modes": bool(_require_key(train, "eval_parallel_policy_modes", "train.json")),
+        # Same keys the eval-mode builder reads (a28 models have no
+        # decode-regime default; pipeline fails loud without it).
+        "decode_regime": (
+            str(train["eval_decode_regime"])
+            if "eval_decode_regime" in train else None
+        ),
+        "intercept_window": str(train.get("eval_intercept_window", "") or ""),
+        # Contiguous per-tick align-hbw trace (intercept_trace.npz). Off by
+        # default — it is ~20x the window instrument's row count and only the
+        # counterfactual-frontier analysis reads it.
+        "intercept_trace": bool(train.get("eval_intercept_trace", False)),
         "device": requested_device,
         "env_backend": str(machine.get("eval_env_backend", "process")),
         "arena_server_binary": str(machine.get("arena_server_binary", "assets/bin/ppo_arena_server")),
@@ -522,12 +533,24 @@ def build_run_eval_config(
             str(train["eval_decode_regime"])
             if "eval_decode_regime" in train else None
         ),
-        # Optional: opt-in batched-forward decode — stack all active envs into
-        # one model.act(B=N) per macro-step so the CPU saturates instead of
-        # idling in the per-env ping-pong. NOT bit-identical to the default B=1
-        # path; only for evals robust to float-level batching differences (e.g.
-        # the aim grid's intercept-hbw). See EvalConfig.batched_forward.
-        "batched_forward": bool(train.get("eval_batched_forward", False)),
+        # Discharge-window instrument spec ("16,4"); config-carried so run
+        # dirs are self-contained (QNN_EVAL_INTERCEPT_WINDOW env overrides).
+        "intercept_window": str(train.get("eval_intercept_window", "") or ""),
+        # Contiguous per-tick align-hbw trace (intercept_trace.npz). Off by
+        # default — it is ~20x the window instrument's row count and only the
+        # counterfactual-frontier analysis reads it.
+        "intercept_trace": bool(train.get("eval_intercept_trace", False)),
+        # Batched-forward decode — stack all active envs into one model.act(B=N)
+        # per macro-step. DEFAULT TRUE since the 8/05 eval profile: the per-env
+        # B=1 ping-pong measured 4.5x SLOWER end-to-end (35.5 vs 7.9 ms per
+        # macro-step at 8 lanes; 11.3x vs 50.6x realtime), because act() carries
+        # a ~4.4 ms FIXED per-call cost that B=1 pays once PER LANE instead of
+        # once per tick. B=1 is not bit-identical to batched, so it stays
+        # REACHABLE (eval_batched_forward: false) for bit-exact replication of
+        # historical runs — but it must never be the operative path for new
+        # work. See EvalConfig.batched_forward and
+        # agents/plans/eval-vecenv-port.md.
+        "batched_forward": bool(train.get("eval_batched_forward", True)),
         # Optional: PER-LANE decode overrides — one {key: value} dict per env
         # slot (aligned with scenario order), so a single ≤64-lane batched eval
         # runs many (swept-value, scenario) cells instead of one cold subprocess

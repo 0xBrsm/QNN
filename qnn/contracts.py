@@ -44,8 +44,6 @@ __all__ = [
     "Contract",
     "GENERATION_CONTRACTS",
     "MODERN",
-    "GEN_V17",
-    "GEN_V22",
     "recognize_generation",
     "backfill_contract",
     "arch_id_from_model_config",
@@ -132,17 +130,10 @@ def semantics_sig() -> str:
 # A contract triple. Plain dict (JSON-friendly, stored verbatim in meta).
 Contract = Dict[str, str]
 
-# Generation tags. These name the converter-recognized GENERATIONS — the same
-# ones migrate_legacy_flat_meta / QNNPolicy.load distinguish.
-MODERN = "modern"   # nested ModelConfig (meta["model"] present) — full_4head lineage
-GEN_V17 = "v17"     # flat meta, v17 markers (no weapon head)
-GEN_V22 = "v22"     # flat meta, v22 markers (recognized but not v17)
-
-# Arch ids for the legacy flat generations. Modern checkpoints derive their arch
-# from the ModelConfig (see arch_id_from_model_config); the legacy generations
-# have no ModelConfig, so their arch id is the generation tag itself.
-_ARCH_V17 = "v17"
-_ARCH_V22 = "v22"
+# Generation tags. a28: MODERN (graph-embedded checkpoints) is the only
+# generation this line recognizes; pre-a28 checkpoints load from their own
+# branches, so the legacy flat generations (v17/v22) have no rows here.
+MODERN = "modern"   # graph-embedded checkpoint (meta["model_graph"] present)
 
 # ── Generation → NATIVE contract registry ────────────────────────────────────
 # Each converter-recognized generation maps to the contract it was NATIVELY born
@@ -150,14 +141,13 @@ _ARCH_V22 = "v22"
 # engine_norm constants) so backfilling an archived checkpoint records what it
 # actually shipped with, not whatever the current HEAD happens to be.
 #
-#   modern / full_4head → wire.13 / semantics.2   (arch derived from ModelConfig)
-#   v17, v22            → wire.7 / semantics.1
+#   modern / core → wire.13 / semantics.2
 #
 # wire.13 is the A27 HEAD contract: wire.11 action decode plus the depth atlas
 # and the pure actor/projectile combat entity stream (semantics.2). The
 # exporter ALWAYS bakes the stateful move decode + the attack decode + their
 # recurrent state I/O into the graph (tools/export_onnx.py ExportWrapper), so a
-# freshly-trained / re-exported full_4head model IS a wire.13 graph (native
+# freshly-trained / re-exported core model IS a wire.13 graph (native
 # 29-obs split + the in-graph decided `move`/`attack` + the move_state/
 # attack_state loop-back pairs) and is stamped wire.13.
 #
@@ -176,16 +166,10 @@ _ARCH_V22 = "v22"
 GENERATION_CONTRACTS: Dict[str, Contract] = {
     # wire.13.2 = wire.11 action decode + finalized 24x11 nibble-packed
     # depth-atlas obs + the A27 pure-combat entity stream (semantics.2).
-    # Distinct from a26's wire.12.x (same atlas, FULL entity stream,
-    # semantics.1); the bin runs wire.11/.12.x/.13.x side by side but this
-    # codebase only exports wire.13.x natively.
-    # (The a27 rc1 line's 72-wide unpacked atlas is wire.13.1; it is not a
-    # GENERATION of its own — same modern ModelConfig — so it has no row
-    # here. The exporter picks the id from the checkpoint's atlas width,
-    # see tools/export_onnx.py:_native_obs_for_model.)
-    MODERN:  {"wire": "wire.13.2", "semantics": "semantics.2", "arch": "full_4head"},
-    GEN_V17: {"wire": "wire.7",  "semantics": "semantics.1", "arch": _ARCH_V17},
-    GEN_V22: {"wire": "wire.7",  "semantics": "semantics.1", "arch": _ARCH_V22},
+    # The a28 core-graph refactor changed the ARCH axis only (arch "core":
+    # explicit edges, no weapon_ctx) — obs wire and decode are untouched,
+    # so wire/semantics stay pinned.
+    MODERN:  {"wire": "wire.13.2", "semantics": "semantics.2", "arch": "core"},
 }
 
 # Defensive parity: the MODERN registry row pins HEAD wire/semantics, which must
@@ -225,13 +209,11 @@ _ENTITY_STREAM_CONTRACT: Dict[str, tuple] = {
 
 # ── Compact a/s/w version render (display / provenance only) ─────────────────
 # The per-axis ids in GENERATION_CONTRACTS remain the source of truth the engine
-# matches; this is just a sane one-string render, e.g. `a24b.s1.w9`. `a` is the
-# arch generation; the in-development `full_4head` arch carries a `b` (bench /
+# matches; this is just a sane one-string render, e.g. `a28b.s2.w13.2`. `a` is
+# the arch generation; the in-development `core` arch carries a `b` (bench /
 # pre-release) suffix until it's blessed as a numbered release.
 _ARCH_A_TAG: Dict[str, str] = {
-    _ARCH_V17:    "a17",
-    _ARCH_V22:    "a22",
-    "full_4head": "a24b",
+    "core": "a28b",   # bench / pre-release until blessed as a numbered release
 }
 
 
@@ -252,38 +234,15 @@ def render_version(contract: Contract) -> str:
 
 
 def recognize_generation(meta: Dict[str, Any]) -> Optional[str]:
-    """Classify a checkpoint ``meta`` dict into a converter-recognized generation.
+    """Classify a checkpoint ``meta`` dict into a recognized generation.
 
-    Keyed on the SAME schema markers the checkpoint converter already uses (see
-    :func:`qnn.utils.checkpoint_converter.migrate_legacy_flat_meta`):
-
-      * a nested ``meta["model"]`` block → :data:`MODERN`.
-      * otherwise a flat legacy meta with the v17/v22 ModelConfig fields:
-          - v17 markers (``target_bypass_gru`` / ``move_categorical`` /
-            ``readout``) → :data:`GEN_V17`.
-          - else, when the required flat-arch fields are present → :data:`GEN_V22`.
-
-    Returns ``None`` when the meta is neither modern nor a recognized legacy flat
-    schema (e.g. a pre-v17 generation the converter doesn't migrate). Never
-    guesses.
+    a28: a graph-embedded checkpoint is :data:`MODERN`; anything else
+    (legacy flat metas included) returns ``None`` — the caller warns,
+    never guesses, and pre-a28 checkpoints load from their own branches.
     """
-    if "model" in meta:
+    if meta.get("model_graph") is not None or "model" in meta:
         return MODERN
-
-    # Mirror migrate_legacy_flat_meta's alias normalization + required-field gate
-    # so we recognize exactly the same set it can migrate (no more, no less).
-    probe = dict(meta)
-    for _old, _new in (("ffn_dim", "d_ffn"), ("gru_hidden", "d_gru")):
-        if _old in probe and _new not in probe:
-            probe[_new] = probe[_old]
-    required = ("d_model", "n_heads", "n_layers", "d_ffn", "attn_dropout",
-                "use_gru", "d_gru", "look_bypass_gru")
-    if any(k not in probe for k in required):
-        return None
-
-    is_v17 = ("target_bypass_gru" in probe or "move_categorical" in probe
-              or "readout" in probe)
-    return GEN_V17 if is_v17 else GEN_V22
+    return None
 
 
 def backfill_contract(meta: Dict[str, Any]) -> Optional[Contract]:
@@ -293,34 +252,22 @@ def backfill_contract(meta: Dict[str, Any]) -> Optional[Contract]:
     ``None`` (caller should warn, never invent) when the generation is
     unrecognized. The returned dict is a fresh copy safe to store in meta.
 
-    For the MODERN generation the arch id is refined from the embedded
-    ModelConfig (``arch_id_from_model_config``) rather than the registry's generic
-    ``"full_4head"`` placeholder, so a non-weapon-head modern checkpoint records
-    its true arch.
     """
     gen = recognize_generation(meta)
     if gen is None:
         return None
-    contract = dict(GENERATION_CONTRACTS[gen])
-    if gen == MODERN:
-        model_cfg = meta.get("model")
-        if isinstance(model_cfg, dict):
-            contract["arch"] = arch_id_from_model_config(model_cfg)
-    return contract
+    return dict(GENERATION_CONTRACTS[gen])
 
 
 def arch_id_from_model_config(model_cfg: Dict[str, Any]) -> str:
-    """Derive a stable arch id from a ModelConfig-shaped dict.
+    """Derive a stable arch id.
 
-    The arch axis pins model internals / weight layout. The stable, observable
-    discriminator across the modern lineage is the head set: the canonical model
-    is ``full_4head`` (move + look + attack + weapon) when ``use_weapon_head`` is
-    set, otherwise ``3head`` (no weapon head, e.g. v17-shaped modern configs).
-    Kept deliberately coarse — a finer arch id would couple to GRU width / d_model
-    which are already captured by ``wire_sig``/``arch`` fingerprint at export.
+    a28: one canonical arch — ``core`` (the base graph in
+    qnn/model/graph/bases/core.json). Kept as a function so the stamping
+    call sites don't hardcode the literal; a future arch bump changes it
+    here and adds a generation row.
     """
-    use_weapon = bool(model_cfg.get("use_weapon_head", True))
-    return "full_4head" if use_weapon else "3head"
+    return "core"
 
 
 def current_contract(
@@ -337,13 +284,12 @@ def current_contract(
     ``SEMANTICS_CONTRACT_ID_FULL_STREAM``). A checkpoint built with
     ``entity_stream="full"`` trains on full-stream data — stamping the combat
     pair on it silently mismatched its actual training contract. arch is
-    derived from the ModelConfig when supplied, else the canonical
-    ``full_4head``.
+    the canonical ``core``.
     """
     if entity_stream not in ENTITY_STREAMS:
         raise ValueError(
             f"unknown entity_stream {entity_stream!r}; allowed: {list(ENTITY_STREAMS)}")
-    arch = arch_id_from_model_config(model_cfg) if isinstance(model_cfg, dict) else "full_4head"
+    arch = arch_id_from_model_config(model_cfg) if isinstance(model_cfg, dict) else "core"
     wire, semantics = _ENTITY_STREAM_CONTRACT[entity_stream]
     return {
         "wire": wire,

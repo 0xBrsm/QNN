@@ -69,6 +69,7 @@ from qnn.bc.container import (
     build_behavior_cloning_sources,
     effective_head_loss_weights,
     validate_cache_for_training,
+    validate_head_hz_against_fixed_tick_hz,
     validate_source_bundle_compatible,
 )
 from qnn.utils import artifacts as _artifacts
@@ -1265,6 +1266,11 @@ def run_behavior_cloning(
 
     head_loss_weights = effective_head_loss_weights(config.head_loss_weights)
 
+    # Two independent Hz paths (config.fixed_tick_hz vs each head's own
+    # HeadNodeSpec.hz) are never otherwise cross-checked — catch a silent
+    # mismatch before touching the corpus or building the model.
+    validate_head_hz_against_fixed_tick_hz(graph, config.fixed_tick_hz)
+
     # Configure mixed-precision autocast via the env var that QNNPolicy reads.
     os.environ["QNN_AUTOCAST_DTYPE"] = config.dtype
     _log(f"dtype={config.dtype}")
@@ -1318,10 +1324,11 @@ def run_behavior_cloning(
     model.bc_weight_decay = float(config.weight_decay)
 
     if source_bundle is None:
-        source_bundle = build_behavior_cloning_sources(config, head_loss_weights=head_loss_weights)
+        source_bundle = build_behavior_cloning_sources(
+            config, head_loss_weights=head_loss_weights, graph=graph)
     else:
         validate_source_bundle_compatible(
-            config, source_bundle, head_loss_weights=head_loss_weights,
+            config, source_bundle, head_loss_weights=head_loss_weights, graph=graph,
         )
 
     train_source = source_bundle.train_source
@@ -1387,21 +1394,7 @@ def run_behavior_cloning(
         if _parsed is not None:
             run_id = _parsed[1]
         import torch as _torch_resume
-        from qnn.utils.checkpoint_converter import (
-            migrate_entity_embed,
-            migrate_obs_embedding_self_token_builder,
-            migrate_self_scalars,
-        )
         ckpt = _torch_resume.load(checkpoint_path, map_location=model.device, weights_only=False)
-        migrate_entity_embed(
-            ckpt["model_state_dict"],
-            optimizer=ckpt.get("optimizer_state_dict"),
-        )
-        migrate_self_scalars(
-            ckpt["model_state_dict"],
-            optimizer=ckpt.get("optimizer_state_dict"),
-        )
-        migrate_obs_embedding_self_token_builder(ckpt["model_state_dict"])
         model.model.load_state_dict(ckpt["model_state_dict"])
         # Resume compat: accept new key, fall back to the old "best_val_loss"
         # name (a misnomer that held the same selection score).

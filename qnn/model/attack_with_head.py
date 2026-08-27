@@ -48,14 +48,59 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from qnn.bc.cache_align_hbw import SENTINEL as _ALIGN_SENTINEL
 from qnn.model import action_labels
 from qnn.model._mlp import make_head_mlp
-from qnn.model.attack_head import AttackSelectorInput, AttackSelectorOutput
 from qnn.model.action_labels import register_label_derive
 from qnn.schema import WEAPON_HEAD_SIZE
 
 ATTACK_WITH_SIZE = 1 + WEAPON_HEAD_SIZE  # 9: no-attack + axe..thunderbolt
 _IGNORE = -100
+
+
+def _align_weight(
+    align_hbw: torch.Tensor, target: torch.Tensor, gamma: float,
+) -> torch.Tensor:
+    """Per-frame multiplicative CE weight on POSITIVE (fire) frames from the
+    corpus's ``align_hbw`` sidecar (``qnn.bc.cache_align_hbw``):
+    ``w = exp(-gamma * hbw)`` — aligned fires (small hbw) get MORE weight,
+    wild fires (large hbw) get less. Sentinel rows (no engaged target / no
+    attributable weapon at that frame) and every negative (non-attack) frame
+    get weight 1.0 — untouched.
+
+    MARGINAL-PRESERVING: rescaled so the positive class's total weight mass
+    equals its frame COUNT (the pre-reweight uniform-1.0 mass) — the reweight
+    only moves gradient WITHIN the positive class, never the aggregate
+    fire-vs-no-fire balance the CE teaches (a28 already under-fires 45-52%;
+    this objective must shift WHEN the model fires, never HOW MUCH).
+    """
+    pos = target > 0
+    has_signal = pos & (align_hbw > _ALIGN_SENTINEL)
+    raw = torch.where(
+        has_signal,
+        torch.exp(-gamma * align_hbw.clamp_min(0.0)),
+        torch.ones_like(align_hbw),
+    )
+    n_pos = pos.sum().clamp_min(1).to(raw.dtype)
+    pos_mass = (raw * pos.to(raw.dtype)).sum().clamp_min(1e-12)
+    scale = n_pos / pos_mass
+    return torch.where(pos, raw * scale, torch.ones_like(raw))
+
+
+@dataclass(frozen=True, slots=True)
+class AttackSelectorInput:
+    """Input to the categorical 0..8 attack selector."""
+
+    selector: torch.Tensor
+    feasibility_mask: torch.Tensor | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttackSelectorOutput:
+    """Categorical attack logits. a28: logits ONLY — the selector no longer
+    emits a motor-conditioning context (weapon_ctx removed)."""
+
+    logits: torch.Tensor
 
 
 def _flat_long(value, device: torch.device) -> torch.Tensor:
@@ -81,18 +126,12 @@ def attack_with_target(
     return target
 
 
-# ── Shared selector metrics ─────────────────────────────────────────
+# ── Selector metrics ────────────────────────────────────────────────
 #
-# attack_loss and weapon_loss compute the SAME numbers; only the metric
-# names differ, and not by a uniform prefix — the marginal-attack block is
-# named identically in both (both heads report P(attack) on one ruler, so
-# epoch aggregation treats it as a single series), while the conditional
-# block diverges: acc_attack_choice vs acc_weapon, attackchoicedist_* vs
-# weapondist_*, n_attack_choice_valid vs n_weapon_valid. Those names are a
-# downstream contract (supervised_loop scans tp_<infix>_<cls> prefixes;
-# bc_summary carries every key into run records), so the naming lives in
-# one table and the arithmetic exists once.
-# Pinned by tests/model/test_selector_metric_keys.py.
+# The metric names are a downstream contract (supervised_loop scans
+# tp_<infix>_<cls> prefixes; bc_summary carries every key into run
+# records), so the naming lives in one table and the arithmetic exists
+# once. Pinned by tests/model/test_selector_metric_keys.py.
 
 
 @dataclass(frozen=True)
@@ -112,12 +151,6 @@ _ATTACK_SLOT_NAMES = _SelectorMetricNames(
     loss="loss_attack", cls_infix="attack", cond_dist="attackchoicedist",
     n_valid="n_attack_choice_valid", cond_acc="acc_attack_choice",
     cond_f1="f1_attack_choice", confidence="confidence_attack")
-
-_WEAPON_SLOT_NAMES = _SelectorMetricNames(
-    loss="loss_weapon", cls_infix="weapon", cond_dist="weapondist",
-    n_valid="n_weapon_valid", cond_acc="acc_weapon",
-    cond_f1="f1_weapon", confidence="confidence_weapon")
-
 
 def _feasibility(actions, device) -> "torch.Tensor | None":
     """Per-frame feasibility bit (input_mask bit 0), or None if absent.
@@ -264,16 +297,48 @@ def _selector_metrics(
 class AttackWithHead(nn.Module):
     """Single MLP: selector (GRU(CLS) readout) → 9 logits.
 
-    Emits the selector output consumed by Network's categorical attack slot;
-    motor-head context contract are untouched; ``context`` is the soft-mix
-    embedding over the 9 classes (motor heads condition on attack-with
-    intent; equipped-weapon state does not exist in the observation).
+    Emits the selector output consumed by Network's categorical attack
+    slot. a28: logits only — no soft-mix context embedding (weapon_ctx
+    removed; the motor heads see exactly their declared graph inputs).
+
+    Realized-alignment edge + DART (``aim_dim`` / ``dart_p``)
+    ---------------------------------------------------------
+    Alignment edge (fire-at-alignment rung 3 arm A′; supersedes probe B-i's
+    3-column form). When the graph declares the ``aim`` edge, Network appends
+    a 17-wide alignment block (per-weapon crest payouts, their realized
+    one-tick deltas, has_target — see
+    ``qnn.model.network.alignment_edge_block``) to the TAIL of this head's
+    input cat, so the head's slice is ``(context | aim)`` with
+    ``context = in_dim - aim_dim`` (the declared gru / target.feat edges).
+    The ``aim2`` edge (A″; crest-ceiling-handoff.md "Candidate next steps"
+    §3) extends this to 49 dims — the same 17 columns plus a forward-
+    projected tail (``qnn.model.lead_aim.weapon_alignment_projected``) —
+    still one tail block, still ``aim_dim`` wide, still gradient-isolated.
+
+    INTENT KEYING — the alignment block's lead geometry is weapon-keyed, and
+    ``QNNPolicy._aim_prior_geometry`` keys it at act time by THIS tick's
+    attack-with intent. That keying is unavailable HERE: this head *is* the
+    intent producer, so a same-tick key would make its own input a function of
+    its own logits. The block is therefore keyed by the PREVIOUS tick's attack
+    class (``obs['attack_intent_prev']``, the column the ``prev_attack`` intent
+    node already plumbs — teacher-forced at train/val). The consequence is a
+    one-tick-stale WEAPON key on the geometry; the geometry itself (target
+    position, velocity, pointer softmax) is current.
+
+    ``dart_p`` > 0 applies train-time channel dropout to the CONTEXT portion of
+    that slice ONLY, never the alignment block and never any other head's
+    inputs (the perturbation is on this head's local copy). Under teacher
+    forcing the context predicts the human's trigger through the human's aim;
+    degrading it is what forces reliance onto the truthful alignment channel.
+    Eval/act are untouched (``self.training`` gate ⇒ nn.Dropout identity).
     """
 
     def __init__(
-        self, *, in_dim: int, d_model: int, d_hidden: int, activation: str,
+        self, *, in_dim: int, d_hidden: int, activation: str,
         feasibility_mask: bool = False, focal_gamma: float = 0.0,
         pos_weight: float = 0.0,
+        aim_dim: int = 0, dart_p: float = 0.0,
+        align_weight_gamma: float = 0.0,
         label: str,
     ) -> None:
         super().__init__()
@@ -301,7 +366,13 @@ class AttackWithHead(nn.Module):
         self.label_contract = contract.name
         self.in_dim = int(in_dim)
         self.mlp = make_head_mlp(in_dim, ATTACK_WITH_SIZE, d_hidden, activation)
-        self.embed = nn.Embedding(ATTACK_WITH_SIZE, int(d_model))
+        # Fire-only family calibration.  This intercept is deliberately NOT
+        # added to the nine selector logits: those logits also own weapon
+        # choice, so shifting them would silently change the selected weapon.
+        # Network publishes the vector beside the raw logits and every fire
+        # consumer adds only the selected entry to the class-vs-no-attack
+        # margin.  Zero preserves older checkpoints exactly.
+        self.fire_bias = nn.Parameter(torch.zeros(ATTACK_WITH_SIZE - 1))
         # P1 feasibility-masking (agents/plans/attack-finished-masking-refactor.md).
         # When set, Network builds a per-class additive mask from obs (owned+ammo
         # AND refire-cooldown) and passes it via AttackSelectorInput.feasibility_mask;
@@ -311,20 +382,62 @@ class AttackWithHead(nn.Module):
         self.wants_feasibility_mask = bool(feasibility_mask)
         self.focal_gamma = float(focal_gamma)
         self.pos_weight = float(pos_weight)
+        # Fire-at-alignment objective knob (agents/plans/
+        # fire-at-alignment-objective.md, rung 1). 0.0 = off ⇒ this head's
+        # loss never touches actions["align_hbw"] and is byte-identical to
+        # a head without the knob.
+        self.align_weight_gamma = float(align_weight_gamma)
+        if self.align_weight_gamma < 0.0:
+            raise ValueError(
+                f"align_weight_gamma must be >= 0, got {self.align_weight_gamma}")
+        # (context | aim) split of this head's own input slice.
+        self.aim_dim = int(aim_dim)
+        if not 0 <= self.aim_dim < self.in_dim:
+            raise ValueError(
+                f"aim_dim {self.aim_dim} must be in [0, in_dim={self.in_dim})")
+        self.context_dim = self.in_dim - self.aim_dim
+        self.dart_p = float(dart_p)
+        if not 0.0 <= self.dart_p < 1.0:
+            raise ValueError(f"dart_p must be in [0, 1), got {self.dart_p}")
+        # Always constructed (p=0 is an exact identity, adds no parameters and
+        # draws no RNG) so the module tree is the same across arms.
+        self.context_dropout = nn.Dropout(self.dart_p)
+
+    def dart_context(self, x: torch.Tensor) -> torch.Tensor:
+        """DART the CONTEXT sub-slice of ``x`` (``(..., in_dim)``); return the
+        re-joined ``(context | aim)`` tensor.
+
+        Off (exact identity, no split, no allocation) when ``dart_p == 0`` or
+        in eval mode. The branch is on Python constants / ``self.training``, not
+        on tensor data, so torch.compile guards it rather than graph-breaking;
+        the mask itself is nn.Dropout's inverted-dropout bernoulli (expectation
+        preserved, no data-dependent control flow).
+        """
+        if self.dart_p == 0.0 or not self.training:
+            return x
+        if self.aim_dim == 0:
+            return self.context_dropout(x)
+        return torch.cat(
+            [self.context_dropout(x[..., : self.context_dim]),
+             x[..., self.context_dim:]],
+            dim=-1,
+        )
 
     def forward(self, inp: AttackSelectorInput) -> AttackSelectorOutput:
-        logits = self.mlp(inp.selector[..., : self.in_dim])
+        logits = self.mlp(self.dart_context(inp.selector[..., : self.in_dim]))
         if inp.feasibility_mask is not None:
-            # Gate BEFORE the context softmax so the intent context fed to the
-            # motor heads reflects only feasible weapons too.
             logits = logits + inp.feasibility_mask.to(logits.dtype)
-        context = F.softmax(logits, dim=-1) @ self.embed.weight
-        return AttackSelectorOutput(logits=logits, context=context)
+        return AttackSelectorOutput(logits=logits)
 
-    def _focal_ce(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """CE with optional focal down-weighting of easy frames (focal_gamma)
-        and a multiplicative up-weight on the rare attack positives (classes
-        1..8; pos_weight). Reduces to the plain mean CE when both are 0."""
+    def _focal_ce(
+        self, logits: torch.Tensor, target: torch.Tensor,
+        align_hbw: "torch.Tensor | None" = None,
+    ) -> torch.Tensor:
+        """CE with optional focal down-weighting of easy frames (focal_gamma),
+        a multiplicative up-weight on the rare attack positives (classes
+        1..8; pos_weight), and an optional marginal-preserving alignment
+        reweight of the positives (align_weight_gamma; see ``_align_weight``).
+        Reduces to the plain mean CE when all three are 0/None."""
         scored = target != _IGNORE
         denom = scored.sum().clamp_min(1).to(logits.dtype)
         # Clamp ignored (-100) to a valid index for the per-sample CE, then zero
@@ -339,6 +452,8 @@ class AttackWithHead(nn.Module):
             w = torch.where(target > 0, term.new_full((), self.pos_weight),
                             term.new_ones(()))
             term = term * w
+        if self.align_weight_gamma > 0.0 and align_hbw is not None:
+            term = term * _align_weight(align_hbw, target, self.align_weight_gamma)
         term = term * scored.to(term.dtype)
         return term.sum() / denom
 
@@ -362,18 +477,47 @@ class AttackWithHead(nn.Module):
             actions, aw_logits.device, valid_flat)
         if self.wants_feasibility_mask and obs is not None \
                 and "self_weapon_readiness" in obs:
-            # The label is the action-side firing intent. If the observation's
-            # ownership/ammo signal contradicts it, exclude that frame instead
-            # of manufacturing a target from sensed arsenal state.
+            # The label is the action-side firing intent. If the observation
+            # contradicts it, exclude the frame instead of manufacturing a
+            # target from sensed arsenal state. The exclusion predicate MUST
+            # mirror Network._weapon_feasibility_mask's FULL predicate
+            # (ownership/ammo AND cooldown): that mask bakes -1e9 into the
+            # contradicted class's logit, so a fire label guarded on only the
+            # readiness half scores CE against a -1e9 logit — a ~1e9 loss row
+            # that dominates the head's gradient direction. Never triggered
+            # by a native 20 Hz corpus, but a composed one pairs window-start
+            # obs with any-fire-in-window labels: the human fired on the
+            # second sub-tick, one native tick before cooldown expiry at the
+            # decision tick (found 2026-08-03, 10 Hz decimation epoch-1 gate).
+            from qnn.model.network import Network  # lazy: avoid import-order knots
             readiness = obs["self_weapon_readiness"].to(aw_logits.device)
             readiness = readiness.reshape(-1, readiness.shape[-1])
             tgt_ready = readiness.gather(1, target.clamp(1, 8).unsqueeze(1) - 1).squeeze(1)
-            target = target.masked_fill((target >= 1) & (tgt_ready <= 0.1 + 1e-4), _IGNORE)
+            infeasible = tgt_ready <= Network._FEAS_OWNED_AMMO
+            if "self_arsenal_scalars" in obs:
+                af = obs["self_arsenal_scalars"][..., 0].to(aw_logits.device).reshape(-1)
+                infeasible = infeasible | (af > Network._FEAS_AF_READY)
+            target = target.masked_fill((target >= 1) & infeasible, _IGNORE)
+        align_hbw = None
+        if self.align_weight_gamma > 0.0:
+            # Fail loud here too (belt-and-suspenders with container.py's
+            # startup gate, qnn.bc.container._required_actions_for_config):
+            # a probe that turns this knob on must never silently fall back
+            # to an unweighted loss because the corpus lacks the sidecar.
+            if "align_hbw" not in actions:
+                raise RuntimeError(
+                    "AttackWithHead.align_weight_gamma > 0 but actions has no "
+                    "'align_hbw' key — run `python -m qnn.bc.cache_align_hbw "
+                    "--collect-dir <corpus>` on this collect first."
+                )
+            align_hbw = torch.as_tensor(
+                actions["align_hbw"], device=aw_logits.device, dtype=torch.float32,
+            ).reshape(-1)
         # Class-0 frames are real labels, so a microbatch is all-ignore only
         # if valid_mask zeroes it entirely — same (weaker) caveat as the
         # categorical CE's mean reduction.
-        if self.focal_gamma > 0.0 or self.pos_weight > 0.0:
-            loss = self._focal_ce(aw_logits, target)
+        if self.focal_gamma > 0.0 or self.pos_weight > 0.0 or self.align_weight_gamma > 0.0:
+            loss = self._focal_ce(aw_logits, target, align_hbw=align_hbw)
         else:
             loss = F.cross_entropy(aw_logits, target, ignore_index=_IGNORE, reduction="mean")
         if not compute_metrics:
@@ -385,133 +529,25 @@ class AttackWithHead(nn.Module):
 
 
 
-    def weapon_loss(
-        self,
-        logits,
-        actions,
-        valid_flat: torch.Tensor | None,
-        compute_metrics: bool,
-        obs=None,
-    ) -> tuple[torch.Tensor, dict]:
-        from qnn.model.network import WEAPON_HEAD  # lazy: avoid import-order knots
-
-        aw_logits = logits[WEAPON_HEAD].reshape(-1, ATTACK_WITH_SIZE)
-        # When masking is on, self-heal the label on frames where the intent
-        # weapon can't fire → the held (actually-fired) weapon. Needs obs
-        # (self_weapon_id + self_weapon_readiness, both dequant outputs the
-        # arsenal token already consumes).
-        held_impulse = intent_ready = None
-        if self.wants_feasibility_mask and obs is not None \
-                and "self_weapon_id" in obs and "self_weapon_readiness" in obs:
-            dev = aw_logits.device
-            swid = _flat_long(obs["self_weapon_id"], dev)                 # raw ENTITY_IDS 3..10
-            held_impulse = torch.where((swid >= 3) & (swid <= 10),
-                                       swid - 2, torch.zeros_like(swid))   # → impulse 1..8 (0=invalid)
-            readiness = obs["self_weapon_readiness"]
-            readiness = readiness.to(dev).reshape(-1, readiness.shape[-1])  # (N, 8)
-            intent = _flat_long(actions["weapon"], dev).clamp(1, 8)
-            intent_ready = readiness.gather(1, (intent - 1).unsqueeze(1)).squeeze(1)  # (N,)
-        # Ditto: the declared contract owns the label, not the slot name.
-        target = action_labels.derive_for(self.label_contract)(
-            actions, aw_logits.device, valid_flat,
-            held_impulse=held_impulse, intent_ready=intent_ready)
-        if held_impulse is not None:
-            # After self-heal, a tiny residual (~1% of fire frames) still labels
-            # a class the mask calls infeasible — the held weapon's own readiness
-            # reads empty though the demo fired it (obs ammo artifact). Those are
-            # bad data: drop to IGNORE so the mask never masks a scored label.
-            tgt_ready = readiness.gather(1, target.clamp(1, 8).unsqueeze(1) - 1).squeeze(1)
-            target = target.masked_fill((target >= 1) & (tgt_ready <= 0.1 + 1e-4), _IGNORE)
-        # Class-0 frames are real labels, so a microbatch is all-ignore only
-        # if valid_mask zeroes it entirely — same (weaker) caveat as the
-        # canonical weapon CE's mean reduction.
-        if self.focal_gamma > 0.0 or self.pos_weight > 0.0:
-            loss = self._focal_ce(aw_logits, target)
-        else:
-            loss = F.cross_entropy(aw_logits, target, ignore_index=_IGNORE, reduction="mean")
-        if not compute_metrics:
-            return loss, {}
-
-        feas = _feasibility(actions, aw_logits.device)
-        return loss, _selector_metrics(
-            loss, aw_logits, target, _WEAPON_SLOT_NAMES, feas=feas)
-
-# ── a26-line (weapon-slot) target + loss — self-heal semantics ─────────
-# Ported verbatim from the a26 line so weapon-slot attack_with graphs
-# train on this branch; the a27 attack-slot path above is untouched.
-@register_label_derive("weapon.v2")
-def attack_with_target_weapon_slot(
-    actions,
-    device: torch.device,
-    valid_flat: torch.Tensor | None,
-    *,
-    held_impulse: torch.Tensor | None = None,
-    intent_ready: torch.Tensor | None = None,
-    **_unused,
-) -> torch.Tensor:
-    """(N,) long target in {-100, 0..8} from the batch's action streams.
-
-    Label contract ``weapon.v2`` — the A25/A26 carried select-intent
-    semantics.  A27 corpora do not satisfy it (``act_weapon`` is retired
-    and always 0); it is kept registered so a25/a26 checkpoints keep
-    loading for cross-line eval.
-
-    ``act_weapon`` is de-scripted deliberate *select-intent* (carried forward),
-    which on ~5% of fire frames names a weapon the player can't actually fire
-    (unowned / no ammo) — the engine then deterministically fires the HELD
-    weapon. When ``held_impulse`` (self_weapon_id→impulse) and ``intent_ready``
-    (readiness of the intent weapon, per-frame) are supplied, self-heal those
-    frames to the held weapon = what actually fired. This keeps the label a
-    fireable class, so a readiness feasibility mask can never mask it (the P1
-    divergence). Feasible-intent frames (incl. owned switch-lag) are untouched.
-    """
-    attack = _flat_long(actions["attack"], device)
-    weapon = _flat_long(actions["weapon"], device)
-    eff = attack > 0
-    if "input_mask" in actions:
-        feas = (_flat_long(actions["input_mask"], device) & 1) != 0
-        eff = eff & feas
-    if held_impulse is not None and intent_ready is not None:
-        # "can't fire with intent" = intent weapon unowned/empty (readiness<=0.1
-        # floor). Substitute the held weapon (what the engine actually fired).
-        heal = eff & (intent_ready <= 0.1 + 1e-4) & (held_impulse >= 1) & (held_impulse <= 8)
-        weapon = torch.where(heal, held_impulse, weapon)
-    target = torch.where(eff, weapon, torch.zeros_like(weapon))
-    # Effective attack with no weapon held (pre-spawn/dead edge frames) is
-    # unattributable — drop rather than mislabel as class 0.
-    target = target.masked_fill(eff & (weapon == 0), _IGNORE)
-    if valid_flat is not None:
-        target = target.masked_fill(~valid_flat, _IGNORE)
-    return target
-
 # -- graph node registration ------------------------------------------------
 from qnn.model.node_registry import register_head  # noqa: E402
 
 
-@register_head("weapon", "attack_with")
-def _build_weapon_attack_with(head, dims, d_model):
-    """a26-line checkpoints place the 9-way selector on the WEAPON slot (the
-    a27 refactor moved it to the attack slot); same module, second registry
-    row, so those checkpoints load for cross-line eval.
-
-    The slot no longer implies the label: ``head.label`` carries the
-    contract, defaulted by :mod:`qnn.model.graph.spec` to this slot's
-    historical semantics (``weapon.v2``) when an older spec omits it."""
-    return AttackWithHead(
-        in_dim=dims["weapon_in"], d_model=d_model, d_hidden=head.d_hidden,
-        activation=head.activation,
-        feasibility_mask=getattr(head, "feasibility_mask", False),
-        focal_gamma=getattr(head, "focal_gamma", 0.0),
-        pos_weight=getattr(head, "pos_weight", 0.0),
-        label=head.resolved_label)
-
-
 @register_head("attack", "attack_with")
 def _build_attack(head, dims, d_model):
+    # Declared-edge cat, plus the realized-alignment tail only when the head
+    # declares it (the intent-edge builders' coord-vs-base pattern). "aim2"
+    # (A″ forward-projected extension) reuses the same dims["aim_dim"] slot —
+    # slot_dims already sized it to AIM2_DIM when the spec resolved aim2_edge.
+    aim = dims["aim_dim"] if ("aim" in head.inputs or "aim2" in head.inputs) else 0
     return AttackWithHead(
-        in_dim=dims["weapon_in"], d_model=d_model, d_hidden=head.d_hidden,
+        in_dim=dims["weapon_coord_in"] if aim else dims["weapon_in"],
+        d_hidden=head.d_hidden,
         activation=head.activation,
         feasibility_mask=getattr(head, "feasibility_mask", False),
         focal_gamma=getattr(head, "focal_gamma", 0.0),
         pos_weight=getattr(head, "pos_weight", 0.0),
+        aim_dim=aim,
+        dart_p=getattr(head, "dart_p", 0.0),
+        align_weight_gamma=getattr(head, "align_weight_gamma", 0.0),
         label=head.resolved_label)

@@ -108,6 +108,8 @@ def _freeze_for_mode(
     ``heads``: only the trained heads' modules get policy gradients — the
     trunk (encoder/GRU/pointer) and every frozen head stay byte-identical,
     which is the behavior-preserving default for fine-tuning.
+    ``fire_bias``: only the model-owned fire intercept trains; the conditional
+    timing logits and weapon selection are frozen.
     ``full``: everything trains (later gens; drift monitored by eval).
     """
     net = policy.model
@@ -126,8 +128,19 @@ def _freeze_for_mode(
                 )
             for p in mod.parameters():
                 p.requires_grad_(True)
+    elif trainable == "fire_bias":
+        for p in net.parameters():
+            p.requires_grad_(False)
+        fire_bias = getattr(getattr(net, "attack_head", None), "fire_bias", None)
+        if not isinstance(fire_bias, torch.nn.Parameter):
+            raise RuntimeError(
+                "trainable='fire_bias' requires attack_head.fire_bias"
+            )
+        fire_bias.requires_grad_(True)
     else:
-        raise ValueError(f"trainable must be 'heads' or 'full', got {trainable!r}")
+        raise ValueError(
+            f"trainable must be 'fire_bias', 'heads', or 'full', got {trainable!r}"
+        )
     return [p for p in net.parameters() if p.requires_grad]
 
 
@@ -202,15 +215,237 @@ def run_native_ppo(
     policy.autocast_dtype = learner_dtype
     # Project standard: op input mask is always on (feedback_input_mask_always_on).
     policy.input_mask = True
+    # act() has no default decode facade — frozen heads execute the seed
+    # generation's BC decode during rollouts. The loaded checkpoint carries
+    # its own graph, so resolve the arch from THAT (no run-dir sniffing:
+    # qnn.run.init copies seeds into runs/ppo/<name>/seed/, where no
+    # probe.json exists).
+    def _inject_decode(p: QNNPolicy) -> None:
+        spec = getattr(p, "graph", None)
+        attack_head = spec.head("attack") if spec is not None else None
+        is_a25 = spec is not None and (
+            spec.head("move_seg") is not None
+            or (attack_head is not None and attack_head.type == "attack_with")
+        )
+        if not is_a25:
+            raise RuntimeError(
+                "cannot determine the seed checkpoint's decode arch from its "
+                "graph (no move_seg head and no attack_with attack head); "
+                "a24 is retired — only a25-arch seeds train under native PPO"
+            )
+        import qnn.model.decode_actions as _decode_mod
+        p._decode_mod = _decode_mod
+
+    # PPO must collect under the same frozen decode operating point retained
+    # eval/export will use. Historically PPO installed only the geometry module,
+    # so attack trained as a raw 9-way categorical while eval applied the fitted
+    # fire vector (SG +4.5312 in the current pin). That made the learner optimize
+    # a different decision boundary from the deployed bot.
+    decode_regime = str(ppo_cfg.get("eval_decode_regime", "") or "").strip()
+
+    def _inject_runtime_decode(p: QNNPolicy):
+        _inject_decode(p)
+        if not decode_regime:
+            return None
+        from qnn.model.decode_config import (
+            apply_policy_decode_params,
+            install_policy_decode_modules,
+        )
+        resolved = install_policy_decode_modules(p, decode_regime)
+        if resolved is not None:
+            apply_policy_decode_params(p, resolved)
+        return resolved
+
+    resolved_decode = _inject_runtime_decode(policy)
+
+    # Promote decode-fit's family intercept into checkpoint-owned model state.
+    # This is a fresh-run initializer only: resume restores the learned tensor
+    # from ppo_state below.  Requiring every legacy external fire offset to be
+    # zero prevents two hidden operating points from adding together.
+    model_fire_bias_init = ppo_cfg.get("model_fire_bias_init")
+    if model_fire_bias_init is not None:
+        values = [float(x) for x in model_fire_bias_init]
+        if len(values) != 8:
+            raise ValueError(
+                f"model_fire_bias_init must contain 8 values, got {len(values)}"
+            )
+        external = {
+            "attack.bias": float(policy.attack_bias),
+            "attack.bias_vec": list(policy.attack_bias_vec or [0.0] * 8),
+            "attack.fire_bias_vec": list(policy.attack_fire_bias_vec or [0.0] * 8),
+        }
+        if (external["attack.bias"] != 0.0
+                or any(float(x) != 0.0 for x in external["attack.bias_vec"])
+                or any(float(x) != 0.0 for x in external["attack.fire_bias_vec"])):
+            raise RuntimeError(
+                "model_fire_bias_init requires zero external attack.bias, "
+                "attack.bias_vec, and attack.fire_bias_vec; got "
+                f"{external}"
+            )
+        fire_bias = getattr(getattr(policy.model, "attack_head", None),
+                            "fire_bias", None)
+        if not isinstance(fire_bias, torch.nn.Parameter):
+            raise RuntimeError(
+                "model_fire_bias_init requires an attack_with head carrying "
+                "the model-owned fire_bias parameter"
+            )
+        if not resume:
+            with torch.no_grad():
+                fire_bias.copy_(fire_bias.new_tensor(values))
+        print(
+            "[ppo] model-owned fire calibration "
+            f"{'restored on resume' if resume else 'initialized'}: {values}; "
+            "external fire decode = zero"
+        )
 
     # ── RL config ─────────────────────────────────────────────────────
     rl_head_weights = _head_weight_map(
         ppo_cfg.get("rl_head_weights"),
         default={"attack": 1.0, "move": 1.0},
     )
-    adapters = build_adapters(rl_head_weights)
+    attack_impulse_raw = ppo_cfg.get("rl_attack_impulse")
+    attack_impulse = (
+        None if attack_impulse_raw is None else int(attack_impulse_raw)
+    )
+    if attack_impulse is not None and resolved_decode is None:
+        raise RuntimeError(
+            "rl_attack_impulse requires eval_decode_regime: the fixed-weapon "
+            "policy must train against an explicit deployed operating point"
+        )
+    adapters = build_adapters(
+        rl_head_weights,
+        attack_impulse=attack_impulse,
+        attack_bias=float(policy.attack_bias),
+        attack_bias_vec=policy.attack_bias_vec,
+        attack_fire_bias_vec=policy.attack_fire_bias_vec,
+    )
+    if attack_impulse is not None:
+        attack_adapter = adapters.get("attack")
+        if attack_adapter is None:
+            raise RuntimeError(
+                "rl_attack_impulse is set but rl_head_weights does not enable "
+                "the attack adapter"
+            )
+        print(
+            "[ppo] decode-aligned fixed-weapon attack policy: "
+            f"impulse={attack_impulse} "
+            f"offset={getattr(attack_adapter, 'decode_offset', float('nan')):.6f} "
+            f"decode={decode_regime}"
+        )
     if not adapters:
         raise RuntimeError("rl_head_weights enables no heads — nothing to train")
+    anchor_kl_coef = _head_weight_map(ppo_cfg.get("anchor_kl_coef"), default={})
+    # Rung-3 trigger objective: fit P(attack | alignment) to a measured human
+    # curve. Absent = off and the loss is byte-identical.
+    pfire_coef = float(ppo_cfg.get("pfire_coef", 0.0))
+    pfire_target = None
+    if pfire_coef != 0.0:
+        from qnn.ppo.pfire_target import PFireTarget
+        cfg_block = ppo_cfg.get("pfire_target")
+        if not cfg_block:
+            raise RuntimeError(
+                "pfire_coef is set but pfire_target is missing — the human "
+                "curve the trigger objective is fit against must be named"
+            )
+        pfire_target = PFireTarget.from_config(cfg_block)
+        print(f"[ppo] trigger objective on (coef {pfire_coef}): "
+              f"{pfire_target.family} {pfire_target.skill_label} "
+              f"<- {pfire_target.source}")
+    fire_occupancy_coef = float(ppo_cfg.get("fire_occupancy_coef", 0.0))
+    fire_occupancy_project = bool(ppo_cfg.get("fire_occupancy_project", False))
+    fire_occupancy_project_max_delta = float(
+        ppo_cfg.get("fire_occupancy_project_max_delta", 0.0)
+    )
+    if fire_occupancy_project_max_delta < 0.0:
+        raise ValueError("fire_occupancy_project_max_delta must be >= 0")
+    fire_occupancy_temperature = float(
+        ppo_cfg.get("fire_occupancy_temperature", 1.0)
+    )
+    fire_occupancy_best_rel_tol_raw = ppo_cfg.get(
+        "fire_occupancy_best_rel_tol"
+    )
+    fire_occupancy_best_rel_tol = (
+        None if fire_occupancy_best_rel_tol_raw is None
+        else float(fire_occupancy_best_rel_tol_raw)
+    )
+    if (fire_occupancy_best_rel_tol is not None
+            and fire_occupancy_best_rel_tol < 0.0):
+        raise ValueError("fire_occupancy_best_rel_tol must be >= 0")
+    if fire_occupancy_temperature <= 0.0:
+        raise ValueError(
+            "fire_occupancy_temperature must be > 0, got "
+            f"{fire_occupancy_temperature}"
+        )
+    fire_occupancy_target = None
+    fire_occupancy_projection_targets = None
+    if fire_occupancy_coef != 0.0 or fire_occupancy_project:
+        tick_hz = float(ppo_cfg["fixed_tick_hz"])
+        if attack_impulse is None:
+            # General 9-way multi-weapon PPO (crest-finetune-allweapons
+            # iteration 2): no single family cadence exists, so the scalar
+            # fire_occupancy_target path is replaced by a per-weapon
+            # projection-targets block. The per-tick occupancy LOSS
+            # (fire_occupancy_coef) only ever scores ONE weapon's ticks
+            # (basis="bolt", fixed-weapon only) — it has no multi-weapon
+            # form, so it stays fixed-weapon-only here too.
+            if fire_occupancy_coef != 0.0:
+                raise RuntimeError(
+                    "fire_occupancy_coef is set for the general (multi-"
+                    "weapon) attack adapter: the per-tick occupancy LOSS "
+                    "only supports a fixed-weapon policy — use "
+                    "fire_occupancy_project + "
+                    "fire_occupancy_projection_targets instead "
+                    "(agents/plans/crest-finetune-allweapons.md)"
+                )
+            from qnn.ppo.pfire_target import load_fire_occupancy_projection_targets
+            cfg_block = ppo_cfg.get("fire_occupancy_projection_targets")
+            if not cfg_block:
+                raise RuntimeError(
+                    "fire_occupancy_project is set for the general attack "
+                    "adapter but fire_occupancy_projection_targets is "
+                    "missing — the per-weapon human cadence rulers must be "
+                    "named"
+                )
+            fire_occupancy_projection_targets = (
+                load_fire_occupancy_projection_targets(cfg_block)
+            )
+            for weapon, target in fire_occupancy_projection_targets.items():
+                if target.tick_hz != tick_hz:
+                    raise RuntimeError(
+                        "fire occupancy tick_hz must match PPO "
+                        f"fixed_tick_hz for {weapon}: {target.tick_hz} != "
+                        f"{tick_hz}"
+                    )
+            print(
+                "[ppo] per-weapon human fire occupancy projection on: "
+                + ", ".join(
+                    f"{w}={t.probability:.6f}/tick({t.basis})"
+                    for w, t in sorted(fire_occupancy_projection_targets.items())
+                )
+                + f"; temperature={fire_occupancy_temperature}"
+            )
+        else:
+            from qnn.ppo.pfire_target import FireOccupancyTarget
+            cfg_block = ppo_cfg.get("fire_occupancy_target")
+            if not cfg_block:
+                raise RuntimeError(
+                    "fire_occupancy_coef is set but fire_occupancy_target is "
+                    "missing — the human cadence ruler must be named"
+                )
+            fire_occupancy_target = FireOccupancyTarget.from_config(cfg_block)
+            if fire_occupancy_target.tick_hz != tick_hz:
+                raise RuntimeError(
+                    "fire occupancy tick_hz must match PPO fixed_tick_hz: "
+                    f"{fire_occupancy_target.tick_hz} != {tick_hz}"
+                )
+            print(
+                f"[ppo] human fire occupancy constraint on (coef "
+                f"{fire_occupancy_coef}): {fire_occupancy_target.weapon} "
+                f"p={fire_occupancy_target.probability:.6f} "
+                f"({fire_occupancy_target.rate_per_s:.6f}/s) <- "
+                f"{fire_occupancy_target.source}; "
+                f"temperature={fire_occupancy_temperature}"
+            )
     update_cfg = PPOUpdateConfig(
         clip_ratio=float(ppo_cfg.get("clip_ratio", 0.2)),
         ppo_epochs=int(ppo_cfg.get("ppo_epochs", 3)),
@@ -221,7 +456,38 @@ def run_native_ppo(
         rl_head_weights=rl_head_weights,
         entropy_coef=_head_weight_map(ppo_cfg.get("entropy_coef"), default={}),
         temperatures=_head_weight_map(ppo_cfg.get("rl_temperatures"), default={}),
+        anchor_kl_coef=anchor_kl_coef,
+        pfire_coef=pfire_coef,
+        pfire_target=pfire_target,
+        fire_occupancy_coef=fire_occupancy_coef,
+        fire_occupancy_target=fire_occupancy_target,
+        fire_occupancy_temperature=fire_occupancy_temperature,
+        fire_occupancy_project=fire_occupancy_project,
+        fire_occupancy_project_max_delta=fire_occupancy_project_max_delta,
+        fire_occupancy_projection_targets=fire_occupancy_projection_targets,
+        value_af=bool(ppo_cfg.get("value_af", False)),
     )
+    if update_cfg.value_af:
+        print("[ppo] value_af on: V(s) reads self_arsenal_scalars[...,0] "
+              "(remaining refire); trainer-owned, never a policy input")
+    # Anchor for the KL fine-tune (rung 3): the frozen seed checkpoint —
+    # ALWAYS reloaded from seed_path (resume-safe; the anchor never drifts
+    # with the trained policy). Runs grad-free on the learner device.
+    anchor_policy = None
+    if any(float(v) != 0.0 for v in anchor_kl_coef.values()):
+        anchor_policy = QNNPolicy.load(seed_path, device=str(device))
+        anchor_policy.model.to(device)
+        anchor_policy.model.eval()
+        anchor_policy.model.requires_grad_(False)
+        anchor_policy.input_mask = True
+        print(f"[ppo] anchor KL on {anchor_kl_coef} (anchor = {seed_path})")
+
+    # Crest-law discharge shaping (rung 3) — process backend only.
+    crest_shaper = None
+    if ppo_cfg.get("crest_reward"):
+        from qnn.ppo.crest_reward import CrestRewardShaper
+        crest_shaper = CrestRewardShaper.from_config(ppo_cfg["crest_reward"])
+        print(f"[ppo] crest reward on: {dict(ppo_cfg['crest_reward'])}")
     gamma = float(ppo_cfg.get("gamma", 0.99))
     gae_lambda = float(ppo_cfg.get("gae_lambda", 0.95))
     base_lr = float(ppo_cfg.get("policy_lr", 1e-4))
@@ -241,6 +507,11 @@ def run_native_ppo(
     # ── env ───────────────────────────────────────────────────────────
     reward_weights = RewardWeights.from_json(str(ppo_cfg["reward_json_path"]))
     if str(ppo_cfg.get("env_backend", "process")) == "arena_grid":
+        if crest_shaper is not None:
+            raise RuntimeError(
+                "crest_reward is implemented for the process backend only — "
+                "arena_grid does not expose the pre-step obs/attack hook"
+            )
         from qnn.ppo.arena_backend import ArenaGridBackend
 
         vec_env = ArenaGridBackend(
@@ -277,6 +548,7 @@ def run_native_ppo(
             reward_weights=reward_weights,
             mode=str(ppo_cfg.get("mode", "pvp")),
             seed=seed,
+            crest_shaper=crest_shaper,
         )
 
     history_path = output_dir / "ppo_history.json"
@@ -287,8 +559,9 @@ def run_native_ppo(
         policy.model.eval()
         with torch.inference_mode():
             features, _, _, _, _ = policy._forward_tensors(dict(obs0), hidden=None)
+        value_in_dim = int(features.shape[-1]) + (1 if update_cfg.value_af else 0)
         value_head = ValueHead(
-            features.shape[-1], int(ppo_cfg.get("value_head_hidden", 256)),
+            value_in_dim, int(ppo_cfg.get("value_head_hidden", 256)),
         ).to(device)
 
         # ── trainability + optimizer ──────────────────────────────────
@@ -333,8 +606,9 @@ def run_native_ppo(
             collect_policy.model.to(collect_device)
             collect_policy.autocast_dtype = collector_dtype
             collect_policy.input_mask = True
+            _inject_runtime_decode(collect_policy)
             collect_value_head = ValueHead(
-                features.shape[-1], int(ppo_cfg.get("value_head_hidden", 256)),
+                value_in_dim, int(ppo_cfg.get("value_head_hidden", 256)),
             ).to(collect_device)
 
             def _sync_collect_replica() -> None:
@@ -374,6 +648,7 @@ def run_native_ppo(
             sample_temperatures=_head_weight_map(
                 ppo_cfg.get("sample_temperatures"), default={},
             ),
+            value_af=update_cfg.value_af,
         )
         d_gru = int(getattr(policy.model, "d_gru", 0))
         device_buffer_count = (
@@ -422,6 +697,7 @@ def run_native_ppo(
             metrics = ppo_update(
                 policy, value_head, active_buffer, adapters, optimizer, update_cfg,
                 mb_generator=mb_gen,
+                anchor_model=anchor_policy.model if anchor_policy else None,
             )
             return metrics, time.monotonic() - t0
 
@@ -472,6 +748,15 @@ def run_native_ppo(
                     else 0.9 * return_ema + 0.1 * ep_return
                 )
                 row["return_ema"] = round(return_ema, 4)
+            occupancy_best_ok = True
+            if (fire_occupancy_best_rel_tol is not None
+                    and fire_occupancy_target is not None):
+                observed = row.get("fire_occupancy/q_mean")
+                occupancy_best_ok = observed is not None and abs(
+                    float(observed) - fire_occupancy_target.probability
+                ) <= (fire_occupancy_best_rel_tol
+                      * fire_occupancy_target.probability)
+                row["fire_occupancy/best_gate"] = float(occupancy_best_ok)
             history.append(row)
             _atomic_write_json(history_path, {"history": history})
             print(
@@ -485,7 +770,11 @@ def run_native_ppo(
                 flush=True,
             )
 
-            improved = return_ema is not None and return_ema > best_score
+            improved = (
+                occupancy_best_ok
+                and return_ema is not None
+                and return_ema > best_score
+            )
             if improved:
                 best_score = float(return_ema)
                 best_dir = output_dir / "best"
@@ -499,6 +788,37 @@ def run_native_ppo(
                         "seed_checkpoint": seed_path,
                         "trainable": trainable,
                         "rl_head_weights": rl_head_weights,
+                        "rl_attack_impulse": attack_impulse,
+                        "eval_decode_regime": decode_regime or None,
+                        "decode_sha256": (
+                            resolved_decode.sha256 if resolved_decode else None
+                        ),
+                        "anchor_kl_coef": anchor_kl_coef,
+                        "pfire_coef": pfire_coef,
+                        "pfire_target": (pfire_target.provenance()
+                                         if pfire_target else None),
+                        "fire_occupancy_coef": fire_occupancy_coef,
+                        "fire_occupancy_target": (
+                            fire_occupancy_target.provenance()
+                            if fire_occupancy_target else None
+                        ),
+                        "fire_occupancy_projection_targets": (
+                            {
+                                w: t.provenance() for w, t in
+                                fire_occupancy_projection_targets.items()
+                            } if fire_occupancy_projection_targets else None
+                        ),
+                        "fire_occupancy_temperature": fire_occupancy_temperature,
+                        "fire_occupancy_project": fire_occupancy_project,
+                        "fire_occupancy_project_max_delta": (
+                            fire_occupancy_project_max_delta
+                        ),
+                        "fire_occupancy_best_rel_tol": fire_occupancy_best_rel_tol,
+                        "model_fire_bias_init": (
+                            [float(x) for x in model_fire_bias_init]
+                            if model_fire_bias_init is not None else None
+                        ),
+                        "crest_reward": dict(ppo_cfg.get("crest_reward") or {}),
                     },
                 })
             if improved or iteration % checkpoint_interval == 0:
@@ -690,6 +1010,11 @@ def run_native_ppo(
             "pipeline_depth": pipeline_depth,
             "pipeline_host_staging": pipeline_host_staging,
             "rl_head_weights": rl_head_weights,
+            "rl_attack_impulse": attack_impulse,
+            "eval_decode_regime": decode_regime or None,
+            "decode_sha256": resolved_decode.sha256 if resolved_decode else None,
+            "anchor_kl_coef": anchor_kl_coef,
+            "crest_reward": dict(ppo_cfg.get("crest_reward") or {}),
             "device": str(device),
         })
         _atomic_write_json(output_dir / "ppo_summary.json", summary)

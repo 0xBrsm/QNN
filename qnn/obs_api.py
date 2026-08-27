@@ -788,7 +788,7 @@ def _shim_declaration(*, with_self_weapon_id: bool, yaw: int, packed: bool,
 # The 12.x rows carry the full 13-field state (self_weapon_id was a
 # consumed input on the a26 line); the 13.x rows drop it (the a27
 # 9-way attack-with head IS the select-and-fire decision — no
-# held-weapon input in the a27 obs contract).
+# engine-equipped-weapon input in the a27 obs contract).
 WIRE_SHIM: dict[str, WireShimRow] = {
     row.wire_id: row for row in (
         WireShimRow("wire.12.1", "semantics.1", _shim_declaration(
@@ -998,10 +998,16 @@ def _run_checkpoint_sidecar(run_dir: Path) -> Path:
     candidates = sorted(ckpt_dir.glob("best_*.json"))
     if len(candidates) == 1:
         return candidates[0]
+    # PPO run layout: the best checkpoint (and its meta sidecar) live one
+    # level deeper, at checkpoints/best/best_model.json (qnn.ppo.train's
+    # best-dir save). Additive fallback — BC layouts never have it.
+    ppo_best = ckpt_dir / "best" / "best_model.json"
+    if ppo_best.is_file():
+        return ppo_best
     raise ValueError(
         f"declaration_for_run: cannot pick a checkpoint sidecar in {ckpt_dir} "
-        f"(found {[c.name for c in candidates]}); need exactly one best_*.json "
-        "or a run.json naming the run_id"
+        f"(found {[c.name for c in candidates]}); need exactly one best_*.json, "
+        "a run.json naming the run_id, or a PPO best/best_model.json"
     )
 
 

@@ -52,7 +52,7 @@ def _resolve_probe_model(probe: dict[str, Any]):
 
     A probe is a delta on a committed base graph:
 
-        {"base": "full_5head", "overrides": {...}}
+        {"base": "core", "overrides": {...}}
 
     ``overrides`` deep-merges onto the base (``null`` deletes a node) and
     the merged graph is validated/built by ``qnn.model.graph``. The graph

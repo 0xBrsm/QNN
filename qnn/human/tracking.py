@@ -66,7 +66,7 @@ NN = len(I.NORM_EDGES) - 1
 N_OFF = 2 * K_MAX + 1                      # crest-offset bins: −K_MAX..+K_MAX
 
 
-def _episode(cnt, rel, vel, typ, rec, wid, hx, af):
+def _episode(cnt, rel, vel, typ, rec, weapon, hx, af):
     """Per (weapon, half) window/discharge hbw histograms + crest-offset
     counts for one episode. Returns
     ``{"win": {k: {w: (2, NN)}}, "dis": {w: (2, NN)}, "off": {w: (N_OFF,)}}``
@@ -77,12 +77,17 @@ def _episode(cnt, rel, vel, typ, rec, wid, hx, af):
     ar *= (1.0 / A._DIST_SCALE)
     av *= (1.0 / A._VEL_SCALE)
 
-    af = np.asarray(af, np.float32)
-    if af.ndim == 2:
-        af = af[:, 0]
-    discharge = np.zeros(T, bool)
-    if T > 1:
-        discharge[1:] = af[1:] > (af[:-1] + 1e-4)
+    # Discharge = the attack-with INTENT (action.attack nonzero 1..8 ONLY on
+    # the fired tick), the SAME intent-keyed discharge as qnn.human.intercept
+    # (a27 attack-with reframe). The legacy attack_finished-rising-edge +
+    # self_weapon_id-obs discharge this baseline was first written against no
+    # longer resolves: self_weapon_id is absent from the a27+ pure-combat obs
+    # contract (wire.13.x drops it), and attack_finished's cooldown-reset tick
+    # reads act_attack already back at 0 (no per-weapon attribution). `af` is
+    # retained in the signature for the caller contract but is no longer the
+    # discharge source (see intercept.py's _episode for the full rationale).
+    wv = np.asarray(weapon, dtype=np.int64).reshape(-1)
+    discharge = (wv >= 1) & (wv <= 8)
     has = lo.any(1)
     di = np.where(discharge & has)[0]
 
@@ -93,7 +98,7 @@ def _episode(cnt, rel, vel, typ, rec, wid, hx, af):
     if not len(di):
         return {"win": win, "dis": dis, "off": off}
 
-    imp_d = I._WI[wid[di]]                       # weapon impulse per discharge
+    imp_d = wv[di]                                # weapon impulse per discharge (== the fired action)
     # per-weapon discharge ordinal parity (EVEN/ODD split-half, as intercept)
     half_d = np.zeros(len(di), np.int64)
     for w in I.ALL_IMP:
@@ -165,7 +170,8 @@ def _worker(args):
     for _ei, dmi, fsl, esl, arr in A.iter_shard_episodes(
             sh, dd,
             obs=("entity_rel", "entity_vel", "entity_types", "entity_recency",
-                 "self_weapon_id", "entity_half_extents", "attack_finished")):
+                 "entity_half_extents", "attack_finished"),
+            acts=("attack",)):
         hx = np.asarray(arr["entity_half_extents"][esl])
         hx_h = hx[:, 0] if hx.ndim == 2 else hx
         out = _episode(np.asarray(arr["entity_count"][fsl], np.int64),
@@ -173,7 +179,7 @@ def _worker(args):
                        np.asarray(arr["entity_vel"][esl]),
                        np.asarray(arr["entity_types"][esl]),
                        np.asarray(arr["entity_recency"][esl]),
-                       np.asarray(arr["self_weapon_id"][fsl]),
+                       np.asarray(arr["attack"][fsl]),
                        np.asarray(hx_h, np.float32),
                        np.asarray(arr["attack_finished"][fsl]))
         b = res.setdefault(int(dmi), {"win": {k: {} for k in K_TICKS},

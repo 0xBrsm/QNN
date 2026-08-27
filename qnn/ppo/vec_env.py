@@ -25,16 +25,15 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 
-from engine.bridge import NativeObsBufferProcess
+import threading
+
+from engine.bridge import NativeEngineError, NativeObsBufferProcess
 from qnn.env.reward import RewardWeights
 from qnn.env.world import NativeWorldEnv
+from qnn.obs_api import DEFAULT_LAYOUT
 from qnn.ppo.env_backend import EnvStepBatch, EpisodeResult
 from qnn.run.metrics import EpisodeStatAccumulator
-from qnn.wire import (
-    OBS_BUFFER_SIZE,
-    unpack_obs_buffer_native,
-    unpack_obs_buffer_native_batch,
-)
+from qnn.wire import OBS_BUFFER_SIZE, unpack_frame, unpack_frame_batch
 from qnn.schema import SPATIAL_TOKEN_COUNT  # noqa: F401  (obs contract anchor)
 from qnn.vocab import MAX_TOKEN_OBJECTS
 
@@ -109,9 +108,18 @@ class VecQuakeEnv:
         reward_weights: RewardWeights,
         mode: str,
         seed: int,
+        crest_shaper: "Any | None" = None,
     ) -> None:
         if num_lanes < 1:
             raise ValueError("num_lanes must be >= 1")
+        # Crest-law discharge shaping (fire-at-alignment rung 3): scored on
+        # the PRE-step obs with the submitted attack classes, added to the
+        # engine reward before booking. None = off, rewards byte-identical.
+        self._crest_shaper = crest_shaper
+        # Always on: the trigger objective's p_fire denominator is independent
+        # of whether crest reward shaping is enabled.
+        from qnn.ppo.align_hbw import AlignHbw
+        self._align = AlignHbw()
         self.num_lanes = int(num_lanes)
         self._lane_states: List[_LaneState] = []
         self.envs: List[NativeWorldEnv] = []
@@ -163,12 +171,54 @@ class VecQuakeEnv:
         self._episode_ids = np.full(self.num_lanes, -1, dtype=np.int64)
         self._inflight_sent: np.ndarray | None = None
         self._inflight_episode_ids: np.ndarray | None = None
+        self._inflight_attack: np.ndarray | None = None
+        # Drain watchdog (rung3a_scout_s43 postmortem): a worker that goes
+        # SILENT — alive but never replying — wedges the serial drain
+        # forever (`_read_exact` has no deadline, and select-on-a-
+        # BufferedReader is unsound). The watchdog kills the worker the
+        # main thread has been stuck reading for > deadline; the read then
+        # hits EOF, raises NativeEngineError, and the drain's heal path
+        # books a terminal frame + full lane respawn. No hot-path cost.
+        self._drain_deadline_s = 90.0
+        self._drain_lane: int | None = None
+        self._drain_started = 0.0
+        self._watchdog_stop = threading.Event()
+        self._watchdog = threading.Thread(
+            target=self._drain_watchdog, name="qnn-vec-env-watchdog", daemon=True,
+        )
+        self._watchdog.start()
+
+    def _drain_watchdog(self) -> None:
+        while not self._watchdog_stop.wait(10.0):
+            lane = self._drain_lane
+            if lane is None:
+                continue
+            stuck_s = time.monotonic() - self._drain_started
+            if stuck_s <= self._drain_deadline_s:
+                continue
+            # The main thread cannot advance past this lane's read, so the
+            # lane is provably the one being drained — killing its worker is
+            # race-free (a completed read would have advanced _drain_lane).
+            proc = getattr(self.envs[lane].adapter.process, "proc", None)
+            if proc is not None:
+                print(
+                    f"[vec-env] WATCHDOG: lane {lane} engine silent for "
+                    f"{stuck_s:.0f}s — killing worker to unwedge the drain",
+                    flush=True,
+                )
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def reset_timings(self) -> None:
         self._timings.clear()
 
     def timing_snapshot(self) -> Dict[str, float]:
-        return dict(self._timings)
+        out = dict(self._timings)
+        if self._crest_shaper is not None:
+            out.update(self._crest_shaper.snapshot())
+        return out
 
     def _time_add(self, key: str, started: float) -> None:
         self._timings[key] = self._timings.get(key, 0.0) + (time.perf_counter() - started)
@@ -213,7 +263,11 @@ class VecQuakeEnv:
             state.length = 0
             state.return_value = 0.0
         self._episode_ids += 1
-        return self._stack_obs(obs_list)
+        stacked = self._stack_obs(obs_list)
+        # The first submit() acts on this obs — keep it as the pre-step
+        # frame so crest shaping (and held-lane replay) always has one.
+        self._prev_obs = {k: v.copy() for k, v in stacked.items()}
+        return stacked
 
     @staticmethod
     def _finish_lane(
@@ -290,6 +344,8 @@ class VecQuakeEnv:
 
         self._inflight_sent = sent
         self._inflight_episode_ids = self._episode_ids.copy()
+        if self._crest_shaper is not None:
+            self._inflight_attack = np.asarray(action_batch["attack"]).copy()
 
     def receive(self) -> EnvStepBatch:
         """Drain the submitted step and return a backend-neutral batch."""
@@ -300,14 +356,42 @@ class VecQuakeEnv:
 
         pending = self._pending_resets
         _stage = time.perf_counter()
-        raws = np.empty((self.num_lanes, OBS_BUFFER_SIZE), dtype=np.uint8)
+        # zeros, not empty: held lanes (async reset in flight) never drain a
+        # reply, and the batch unpack walks EVERY row before held rows are
+        # replaced from _prev_obs — a dirty buffer row is garbage entity
+        # tags ("invalid token tag"). A zero row is a valid empty frame.
+        raws = np.zeros((self.num_lanes, OBS_BUFFER_SIZE), dtype=np.uint8)
         results: List[LaneStep | None] = [None] * self.num_lanes
         for lane, env in enumerate(self.envs):
             if not sent[lane]:
                 continue
-            raw, reward, done, info = env.step_recv_raw()
+            self._drain_started = time.monotonic()
+            self._drain_lane = lane
+            try:
+                raw, reward, done, info = env.step_recv_raw()
+            except (NativeEngineError, OSError) as exc:
+                # Dead OR watchdog-killed silent worker. Book a zero-reward
+                # terminal frame (raws row stays zeros — a valid empty
+                # frame) and tear the process down so the ordinary
+                # death path's async env.reset() spawns a FRESH worker
+                # (shutdown() → proc=None → reset restarts).
+                print(
+                    f"[vec-env] lane {lane} engine failed during drain "
+                    f"({exc}); respawning lane",
+                    flush=True,
+                )
+                try:
+                    env.adapter.process.shutdown()
+                except Exception:
+                    pass
+                results[lane] = self._finish_lane(
+                    None, 0.0, True,
+                    {"done_reason": "engine_dead", "player_died": False},
+                )
+                continue
             raws[lane] = np.frombuffer(raw, dtype=np.uint8)
             results[lane] = self._finish_lane(None, reward, done, info)
+        self._drain_lane = None
         self._time_add("drain_s", _stage)
 
         # Match-scoped arenas never enter the expensive map/sign-on reset
@@ -337,7 +421,16 @@ class VecQuakeEnv:
             raws[lane] = np.frombuffer(future.result(), dtype=np.uint8)
 
         _stage = time.perf_counter()
-        obs_b = unpack_obs_buffer_native_batch(raws)
+        # Generic codec at DEFAULT_LAYOUT, NOT the legacy
+        # unpack_obs_buffer_native_batch wrapper: that wrapper drops
+        # self_weapon_id ("occupies the frame byte; not consumed" — the a27+
+        # combat model never takes it as an input feature). PPO's per-weapon
+        # fire-occupancy projection (crest-finetune-allweapons iteration 2)
+        # needs the EQUIPPED weapon per tick to bin engaged ticks by weapon, so
+        # this obs dict keeps the byte as trainer-side bookkeeping; it rides
+        # through _obs_tensors_dequant untouched (Network.forward only reads
+        # keys it explicitly names, so the extra key is inert for the model).
+        obs_b = unpack_frame_batch(raws, DEFAULT_LAYOUT)
         self._time_add("unpack_s", _stage)
         _stage = time.perf_counter()
         hold = np.zeros(self.num_lanes, dtype=bool)
@@ -348,7 +441,27 @@ class VecQuakeEnv:
             if fut.done():
                 fresh = pad_entities(fut.result())
                 for k, v in obs_b.items():
-                    v[lane] = fresh[k]
+                    if k in fresh:
+                        v[lane] = fresh[k]
+                    elif k == "self_weapon_id":
+                        # NativeWorldEnv.reset() (a per-lane episode reset,
+                        # unlike the vectorized step()-drain unpack above)
+                        # still routes through engine.bridge's default
+                        # unpack_obs_buffer_native, which drops this byte —
+                        # fixing that negotiation needs a live-engine-
+                        # verified declaration change, out of scope here.
+                        # 0 = ENTITY_IDS "NONE" -> impulse 0 via
+                        # self_weapon_id_to_impulse, a value no configured
+                        # weapon target matches, so the lane's first
+                        # post-reset tick is safely EXCLUDED from every
+                        # weapon's fire-occupancy projection population
+                        # rather than misattributed to the wrong weapon.
+                        v[lane] = 0
+                    else:
+                        raise KeyError(
+                            f"fresh reset obs for lane {lane} is missing "
+                            f"obs_b key {k!r}"
+                        )
                 del pending[lane]
                 self._episode_ids[lane] += 1
             elif self._prev_obs is not None:
@@ -361,7 +474,7 @@ class VecQuakeEnv:
             if r is not None and r.truncated:
                 if lane in truncation_raw:
                     r.final_obs = pad_entities(
-                        unpack_obs_buffer_native(truncation_raw[lane])
+                        unpack_frame(truncation_raw[lane], DEFAULT_LAYOUT)
                     )
                 else:
                     r.final_obs = {k: v[lane].copy() for k, v in obs_b.items()}
@@ -383,15 +496,33 @@ class VecQuakeEnv:
         # Held filler frames: terminal (GAE cuts, nothing carries), zero
         # reward, no stats booked, no episode emitted.
         terminal[hold] = True
+        align_hbw = (
+            self._align.all_los(self._prev_obs, sent)
+            if self._prev_obs is not None
+            else np.full(self.num_lanes, np.nan, dtype=np.float32)
+        )
+        crest_bonus = None
+        if self._crest_shaper is not None:
+            if self._prev_obs is None:
+                raise RuntimeError(
+                    "crest shaping needs the pre-step obs — reset() first"
+                )
+            crest_bonus = self._crest_shaper.bonuses(
+                self._prev_obs, self._inflight_attack, sent, episode_ids,
+            )
         for lane, r in enumerate(results):
             if r is None:
                 continue
             state = self._lane_states[lane]
             done = r.terminal or r.truncated
-            state.stats.add_step(reward=r.reward, info=r.info, terminal=done)
+            reward = r.reward + (
+                float(crest_bonus[lane]) + self._crest_shaper.hit_bonus(r.info)
+                if crest_bonus is not None else 0.0
+            )
+            state.stats.add_step(reward=reward, info=r.info, terminal=done)
             state.length += 1
-            state.return_value += r.reward
-            rewards[lane] = r.reward
+            state.return_value += reward
+            rewards[lane] = reward
             terminal[lane] = r.terminal
             truncated[lane] = r.truncated
             if r.final_obs is not None:
@@ -413,6 +544,7 @@ class VecQuakeEnv:
         self._prev_obs = obs_b
         self._inflight_sent = None
         self._inflight_episode_ids = None
+        self._inflight_attack = None
         return EnvStepBatch(
             env_ids=np.arange(self.num_lanes, dtype=np.int64),
             episode_ids=episode_ids,
@@ -423,6 +555,7 @@ class VecQuakeEnv:
             valid=~hold,
             final_obs_rows=final_rows,
             episodes=episodes,
+            align_hbw=align_hbw,
         )
 
     def step(
@@ -451,6 +584,7 @@ class VecQuakeEnv:
         )
 
     def close(self) -> None:
+        self._watchdog_stop.set()
         self._executor.shutdown(wait=True)
         for env in self.envs:
             env.close()

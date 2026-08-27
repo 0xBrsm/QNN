@@ -4,7 +4,7 @@ Given a declarative ``fields`` list (``obs_fields.FieldSource`` primitives)
 and the shared embedding tables, ``TokenBuilder`` produces a ``(B*, d_model)``
 token from an :class:`ObsAccessor`. It owns one ``Linear`` per
 ``ScalarGroup``; embedding tables are *tied* (passed in from the encoder, not
-re-declared) so held-weapon/entity-token rockets share one vocab.
+re-declared) so equipped-weapon/entity-token rockets share one vocab.
 
 This single module expresses every bench self-token and attack/look bundle
 that used to be a bespoke ``_build_self_block`` override or ``_*_token``

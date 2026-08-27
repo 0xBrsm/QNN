@@ -150,7 +150,7 @@ int QNN_AppendPlayerEntityUpdates(const qnn_snapshot_t *snapshot,
 		eu->half_extents[2] = half_extents[2];
 		eu->frags = (cl.scores != NULL) ? cl.scores[slot].frags : info->frags;
 		eu->in_fov = QNN_InFov(snapshot->player_origin,
-			snapshot->player_view_angles, anchor_origin);
+			snapshot->player_view_angles, anchor_origin, half_extents[2]);
 		count++;
 	}
 

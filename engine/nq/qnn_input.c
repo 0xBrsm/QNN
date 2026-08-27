@@ -17,28 +17,84 @@ static void QNN_PressButton(kbutton_t *button)
 	button->state |= 1 + 2;
 }
 
+/*
+ * `look` is the NEW forward direction expressed in the CURRENT view basis — a
+ * unit vector (dot·forward, dot·right, dot·up), exactly as qnn_collect_main.c
+ * builds the training label:
+ *
+ *     look = (dot(new_fwd, forward), dot(new_fwd, right), dot(new_fwd, up))
+ *
+ * The ONLY exact inverse is to undo that projection — rotate `look` back into
+ * world coordinates against the same basis, then read the angles off the
+ * resulting direction.  (forward, right, up) from AngleVectors is orthonormal,
+ * so the reconstruction is exact for any view attitude:
+ *
+ *     new_fwd = look[0]*forward + look[1]*right + look[2]*up
+ *     yaw     = atan2(new_fwd[1], new_fwd[0])
+ *     pitch   = asin(-new_fwd[2])          (Quake: forward[2] = -sin(pitch))
+ *
+ * TWO BUGS LIVED HERE (a26-superiority-decomposition.md E9/E10); both are
+ * fixed by using the real inverse rather than a decomposition:
+ *
+ *  E9 — pitch was derived as atan2f(pitch_comp, fwd), reusing the YAW
+ *  denominator.  fwd = look[0] = cos(total turn), so on a large turn it goes
+ *  to zero and the pitch term blew up toward ±90° regardless of the true
+ *  vertical component, then slammed the clamp.  It was exact only when
+ *  look[1] == 0 (there look[0]² + look[2]² = 1), so it corrupted precisely the
+ *  mixed yaw+pitch turns needed to track a target above you, and a pure-axis
+ *  test could not see it.  Against real human frames it correlated +0.20 with
+ *  true per-tick pitch change (−0.05 on turns >20°, commands up to 173.6°).
+ *
+ *  E10 — the recovered angles were then applied as INCREMENTS in absolute
+ *  view-angle space (viewangles[YAW] -= yaw_deg).  But `look` is relative to a
+ *  basis TILTED by the current pitch, so that is only valid from a level view.
+ *  From pitch −45° a 40° turn landed ~10° off; the error grew with pitch, so
+ *  it bit hardest while already looking up — the same case as E9.
+ *
+ * Setting the angles absolutely from the reconstruction (rather than
+ * accumulating deltas) also stops per-tick floating-point error from
+ * integrating over a fight.  ROLL is deliberately untouched: it is not part of
+ * the aim contract, and forward is independent of it in AngleVectors.
+ */
 void QNN_ApplyActionLook(const qnn_action_t *action, vec3_t viewangles)
 {
-	float fwd, yaw_comp, pitch_comp, yaw_deg, pitch_deg;
+	vec3_t forward, right, up, new_fwd;
+	float lx, ly, lz, len, yaw_deg, pitch_deg;
 
-	fwd = QNN_Clamp(action->look[0], -1.0f, 1.0f);
-	yaw_comp = QNN_Clamp(action->look[1], -1.0f, 1.0f);
-	pitch_comp = QNN_Clamp(-action->look[2], -1.0f, 1.0f);
+	lx = QNN_Clamp(action->look[0], -1.0f, 1.0f);
+	ly = QNN_Clamp(action->look[1], -1.0f, 1.0f);
+	lz = QNN_Clamp(action->look[2], -1.0f, 1.0f);
 
-	yaw_deg = atan2f(yaw_comp, fwd) * (180.0f / (float)M_PI);
-	pitch_deg = atan2f(pitch_comp, fwd) * (180.0f / (float)M_PI);
+	/* A hold is (1,0,0) — the no-turn label and the cleared action alike.
+	 * Return before touching the view so a held aim cannot drift. */
+	if (lx >= 1.0f && ly == 0.0f && lz == 0.0f)
+		return;
 
-	if (yaw_deg != 0.0f)
-		viewangles[YAW] = anglemod(viewangles[YAW] - yaw_deg);
+	/* The label is a unit vector by construction, but the model's decoded
+	 * output need not be; normalizing keeps asin in domain and makes the
+	 * recovered angles independent of the emitted magnitude. */
+	len = sqrtf(lx * lx + ly * ly + lz * lz);
+	if (len < 1e-6f)
+		return;                 /* degenerate: no direction to aim at */
+	lx /= len;
+	ly /= len;
+	lz /= len;
 
-	if (pitch_deg != 0.0f)
-	{
-		viewangles[PITCH] += pitch_deg;
-		if (viewangles[PITCH] > 80.0f)
-			viewangles[PITCH] = 80.0f;
-		if (viewangles[PITCH] < -70.0f)
-			viewangles[PITCH] = -70.0f;
-	}
+	AngleVectors(viewangles, forward, right, up);
+	new_fwd[0] = lx * forward[0] + ly * right[0] + lz * up[0];
+	new_fwd[1] = lx * forward[1] + ly * right[1] + lz * up[1];
+	new_fwd[2] = lx * forward[2] + ly * right[2] + lz * up[2];
+
+	yaw_deg = atan2f(new_fwd[1], new_fwd[0]) * (180.0f / (float)M_PI);
+	pitch_deg = asinf(QNN_Clamp(-new_fwd[2], -1.0f, 1.0f))
+		* (180.0f / (float)M_PI);
+
+	viewangles[YAW] = anglemod(yaw_deg);
+	viewangles[PITCH] = pitch_deg;
+	if (viewangles[PITCH] > 80.0f)
+		viewangles[PITCH] = 80.0f;
+	if (viewangles[PITCH] < -70.0f)
+		viewangles[PITCH] = -70.0f;
 }
 
 void IN_Init(void)

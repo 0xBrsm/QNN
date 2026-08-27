@@ -2,7 +2,7 @@
 
 Mirrors the sibling forward-scoped side-channel contexts: it carries the
 per-frame engagement EMA scalar without extending the core
-``AttackHeadInput`` dataclass. The trainer stashes the batch's
+head input dataclasses. The trainer stashes the batch's
 ``engagement_ema`` tensor on entry to the forward pass, and consumers
 (``ObsAccessor.aux("engagement")``) read it from the contextvar during
 ``forward``.

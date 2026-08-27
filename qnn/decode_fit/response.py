@@ -35,10 +35,12 @@ the frontier.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import dataclasses
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -806,6 +808,20 @@ def _weighted_corr(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
 
 
 ACQ_MARGINAL_CORR_FLOOR = 0.25
+# A tms cell whose settled mass has COLLAPSED relative to the sweep cannot
+# estimate throughput at all: heavy damping (slow turning) lets only the
+# EASIEST acquisitions finish before the eval's settle window closes, so the
+# survivors' throughput reads DECEPTIVELY FAST, not slow — a response that is
+# genuinely monotone in tms can read U-shaped once that arm is pooled in,
+# which is a measurement artifact, not evidence the lever is dead (rung3k
+# 2026-08: tms 0.5 n_settled 830 vs 3514 at tms 1.4, sd triples in step). A
+# cell whose total settled count falls under this fraction of the sweep's
+# PER-TMS median cannot be trusted to estimate that cell's throughput and is
+# dropped before the correlation and inversion are computed — never silently
+# folded in, always visible in the report as ``dropped_tms``. A genuinely
+# dead lever has no mechanism to produce a settled-count collapse, so this
+# can only rescue a false-positive refusal, never mask a real one.
+ACQ_SETTLED_COLLAPSE_FRAC = 0.5
 
 
 def fit_acquisition(cells: list[dict], band: dict, *, target_pct: float = 50.0,
@@ -824,7 +840,17 @@ def fit_acquisition(cells: list[dict], band: dict, *, target_pct: float = 50.0,
     not out-vote a ~300-settle one. A dead lever still reads ~0 under any
     weighting; ``acq_marginal`` marks the ambiguous band above
     ``ACQ_MARGINAL_CORR_FLOOR`` where one seed-replicate extension (never a
-    guess) is allowed to decide."""
+    guess) is allowed to decide.
+
+    Before any of that: whole tms LEVELS whose settled mass has collapsed
+    (``ACQ_SETTLED_COLLAPSE_FRAC``) are dropped outright — settled-weighting
+    alone still lets a severe enough collapse drag the corr under the gate
+    (rung3k measured 0.385 weighted, 0.937 on the surviving branch). The
+    correlation, inversion, bootstrap and sweep-bound checks all ride the
+    surviving levels; ``curve`` and ``dropped_tms`` keep the full sweep
+    visible for the report. ``tms_throughput_corr_raw`` is deliberately left
+    on the UNFILTERED sweep — it is the naive-estimator diagnostic, not a
+    decision quantity."""
     from qnn.decode_fit.human_refs import pct_to_throughput, throughput_to_pct
     rows = [(float(c["tms"]), float(c["throughput_bits_per_s"]),
              max(float(c.get("n_settled") or 1.0), 1.0))
@@ -834,7 +860,22 @@ def fit_acquisition(cells: list[dict], band: dict, *, target_pct: float = 50.0,
     tms_v = np.array([t for t, _, _ in rows], float)
     tp_v = np.array([p for _, p, _ in rows], float)
     w_v = np.array([w for _, _, w in rows], float)
-    corr = _weighted_corr(tms_v, tp_v, w_v)
+
+    # settled-collapse exclusion (see ACQ_SETTLED_COLLAPSE_FRAC above).
+    uniq_tms = np.unique(tms_v)
+    settled_by_tms = {float(t): float(w_v[tms_v == t].sum()) for t in uniq_tms}
+    med_settled = float(np.median(list(settled_by_tms.values())))
+    dropped_tms = {t: n for t, n in settled_by_tms.items()
+                  if n < ACQ_SETTLED_COLLAPSE_FRAC * med_settled}
+    if uniq_tms.size - len(dropped_tms) < 2:
+        raise ValueError(
+            f"acquisition fit: {len(dropped_tms)} of {uniq_tms.size} tms "
+            f"levels settled-collapsed ({sorted(round(t, 3) for t in dropped_tms)}) "
+            "— fewer than 2 reliable levels remain to fit a response")
+    keep = np.array([t not in dropped_tms for t in tms_v])
+    tms_k, tp_k, w_k = tms_v[keep], tp_v[keep], w_v[keep]
+
+    corr = _weighted_corr(tms_k, tp_k, w_k)
     corr_raw = float(np.corrcoef(tms_v, tp_v)[0, 1]) if np.std(tp_v) > 1e-9 else 0.0
     ladder = {float(k): float(v) for k, v in band["ladder"].items()}
     target_tp = pct_to_throughput(float(target_pct), ladder)
@@ -849,20 +890,22 @@ def fit_acquisition(cells: list[dict], band: dict, *, target_pct: float = 50.0,
         order = np.argsort(ps)
         return float(np.interp(target_tp, ps[order], ts[order]))
 
-    tms_star = _invert(tms_v, tp_v)
+    tms_star = _invert(tms_k, tp_k)
     rng = np.random.default_rng(seed)
     boots = []
     for _ in range(max(n_boot, 0)):
-        idx = rng.integers(0, len(tms_v), len(tms_v))
-        if len(set(tms_v[idx])) < 2:
+        idx = rng.integers(0, len(tms_k), len(tms_k))
+        if len(set(tms_k[idx])) < 2:
             continue
-        boots.append(_invert(tms_v[idx], tp_v[idx]))
+        boots.append(_invert(tms_k[idx], tp_k[idx]))
     ci = ((float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5)))
           if boots else (tms_star, tms_star))
     lo_tp, hi_tp = band["band"]
     med_by_tms = {t: float(np.median(tp_v[tms_v == t])) for t in np.unique(tms_v)}
-    achieved = float(np.interp(tms_star, sorted(med_by_tms),
-                               [med_by_tms[t] for t in sorted(med_by_tms)]))
+    med_by_tms_reliable = {t: v for t, v in med_by_tms.items() if t not in dropped_tms}
+    achieved = float(np.interp(
+        tms_star, sorted(med_by_tms_reliable),
+        [med_by_tms_reliable[t] for t in sorted(med_by_tms_reliable)]))
     return {
         "turn_mag_scale": round(tms_star, 3),
         "tms_ci": [round(ci[0], 3), round(ci[1], 3)],
@@ -876,11 +919,22 @@ def fit_acquisition(cells: list[dict], band: dict, *, target_pct: float = 50.0,
         "tms_throughput_corr_raw": round(corr_raw, 3),
         "unfittable": bool(corr < min_corr),
         "acq_marginal": bool(ACQ_MARGINAL_CORR_FLOOR <= corr < min_corr),
-        "sweep_floor_bound": bool(target_tp < float(tp_v.min())),
-        "sweep_ceil_bound": bool(target_tp > float(tp_v.max())),
+        "sweep_floor_bound": bool(target_tp < float(tp_k.min())),
+        "sweep_ceil_bound": bool(target_tp > float(tp_k.max())),
         "swept_tms_range": [round(float(tms_v.min()), 3), round(float(tms_v.max()), 3)],
+        "reliable_tms_range": [round(float(tms_k.min()), 3), round(float(tms_k.max()), 3)],
         "curve": [{"turn_mag_scale": float(t), "throughput_bits_per_s": round(med_by_tms[t], 4)}
                   for t in sorted(med_by_tms)],
+        "dropped_tms": [{"turn_mag_scale": round(t, 3),
+                         "n_settled": round(n, 1),
+                         "sweep_median_n_settled": round(med_settled, 1),
+                         "reason": "settled collapse: n_settled "
+                                   f"< {ACQ_SETTLED_COLLAPSE_FRAC:g}x the sweep's "
+                                   "per-tms median — too little turning to complete "
+                                   "acquisitions inside the settle window; the "
+                                   "survivors' throughput reads deceptively fast, "
+                                   "not comparable to the well-sampled levels"}
+                        for t, n in sorted(dropped_tms.items())],
         "n_cells": len(rows),
     }
 
@@ -914,14 +968,25 @@ def build_plan(gain_fits: dict[str, GainResponse],
                reachable: dict[str, tuple[float, float]],
                targets: dict[str, float], *,
                tms: float,
-               alpha_style_cap: float | None = None) -> dict[str, WeaponPlan]:
+               alpha_style_cap: float | None = None,
+               no_demote: bool = False) -> dict[str, WeaponPlan]:
     """Resolve every targeted weapon's operating point with refusal semantics
     (decision 1): the achievable frontier is ``max(gain/α floor upper-CI,
     human reachable elite)``; a target tighter than the frontier is REFUSED and
     the plan rides the frontier. SG/SSG and NG/SNG share one response, human
     family ladder, target, and resolved operating point. ``alpha_style_cap``
     bounds α (the hold-destruction lever) — None = uncapped, adjudicated by
-    the style gate."""
+    the style gate.
+
+    ``no_demote`` (Brian 2026-08-14, the p90-FLOOR policy): a target at or
+    below the weapon's native landing is a floor, not a demotion request —
+    the plan places at NATIVE (gain/α/tremor all zero, band "native-floor")
+    and is marked ``refused`` with the native point as its promised floor,
+    so the placement gate and --seed-replicates score it against the native
+    landing exactly as frontier-refused plans score against the frontier.
+    Without the flag, the DOWN band demotes via tremor as before (the
+    demotion arm remains a legitimate instrument for humanness experiments
+    — it is only this placement POLICY that forbids it)."""
     plans: dict[str, WeaponPlan] = {}
     for abbr, tgt_pct in targets.items():
         lad = ladder.get(abbr)
@@ -951,8 +1016,17 @@ def build_plan(gain_fits: dict[str, GainResponse],
         eff_target = max(target_hbw, frontier_hbw)
 
         gain, alpha, tremor_mag = 0.0, 0.0, 0.0
+        notes = ""
         knee_g, _ = fit.knee(0.95)
-        if eff_target >= n_eff:                      # DOWN band (tremor owns it)
+        if eff_target >= n_eff and no_demote:        # target ≤ native: FLOOR
+            band = "native-floor"
+            refused = True                            # policy refusal (see doc)
+            frontier_hbw = n_eff                      # the promised floor
+            pred = n_eff
+            ci = fit.predict_ci(0.0, tms)
+            notes = ("target at/below post-fix native; demotion disabled "
+                     "(no-demote p90-floor policy) — placed at native")
+        elif eff_target >= n_eff:                    # DOWN band (tremor owns it)
             band = "down"
             if tremor_fit is not None:
                 tremor_mag = tremor_fit.invert(src, eff_target)
@@ -998,8 +1072,8 @@ def build_plan(gain_fits: dict[str, GainResponse],
             frontier_hbw=round(frontier_hbw, 4),
             band=band, tremor=round(tremor_mag, 4),
             alias_of=(src if src != abbr else None),
-            notes=("target below achievable frontier — riding the frontier "
-                   "(decision 1)" if refused else ""),
+            notes=(notes or ("target below achievable frontier — riding the "
+                             "frontier (decision 1)" if refused else "")),
         )
     # Make family identity structural even for direct callers that supplied
     # distinct member ladders. The CLI already expands one requested member to
@@ -1043,6 +1117,152 @@ def build_vectors(plans: dict[str, WeaponPlan]) -> dict[str, Any]:
                            "achieved_pct": p.achieved_pct, "band": p.band,
                            "refused": p.refused, "frontier_pct": p.frontier_pct}
                        for w, p in plans.items()}}
+
+
+# ── fit-state sidecar (the --replan-from performance restoration) ───────────
+#
+# The full closed-loop rounds (ACQ, live-pins, screen/extend/ciext/alphaanchor)
+# are the expensive part of a fit — they launch live evals. A planning-only
+# flag change (--skill, --no-demote) needs none of that: response.build_plan
+# is a pure function of the fitted responses + ladder/reachable + targets. So
+# every NORMAL (non-replan) fit persists a compact sidecar of exactly those
+# inputs — including the cluster-bootstrap draws, since GainResponse.
+# predict_ci/knee/floor_ci and AlphaResponse.predict_ci/floor_ci RAISE without
+# them (no point-CI fallback, by design) — and qnn.decode_fit.cli's
+# --replan-from loads it, verifies the manifest still matches this checkpoint/
+# corpus/look-grid/instrument contract, and rebuilds plans fresh without
+# touching a single wave.
+FIT_STATE_SCHEMA_VERSION = 1
+FIT_STATE_NPZ = "_fit_state.npz"
+
+
+def _gain_response_to_json(f: GainResponse) -> dict[str, Any]:
+    d = dataclasses.asdict(f)
+    d.pop("_boot", None)
+    return d
+
+
+def _gain_response_from_json(d: dict[str, Any],
+                             boot: np.ndarray | None) -> GainResponse:
+    d = dict(d)
+    d["param_ci"] = {k: tuple(v) for k, v in (d.get("param_ci") or {}).items()}
+    d["swept_gain_span"] = tuple(d["swept_gain_span"])
+    return GainResponse(_boot=boot, **d)
+
+
+def _alpha_response_to_json(f: AlphaResponse) -> dict[str, Any]:
+    d = dataclasses.asdict(f)
+    d.pop("_boot", None)
+    return d
+
+
+def _alpha_response_from_json(d: dict[str, Any],
+                              boot: np.ndarray | None) -> AlphaResponse:
+    d = dict(d)
+    d["param_ci"] = {k: tuple(v) for k, v in (d.get("param_ci") or {}).items()}
+    return AlphaResponse(_boot=boot, **d)
+
+
+def save_fit_state(path: Path, *, manifest: dict[str, Any], tms_star: float,
+                   tms_fit: dict[str, Any], live: dict[str, Any],
+                   gain_fits: dict[str, GainResponse],
+                   alpha_fits: dict[str, "AlphaResponse | None"],
+                   tremor_fit: "TremorResponse | None",
+                   ladder: dict[str, dict[float, float]],
+                   reachable: dict[str, tuple[float, float]]) -> None:
+    """Persist everything ``response.build_plan`` needs, keyed on ``manifest``
+    (the guard qnn.decode_fit.cli checks before honoring --replan-from).
+    Written unconditionally at the end of every normal (non-replan,
+    non-offline-retrofit) fit. Atomic write (tmp + replace) so a crash mid-
+    write never leaves a half-written sidecar that reads as valid."""
+    payload: dict[str, Any] = {
+        "schema_version": np.int64(FIT_STATE_SCHEMA_VERSION),
+        "manifest_json": np.array(json.dumps(manifest, sort_keys=True,
+                                              default=str)),
+        "tms_star": np.float64(tms_star),
+        "tms_fit_json": np.array(json.dumps(tms_fit, default=str)),
+        "live_json": np.array(json.dumps(live, default=str)),
+        "ladder_json": np.array(json.dumps(
+            {w: {str(k): v for k, v in lad.items()}
+             for w, lad in ladder.items()})),
+        "reachable_json": np.array(json.dumps(
+            {w: list(v) for w, v in reachable.items()})),
+        "gain_weapons_json": np.array(json.dumps(sorted(gain_fits))),
+        "alpha_weapons_json": np.array(json.dumps(sorted(
+            a for a, f in alpha_fits.items() if f is not None))),
+        "has_tremor": np.bool_(tremor_fit is not None),
+    }
+    for abbr, f in gain_fits.items():
+        payload[f"gain__{abbr}__json"] = np.array(
+            json.dumps(_gain_response_to_json(f)))
+        boot = f._boot if f._boot is not None else np.empty((0, 4))
+        payload[f"gain__{abbr}__boot"] = np.asarray(boot, dtype=np.float64)
+    for abbr, f in alpha_fits.items():
+        if f is None:
+            continue
+        payload[f"alpha__{abbr}__json"] = np.array(
+            json.dumps(_alpha_response_to_json(f)))
+        boot = f._boot if f._boot is not None else np.empty((0, 3))
+        payload[f"alpha__{abbr}__boot"] = np.asarray(boot, dtype=np.float64)
+    if tremor_fit is not None:
+        payload["tremor_json"] = np.array(
+            json.dumps(dataclasses.asdict(tremor_fit)))
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        np.savez(fh, **payload)
+    tmp.replace(path)
+
+
+def load_fit_state(path: Path) -> dict[str, Any]:
+    """The inverse of :func:`save_fit_state`. Raises loud on a schema
+    mismatch (never silently reinterprets an older sidecar's layout)."""
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as z:
+        version = int(z["schema_version"])
+        if version != FIT_STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f"{path}: fit-state schema {version} != "
+                f"{FIT_STATE_SCHEMA_VERSION} — re-run the fit on this "
+                "checkout to refresh the sidecar")
+        manifest = json.loads(str(z["manifest_json"].item()))
+        tms_star = float(z["tms_star"])
+        tms_fit = json.loads(str(z["tms_fit_json"].item()))
+        live = json.loads(str(z["live_json"].item()))
+        ladder_raw = json.loads(str(z["ladder_json"].item()))
+        ladder = {w: {float(k): v for k, v in lad.items()}
+                  for w, lad in ladder_raw.items()}
+        reachable_raw = json.loads(str(z["reachable_json"].item()))
+        reachable = {w: tuple(v) for w, v in reachable_raw.items()}
+        gain_weapons = json.loads(str(z["gain_weapons_json"].item()))
+        alpha_weapons = json.loads(str(z["alpha_weapons_json"].item()))
+        has_tremor = bool(z["has_tremor"])
+
+        gain_fits: dict[str, GainResponse] = {}
+        for abbr in gain_weapons:
+            d = json.loads(str(z[f"gain__{abbr}__json"].item()))
+            boot = z[f"gain__{abbr}__boot"]
+            gain_fits[abbr] = _gain_response_from_json(
+                d, boot if boot.size else None)
+
+        alpha_fits: dict[str, AlphaResponse | None] = {a: None for a in gain_weapons}
+        for abbr in alpha_weapons:
+            d = json.loads(str(z[f"alpha__{abbr}__json"].item()))
+            boot = z[f"alpha__{abbr}__boot"]
+            alpha_fits[abbr] = _alpha_response_from_json(
+                d, boot if boot.size else None)
+
+        tremor_fit = None
+        if has_tremor:
+            d = json.loads(str(z["tremor_json"].item()))
+            d["slope_ci"] = tuple(d["slope_ci"])
+            tremor_fit = TremorResponse(**d)
+
+    return {"manifest": manifest, "tms_star": tms_star, "tms_fit": tms_fit,
+            "live": live, "gain_fits": gain_fits, "alpha_fits": alpha_fits,
+            "tremor_fit": tremor_fit, "ladder": ladder, "reachable": reachable}
 
 
 # ── the CREST arm (discharge-quality gate θ) ─────────────────────────────────
@@ -1118,64 +1338,6 @@ def select_operating_cells(table, weapon: str, gain: float, alpha: float, *,
             & (np.abs(table["alpha"] - float(alpha)) <= float(alpha_tol)))
 
 
-def replay_crest(fwd: np.ndarray, cluster: np.ndarray, tick: np.ndarray,
-                 theta: float, hold_ticks: int
-                 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The gated counterfactual for every discharge row: ``(offset, hbw,
-    absorbed)``.
-
-    Mirrors ``qnn.model.decode_actions.attack_crest_gate_step`` exactly at
-    ``ready=True`` (the eval only logs a window for a discharge the engine
-    honored, which is precisely the gate's ``ready`` condition):
-
-      * ``stop_waiting[j] = aligned[j] | diverging[j]`` with
-        ``aligned = live & (hbw ≤ θ)`` and ``diverging = live & (hbw_{j+1} >
-        hbw_j)``; the decode derives ``hbw_next`` from the feed-forward
-        ``z_rate``, the replay reads the REALIZED next tick — the quantity that
-        feed-forward is estimating (the residual is why step 5's closed-loop
-        confirmation exists).
-      * release at the first ``j ∈ [0, H)`` with ``stop_waiting``, else blind
-        at ``j = H`` (the head's discharge is never canceled).
-      * a NaN slot is a dead row (LOS lost / episode ended): neither aligned
-        nor diverging, so the countdown runs on to expiry — the plan's
-        LOS-lost law, not a fake crest and not a fake divergence.
-
-    ``absorbed`` is the no-restack consequence, which the naive per-row replay
-    misses: the gate arms at most one countdown at a time, so a head re-fire at
-    a tick inside a live hold is folded into the pending discharge instead of
-    starting its own. Absorbed rows leave the at-discharge distribution (and
-    are the replay's honest read on the gate's rate cost, which stage 6's
-    attack trim is what actually compensates)."""
-    H = int(hold_ticks)
-    if H < 1:
-        raise ValueError(f"crest replay needs hold_ticks >= 1, got {H}")
-    if fwd.shape[1] < H + 1:
-        raise ValueError(
-            f"crest replay at H={H} needs {H + 1} forward slots, window has "
-            f"{fwd.shape[1]} — capture at a larger QNN_EVAL_INTERCEPT_WINDOW")
-    n = len(fwd)
-    w = fwd[:, :H + 1]
-    live = np.isfinite(w)
-    nxt = fwd[:, 1:H + 2] if fwd.shape[1] >= H + 2 else np.concatenate(
-        [fwd[:, 1:H + 1], np.full((n, 1), np.nan)], axis=1)
-    stop = (live & (w <= float(theta))) | (live & np.isfinite(nxt) & (nxt > w))
-    stop[:, H] = True                       # expiry: pending==1 always releases
-    off = stop.argmax(axis=1)
-    hbw = w[np.arange(n), off]
-    # no-restack, walked per cluster in tick order (the latch is per lane)
-    absorbed = np.zeros(n, dtype=bool)
-    order = np.lexsort((tick, cluster))
-    cur = None
-    busy = np.int64(-1)
-    for i in order:
-        if cluster[i] != cur:
-            cur = cluster[i]
-            busy = np.int64(np.iinfo(np.int64).min // 2)
-        if tick[i] <= busy:
-            absorbed[i] = True
-        else:
-            busy = tick[i] + off[i]
-    return off, hbw, absorbed
 
 
 @dataclass
@@ -1264,116 +1426,6 @@ class CrestResponse:
                 "floor_admits_none": False}
 
 
-def fit_crest_response(windows: CrestWindowTable, tracking: EventTable,
-                       weapon: str, *, hold_ticks: int,
-                       pin_weights: dict[str, float] | None = None,
-                       theta_grid: "tuple[float, ...] | np.ndarray" = CREST_THETA_GRID,
-                       n_boot: int = 200, seed: int = 0) -> CrestResponse:
-    """Replay the θ grid over ``windows`` (already filtered to one weapon's
-    operating cells) against the window statistic of the SAME cells in
-    ``tracking``. Bootstrap is BY EPISODE and PAIRED — one cluster resample
-    drives numerator and denominator together, so the capture CI is the CI of
-    the ratio, not the (much wider) quotient of two independent CIs.
-
-    Raises on thin evidence (fail loud; there is no cross-weapon fallback for
-    a lever that changes when a bot pulls the trigger)."""
-    if len(windows) < CREST_MIN_ROWS:
-        raise ValueError(
-            f"{weapon}: crest arm has {len(windows)} discharge windows at the "
-            f"selected cells (min {CREST_MIN_ROWS}) — widen the cell tolerance "
-            "or capture windows at the placed operating point; no fallback.")
-    if not len(tracking):
-        raise ValueError(
-            f"{weapon}: crest arm has no window-sampled tracking rows at the "
-            "selected cells — the capture denominator is undefined.")
-    grid = np.asarray(theta_grid, dtype=np.float64)
-    w_win = _pin_row_weights(EventTable(windows.cols), pin_weights)
-    w_trk = _pin_row_weights(tracking, pin_weights)
-    cl_win, cl_trk = windows["cluster"], tracking["cluster"]
-    uniq = np.unique(np.concatenate([cl_win, cl_trk]))
-    if len(uniq) < CREST_MIN_CLUSTERS:
-        raise ValueError(
-            f"{weapon}: crest arm spans {len(uniq)} bootstrap clusters "
-            f"(min {CREST_MIN_CLUSTERS}) — a CI from this many episodes is not "
-            "honest uncertainty; widen the cell tolerance.")
-    iw = np.searchsorted(uniq, cl_win)
-    it = np.searchsorted(uniq, cl_trk)
-    nC = len(uniq)
-
-    # per-cluster sufficient statistics: a weighted geometric mean over any
-    # cluster resample is (Σ_c cnt_c·S_c) / (Σ_c cnt_c·W_c) in log space, so
-    # the bootstrap never re-touches a row.
-    t_num = np.bincount(it, weights=w_trk * np.log(
-        np.maximum(tracking["hbw"], _HBW_EPS)), minlength=nC)
-    t_den = np.bincount(it, weights=w_trk, minlength=nC)
-
-    S = np.zeros((len(grid), nC))
-    W = np.zeros((len(grid), nC))
-    delay, defer, expiry, absorb, blind = (np.zeros(len(grid)) for _ in range(5))
-    for j, th in enumerate(grid):
-        off, hbw, ab = replay_crest(windows.fwd, cl_win, windows["tick"],
-                                    float(th), hold_ticks)
-        keep = ~ab
-        fin = keep & np.isfinite(hbw)
-        S[j] = np.bincount(iw[fin], weights=w_win[fin] * np.log(
-            np.maximum(hbw[fin], _HBW_EPS)), minlength=nC)
-        W[j] = np.bincount(iw[fin], weights=w_win[fin], minlength=nC)
-        kw = w_win[keep]
-        ksum = max(kw.sum(), 1e-12)
-        delay[j] = float((kw * off[keep]).sum() / ksum)
-        defer[j] = float((kw * (off[keep] > 0)).sum() / ksum)
-        expiry[j] = float((kw * (off[keep] == hold_ticks)).sum() / ksum)
-        absorb[j] = float((w_win * ab).sum() / max(w_win.sum(), 1e-12))
-        blind[j] = float((kw * ~np.isfinite(hbw[keep])).sum() / ksum)
-
-    n_num = np.bincount(iw, weights=w_win * np.log(
-        np.maximum(windows.fwd[:, 0], _HBW_EPS)), minlength=nC)
-    n_den = np.bincount(iw, weights=w_win, minlength=nC)
-
-    def _cap(cnt: np.ndarray) -> tuple[np.ndarray, float]:
-        lw = float((t_num @ cnt) / max(float(t_den @ cnt), 1e-12))
-        cur = (S @ cnt) / np.maximum(W @ cnt, 1e-12)
-        nat = float((n_num @ cnt) / max(float(n_den @ cnt), 1e-12))
-        return np.exp(cur - lw), float(math.exp(nat - lw))
-
-    ones = np.ones(nC)
-    capture, native_capture = _cap(ones)
-    rng = np.random.default_rng(seed)
-    draws = np.empty((max(n_boot, 0), len(grid)))
-    nat_draws = np.empty(max(n_boot, 0))
-    for b in range(max(n_boot, 0)):
-        cnt = np.bincount(rng.integers(0, nC, nC), minlength=nC).astype(float)
-        draws[b], nat_draws[b] = _cap(cnt)
-    if n_boot > 0:
-        ci = np.stack([np.percentile(draws, 2.5, axis=0),
-                       np.percentile(draws, 97.5, axis=0)], axis=1)
-        nat_ci = (float(np.percentile(nat_draws, 2.5)),
-                  float(np.percentile(nat_draws, 97.5)))
-    else:
-        raise ValueError(f"{weapon}: crest arm needs n_boot > 0 — a point "
-                         "estimate cannot be adjudicated by the clamp.")
-    d = np.diff(capture)
-    cells = sorted({(round(float(g), 4), round(float(a), 4))
-                    for g, a in zip(windows["gain"], windows["alpha"])})
-    return CrestResponse(
-        weapon=weapon, hold_ticks=int(hold_ticks), theta_grid=grid,
-        capture=capture, capture_ci=ci,
-        native_capture=native_capture, native_capture_ci=nat_ci,
-        window_hbw=_geo(tracking["hbw"], w_trk),
-        native_hbw=_geo(windows.fwd[:, 0], w_win),
-        delay_mean=delay, defer_frac=defer, expiry_frac=expiry,
-        absorbed_frac=absorb, blind_nan_frac=blind,
-        n_events=int(len(windows)), n_clusters=int(nC), cells=cells,
-        diagnostics={
-            "n_tracking_rows": int(len(tracking)),
-            "n_boot": int(n_boot),
-            # the curve must be monotone in θ or the inversion is meaningless
-            "monotone_frac": round(float((d >= -1e-9).mean()), 4),
-            "max_backstep": round(float(-min(d.min(), 0.0)), 5),
-            "theta_span": [float(grid[0]), float(grid[-1])],
-            "capture_span": [round(float(capture[0]), 4),
-                             round(float(capture[-1]), 4)],
-        })
 
 
 @dataclass
@@ -1405,150 +1457,5 @@ class CrestPlan:
     notes: str = ""
 
 
-def build_crest_plan(plans: dict[str, WeaponPlan],
-                     crest_fits: dict[str, CrestResponse],
-                     ladder: dict[str, dict[float, float]],
-                     reachable: dict[str, tuple[float, float]],
-                     human_capture: dict[str, float], *,
-                     min_effect: float = CREST_MIN_EFFECT
-                     ) -> dict[str, CrestPlan]:
-    """Plan inversion for the crest arm (plan §Fit procedure step 4).
-
-    ``ladder`` / ``reachable`` are the AT-DISCHARGE (intercept) references —
-    NOT the window-sampled tracking ones the gain/α arms are placed on. θ moves
-    the tick the trigger lands on, so the at-discharge ladder is the only
-    coordinate it acts in. ``human_capture`` is the human family
-    ``crest_capture`` p50 (``_aim_tracking_window.json``): the timing target,
-    i.e. what fraction of its own typical tracking alignment a human's trigger
-    actually captures.
-
-    **Overshoot clamp — the safety-critical rule.** Tightening θ improves the
-    at-discharge coordinate for free, so an uncalibrated θ walks the model
-    straight past the elite anchor. The clamp is CI-conservative: θ may only be
-    placed where the replayed level's bootstrap LOWER bound still sits at or
-    above p100 (= the elite anchor exactly, human_refs §16). An over-elite ask
-    is REFUSED and the plan rides the clamp — the same semantics as a gain
-    refusal riding the achievable frontier, and for the same reason: the fit
-    may not promise a placement the band says is not a human coordinate.
-
-    Three ways a weapon ends up OFF, each recorded rather than silently
-    zeroed: (a) no crest gap — the model's native capture is already at or
-    tighter than the human's, so θ could only overshoot; (b) already over-elite
-    natively — the clamp admits no θ at all, a pre-existing condition of the
-    (g, α) placement that this lever cannot fix and must not deepen;
-    (c) below ``min_effect`` — the admissible tightening is too small to be
-    worth deferring discharges for.
-
-    **Scale note (load-bearing, and thin-margin for SG).** The level this arm
-    clamps is ``plan.pred_hbw × capture``, i.e. the plan's OWN promised level
-    (pin-offset-adjusted onto the human range-mix aggregate, exactly what
-    ``measured_frontier`` / the placement gate ride) scaled by the arm's paired
-    capture ratio. It therefore assumes the per-pin level offset is COMMON to
-    the window and at-discharge statistics — the same pins, the same
-    difficulty, measured one tick apart. The arm's own unadjusted arena-mix
-    at-discharge level is carried alongside as
-    ``raw_native_at_discharge_hbw``; where the two straddle the elite anchor
-    the θ is decided by that adjustment and the closed-loop confirmation is
-    what settles it. Note also that the CLAMP rides the plan's POINT promise:
-    the uncertainty on the base level is the placement gate's business, this
-    arm is only responsible for the increment it adds."""
-    out: dict[str, CrestPlan] = {}
-    for abbr, plan in plans.items():
-        src = plan.alias_of or abbr
-        fit = crest_fits.get(src)
-        lad = ladder.get(abbr)
-        if fit is None or lad is None:
-            continue
-        elite = float(reachable.get(abbr, reachable.get(src, (0.0, 0.0)))[0])
-        base = float(plan.pred_hbw)
-        nat_cap = float(fit.native_capture)
-        nat_hbw = base * nat_cap
-        target = float(human_capture.get(abbr, human_capture.get(src, nat_cap)))
-        # the tightest capture the band permits at this weapon's placed level
-        clamp_cap = elite / max(base, 1e-9)
-        refused = bool(target < clamp_cap - 1e-9)
-        eff_target = max(target, clamp_cap)
-
-        theta, placed_cap, clamped, note = 0.0, nat_cap, False, ""
-        if nat_hbw <= elite + 1e-9:
-            note = (f"already at/past the at-discharge elite anchor natively "
-                    f"({nat_hbw:.3f} vs p100 {elite:.3f}) — the clamp admits no "
-                    f"θ; gate stays OFF (the overshoot predates this lever and "
-                    f"is the (gain, α) placement's to answer for)")
-        elif eff_target >= nat_cap - 1e-9:
-            note = (f"no crest gap: native capture {nat_cap:.3f} already at or "
-                    f"tighter than the effective target {eff_target:.3f} "
-                    f"(human {target:.3f}) — θ can only overshoot; OFF")
-        else:
-            inv = fit.theta_for_capture(eff_target, ci_floor=clamp_cap)
-            if not inv["reachable"]:
-                note = ("no admissible θ: no grid point places the replayed "
-                        f"level with its lower CI at or above p100 "
-                        f"({elite:.3f} hbw) — refusing rather than promising an "
-                        "over-elite placement")
-            elif nat_cap - inv["capture"] < min_effect:
-                note = (f"admissible tightening {nat_cap - inv['capture']:.4f} "
-                        f"< min_effect {min_effect} — the clamp leaves too "
-                        f"little for the style spend; OFF")
-            else:
-                theta = float(inv["theta"])
-                placed_cap = float(inv["capture"])
-                clamped = not bool(inv["reached_target"])
-                note = (f"target capture {target:.3f} is below the p100 clamp "
-                        f"{clamp_cap:.3f} — riding the clamp (CI-conservative: "
-                        f"the placed level's lower CI stays at or above the "
-                        f"elite anchor)" if refused else "")
-        armed = theta > 0.0
-        at_hbw = base * placed_cap
-        cap_lo, cap_hi = (fit.capture_ci_at(theta) if armed
-                          else fit.native_capture_ci)
-        out[abbr] = CrestPlan(
-            weapon=abbr, impulse=WEAPON_IMPULSE[abbr],
-            hold_ticks=int(fit.hold_ticks) if armed else 0,
-            theta=round(theta, 4), armed=armed, refused=refused,
-            clamped=clamped,
-            target_capture=round(target, 4),
-            native_capture=round(nat_cap, 4),
-            placed_capture=round(placed_cap, 4),
-            base_hbw=round(base, 4),
-            at_discharge_hbw=round(at_hbw, 4),
-            at_discharge_hbw_ci=(round(base * cap_lo, 4),
-                                 round(base * cap_hi, 4)),
-            at_discharge_pct=round(hbw_to_pct(at_hbw, lad), 1),
-            native_at_discharge_hbw=round(nat_hbw, 4),
-            native_at_discharge_pct=round(hbw_to_pct(nat_hbw, lad), 1),
-            elite_hbw=round(elite, 4),
-            raw_native_at_discharge_hbw=round(float(fit.native_hbw), 4),
-            style_flags=fit.flags_at(theta) if armed else {},
-            alias_of=(src if src != abbr else None),
-            notes=note)
-    # calibration families are indivisible aim coordinates (build_plan's final
-    # copy, same reason): SG/SSG and NG/SNG must not diverge in θ.
-    for source, members in CALIBRATION_FAMILIES.items():
-        present = [m for m in members if m in out]
-        if len(present) < 2 or source not in out:
-            continue
-        canonical = out[source]
-        for member in present:
-            out[member] = dataclasses.replace(
-                canonical, weapon=member, impulse=WEAPON_IMPULSE[member],
-                alias_of=(source if member != source else None))
-    return out
 
 
-def build_crest_vectors(crest_plans: dict[str, CrestPlan]) -> dict[str, Any]:
-    """The emitted decode params: ``attack.crest_theta_vec`` (8,) per impulse-1
-    and the SHARED ``attack.crest_hold_ticks``. Explicit-OFF is 0.0 / 0, never
-    omission (fail-loud required-params policy, plan §Parameters). H must agree
-    across every armed weapon — it is one shared reaction-latency bound."""
-    theta = [0.0] * 8
-    holds = {p.hold_ticks for p in crest_plans.values() if p.armed}
-    if len(holds) > 1:
-        raise ValueError(
-            f"crest_hold_ticks must be shared across weapons, got {sorted(holds)} "
-            "— H is a reaction-latency bound, not weapon physics")
-    for p in crest_plans.values():
-        if p.armed:
-            theta[p.impulse - 1] = round(float(p.theta), 4)
-    return {"attack.crest_theta_vec": theta,
-            "attack.crest_hold_ticks": int(holds.pop()) if holds else 0}

@@ -1,6 +1,6 @@
-"""Per-held-weapon HUMAN engagement-RANGE distribution (the decode-fit pooling prior).
+"""Per-equipped-weapon HUMAN engagement-RANGE distribution (the decode-fit pooling prior).
 
-For each held-weapon impulse W (1..8 = Axe,SG,SSG,NG,SNG,GL,RL,LG), accumulates the
+For each equipped-weapon impulse W (1..8 = Axe,SG,SSG,NG,SNG,GL,RL,LG), accumulates the
 distribution of ENGAGEMENT RANGE (units) over engaged-LOS frames — the Euclidean
 norm of the ``rel`` of the MOST-ALIGNED LOS actor (the SAME referent the lead-aim
 kernel scores: the argmin over ``_lead_aim_angle_deg_live`` masked to LOS actors). Humans

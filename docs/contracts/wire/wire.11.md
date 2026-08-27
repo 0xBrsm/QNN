@@ -4,8 +4,21 @@ The current wire contract — what `tools/export_onnx.py` produces for a
 `full_4head` model at HEAD. `wire.11` = [`wire.9`](wire.9.md) **+ the in-graph
 ATTACK decode**: the `attack` output is the **decided fire/no-fire bit** (int64
 `(B,1)`) rather than the raw `fire_logit` float, and the recurrent **attack-decode
-state** (`attack_state` — the continuous-weapon hold-tail) is threaded as I/O.
+state** (`attack_state`) is threaded as I/O.
 Stamped as `wire_contract=wire.11` in model metadata.
+
+> **CORRECTION (2026-08-26) — the hold-tail was never in-graph.** This doc
+> originally described `attack_state` as carrying the continuous-weapon
+> **hold-tail**, and said the engine runs none of its own. Neither was ever true
+> of the shipped code: `qnn_onnx_apply_continuous_hold_tail` has run
+> **engine-side for every wire generation**, `wire.11` included, and
+> `attack_state` today carries `weapon.af_lockout` (4 lanes: `y`,
+> `locked_weapon`, `af_prev`, `dt` — `ATTACK_STATE_DIM`). The in-graph attack
+> decode is memoryless. The tail is now gated per model by the
+> `decode.attack.hold_tail_sec` stamp (0 = off, the default for every fresh
+> export); an artifact exported before that key existed — every `wire.11`
+> artifact — inherits the historical 0.25 s. Sentences below that assert
+> otherwise are left as written for the record; this note supersedes them.
 
 > **`wire.11` REPLACES `wire.9`.** The two share the native obs format and the
 > in-graph move/weapon decode; they differ in exactly one output (`fire_logit` →
@@ -27,6 +40,22 @@ Stamped as `wire_contract=wire.11` in model metadata.
   `src/engine/common/qnn_onnx.c`.
 
 ## The in-graph ATTACK decode
+
+> **CORRECTION (2026-08-27) — this section describes the retired a24 decode
+> law, not what HEAD exports.** `tools/export_onnx.py` now refuses any decode
+> config whose `decode_module` is not `qnn.model.decode_actions` — a24's
+> Bernoulli attack step is unreachable from export. The a25/a28 attack decode
+> (`qnn.model.decode_actions.attack_with_decode` /
+> `attack_with_decode_step`) is a **deterministic, greedy** joint argmax over
+> the 9-way `attack_logits` (class 0 = no-attack, 1..8 = attack that weapon),
+> not a Bernoulli draw, and `attack.bias`/`attack_bias` no longer exists (see
+> [`decode-config-defaults.md`](../../decode-config-defaults.md)). `attack_rng`
+> is still threaded as I/O for wire/state parity but is **INERT** — nothing
+> reads it — per `qnn.model.decode_actions.attack_decode_reset_flat`'s own
+> docstring. `attack_state`'s 4 lanes carry `weapon.af_lockout`, as the note
+> above already says. The paragraph below is left as written for the
+> historical record of what `wire.11` shipped with at a24; it does not
+> describe the current decode law.
 
 The attack decode is **SAMPLED**: `attack_bit ~ Bernoulli(sigmoid((fire_logit +
 attack_bias) / temp))` off attack's **own xorshift rng** (`attack_rng`), plus the

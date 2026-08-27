@@ -100,11 +100,48 @@ class NativeProcessBase:
             raise NativeEngineError("Native engine process is not running")
         return self.proc
 
-    def _stderr_tail(self) -> str:
-        if self.proc is None or self.proc.stderr is None:
+    def _open_stderr_sink(self, prefix: str):
+        """Worker stderr goes to a FILE, never a pipe.
+
+        QNN_STDOUT_PROTOCOL routes every engine print (map loads, resets,
+        Sys_Printf chatter) to stderr, and nothing drains it during normal
+        operation — with stderr=PIPE, any worker that printed >64KB blocked
+        mid-write and went silent on stdout, wedging the driver in a pipe
+        read (2026-08-05: rung3a_scout_s43 stall at it 11; crest_aedge43_bc
+        eval stall — worker caught in anon_pipe_write). A file sink cannot
+        block; ``_stderr_tail`` reads its tail for crash diagnostics."""
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            mode="wb", prefix=prefix, suffix=".stderr.log", delete=False)
+        self._stderr_path = f.name
+        return f
+
+    def _close_stderr_sink(self) -> None:
+        path = getattr(self, "_stderr_path", None)
+        f = getattr(self, "_stderr_file", None)
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+            self._stderr_file = None
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            self._stderr_path = None
+
+    def _stderr_tail(self, max_bytes: int = 4096) -> str:
+        path = getattr(self, "_stderr_path", None)
+        if path is None:
             return ""
         try:
-            return self.proc.stderr.read().decode("utf-8", errors="replace")
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes))
+                return f.read().decode("utf-8", errors="replace")
         except Exception:
             return ""
 
@@ -353,11 +390,12 @@ class NativeProcessBase:
         # route to stderr instead of polluting the binary obs / JSON
         # response stream. See src/engine/nq/qnn_sys.c Sys_Printf.
         env.setdefault("QNN_STDOUT_PROTOCOL", "1")
+        self._stderr_file = self._open_stderr_sink("qnn-worker-")
         self.proc = subprocess.Popen(
             [self.executable, *self.extra_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=self._stderr_file,
             cwd=self.workdir,
             env=env,
         )
@@ -391,6 +429,7 @@ class NativeProcessBase:
         self.proc.wait(timeout=5)
         self.proc = None
         self.hello = None
+        self._close_stderr_sink()
         self.capabilities = ()
         self.map_state = None
         self._training_enabled = False
@@ -746,13 +785,12 @@ class NativeClientProcess:
             raise NativeEngineError("Native client process is not running")
         return self.proc
 
-    def _stderr_tail(self) -> str:
-        if self.proc is None or self.proc.stderr is None:
-            return ""
-        try:
-            return self.proc.stderr.read().decode("utf-8", errors="replace")
-        except Exception:
-            return ""
+    # File-sink stderr — same deadlock fix as NativeProcessBase (an undrained
+    # stderr=PIPE blocks the engine mid-print after 64KB; see _open_stderr_sink
+    # there for the 2026-08-05 postmortem).
+    _open_stderr_sink = NativeProcessBase._open_stderr_sink
+    _close_stderr_sink = NativeProcessBase._close_stderr_sink
+    _stderr_tail = NativeProcessBase._stderr_tail
 
     def _read_exact(self, size: int) -> bytes:
         proc = self._ensure_running()
@@ -774,11 +812,12 @@ class NativeClientProcess:
 
         env = os.environ.copy()
         env.update(self.env)
+        self._stderr_file = self._open_stderr_sink("qnn-client-")
         self.proc = subprocess.Popen(
             [self.executable, self.server_addr, *self.extra_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=self._stderr_file,
             cwd=self.workdir,
             env=env,
         )
@@ -821,6 +860,7 @@ class NativeClientProcess:
         if self.proc.stderr is not None:
             self.proc.stderr.close()
         self.proc = None
+        self._close_stderr_sink()
 
     def __enter__(self) -> "NativeClientProcess":
         return self

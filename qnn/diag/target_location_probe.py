@@ -21,7 +21,7 @@ Hook points (verified against ``qnn/model/network.py`` and ``qnn/model/{temporal
   - ``policy.model.temporal`` is an ``nn.Module`` (``Temporal``); its forward
     returns a ``TemporalOutput`` dataclass with ``.flat_out`` — this becomes
     ``readout_flat`` in ``Network.forward`` with NO further transform before
-    heads consume it. GRU d_gru=64 for both runs' shared ``full_5head`` base.
+    heads consume it. GRU d_gru=64 for both runs' shared base graph.
   - ``policy.model.target_pointer`` is an ``nn.Module`` (``TargetPointer``);
     its forward returns a ``TargetPointerOutput`` dataclass with
     ``.target_feat`` (16-dim, ``pointers.target.d_target`` in the base graph
@@ -123,7 +123,7 @@ def _register_hooks(policy) -> tuple[dict[str, list], list]:
     if not getattr(model, "_has_temporal", False) or temporal is None:
         raise RuntimeError(
             "policy.model has no active temporal (GRU) module — this probe "
-            "requires a GRU-readout graph (full_5head base); got "
+            "requires a GRU-readout graph; got "
             f"_has_temporal={getattr(model, '_has_temporal', None)!r}"
         )
     if not getattr(model, "_has_target_pointer", False) or pointer is None:

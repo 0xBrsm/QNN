@@ -214,3 +214,25 @@ Cache format is frozen (disk budget). A code audit proposed in-process levers; e
 | Native PPO collection | Separate campaign | See `research/performance-tuning.md`; the bounded BF16 host-staged pipeline and confirmed 768-lane knee are the retained defaults. |
 
 The real, already-built levers remain the resident ablation daemon (~2.5× vs streaming) and parallel ablation containers (4× sweet spot, 5× practical limit). Further single-job BC throughput means changing the training itself (lane count / model size), not the harness.
+
+## Defensibility (arch-defensibility-sweep, 2026-08-04, N=6 seeds)
+
+Every open ablation of the `core` base graph, measured at the seed-
+DISTRIBUTION level against fixed rulers (FrikBot ladder + the a26rc1b
+fitted bar + pairwise h2h). Instrument validation: ladder frags/min and
+h2h win rate rank checkpoints identically (r=0.83, N=6) — closed-loop
+seed variance is a stable checkpoint property, so distribution-level
+acceptance is mandatory (any 2-seed verdict samples tails). Data:
+runs/eval/ladder_sweep{,_rc1b}/, runs/eval/cellB_*/, runs/eval/cellC_*/;
+plan agents/plans/arch-defensibility-sweep.md.
+
+| Component / question | Cell | N | Effect (mean ± sd) | Verdict |
+|---|---|---|---|---|
+| weapon_ctx removal (the a28 cut) | A | 6 vs bar | frag-diff −4.48±0.57 vs bar −4.48; pace 5.54±0.46 vs 6.32 | **CUT STANDS** — differential parity; pace/return gap confounded with decode fit (bar fitted, arms on comparability template). Residual: decode-fit one median seed + re-ladder. |
+| aux look_seg loss ("trunk effect") | B | 6+6 | h2h win 0.403±0.207 (common) / 0.368±0.136 (base); ladder sd 3× core's | **REJECTED** — the 8/3 "67/61% trunk lead" was the top two seeds of six; mean below 50% at both operating points; triples closed-loop seed variance. |
+| 10 Hz decision rate (vs 20 Hz twin) | C | 6 pairs | win 0.320±0.128, CI on mean [0.22, 0.43]; own-rate ladder pace 3.91±0.87 vs 5.54±0.46 | **REAL PENALTY (~−18 pts)** — 20 Hz retained for the deploy line; 10 Hz stays a goal with known levers (fire-at-aim-completion coordination objective, pinning fine-tune). |
+| move_seg, attack_with, polar look, softmax-feat inputs | — | — | settled pre-sweep (multi-way or outside-CI both seeds + rate-robust) | retained |
+
+Seed-variance calibration (the number to hold against every pre-sweep
+2-seed verdict): ladder frags/min sd — core 0.46, core@10 0.87,
+lookseg-aux 1.38; h2h win-rate sd across seeds 0.13–0.21.

@@ -9,66 +9,72 @@ rate (runs/bc/bench/_attack_with_shape.json).
 
 Decode law (per frame) — two explicitly parameterised decisions:
 
-    select_score = (l1..l8) + bias_vec + preference_bias_vec
-    ideal  = argmax(select_score)                  # best weapon this frame
-    choice = hysteresis(select_score, held, switch_margin)
-    fire_score = (l1..l8)[choice] + bias_vec[choice] + fire_bias_vec[choice]
+    select_score = (l1..l8) + preference_bias_vec
+    choice = argmax(select_score)                  # best weapon this frame
+    fire_score  = (l1..l8)[intent] + fire_bias_vec[intent]
     # attack decision (whether) — conditional on the weapon that will fire
-    l0'    = l0 - attack_bias - align_bias         # class-0 = "don't attack" anchor
+    l0'         = l0 - align_bias                 # class-0 = "don't attack" anchor
     fire   = fire_score > l0'   AND NOT veto
-    weapon = fire ? choice+1 : held_impulse        # held = server no-op
+    weapon = choice+1                             # the selected weapon
 
 Knob mapping:
-  * ``attack_bias`` (the s-slider / propensity knob) and the alignment-
-    conditioned bias act on the MARGINAL log-odds by subtracting from the
-    class-0 logit (bias > 0 → more attack).
-  * ``bias_vec`` (8,) is the LEGACY JOINT operating point. It is retained so
-    existing a26 configs keep their exact meaning: it affects both selection
-    and firing. New fits emit it as all-zero and use the two explicit vectors
-    below; silently reinterpreting an old config would make branch artifacts
-    non-reproducible.
+  * the alignment-conditioned guard bias acts on the MARGINAL log-odds by
+    subtracting from the class-0 logit (bias > 0 → more attack).
   * ``fire_bias_vec`` (8,) affects only the fire comparison for the selected
-    weapon. It cannot change the ideal or clear a switch margin.
-  * ``preference_bias_vec`` (8,) affects only weapon selection. It is the
-    closed-loop occupancy-restoration lever used after adding hysteresis; it
-    does not directly lift a weapon over the no-attack class.
-  * ``switch_margin`` is weapon-switch hysteresis (anti-jitter / anti-camp):
-    leave the held weapon only when the ideal beats it by the margin. Under the
-    split-v1 law the fire test is conditional on that selected weapon, so every
-    per-weapon fire correction is identifiable from the emitted action stream.
-    The final closed-loop gate fits switching, occupancy, and firing jointly.
-    Feasibility rides the score (dead held scores low → forced switch).
-  * hard guards (attack-splash / RL self-splash / LG range) arrive as a
-    boolean veto mask from the a24 guard primitives instead of a buried
-    logit.
-  * ``crest_theta_vec`` / ``crest_hold_ticks`` — the DISCHARGE-QUALITY gate
-    ("crest-firing"): a deterministic countdown latch that shifts WHEN a
-    commanded fire lands within a bounded window (≤ H ticks) without changing
-    the count — hold until crosshair→lead alignment crosses θ_w, blind-fire at
-    expiry. A hold only continues while alignment is CONVERGING (the
-    feed-forward rate predicts the next tick's hbw improving); the moment it's
-    predicted to worsen instead, the gate releases immediately rather than
-    waiting out a hold that isn't going to pay off — same check at arm time
-    (never start a hold that's already diverging) and every hold tick
-    (bail the instant it turns). Composes AFTER the step (guards outrank);
-    OFF = bit-identical. See attack_crest_gate_step +
-    agents/plans/discharge-quality-gate.md.
+    weapon. It cannot change which weapon is selected.
+  * ``preference_bias_vec`` (8,) affects only weapon selection; it does not
+    directly lift a weapon over the no-attack class. Weapon SELECTION
+    otherwise belongs to the network. The post-a26 selection laws (human
+    transition/continuation, SPRT accumulator, switch lockout, static
+    feasibility mask, fire-gather selector, LG range/alignment guards) were
+    removed 2026-08-26, and the held-weapon anchor + ``weapon.switch_margin``
+    hysteresis on 2026-08-26; their keys FAIL LOUD. Do not reintroduce a
+    decode-side law that decides WHICH weapon among the FEASIBLE set, and do
+    not reintroduce a held-weapon concept keyed off engine equip state: there
+    is no such signal in the a28 obs contract, so an "anchor" sourced that way
+    degenerates to this tick's own argmax and any margin on it becomes a
+    silent no-op.
+  * ``infeasible_vec`` (8,) — static, config-declared exclusion: masks the
+    named weapon(s) to -1e9 before ANY selection/fire logic runs. This is a
+    FEASIBILITY declaration (this weapon is not on the table this run), not a
+    selection law — it does not pick among what remains feasible.
+  * ``af_lockout`` (float, a MULTIPLIER, 0 = none) — restores a weapon-switch
+    lockout, but keyed entirely off ``self_arsenal_scalars`` (the engine's own
+    ``attack_finished`` countdown), not off a re-derived held-weapon identity.
+    On the tick a shot lands, ``attack_finished`` goes 0→x (the engine's own
+    true per-weapon refire delay, no cooldown table needed); the EXTENSION
+    target ``af_lockout * x`` (ceilinged by ``af_lockout_cap``, seconds, 0 =
+    uncapped) is SET ONCE at that rising edge and HELD steady — it does not
+    track af's own decrements — then only ticks down, at the same real
+    per-tick rate af was observed decaying at, once ``attack_finished``
+    actually reaches zero. Net effect: every weapon but the one that just
+    fired stays masked for x (real engine cooldown) + min(af_lockout * x,
+    af_lockout_cap or ∞) more. af_lockout=1, uncapped reproduces the original
+    single-multiplier design (a full extra x); af_lockout=0 is the real
+    engine-enforced window with no decode-side extension at all. Real
+    precedent: a28rc1h shipped the a26-lineage equivalent
+    (switch_lockout_mult=2.0, switch_lockout_cap_ticks=6 = 0.3s at 20Hz,
+    formula "lockout = cd + min(cd, T)" — agents/plans/rl-skill-finetune.md).
+    State is 4 persisted floats in ``attack_state`` (y, locked_weapon,
+    af_prev, dt); see ATTACK_STATE_DIM.
+  * hard guards (attack-splash / RL self-splash) arrive as a boolean veto
+    mask from the a24 guard primitives instead of a buried logit.
   * the a24 sticky gate / hazard / switch-back weapon machinery has no analog —
-    it is retired for this head; selection happens only at attack frames and
-    emitting the held impulse otherwise is a server no-op. ``switch_margin`` is a
-    single-scalar switch hysteresis, NOT a revival of that stack.
+    it is retired for this head, along with the a26 held-anchor hysteresis.
 
 TRACE-SAFETY: torch-only, no ``.item()``, no data-dependent control flow
-(``switch_margin``/vector presence is decided on static python config, not tensor
-values).
+(vector/bool presence is decided on static python config, not tensor values;
+af_lockout's own branching inside attack_with_decode is likewise static).
 """
 from __future__ import annotations
 
 import torch
 
-from qnn.model.decode import BatchedRNG, inverse_cdf_sample, row_uniforms
+from qnn.model.decode import BatchedRNG, gumbel_argmax, inverse_cdf_sample, row_uniforms
 from qnn.model.look_bins import tangent_expmap
 from qnn.schema import WEAPON_HEAD_SIZE
+from qnn.engine_norm import DIST_SCALE as _DIST_SCALE
+from qnn.engine_norm import TIME_SCALE as _TIME_SCALE
 
 # Re-exported so this module is the a25 generation's complete decode FACADE: the core
 # (QNNPolicy.act) resolves one decode_module from the run's decode config and reads
@@ -82,40 +88,16 @@ from qnn.model.lead_aim import (  # noqa: F401
 
 ATTACK_WITH_SIZE = 1 + WEAPON_HEAD_SIZE  # 9
 
-
-def _attack_with_select(
-    score: torch.Tensor,
-    held: torch.Tensor,
-    switch_margin: float,
-) -> torch.Tensor:
-    """Weapon SELECTION with switch hysteresis (anti-jitter / anti-camp).
-
-    Switch off the currently-held weapon only when the ideal weapon (argmax of
-    ``score`` = weapon logits + per-weapon bias_vec) beats the held weapon by
-    more than ``switch_margin``; otherwise stay on held. This replaces the a25
-    ``stick_bias`` (which biased selection toward held AND perturbed the fire
-    decision, causing weapon camping): the margin only gates *which* weapon and
-    cannot change fire rate. Feasibility rides the score (an infeasible held
-    scores low → the margin is cleared → forced switch off a dead weapon).
-
-    The SINGLE selection law shared by :func:`attack_with_decode_step` and the
-    crest gate's per-tick θ re-read. ``switch_margin`` = 0 → always take the
-    ideal (no hysteresis). Returns the (B,) class index 0..7 (impulse − 1)."""
-    n = score.shape[-1]
-    held_idx = (held.reshape(score.shape[:-1]).to(torch.long) - 1).clamp(0, n - 1)
-    w_star = score.argmax(dim=-1)
-    s_star = score.gather(-1, w_star.unsqueeze(-1)).squeeze(-1)
-    s_held = score.gather(-1, held_idx.unsqueeze(-1)).squeeze(-1)
-    switch = (s_star - s_held) > float(switch_margin)
-    return torch.where(switch, w_star, held_idx)
-
+# weapon.af_lockout's dt bootstrap: real seconds/tick, used ONLY until a real
+# active-to-active af sample is observed. 20Hz-equivalent (the fastest
+# plausible operating rate) so the untested guess under-decays rather than
+# over-decays — see the dt derivation in attack_with_decode for why this
+# cannot be the discharge's own `af` value.
+_DT_BOOTSTRAP_SEC = 0.05
 
 def attack_with_decode_step(
     logits9: torch.Tensor,
-    held_impulse: torch.Tensor,
     *,
-    attack_bias: float = 0.0,
-    bias_vec: torch.Tensor | None = None,
     fire_bias_vec: torch.Tensor | None = None,
     preference_bias_vec: torch.Tensor | None = None,
     switch_margin: float = 0.0,
@@ -127,63 +109,74 @@ def attack_with_decode_step(
     Two DECOUPLED decisions (the a25 ``stick_bias`` coupling — which perturbed
     the fire decision and caused weapon camping — is retired):
 
-      1. WEAPON — switch off the held weapon only if the ideal beats it by
-         ``switch_margin`` (:func:`_attack_with_select`); else select held.
-      2. ATTACK — under the explicit split-v1 vectors, fire iff the SELECTED
-         weapon's raw+legacy+fire score beats no-attack. This makes each
-         weapon's rate correction observable on the weapon that actually
-         fires. Legacy configs (both explicit vectors absent) retain the old
-         ideal-weapon fire comparison exactly.
+      1. WEAPON — argmax of the preference-adjusted weapon logits, gated by
+         ``switch_margin`` (restored 2026-08-26): the preference-adjusted
+         ideal only wins over this tick's own RAW argmax (the a28 obs
+         contract carries no equip state, so there is no other anchor to
+         compare against — no memory across ticks, purely a same-tick
+         confidence gate on how much the preference vector is allowed to
+         override the network's own unbiased pick) when it beats that raw
+         pick's score by more than the margin. 0.0 (default) is a PROVABLE
+         no-op — always take the ideal — so every config that omits it is
+         bit-identical to before this knob existed.
+      2. ATTACK — under the explicit split-v1 vectors, raw attack intent is
+         the best RAW attack class and is independent of the selected
+         weapon. That intent class's fire-only calibration is then added to
+         its score. Thus a preference/continuation correction cannot
+         silently cancel an attack merely because it selected a weapon whose
+         raw joint class was low. Legacy configs (all explicit vectors absent)
+         retain the old ideal-weapon fire comparison exactly. The two
+         decisions stay decoupled: no fire-only term reaches selection, and no
+         selection-only term is added into the fire score.
 
     Parameters
     ----------
     logits9 : (B, 9) raw head logits (class 0 = no-attack, 1..8 = attack weapon k)
-    held_impulse : (B,) int64 engine impulse 1..8 of the currently held weapon.
-    attack_bias : global propensity knob (positive = more attack)
-    bias_vec : optional legacy (8,) JOINT operating point, added to both the
-        selection and fire scores. Existing configs retain their exact law.
     fire_bias_vec : optional (8,) fire-only operating point. It is gathered at
         the ideal selected weapon and cannot affect selection.
     preference_bias_vec : optional (8,) selection-only operating point. It
         cannot directly affect the no-attack comparison.
-    switch_margin : weapon-switch hysteresis (>= 0) — leave held only if the
-        ideal weapon's score exceeds held's by this margin. 0.0 = always ideal.
+    switch_margin : (>= 0) leave this tick's raw argmax only if the
+        preference-adjusted ideal beats it by this much. 0.0 = always ideal
+        (no gate) — the law before this knob existed.
     align_bias : optional (B,) additive alignment bias (positive = more attack)
     veto_mask : optional (B,) bool — hard guard veto rows (True = never attack)
-
     Returns
     -------
     (attack, weapon_impulse) : (B,) int64 attack bit, (B,) int64 impulse 1..8
     """
     weap = logits9[..., 1:]                                  # (B, 8) raw weapon logits
-    held = held_impulse.reshape(weap.shape[:-1]).to(torch.long)  # impulse 1..8
-    legacy = (torch.zeros_like(weap) if bias_vec is None
-              else bias_vec.reshape(-1).to(weap.dtype))
-    select_score = weap + legacy
+    # ── weapon selection ───────────────────────────────────────────────────
+    select_score = weap
     if preference_bias_vec is not None:
         select_score = select_score + preference_bias_vec.reshape(-1).to(weap.dtype)
-    # ── weapon selection ───────────────────────────────────────────────────
-    ideal_idx = select_score.argmax(dim=-1)
-    sel_idx = _attack_with_select(select_score, held, switch_margin)
-    # Explicit vectors opt into split-v1: condition fire on the weapon that
-    # will actually be emitted. With both absent, preserve the historical a26
-    # law byte-for-byte (fire on ideal even when hysteresis holds another).
-    split_v1 = fire_bias_vec is not None or preference_bias_vec is not None
-    fire_idx = sel_idx if split_v1 else ideal_idx
+    if switch_margin != 0.0:
+        held_idx = weap.argmax(dim=-1)               # same-tick raw pick, no memory
+        ideal_idx = select_score.argmax(dim=-1)
+        s_ideal = select_score.gather(-1, ideal_idx.unsqueeze(-1)).squeeze(-1)
+        s_held = select_score.gather(-1, held_idx.unsqueeze(-1)).squeeze(-1)
+        sel_idx = torch.where((s_ideal - s_held) > float(switch_margin), ideal_idx, held_idx)
+    else:
+        sel_idx = select_score.argmax(dim=-1)
     # ── attack decision ────────────────────────────────────────────────────
-    fire_score = weap + legacy
+    # Intent is the model's best RAW attack-with class; the fire test is
+    # evaluated there. Selection-only terms must not be able to veto that
+    # intent by steering to a low raw class, so preference_bias_vec is absent
+    # from this score by construction.
+    gather_idx = weap.argmax(dim=-1)
+    score_ideal = weap.gather(-1, gather_idx.unsqueeze(-1)).squeeze(-1)
     if fire_bias_vec is not None:
-        fire_score = fire_score + fire_bias_vec.reshape(-1).to(weap.dtype)
-    score_ideal = fire_score.gather(-1, fire_idx.unsqueeze(-1)).squeeze(-1)
-    l0 = logits9[..., 0] - float(attack_bias)
+        fire_cal = fire_bias_vec.reshape(-1).to(weap.dtype).gather(
+            0, gather_idx.reshape(-1)).reshape(score_ideal.shape)
+        score_ideal = score_ideal + fire_cal
+    l0 = logits9[..., 0]
     if align_bias is not None:
         l0 = l0 - align_bias.reshape(l0.shape).to(l0.dtype)
     fire = score_ideal > l0
     if veto_mask is not None:
         fire = fire & ~veto_mask.reshape(fire.shape)
-    choice = sel_idx.to(held.dtype) + 1                      # impulse 1..8
-    weapon_impulse = torch.where(fire, choice, held)
-    return fire.to(torch.int64), weapon_impulse.to(torch.int64)
+    weapon_impulse = sel_idx.to(torch.int64) + 1             # impulse 1..8
+    return fire.to(torch.int64), weapon_impulse
 
 
 def attack_lane_gate(fire: torch.Tensor, weapon_impulse: torch.Tensor) -> torch.Tensor:
@@ -194,10 +187,9 @@ def attack_lane_gate(fire: torch.Tensor, weapon_impulse: torch.Tensor) -> torch.
     derives BOTH the attack button and the weapon impulse from this one value
     (``qnn_onnx.c`` ``qnn_onnx_decode_core``: ``attack_bit = attack_decided !=
     0``; ``qnn_input.c``: ``impulse = action.attack`` in combat mode). The decode
-    itself emits the HELD impulse on no-fire ticks — the A26 SWITCH convention,
-    where ``attack`` is a separate fire bit and a held impulse is a server no-op
-    — so the lane MUST be gated on the fire bit before it leaves the model, or
-    the bot holds the trigger down every tick.
+    itself emits the SELECTED impulse on every tick, fire or not, so the lane
+    MUST be gated on the fire bit before it leaves the model, or the bot holds
+    the trigger down every tick.
 
     Same-tick select-and-fire is intact: the server's QC runs ``ImpulseCommands``
     (the weapon change) BEFORE the ``button0`` attack check inside one
@@ -217,271 +209,239 @@ def attack_with_marginal_logit(logits9: torch.Tensor) -> torch.Tensor:
     return torch.logsumexp(logits9[..., 1:], dim=-1) - logits9[..., 0]
 
 
-# ── DISCHARGE-QUALITY GATE ("crest-firing"; agents/plans/discharge-quality-gate.md)
-#
-# When the head commands fire, the decode may HOLD the discharge up to H ticks
-# until crosshair→lead-point alignment crosses a per-weapon threshold θ_w — fire
-# at first crossing, else BLIND at H expiry (honor the head; never cancel — a
-# canceled fire is silent rate starvation, the rc2a failure class). Same family
-# as move.threat_break_hazard: a decode bridge for a conditioning the head
-# doesn't carry natively (the attack head is alignment-blind); the fitted θ is
-# the training register for an eventual alignment feature on the attack head.
-#
-# The latch stores ONE countdown in the existing attack_state wire slot (lane 0;
-# 0 = idle, so the existing zeros-init/episode-reset loopback already means
-# idle — no wire bump). Deterministic (no RNG): greedy and sampled run it
-# identically, and the export decode-parity gate exercises it for free.
-
-# Angular hitbox radius geometry: the eval's _intercept_hbw law shares this
-# half-width; range here is in lead_aim MODULE units (/DIST_SCALE), so the
-# atan(halfw/range) ratio is unit-consistent (angle ratios are scale-free).
-from qnn.engine_norm import DIST_SCALE as _DIST_SCALE  # noqa: E402
-from qnn.eval.aim_kernel import ACTOR_HALFW_U as _ACTOR_HALFW_U  # noqa: E402
-_CREST_HALFW_MOD = _ACTOR_HALFW_U / _DIST_SCALE
-
-
-def crest_alignment_hbw(
-    z_err: torch.Tensor,       # (B, 2) UNSCALED aim-prior error tangent (radians)
-    aim_range: torch.Tensor,   # (B,) pooled lead-point range, module units
-) -> "tuple[torch.Tensor, torch.Tensor]":
-    """``(hbw, live)`` — crosshair→lead-point alignment in hitbox-half-widths.
-
-    ``hbw = |z_err| / atan(halfw / range)`` — the eval's ``_intercept_hbw`` law
-    on the obs-side aim geometry (the small obs-vs-engine ruler gap is absorbed
-    by the closed-loop confirmation fit). ``live`` is the enemy-presence gate:
-    ``aim_prior_tangent_ffwd`` emits exact-zero z_err/range rows when no enemy
-    is perceived (the existing β-gate convention), and a dead row must never
-    read as aligned. Trace-safe (torch-only, no data-dependent control flow)."""
-    z = z_err.reshape(-1, 2)
-    rng = aim_range.reshape(-1).to(z.dtype)
-    live = (z.abs().sum(dim=-1) > 1e-9) & (rng > 1e-9)
-    ang = torch.linalg.vector_norm(z, dim=-1)                       # (B,) radians
-    radius = torch.atan2(torch.full_like(rng, _CREST_HALFW_MOD),
-                         rng.clamp_min(1e-6))
-    return ang / radius.clamp_min(1e-9), live
-
-
-def attack_crest_gate_step(
-    fire_raw: torch.Tensor,       # (B,) int64 — attack_with_decode_step's decision
-    choice: torch.Tensor,         # (B,) int64 — this tick's selected impulse 1..8
-    held_impulse: torch.Tensor,   # (B,) int64 — held impulse 1..8 (server no-op)
-    attack_state: torch.Tensor,   # (B, ATTACK_STATE_DIM) float32 — lane 0 = countdown
-    *,
-    crest_theta_vec: torch.Tensor,  # (8,) θ_w per impulse-1, hbw units; <= 0 = OFF for w
-    crest_hold_ticks: int,          # H, max hold in ticks (static; caller gates on > 0)
-    hbw: torch.Tensor,              # (B,) crosshair→lead alignment (crest_alignment_hbw)
-    live: torch.Tensor,             # (B,) bool — enemy perceived (z_err presence gate)
-    ready: torch.Tensor,            # (B,) bool — obs attack_finished expired (engine honors)
-    diverging: torch.Tensor,        # (B,) bool — hbw predicted to WORSEN next tick (feed-forward)
-    veto_mask: torch.Tensor | None = None,  # (B,) bool — hard guards outrank the gate
-) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
-    """One tick of the crest latch. Returns ``(attack, weapon_impulse,
-    attack_state_out)``.
-
-    Decode law (all rows in parallel; countdown ``pending`` = state lane 0):
-
-    * arm     — head fires, gate applies (θ>0, enemy live, weapon ready), not at
-                crest, not diverging, latch idle → HOLD: emit attack=0 + held
-                impulse (a server no-op), start the countdown at H.
-    * release — at crest (``hbw ≤ θ`` of the CURRENT selection), or predicted to
-                diverge (waiting won't help — fire now instead of riding a hold
-                that's only getting worse), or countdown expiring (pending==1 →
-                blind-fire; the head's discharge is never canceled), or a
-                gate-exempt fire (θ≤0 / no enemy / on cooldown / already aligned)
-                passing straight through on its own tick.
-    * fire    — release minus this tick's hard-guard veto (guards outrank; a
-                vetoed release still clears the latch — the discharge is lost,
-                same as a vetoed raw fire).
-
-    Cooldown-honesty: ``ready`` gating means a fire the engine would discard
-    (attack_finished pending) is passed through raw, never converted into a
-    delayed REAL discharge. No restack: arm requires pending==0, so a head
-    re-fire during a hold is absorbed into the pending discharge. Exactly one
-    attack=1 tick per armed discharge (single-tick preserved).
-
-    Convergence gating: ``diverging`` is re-read every tick (arm AND each hold
-    tick share the identical ``stop_waiting`` predicate) — a hold is only ever
-    worth continuing while the feed-forward rate predicts hbw improving; the
-    tick it turns, the gate stops waiting immediately rather than riding out
-    the remaining hold to a worse blind-fire at expiry."""
-    st = attack_state.reshape(-1, ATTACK_STATE_DIM)
-    pending = st[:, 0].round().to(torch.int64)
-    fire_b = fire_raw.reshape(-1).to(torch.bool)
-    ch = choice.reshape(-1).to(torch.int64)
-    theta = crest_theta_vec.reshape(-1).to(hbw.dtype).index_select(
-        0, (ch - 1).clamp(0, WEAPON_HEAD_SIZE - 1))
-    gate_on = (theta > 0) & live & ready
-    # aligned needs live: a dead z_err row (hbw 0/undefined) must hold to expiry
-    # (LOS-lost law), not release as a fake crest. θ≤0 rows can never align
-    # (hbw > 0 whenever live), so a mid-hold switch to an OFF weapon runs to
-    # expiry — the release-tick selection's θ is what's evaluated.
-    aligned = live & (hbw <= theta)
-    # diverging needs live too, same reasoning as aligned: a dead row (LOS
-    # lost) must hold to expiry, not release as a fake divergence.
-    stop_waiting = aligned | (live & diverging)
-    idle = pending == 0
-    arm = fire_b & gate_on & ~stop_waiting & idle
-    tick = pending > 0
-    release = ((fire_b & (stop_waiting | ~gate_on) & idle)
-               | (tick & (stop_waiting | (pending == 1))))
-    fire = release if veto_mask is None else release & ~veto_mask.reshape(release.shape)
-    pending_next = torch.where(
-        arm, torch.full_like(pending, int(crest_hold_ticks)),
-        torch.where(tick & ~release, pending - 1, torch.zeros_like(pending)))
-    held = held_impulse.reshape(-1).to(torch.int64)
-    weapon_impulse = torch.where(fire, ch, held)
-    # rebuild, don't mutate (trace-safe; lane 0 is the whole a25 attack state).
-    attack_state_out = pending_next.to(attack_state.dtype).unsqueeze(-1)
-    return fire.to(torch.int64), weapon_impulse, attack_state_out
-
-
 def attack_with_decode(
     logits9: torch.Tensor,
     obs_tensors,
     move_logits: torch.Tensor,
     *,
-    self_weapon_id: torch.Tensor | None = None,
     guard=None,
-    attack_bias: float = 0.0,
-    bias_vec: torch.Tensor | None = None,
     fire_bias_vec: torch.Tensor | None = None,
     preference_bias_vec: torch.Tensor | None = None,
     switch_margin: float = 0.0,
-    crest_theta_vec: torch.Tensor | None = None,
-    crest_hold_ticks: int = 0,
-    aim_z_err: torch.Tensor | None = None,
-    aim_range: torch.Tensor | None = None,
-    aim_z_rate: torch.Tensor | None = None,
+    infeasible_vec: torch.Tensor | None = None,
     attack_state: torch.Tensor | None = None,
+    af_lockout: float = 0.0,
+    af_lockout_cap: float = 0.0,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]":
-    """Full a25 attack-with decode — the SINGLE implementation shared by
-    ``QNNPolicy.act`` and the ONNX ExportWrapper (decode-regime-in-model: the
-    offline decode and the baked-into-ONNX deploy decode are the same code, so
-    they cannot skew). Resolves the held impulse and the guard's alignment
-    bias + hard-veto mask, runs :func:`attack_with_decode_step`, then composes
-    the crest gate (:func:`attack_crest_gate_step`) when armed.
+    """Full attack decode: weapon SELECTION + FIRE + guard. Stateless unless
+    ``af_lockout`` is armed.
 
-    Parameters
-    ----------
-    logits9 : (B, 9) raw attack-with logits.
-    obs_tensors : the guard's obs input (each caller passes the form its guard
-        expects — dequantised in act, native in export; the guard reads it).
-        The crest gate also reads ``attack_finished`` from it (cooldown gate).
-    move_logits : (B, MOVE_AXES, classes) or flat — the guard argmaxes it for the
-        movement-direction splash checks.
-    self_weapon_id : (B,) / (B,1) held-weapon id (obs ``self_weapon_id``), or
-        None for a held-weapon-blind graph (the A27 pure-combat contract, which
-        has no held-weapon input — see agents/plans/decode-fit-reconciliation.md
-        "A27 Port Boundary"). None falls back to always selecting the ideal
-        weapon (``switch_margin`` has no effect: there is no held weapon to
-        hysterese against) until A27 restores a held-weapon signal.
-    guard : the resolved guard module (``guard_attack_logit_for_export``); None →
-        no alignment bias / veto. The guard applies the SAME hard vetoes
-        (attack-splash / RL self-splash / LG range) that the deployed graph bakes.
-    attack_bias / bias_vec / fire_bias_vec / preference_bias_vec /
-        switch_margin : the operating-point knobs
-        (research/attack-head.md §11), forwarded to :func:`attack_with_decode_step`.
-    crest_theta_vec / crest_hold_ticks : the discharge-quality gate
-        (attack.crest_theta_vec (8,) θ per impulse-1, ≤0 = OFF per weapon;
-        attack.crest_hold_ticks shared H, 0 = OFF globally). Both OFF (the
-        default) is BIT-IDENTICAL: the step result passes straight through and
-        ``attack_state`` is returned untouched.
-    aim_z_err / aim_range : the crest alignment signal — the UNSCALED aim-prior
-        error tangent + pooled lead-point range from ``aim_prior_tangent_ffwd``
-        (both callers compute it upstream for the look decode). Required when
-        the gate is armed; a pointer-less caller must fail loud, not skip.
-    aim_z_rate : the same function's feed-forward tangent DELTA (one tick
-        ahead, under the target's current relative velocity) — reconstructs
-        ``z_next = aim_z_err + aim_z_rate`` to predict whether hbw is
-        converging or diverging, so the gate never holds a discharge that
-        isn't going to improve. Required when the gate is armed, same as
-        aim_z_err/aim_range.
-    attack_state : (B, ATTACK_STATE_DIM) — the countdown latch's wire slot
-        (lane 0; zeros = idle). Required when the gate is armed.
+    Weapon selection belongs to the NETWORK. The decode's selection knobs are
+    ``preference_bias_vec`` (additive per-weapon bias) and ``switch_margin``
+    (restored 2026-08-26 — a same-tick confidence gate on how much that bias
+    is allowed to override the network's own raw pick; 0.0 = no gate, a
+    provable no-op). The choice is argmax over whatever the FEASIBILITY layer
+    (``infeasible_vec`` + guard + ``af_lockout``, all upstream of selection)
+    left standing. There is no held-weapon anchor keyed off engine equip
+    state — switch_margin's "anchor" is this tick's own raw argmax, with no
+    memory across ticks — see the module docstring.
 
-    Returns ``(attack, weapon_impulse, attack_state_out)``; with the gate OFF
-    ``attack_state_out`` is the input ``attack_state`` unchanged (passthrough).
+    The post-a26 selection surface — the human transition/continuation laws,
+    the SPRT evidence accumulator, the fire-gather selector and the LG
+    range/alignment guards — was REMOVED WHOLESALE on 2026-08-26 (Brian: clean
+    slate). Measured on the live RA venue, those laws overrode the network's
+    own weapon choice on 52-58% of firing ticks and cost the deployed config
+    two thirds of its LG. Do not reintroduce a decode-side law that decides
+    WHICH weapon among the feasible set; if selection is wrong, the model is
+    wrong. ``infeasible_vec`` and ``af_lockout`` are feasibility, not
+    selection — they narrow the candidate set, argmax still owns the pick.
+    See qnn.model.decode_config's "REMOVED DECODE LAWS" (the removed keys FAIL
+    LOUD) and agents/plans/rl-skill-finetune.md.
 
-    TRACE-SAFETY: torch-only, no ``.item()`` / data-dependent control flow (the
-    guard presence + knobs are static python config, decided at trace build).
+    Returns ``(attack, weapon_impulse, attack_state_out)``. ``attack_state_out``
+    is the input unchanged unless ``af_lockout`` is armed.
+
+    TRACE-SAFETY: torch-only, no ``.item()`` / data-dependent control flow
+    (guard presence and af_lockout are static python config, decided at trace
+    build; only ordinary tensor ops read attack_state/obs values).
     """
-    from qnn.vocab import self_weapon_id_to_impulse
-
     l9 = logits9.reshape(-1, ATTACK_WITH_SIZE)
-    # Naive ideal weapon (no bias_vec, no hysteresis) — a guard-probe heuristic
-    # only; the real selection (with switch_margin) happens below.
-    choice = l9[..., 1:].argmax(dim=-1) + 1
-    held_impulse = (
-        self_weapon_id_to_impulse(self_weapon_id.reshape(-1))
-        if self_weapon_id is not None else choice)
+    rows = l9.shape[0]
+    # Network._weapon_feasibility_mask has already masked unowned/dry classes
+    # to -1e9 upstream; the layers below are the DECODE-side feasibility
+    # additions (config-declared / guard / af-lockout), composed by OR into
+    # one mask applied once, upstream of every selection/fire computation.
+    # ── FEASIBILITY ─────────────────────────────────────────────────────────
+    infeasible_cols = None
+    if infeasible_vec is not None:
+        # weapon.infeasible_vec — static per-run exclusion (e.g. "no SG this
+        # config"), restored 2026-08-26 (Brian). Unconditional: masked
+        # regardless of what the raw logit or preference_bias_vec say.
+        infeasible_cols = (infeasible_vec.reshape(-1).to(l9.dtype) > 0.5).expand(
+            rows, WEAPON_HEAD_SIZE)
+    # guard.lg_range: LG cannot reach past its beam range, so mark it
+    # INFEASIBLE for the tick at the same layer ammo/ownership already ride
+    # (Network._weapon_feasibility_mask, applied upstream). The network then
+    # picks a weapon that can reach — the decode does not choose for it, and
+    # does not veto the shot. Compat-gated on the adapter publishing the hook.
+    if guard is not None and hasattr(guard, "lg_select_mask"):
+        from qnn.model.guard import LG_IMPULSE
+        lg_col = torch.zeros(rows, WEAPON_HEAD_SIZE,
+                             dtype=torch.bool, device=l9.device)
+        lg_col[:, LG_IMPULSE - 1] = guard.lg_select_mask(
+            obs_tensors, rows, device=l9.device).reshape(rows)
+        infeasible_cols = lg_col if infeasible_cols is None else infeasible_cols | lg_col
+    # weapon.af_lockout — restored 2026-08-26 (Brian), keyed off the engine's
+    # OWN attack_finished countdown rather than a re-derived held-weapon
+    # identity (see module docstring). ``af_lockout`` is a MULTIPLIER on the
+    # real per-discharge cooldown (0 = none, 1 = hold for one more cooldown's
+    # worth after the real one clears, 3 = three more, etc — matching the
+    # a26-lineage weapon.switch_lockout_mult's role, but against the real
+    # observed af value instead of a static per-weapon table).
+    # ``af_lockout_cap`` ceilings the EXTENSION at that many seconds (0 = no
+    # ceiling) — the a26-lineage weapon.switch_lockout_cap_ticks role, in
+    # seconds instead of ticks (real precedent: a28rc1h shipped
+    # switch_lockout_cap_ticks=6 = 0.3s at 20Hz, formula "lockout = cd +
+    # min(cd, T)"; see agents/plans/rl-skill-finetune.md). State (y,
+    # locked_weapon, af_prev, dt) lives in attack_state; read at tick-start
+    # (below) so it gates THIS tick's mask, written at tick-end (below) from
+    # THIS tick's own fire outcome — no separate anchor-tracking law needed.
+    #
+    # Both fixed 2026-08-26 (Brian + independent Opus review) after
+    # a28rc1h2 shipped with two live bugs:
+    #  1. self_arsenal_scalars is dequantized /TIME_SCALE (=60) — af here was
+    #     seconds/60, not seconds, so af_lockout_cap (documented AND written
+    #     in configs as real seconds) never bound at any real value: 0.3
+    #     compared against seconds/60 only binds above 18 real seconds.
+    #     Fixed by rescaling to real seconds at the read, below — every
+    #     other quantity in this block (y, dt, af_prev) inherits real-second
+    #     units for free since they are all derived from `af`.
+    #  2. y was armed ONCE at the af 0->positive rising edge and then just
+    #     HELD (not decayed) for as long as af stayed active — correct for a
+    #     single discharge, but wrong for a held continuous-weapon burst:
+    #     the server's think-chain re-bumps attack_finished every 0.1s while
+    #     button0 stays down (research/mvd-attack-audit.md), so af never
+    #     truly clears mid-burst, and the ENGINE'S OWN continuous-fire
+    #     hold-tail (qnn_onnx_apply_continuous_hold_tail, C-side, invisible
+    #     to this graph) can keep button0 down for up to 0.25s after the
+    #     model's own per-tick decode stops wanting to fire. (That tail is
+    #     now per-model: `attack.hold_tail_sec`, 0 on every fresh export, so
+    #     new models have no such overhang — but an archived .onnx with no
+    #     stamp still inherits the 0.25s one.) Held-then-decay
+    #     therefore waited for af to fully clear before EVER starting the
+    #     decay countdown, tacking af_lockout's full extension onto the END
+    #     of however long the engine kept the button down — not what
+    #     "one more cooldown's worth of grace after the model stops" means.
+    #     Fixed below: arm/decay are now keyed on `fired` (THIS function's
+    #     OWN per-tick fire decision, computed inside the graph, genuinely
+    #     memoryless and blind to whatever the C client does afterward) —
+    #     re-arm on every genuine fire, decay starts the instant this
+    #     function's own decode stops firing, same tick, whether or not the
+    #     engine goes on to override the actual button state.
+    y_prev = locked_prev = af_prev_in = dt_prev = dt = af = None
+    if af_lockout != 0.0:
+        if attack_state is None:
+            raise ValueError(
+                "weapon.af_lockout requires attack_state to be threaded "
+                "(ATTACK_STATE_DIM lanes: y, locked_weapon, af_prev, dt)")
+        # -1 (not the traced `rows` value) for the dynamic dim, matching l9's
+        # own reshape above: a literal -1 keeps ONNX shape inference static
+        # on ATTACK_STATE_DIM, where reshape(rows, ...) loses it (rows is
+        # itself a traced tensor op, not a python int, once batch is a
+        # dynamic_axes dim) — caught via onnx_smoke showing attack_state as
+        # (dyn,dyn) instead of (dyn,4), 2026-08-26.
+        state = attack_state.reshape(-1, ATTACK_STATE_DIM).to(l9.dtype)
+        y_prev, locked_prev, af_prev_in, dt_prev = (
+            state[:, 0], state[:, 1], state[:, 2], state[:, 3])
+        # self_arsenal_scalars is /TIME_SCALE on the wire (dequant.py); real
+        # seconds from here on, matching af_lockout_cap's own units.
+        af = (obs_tensors["self_arsenal_scalars"][..., 0].reshape(-1).to(l9.dtype)
+              * _TIME_SCALE)
+        active = af > 0.0
+        real_step = active & (af_prev_in > 0.0)        # a genuine active-to-active sample
+        step = torch.clamp(af_prev_in - af, min=0.0)   # real seconds elapsed between samples
+        # dt: the free-decay rate, independent of the arm/decay fix above.
+        # Sampled from a real active-to-active pair when one exists (and kept
+        # from the LAST such sample anywhere in the episode otherwise — never
+        # reset per-discharge). The only remaining fallback is the true
+        # episode-start bootstrap (dt_prev still exactly its zero-init),
+        # which must NOT be this discharge's own `af` (a full cooldown magnitude
+        # used as a PER-TICK rate collapses y to 0 in one step the first time a
+        # burst is shorter than the real cooldown itself — measured, not
+        # theoretical: single-tick RL discharge at af_lockout=1 released two
+        # ticks after arming instead of ~4, eating the whole extension before
+        # it was ever observable). A conservative fixed guess (20Hz-equivalent,
+        # the fastest plausible operating rate) UNDER-decays instead —
+        # slightly more lockout than intended, never a premature release —
+        # until a real sample (from this or any later cooldown) replaces it.
+        dt = torch.where(real_step, step, torch.where(dt_prev > 0.0, dt_prev, _DT_BOOTSTRAP_SEC))
+        # Masking for THIS tick reads last tick's ending state (y_prev,
+        # locked_prev) — matches locked_weapon's own convention: the tick a
+        # fire happens is not masked against itself, only ticks after it.
+        lockout_active = (y_prev > 0.0) & (locked_prev > 0.5)
+        locked_idx = torch.clamp(
+            locked_prev.round().to(torch.long) - 1, 0, WEAPON_HEAD_SIZE - 1)
+        locked_onehot = torch.nn.functional.one_hot(
+            locked_idx, WEAPON_HEAD_SIZE).to(torch.bool)
+        lock_cols = (~locked_onehot) & lockout_active.unsqueeze(-1)
+        infeasible_cols = lock_cols if infeasible_cols is None else infeasible_cols | lock_cols
+    if infeasible_cols is not None:
+        l9 = torch.cat(
+            [l9[..., :1], torch.where(
+                infeasible_cols, torch.full_like(l9[..., 1:], -1.0e9), l9[..., 1:])],
+            dim=-1)
+    def _resolved_selection() -> torch.Tensor:
+        """The impulse 1..8 this tick will actually discharge — the SAME law
+        ``attack_with_decode_step`` is about to apply, evaluated early.
+
+        Every weapon-keyed consumer must read this, never a raw-logit argmax
+        that is blind to ``preference_bias_vec`` / ``switch_margin``. Fixed
+        2026-08-21 (Brian: "silly oversight, not intentional"): the guard
+        zeros-probe was keyed on the naive argmax, so the RL self-splash veto
+        was evaluated against the wrong weapon in both directions. Must stay
+        in lockstep with attack_with_decode_step's own selection below.
+        """
+        _weap = l9[..., 1:]
+        _score = _weap
+        if preference_bias_vec is not None:
+            _score = _score + preference_bias_vec.reshape(-1).to(l9.dtype)
+        if switch_margin != 0.0:
+            _held = _weap.argmax(dim=-1)
+            _ideal = _score.argmax(dim=-1)
+            _s_ideal = _score.gather(-1, _ideal.unsqueeze(-1)).squeeze(-1)
+            _s_held = _score.gather(-1, _held.unsqueeze(-1)).squeeze(-1)
+            _idx = torch.where((_s_ideal - _s_held) > float(switch_margin), _ideal, _held)
+        else:
+            _idx = _score.argmax(dim=-1)
+        return (_idx + 1).to(torch.int64)
+
+    selected_impulse = _resolved_selection()
     align_bias = None
     veto_mask = None
     if guard is not None and hasattr(guard, "guard_attack_logit_for_export"):
         # Probe the guard on a zeros logit: the adapter is additive (alignment
         # bias) except hard vetoes buried at -1e9, so the probe separates them —
         # veto = probe < -1e8, align_bias = probe elsewhere.
-        # The resolved guard's export hook is a make_guard closure that owns its
-        # alignment strength — call it with (obs, move, logit) exactly as the
-        # original export did; do NOT pass a 4th strength arg.
         probe = guard.guard_attack_logit_for_export(
-            obs_tensors, move_logits, choice,
+            obs_tensors, move_logits, selected_impulse,
             torch.zeros_like(l9[..., :1])).reshape(-1)
         veto_mask = probe < -1.0e8
         align_bias = torch.where(veto_mask, torch.zeros_like(probe), probe)
     fire, weapon_impulse = attack_with_decode_step(
-        l9, held_impulse,
-        attack_bias=attack_bias, bias_vec=bias_vec,
+        l9,
         fire_bias_vec=fire_bias_vec,
         preference_bias_vec=preference_bias_vec,
         switch_margin=switch_margin,
         align_bias=align_bias, veto_mask=veto_mask)
-    # crest activation is STATIC python config (trace-safe branch): OFF returns
-    # the step result + the untouched state slot, bit-identical to pre-crest.
-    if int(crest_hold_ticks) <= 0 or crest_theta_vec is None:
-        return fire, weapon_impulse, attack_state
-    if aim_z_err is None or aim_range is None:
-        raise ValueError(
-            "attack crest gate is armed (crest_hold_ticks>0, crest_theta_vec set) "
-            "but no aim geometry was supplied — the gate needs the aim-prior "
-            "z_err tangent + pooled range (target pointer required; a "
-            "pointer-less model cannot run θ>0).")
-    if aim_z_rate is None:
-        raise ValueError(
-            "attack crest gate is armed but aim_z_rate was not supplied — the "
-            "convergence check needs the feed-forward tangent delta from the "
-            "same aim_prior_tangent_ffwd call that produced aim_z_err/aim_range.")
-    if attack_state is None:
-        raise ValueError(
-            "attack crest gate is armed but attack_state was not threaded — the "
-            "countdown latch rides the (B, ATTACK_STATE_DIM) wire slot.")
-    if obs_tensors is None or "attack_finished" not in obs_tensors:
-        raise ValueError(
-            "attack crest gate is armed but obs 'attack_finished' is missing — "
-            "the cooldown gate (ready) keeps the latch from converting "
-            "engine-discarded fires into delayed real discharges.")
-    # ready: the engine would honor this fire (QC cooldown expired — the same
-    # `<= eps` the eval's discharge definition uses; 0 is 0 in any scaling).
-    ready = obs_tensors["attack_finished"].reshape(-1).float() <= 1e-6
-    hbw, live = crest_alignment_hbw(aim_z_err, aim_range)
-    # Feed-forward convergence check: predict next tick's z_err under the
-    # target's current relative velocity (z_next = z_err + z_rate, exactly the
-    # quantity aim_prior_tangent_ffwd's z_rate is defined from) and run it
-    # through the SAME hbw law. diverging = the gate would be worse off a tick
-    # from now, so holding can't pay off — release now instead of waiting.
-    hbw_next, _ = crest_alignment_hbw(
-        aim_z_err.reshape(-1, 2) + aim_z_rate.reshape(-1, 2), aim_range)
-    diverging = hbw_next > hbw
-    # per-tick selection re-read (same law as the step, incl. switch hysteresis)
-    # so a mid-hold weapon switch releases against the NEW weapon's θ.
-    _score = (l9[..., 1:] if bias_vec is None
-              else l9[..., 1:] + bias_vec.reshape(-1).to(l9.dtype))
-    if preference_bias_vec is not None:
-        _score = _score + preference_bias_vec.reshape(-1).to(l9.dtype)
-    choice = _attack_with_select(_score, held_impulse, switch_margin) + 1
-    return attack_crest_gate_step(
-        fire, choice.to(torch.int64), held_impulse, attack_state,
-        crest_theta_vec=crest_theta_vec, crest_hold_ticks=int(crest_hold_ticks),
-        hbw=hbw, live=live, ready=ready, diverging=diverging, veto_mask=veto_mask)
+
+    attack_state_out = attack_state
+    if af_lockout != 0.0:
+        fired = fire.reshape(-1).to(torch.bool)
+        # y: re-armed on EVERY genuine fire this function decodes (not just
+        # the burst's first — mirrors locked_weapon's own re-arm-on-fired
+        # rule immediately below), from THIS tick's own observed af — target
+        # af_lockout * af, ceilinged by af_lockout_cap (0 = uncapped).
+        # Decays the instant this function's OWN decode stops firing,
+        # regardless of whatever the engine does with the button afterward.
+        y_target = af * float(af_lockout)
+        if af_lockout_cap != 0.0:
+            y_target = torch.clamp(y_target, max=float(af_lockout_cap))
+        y = torch.where(fired, y_target, torch.clamp(y_prev - dt_prev, min=0.0))
+        locked_new = torch.where(
+            fired, weapon_impulse.reshape(-1).to(l9.dtype), locked_prev)
+        attack_state_out = torch.stack([y, locked_new, af, dt], dim=-1)
+    return fire, weapon_impulse, attack_state_out
+
 
 
 # ── a25 MOVE COMMITMENT decode (segment head → semi-Markov generative) ───────
@@ -669,17 +629,28 @@ def move_engagement_signals(
     fraction), NOT the raw byte counts: :func:`ammo_staleness_step` only ever
     compares a pool against its own previous value, so the normalization is
     irrelevant to the law — but the two paths must pick the SAME one, or a
-    tick that switches the held weapon across pools compares two different
+    tick that switches the anchor weapon across pools compares two different
     scales and disagrees about whether ammo dropped.
 
     Accepts either entity-event-count spelling (``entity_event_counts`` is the
     dequantizer/schema output, ``entity_event_count`` the native wire field).
     Raises on an obs missing any required field — the caller asked for the
     engagement gate, so it must be computable.
+
+    ``self_weapon_id`` is the one EXCEPTION, not a required field: the A27+
+    pure-combat wire dropped it (schema v6, qnn/schema.py "the held weapon
+    CONCEPT is retired"; QNNPolicy.act's attack-with call already falls back
+    to anchor-weapon-blind selection on its absence, same reason). Missing here
+    just means ``held_impulse`` comes back all-zero — impulse 0 is already
+    "none/unknown" by convention (``self_weapon_id_to_impulse``), and
+    :func:`held_ammo_for_impulse` treats impulse 0 as ``has_pool=False``, so
+    the ammo-lockout override this feeds simply stays inert (matches what
+    happens when a caller omits ammo_pools/held_impulse entirely) rather than
+    raising for a signal this obs contract cannot supply.
     """
     from qnn.vocab import self_weapon_id_to_impulse
     missing = [k for k in ("entity_types", "entity_event_actions",
-                           "self_ammo_pools", "self_weapon_id") if k not in obs]
+                           "self_ammo_pools") if k not in obs]
     counts = obs.get("entity_event_counts")
     if counts is None:
         counts = obs.get("entity_event_count")
@@ -696,8 +667,11 @@ def move_engagement_signals(
         rows, et.shape[1], -1).long()
     cnt = torch.as_tensor(counts).reshape(rows, -1).long()
     ammo_pools = torch.as_tensor(obs["self_ammo_pools"]).reshape(rows, 4).float()
-    held_impulse = self_weapon_id_to_impulse(
-        torch.as_tensor(obs["self_weapon_id"]).reshape(rows).long())
+    if "self_weapon_id" in obs:
+        held_impulse = self_weapon_id_to_impulse(
+            torch.as_tensor(obs["self_weapon_id"]).reshape(rows).long())
+    else:
+        held_impulse = torch.zeros(rows, dtype=torch.int64)
     return (world_enemy_present(et),
             world_engaged_active(et, actions, cnt, rel),
             ammo_pools, held_impulse)
@@ -710,7 +684,7 @@ def move_engagement_signals(
 # their world-result is unmistakable: the bot keeps commanding fire and its
 # ammo never moves. Reuses the SAME shared threshold as the engagement
 # cooldown hold (idle_cooldown_ticks) rather than a second knob: if the ammo
-# pool relevant to the held weapon hasn't decremented in over that many
+# pool relevant to the anchor weapon hasn't decremented in over that many
 # ticks, `engagement_none_bias` forces E to 0 outright — full idle stillness
 # — regardless of what enemy_present/engaged_active say. Needs 2 lanes of
 # persistent state (a baseline ammo value + a staleness counter), threaded on
@@ -730,9 +704,9 @@ _AMMO_POOL_BY_IMPULSE = torch.tensor(
 
 def held_ammo_for_impulse(
     ammo_pools: torch.Tensor,   # (B, 4) [shells, nails, rockets, cells]
-    impulse: torch.Tensor,      # (B,) held weapon impulse 1..8
+    impulse: torch.Tensor,      # (B,) anchor weapon impulse 1..8
 ) -> "tuple[torch.Tensor, torch.Tensor]":
-    """``(ammo, has_pool)`` — the ammo count relevant to the held weapon,
+    """``(ammo, has_pool)`` — the ammo count relevant to the anchor weapon,
     gathered from ``ammo_pools``. ``has_pool`` is False for the axe (no ammo
     pool at all); callers must exempt those rows from staleness tracking.
     Trace-safe (index_select/gather only)."""
@@ -817,14 +791,13 @@ def move_commit_step(
     water: torch.Tensor | None = None,   # (B,) bool — enables the ud (swim) axis
     threat: torch.Tensor | None = None,  # (B,) bool — incoming projectile present
     threat_break_hazard: float = 0.0,    # per-tick re-decision prob on threat rows
-    recommit: bool = False,              # allow re-commit to the held class at expiry
     enemy_present: torch.Tensor | None = None,   # (B,) bool — an actor is observed
     engaged_active: torch.Tensor | None = None,  # (B,) bool — target firing / non-self projectile
     idle_none_bias: "tuple[float, float]" = (0.0, 0.0),  # per-axis (fb,lr) idle stand-still bias
     idle_engagement_base: float = 0.5,   # E when an enemy is present but not active
     idle_cooldown_ticks: int = 20,       # 1s @ 20Hz engagement hold after combat
     ammo_pools: torch.Tensor | None = None,      # (B,4) [shells,nails,rockets,cells]
-    held_impulse: torch.Tensor | None = None,    # (B,) held weapon impulse 1..8
+    held_impulse: torch.Tensor | None = None,    # (B,) anchor weapon impulse 1..8
 ) -> torch.Tensor:
     """One tick of the commitment decode. Mutates ``commit_state`` in place;
     returns (B, 2) int64 fb/lr classes to emit this tick — or (B, 3) with the
@@ -939,13 +912,11 @@ def move_commit_step(
         held = cls.clamp(min=0)
         bucket_cols = torch.arange(N_BUCKETS, device=dev)
         mask_cols = held.unsqueeze(1) * N_BUCKETS + bucket_cols  # (B, 10)
-        # recommit: allow the head to re-commit to the held class at expiry (no
-        # forced switch) — the held class stays available so a maximal run can
-        # be extended. Off (default) = the maximal-run law (expiry forces a
-        # class change), bit-identical to pre-knob.
+        # MAXIMAL-RUN law: at expiry the held class is masked out, so a segment
+        # is a maximal run (expiry means change) — the population the seg head
+        # was trained on. The move.commit_recommit opt-out was deleted
+        # 2026-08-26 (never set by any config).
         row_has_held = ((cls >= 0) & (rem <= 0)).unsqueeze(1)
-        if recommit:
-            row_has_held = torch.zeros_like(row_has_held)
         logits.scatter_(1, mask_cols, torch.where(
             row_has_held.expand(-1, N_BUCKETS),
             torch.full_like(mask_cols, -1, dtype=logits.dtype).fill_(-1e9),
@@ -1061,14 +1032,13 @@ def move_commit_step_graph(
     jump_threshold: float = 0.0,            # >0 = deterministic jump gate p_jump > τ
     threat: torch.Tensor | None = None,     # (B,) bool — incoming projectile present
     threat_break_hazard: float = 0.0,       # per-tick re-decision prob on threat rows
-    recommit: bool = False,                 # allow re-commit to the held class at expiry
     enemy_present: torch.Tensor | None = None,   # (B,) bool — an actor is observed
     engaged_active: torch.Tensor | None = None,  # (B,) bool — target firing / non-self projectile
     idle_none_bias: "tuple[float, float]" = (0.0, 0.0),  # per-axis (fb,lr) idle stand-still bias
     idle_engagement_base: float = 0.5,      # E when an enemy is present but not active
     idle_cooldown_ticks: int = 20,          # 1s @ 20Hz engagement hold after combat
     ammo_pools: torch.Tensor | None = None,      # (B,4) [shells,nails,rockets,cells]
-    held_impulse: torch.Tensor | None = None,    # (B,) held weapon impulse 1..8
+    held_impulse: torch.Tensor | None = None,    # (B,) anchor weapon impulse 1..8
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
     """TRACE-SAFE in-graph twin of :func:`move_commit_step` (fb/lr only) — the
     DECODE LAW baked into the ONNX so deploy == the QNNPolicy.act commitment decode.
@@ -1163,8 +1133,6 @@ def move_commit_step_graph(
         # re-decision (held stays available) — matches the eager scatter law.
         held = cls.clamp(min=0).reshape(B, 1)                       # (B,1)
         row_has_held = ((cls >= 0) & (rem <= 0)).reshape(B, 1)      # (B,1)
-        if recommit:                                                # allow re-commit: never mask held
-            row_has_held = torch.zeros_like(row_has_held)
         is_held_col = (col_class == held)                          # (B,JOINT) bool
         penalty = torch.where(row_has_held & is_held_col,
                               torch.full((), -1.0e9, device=dev, dtype=logits.dtype),
@@ -1279,9 +1247,9 @@ def move_commit_step_graph(
 # BIT-IDENTICAL clones of the reachable a24 decode geometry so the a25 arch never
 # imports/executes a24 code (cross-arch decode-coupling ban). These are the a24
 # functions the a25 seg+attack_with policy/export actually run:
-#   * assemble_aim_prior / assemble_pitch_correction / decode_look_from_polar —
+#   * assemble_aim_prior / decode_look_from_polar —
 #     the shared look decode (sampled magnitude × continuous direction + aim-prior
-#     blend + feet-aim pitch + expmap).
+#     blend + expmap).
 #   * build_weapon_ban_tensors — the weapon-ban tensor constructor (executed at
 #     export construction; empty ban → (None, None)).
 # The a24 move sticky/hazard/switch-back stack, the split-attack decode step, and
@@ -1306,38 +1274,6 @@ def assemble_aim_prior(
     return gain * z_err + ffwd * z_rate
 
 
-def assemble_pitch_correction(
-    z_err: torch.Tensor,
-    weapon_pitch_gain: torch.Tensor,
-    weapon_impulse: torch.Tensor,
-    weapon_pitch_bias: "torch.Tensor | None" = None,
-) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
-    """Per-row VERTICAL feet-aim BLEND terms — the RL-splash feet-aiming.
-
-    ``z_err`` is the UNSCALED aim-prior error tangent (vertical component
-    ``z_err[..., 1]`` is the absolute turn-to-anchor pitch, + = up / − = down).
-    ``weapon_pitch_gain`` is a (9,) per-IMPULSE blend weight β ∈ [0, 1] (0 = OFF).
-    ``weapon_impulse`` is the attack-with intent in engine order (0..8).
-
-    Returns ``(beta, target_vert, feet_vert)``, consumed by :func:`decode_look_from_polar`
-    as the LERP ``z_vert ← (1−β)·z_head_vert + β·target_vert``. β is enemy-gated
-    (``z_err`` is exactly zero rows otherwise). ``weapon_pitch_bias`` (per-IMPULSE deg,
-    default None) deepens the target to cancel the static RL fire-high offset.
-    """
-    imp = weapon_impulse.reshape(-1).long().clamp(0, 8)
-    beta = weapon_pitch_gain.reshape(-1).index_select(0, imp)            # (R,)
-    z = z_err.reshape(-1, z_err.shape[-1])                               # (R, 2)
-    feet_vert = z[:, 1]                                                  # (R,) UN-biased feet-anchor pitch (floor)
-    target_vert = feet_vert                                             # drive target
-    if weapon_pitch_bias is not None:
-        bias_deg = weapon_pitch_bias.reshape(-1).index_select(0, imp)    # (R,) deg
-        # deg→rad as a plain multiply (aten::deg2rad does NOT export to opset 18).
-        target_vert = target_vert - bias_deg * 0.017453292519943295     # + = aim DOWN
-    # presence gate: aim_prior_tangent_ffwd zeroes BOTH components on no-enemy frames,
-    # so a nonzero L1 means an enemy is perceived. Zeroing β there keeps the lerp a
-    # no-op (z_vert unchanged) instead of shrinking the head's vertical.
-    present = (z.abs().sum(dim=-1) > 1e-9).to(beta.dtype)               # (R,)
-    return beta * present, target_vert, feet_vert
 
 
 def decode_look_from_polar(
@@ -1348,13 +1284,7 @@ def decode_look_from_polar(
     z_prior: torch.Tensor | None = None,
     mag_gain: float = 0.0,
     turn_mag_scale: "float | torch.Tensor" = 1.0,
-    hold_drift_eps: float = 0.0,
     hold_passthrough: bool = False,
-    pitch_correction: "tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None" = None,
-    feet_elev: "torch.Tensor | None" = None,
-    origin_elev: "torch.Tensor | None" = None,
-    pitch_mode: str = "lock",
-    shift_strength: float = 1.0,
     *,
     theta_override: "torch.Tensor | None" = None,
     phi_override: "torch.Tensor | None" = None,
@@ -1366,14 +1296,14 @@ def decode_look_from_polar(
     supplies ``mag_bin`` from ITS OWN magnitude sampler (seeded categorical offline /
     in-graph Gumbel-argmax for export). This function owns the shared remainder: the
     continuous DIRECTION readout (circular mean of the direction softmax), the
-    z-assembly, the aim-prior blend, the feet-aim pitch, and the expmap.
+    z-assembly, the aim-prior blend, and the expmap.
 
     ``theta_override`` / ``phi_override`` (the look_seg COMMIT decode path): when
     given, skip the polar mag_bin/dir readout and take the per-tick signed
     magnitude θ and direction φ DIRECTLY from the commit playout
     (``look_commit_step`` / ``look_commit_step_graph``). ``turn_mag_scale`` still
     applies to the supplied θ; the shared z-assembly + aim-prior blend + feet-aim
-    pitch + expmap remainder is IDENTICAL to the polar path — the single source of
+    expmap remainder is IDENTICAL to the polar path — the single source of
     truth co-decoded with tools/export_onnx.ExportWrapper.
 
     Returns the look unit vector with shape ``mag_bin.shape + (3,)``.
@@ -1398,14 +1328,6 @@ def decode_look_from_polar(
     elif turn_mag_scale != 1.0:
         theta = theta * float(turn_mag_scale)
     z = torch.stack([theta * torch.cos(phi), theta * torch.sin(phi)], dim=-1)
-    if hold_drift_eps > 0.0:
-        # HOLD-DRIFT (default 0.0 = OFF = bit-identical): replace exact holds with an
-        # eps-magnitude turn along the head's continuous direction φ; the aim-prior
-        # blend below rotates the eps onto the true error direction when present.
-        is_hold = (theta == 0).unsqueeze(-1)
-        drift = float(hold_drift_eps) * torch.stack(
-            [torch.cos(phi), torch.sin(phi)], dim=-1)
-        z = torch.where(is_hold, drift, z)
     if z_prior is not None:
         # AIM-PRIOR blend: direction is the rotated heading normalize(z + z_prior); the
         # kept MAGNITUDE blends from |z|=θ (mag_gain=0, PURE ROTATION) toward |z+z_prior|
@@ -1423,56 +1345,15 @@ def decode_look_from_polar(
             mag = mag + float(mag_gain) * (n - mag)                    # θ → |z+z_prior|
         # where z_t collapses to ~0 (tiny head turn + no aim), keep z unrotated.
         z = torch.where(n > 1e-9, mag * z_t / n.clamp_min(1e-9), z)
-    if pitch_correction is not None:
-        # VERTICAL feet-aim BLEND (RL-splash): lerp the decoded turn's vertical toward
-        # the absolute geometric anchor, OUTSIDE the rotation-magnitude clamp. β is
-        # enemy-gated, so no-target frames are an exact no-op. Default None = no-op.
-        # FLOOR CLAMP (feet_vert): never aim below the feet at range. SHIFT mode SKIPS
-        # the tangent β-blend (it would collapse the head's vertical spread).
-        if pitch_mode != "shift":
-            beta, target_vert, feet_vert = pitch_correction
-            beta = beta.reshape(z[..., 1].shape)
-            target_vert = target_vert.reshape(z[..., 1].shape)
-            feet_vert = feet_vert.reshape(z[..., 1].shape)
-            z_vert = z[..., 1] + beta * (target_vert - z[..., 1])   # blend toward biased drive
-            gate = (beta > 0).to(z_vert.dtype)                      # RL + enemy present
-            z_vert = torch.maximum(z_vert, feet_vert) * gate + z_vert * (1.0 - gate)
-            z = torch.stack([z[..., 0], z_vert], dim=-1)
     if hold_passthrough:
         # HOLD PASS-THROUGH (default False = bit-identical): frames where the head
         # commanded an exact hold (θ == 0) emit an exact hold — the aim-prior
         # magnitude blend above otherwise converts every engaged hold into an
         # α·|aim-error| micro-correction, driving measured exact-hold occupancy to
         # zero (humans: ~14% of engaged frames). Turning frames are untouched.
-        # Mutually exclusive with hold_drift_eps in spirit (drift REPLACES holds;
-        # pass-through PRESERVES them) — pass-through wins on the θ==0 rows.
         _hold_rows = (theta == 0).unsqueeze(-1)
         z = torch.where(_hold_rows, torch.zeros_like(z), z)
     look_vec = tangent_expmap(z)                                    # (..., 3) fwd,right,up
-    if pitch_correction is not None and feet_elev is not None:
-        # POST-EXPMAP FEET-ELEVATION LOCK (RL splash robustness). Set the fired look's
-        # ELEVATION to the feet anchor (feet_elev) keeping AZIMUTH, AFTER the turn.
-        # Gated to β>0 (RL + enemy present); feet_elev is 0 on no-enemy frames.
-        beta_g = pitch_correction[0].reshape(look_vec[..., 0].shape)
-        gate_e = (beta_g > 0).to(look_vec.dtype)
-        if hold_passthrough:
-            # elevation lock would re-pitch pass-through holds; keep them exact
-            gate_e = gate_e * (theta != 0).to(look_vec.dtype).reshape(gate_e.shape)
-        fe = feet_elev.reshape(look_vec[..., 0].shape)
-        h = torch.linalg.vector_norm(look_vec[..., :2], dim=-1).clamp_min(1e-6)
-        # Target elevation to set (keeping azimuth). "lock" → feet_elev exactly;
-        # "shift" → translate the head's OWN fired elevation DOWN by
-        # shift_strength·(origin_elev − feet_elev), preserving the head's spread.
-        if pitch_mode == "shift" and origin_elev is not None:
-            cur = torch.atan2(look_vec[..., 2], h)
-            oe = origin_elev.reshape(look_vec[..., 0].shape)
-            tgt = cur - float(shift_strength) * (oe - fe)
-        else:
-            tgt = fe
-        ce = torch.cos(tgt)
-        setv = torch.stack(
-            [ce * look_vec[..., 0] / h, ce * look_vec[..., 1] / h, torch.sin(tgt)], dim=-1)
-        look_vec = setv * gate_e.unsqueeze(-1) + look_vec * (1.0 - gate_e).unsqueeze(-1)
     return look_vec
 
 
@@ -1503,10 +1384,29 @@ def build_weapon_ban_tensors(
 # export/parity scaffolding a25-native initial state so the LIVE a25 export executes
 # no a24 code. The rng seed literals ARE the wire/state contract (mirrored in
 # src/engine/common/qnn_onnx.c).
-# attack_state lane 0 = the crest-gate countdown (attack_crest_gate_step); 0 = idle,
-# so the existing zeros-init/episode-reset loopback semantics are unchanged. With
-# the gate OFF the slot passes through untouched (wire parity, bit-identical).
-ATTACK_STATE_DIM = 1
+# attack_state was fully INERT from 2026-08-26 (every lane's consumer had been
+# removed: lane 0 was the crest-gate countdown, lanes 1/2 the removed
+# selection laws' anchor + accumulator, lane 3 the switch lockout's tick
+# counter) until weapon.af_lockout restored a consumer the same day, reusing
+# all 4 lanes for a NEW, simpler state:
+#   lane 0 (y)            — seconds remaining in the lockout window
+#   lane 1 (locked_weapon) — impulse (0..8) currently exempted from the mask
+#   lane 2 (af_prev)      — last tick's self_arsenal_scalars attack_finished
+#   lane 3 (dt)           — the real per-tick seconds af was observed to
+#                            decay by, captured live and frozen once af hits 0
+# See attack_with_decode's af_lockout branch. attack_with_decode is stateless
+# (reads/writes nothing) UNLESS af_lockout is armed, in which case it both
+# reads and writes this tensor every call. Every config that does not set
+# weapon.af_lockout gets the old zero-effect passthrough, unchanged.
+#
+# The tensor is kept as wire scaffolding independent of whether any consumer
+# is currently armed: removing it (and attack_rng, whose seed literals are
+# MIRRORED in src/engine/common/qnn_onnx.c) is a deliberate wire/state-contract
+# change, not a decode cleanup. The engine binds loopbacks generically from
+# `state.loopback` metadata, so dropping the pair is mechanically safe when
+# someone chooses to, but the lanes are live again now — do not repurpose
+# them for anything else without checking af_lockout carriers first.
+ATTACK_STATE_DIM = 4
 _RNG_DEFAULT_SEED = 0x9E3779B9          # xorshift reseed-on-zero constant
 _RNG_U32 = 0xFFFFFFFF
 
@@ -1535,9 +1435,10 @@ def attack_decode_reset_flat(
     rng_state: "int | torch.Tensor" = _RNG_DEFAULT_SEED,
     device: "torch.device | str | None" = None,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
-    """Flat (graph-I/O) a25 attack-state reset: ``(B, ATTACK_STATE_DIM)`` zeros + the
-    ``(B,)`` int64 attack_rng. Zeros = the crest latch idle (lane 0 countdown = 0);
-    with the gate OFF the slots pass through unchanged (wire parity)."""
+    """Flat (graph-I/O) attack-state reset: ``(B, ATTACK_STATE_DIM)`` zeros + the
+    ``(B,)`` int64 attack_rng. All-zeros is the correct off state for
+    weapon.af_lockout too (y=0, locked_weapon=0 ⇒ no active lockout). attack_rng
+    is INERT (kept for wire/state parity only) regardless."""
     s = torch.zeros(batch, ATTACK_STATE_DIM, dtype=torch.float32, device=device)
     rng = torch.full((batch,), int(rng_state) & _RNG_U32, dtype=torch.int64, device=device)
     return s, rng

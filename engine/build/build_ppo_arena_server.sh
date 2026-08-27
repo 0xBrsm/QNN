@@ -17,6 +17,7 @@ PATCHES=(
   "${ENGINE_DIR}/patches/arena/net_loop.c.patch"
   "${ENGINE_DIR}/patches/arena/net_dgrm.c.patch"
   "${ENGINE_DIR}/patches/arena/sv_main.c.patch"
+  "${ENGINE_DIR}/patches/arena/sv_phys.c.patch"
   "${ENGINE_DIR}/patches/arena/sv_user.c.patch"
 )
 CUSTOM_SOURCES=(

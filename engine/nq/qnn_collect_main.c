@@ -458,7 +458,14 @@ static void QNN_WriteHelloResponse(void)
 	QNN_WriteJsonString(stdout, QNN_WORKER_PROTOCOL);
 	fprintf(stdout, ",\"server\":");
 	QNN_WriteJsonString(stdout, QNN_WORKER_SERVER_NAME);
-	fprintf(stdout, ",\"tick_hz\":%d,\"worker_build\":{\"basedir\":", qnn_runtime.fixed_tick_hz);
+	/* Resolved perception regime (E6 provenance fix) — see the qw worker's
+	 * QNN_WriteHelloResponse for the full rationale. */
+	fprintf(stdout,
+		",\"tick_hz\":%d,\"perception\":{\"los_clearance\":%d,\"fov\":%.6g},"
+		"\"worker_build\":{\"basedir\":",
+		qnn_runtime.fixed_tick_hz,
+		QNN_LosClearanceResolved() ? 1 : 0,
+		(double)QNN_FovResolved());
 	QNN_WriteJsonString(stdout, basedir);
 	fprintf(stdout, ",\"upstream_commit\":");
 	QNN_WriteJsonString(stdout, QNN_WORKER_UPSTREAM_COMMIT);
@@ -491,6 +498,12 @@ static int QNN_HandleHello(const char *line)
 		QNN_WriteError(error);
 		return 0;
 	}
+
+	/* Resolve the perception cvars before reporting them — see the qw
+	 * worker's QNN_HandleHello for the full rationale (QNN_IOInit
+	 * normally does this registration, but doesn't run until the first
+	 * demo's reset, too late for hello to reflect the real regime). */
+	QNN_RegisterPerceptionCvars();
 
 	QNN_WriteHelloResponse();
 	return 0;

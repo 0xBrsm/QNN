@@ -17,7 +17,7 @@ import torch
 from qnn.model.decode import BatchedRNG
 from qnn.ppo.distributions import HeadDistribution
 from qnn.ppo.env_backend import EpisodeResult, RolloutEnvBackend
-from qnn.ppo.learner import ValueHead
+from qnn.ppo.learner import ValueHead, value_features
 from qnn.ppo.rollout import RolloutBuffer
 
 class RolloutCollector:
@@ -36,9 +36,11 @@ class RolloutCollector:
         initial_obs: Dict[str, np.ndarray] | None = None,
         temperatures: Mapping[str, float] | None = None,
         sample_temperatures: Mapping[str, float] | None = None,
+        value_af: bool = False,
     ) -> None:
         self.policy = policy
         self.value_head = value_head
+        self.value_af = bool(value_af)
         self.vec_env = vec_env
         self.adapters = dict(adapters)
         self.device = torch.device(device)
@@ -55,6 +57,15 @@ class RolloutCollector:
         self.row_generators = BatchedRNG.seeded(seed, B, self.device)
 
         self.hidden: torch.Tensor | None = None
+        # Commitment-decode state threading (a25/a28): prepare_act_state is
+        # the single-source contract — per-lane arrays act() mutates IN
+        # PLACE, re-initialized to their reset lanes on episode boundaries
+        # (same lifecycle as the GRU hidden zeroing below). Older graphs
+        # return {} and act() runs stateless, unchanged.
+        self._act_state = policy.prepare_act_state(B)
+        self._act_state_reset = {
+            k: v[0].copy() for k, v in self._act_state.items()
+        }
         # initial_obs lets the orchestrator reset once, size the value head
         # from a probe forward, and hand the same obs here.
         self.obs = initial_obs if initial_obs is not None else vec_env.reset()
@@ -75,7 +86,9 @@ class RolloutCollector:
             features, _, _, _, _ = self.policy._forward_tensors(
                 dict(obs), hidden=hidden, eager_model=True,
             )
-            return self.value_head(features).float()
+            return self.value_head(
+                value_features(features, obs, self.value_af)
+            ).float()
 
     def _ensure_hidden(self, B: int) -> torch.Tensor | None:
         if not self.policy.use_gru:
@@ -115,6 +128,12 @@ class RolloutCollector:
             buffer_s += time.perf_counter() - _t0
 
             _t0 = time.perf_counter()
+            if self._act_state and self.reset_flags.any():
+                # Fresh episodes restart their commitment machines exactly
+                # like the ONNX state_loopback memset / eval row re-init.
+                for lane in np.flatnonzero(self.reset_flags):
+                    for k, template in self._act_state_reset.items():
+                        self._act_state[k][lane] = template
             with self.policy._autocast():
                 batch, extras = self.policy.act(
                     dict(self.obs),
@@ -124,9 +143,12 @@ class RolloutCollector:
                     row_generators=self.row_generators,
                     sample_temperatures=self.sample_temperatures,
                     rl_extras=True,
+                    **self._act_state,
                 )
             with torch.inference_mode():
-                buffer.values[t].copy_(self.value_head(extras["features"]).float())
+                buffer.values[t].copy_(self.value_head(
+                    value_features(extras["features"], self.obs, self.value_af)
+                ).float())
 
             self._sample_heads(buffer, t, batch, extras)
 
@@ -145,6 +167,8 @@ class RolloutCollector:
                 not_held = ~torch.from_numpy(step.hold).to(self.device)
                 for head in self.adapters:
                     buffer.decision_mask[head][t] &= not_held
+            if step.align_hbw is not None:
+                buffer.align_hbw[t].copy_(torch.from_numpy(step.align_hbw))
             buffer.rewards[t].copy_(torch.from_numpy(step.rewards))
             buffer.terminal[t].copy_(torch.from_numpy(step.terminal))
             buffer.truncated[t].copy_(torch.from_numpy(step.truncated))

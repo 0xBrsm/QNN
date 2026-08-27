@@ -128,7 +128,7 @@ def _build_job(job_id: str, run_dir: Path) -> _AblationJob:
         job_id=job_id,
         ctx=ctx,
         config=bc_config,
-        source_key=source_compatibility_key_for_config(bc_config),
+        source_key=source_compatibility_key_for_config(bc_config, graph=graph),
         seed_checkpoint=str(ctx.run_cfg.get("checkpoint_path", "") or ""),
         model_factory=model_factory,
         graph=graph,
@@ -427,7 +427,7 @@ class AblationDaemon:
                         f"  [bc/daemon] loading source bundle for {first.ctx.run_dir}",
                         flush=True,
                     )
-                    bundle = build_behavior_cloning_sources(first.config)
+                    bundle = build_behavior_cloning_sources(first.config, graph=first.graph)
                     loaded_error = None
                 except Exception as exc:
                     bundle = None

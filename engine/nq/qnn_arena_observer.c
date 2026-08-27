@@ -96,7 +96,7 @@ void QNN_ArenaObserverPrepare(void)
 
 void QNN_ArenaObserverWrite(FILE *out, const struct qnn_obs_plan_s *plan,
 	const qnn_action_t *previous_action,
-	int tick, int steps, qboolean reset_flag)
+	int tick, int steps, qboolean reset_flag, float dt)
 {
 	qnn_snapshot_t snapshot;
 	qnn_tick_result_t result;
@@ -126,12 +126,12 @@ void QNN_ArenaObserverWrite(FILE *out, const struct qnn_obs_plan_s *plan,
 			snapshot.player_origin[2], reset_flag ? 1 : 0);
 	if (reset_flag)
 		QNN_PredictReset();
-	QNN_PredictTick(1.0f / 20.0f);
+	QNN_PredictTick(dt);
 	QNN_PredictSelfVelocity(snapshot.player_velocity);
 	snapshot.action_label = *previous_action;
 	snapshot.done = QNN_TrainingNetworkRoundReset();
 	QNN_DrainSounds(&snapshot);
-	QNN_IOUpdate(&snapshot, 1.0f / 20.0f, reset_flag);
+	QNN_IOUpdate(&snapshot, dt, reset_flag);
 	QNN_IOEmitPlan(plan, &snapshot, &result);
 	QNN_ObsPlanPack(plan, obs, plan->frame_bytes, &result);
 	if (QNN_IOPoseTailEnabled())

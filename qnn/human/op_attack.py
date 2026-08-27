@@ -15,6 +15,20 @@ re-entries) are engine-owned on BOTH human and bot sides and excluded on
 both, so the pair stays commensurate with the eval's per-LOS-tick
 engine_los_attack tables.
 
+POPULATION, stated explicitly because a downstream consumer once got this
+wrong (agents/plans/blind-fire-cadence.md): ``rate_per_s`` here is
+conditional on LOS *AND* a ``target_probs``-labeled engagement -- a
+NARROWER population than plain "actor in LOS" (1.72x smaller on SG+SSG).
+That narrower rate is the correct ruler for anything whose own bot-side mask
+shares this same double condition (the live-pins forced-cadence fit,
+``qnn.decode_fit.live_pins`` -- see ``instruments.collect_forced_attack_rate``'s
+``keep & engaged`` band-v5 mask). It is the WRONG rate for a consumer whose
+mask is pure-LOS (e.g. ``qnn.ppo.learner._fire_occupancy_loss``'s
+``isfinite(align_hbw)``) -- that consumer must read
+``qnn.human.blind_fire``'s ``aimed_rate_per_s`` /
+``qnn.decode_fit.human_refs.family_aimed_rates_los`` instead, which drops the
+``target_probs`` condition and matches its population exactly.
+
 Intervals are gaps between consecutive effective-attack frames within an
 unbroken (engaged-LOS AND same attack context) run -- the within-engagement refire
 texture ("histogram the results"), right-censoring dropped with the run.

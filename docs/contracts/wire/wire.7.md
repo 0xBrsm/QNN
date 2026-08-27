@@ -20,7 +20,7 @@ bin as the current model.
 | # | name | dtype | shape | meaning |
 |---|------|-------|-------|---------|
 | 0 | `self_scalars` | float32 | (17,) | health, armor, 7 weapon one-hots (SG,SSG,NG,SNG,GL,RL,LG), ammo×4 (shells,nails,rockets,cells), vel[3] view-frame, attack_finished(s). Slot 16 = attack_finished |
-| 1 | `self_weapon_id` | int64 | (1,) | held weapon, **ENTITY_IDS-encoded** (NONE=0…THUNDERBOLT=10), not impulse |
+| 1 | `self_weapon_id` | int64 | (1,) | engine-equipped weapon, **ENTITY_IDS-encoded** (NONE=0…THUNDERBOLT=10), not impulse |
 | 2 | `self_armor_type_id` | int64 | (1,) | 0/green/yellow/red |
 | 3 | `self_movement_id` | int64 | (1,) | 0 ground / 1 air / 2-4 water |
 | 4 | `self_powerup_ids` | int64 | (5,) | active powerup subject-ids, zero-padded |

@@ -134,7 +134,8 @@ SPATIAL_SCALAR_DIM = 48  # per band: depth x 24 + hit x 24
 #    12    attack_finished          f16         ()             2  (seconds)
 #    14    self_weapon_id           u8          ()             1  (engine-written;
 #                                                                 NOT parsed — no
-#                                                                 held-weapon input
+#                                                                 engine-equipped-
+#                                                                 weapon input
 #                                                                 in the A27 obs)
 #    15    self_movement_id         u8          ()             1
 #    16    self_items               u32         ()             4

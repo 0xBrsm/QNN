@@ -51,12 +51,13 @@ def run_episode(
         _stack_obs,
     )
     from qnn.eval.probe_table import assign_closed_loop
+    from qnn.model.decode_actions import ATTACK_STATE_DIM
     import torch
 
     env.reset(seed=episode_seed)
     acc = GeometryAccumulator(tick_hz=tick_hz)
     hidden = model.zero_hidden(1)
-    attack_state = np.zeros((1, 1), dtype=np.float32)
+    attack_state = np.zeros((1, ATTACK_STATE_DIM), dtype=np.float32)
     attack_rng = _seed_attack_rng(episode_seed)
     move_commit = np.asarray(_commit_reset_lanes(), dtype=np.float32)
     rng = torch.Generator().manual_seed(episode_seed)

@@ -139,7 +139,8 @@ def _build_jump(head, dims, d_model):
     # target.feat from inputs shrinks the consumed prefix.
     # coord_features_dim == base_features_dim unless a shared attack-intent
     # block is spliced in (network.slot_dims); this head is a CONSUMER of it.
-    in_dim = dims["coord_features_dim"]
+    in_dim = (dims["coord_features_dim"] if "intent" in head.inputs
+              else dims["base_features_dim"])
     if "target.feat" not in head.inputs:
         in_dim -= d_model
     # Spec default pos_weight=0.0 means "unset" → no reweighting (1.0).

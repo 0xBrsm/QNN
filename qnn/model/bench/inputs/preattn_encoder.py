@@ -25,7 +25,6 @@ class PreAttnEncoder(nn.Module):
             self_readout=tokens[:, inp.self_slice.start, :],
             entity_outs=tokens[:, inp.entity_slice, :],
             entity_mask=inp.entity_mask,
-            self_block=tokens[:, inp.self_slice, :],
         )
 
 

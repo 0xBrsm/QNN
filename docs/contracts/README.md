@@ -144,6 +144,36 @@ grid's **bin count** must equal the head's trained output width (center values
 are free to tune; the count is not — a count mismatch is an incompatible
 decode/checkpoint pairing).
 
+**One decode knob is ENGINE-applied** (`attack.hold_tail_sec`). Everything else
+decodes in-graph or in python; the continuous-weapon **hold-tail** — button0 held
+for N seconds after a NG/SNG/LG fire, so the server's 0.1 s
+`player_nail`/`player_light` think-chain streams the shots between the model's
+~0.2 s op-fire decisions — lives in the live client
+(`qnn_onnx_apply_continuous_hold_tail`) and has **no in-graph twin and no policy
+attribute**. It therefore travels as a stamp the engine reads at load
+(`decode.attack.hold_tail_sec`), not as a `DECODE_PARAMS` row.
+
+It is a decode param and not a wire/semantics bump for the reason this whole
+registry exists: **neither axis can say "this model, not that one" here.** The
+tensor signature is identical either way, the wire version gates exactly one
+behavior by design (decided `move` vs raw `move_logits`), and **one bin serves
+every registered codec** — so a binary-wide switch (a `#define`, or the
+2026-08-26 test build's `QNN_CONTINUOUS_HOLD_TAIL` env, both gone) silently
+changes every model on the share at once.
+
+| where | value | why |
+|---|---|---|
+| fresh export | **0.0** (`ATTACK_HOLD_TAIL_DEFAULT`), always stamped explicitly | the tail is scrapped from 2026-08-26 on; the ONNX states the law even when the config is silent |
+| a config that wants it | `params["attack.hold_tail_sec"] = 0.25` | per-model opt-in, no rebuild |
+| **stamp absent** | **0.25 s** (`QNN_FIRE_HOLD_SEC`, engine-side) | every already-exported `.onnx` keeps its shipped behavior bit-for-bit. Load-bearing FOREVER, not a migration window: archived models are era-locked to their own branches and cannot be re-exported, so an absent stamp is the only signal that a graph predates the law |
+| an archived `.onnx` you want changed | `tools/stamp_onnx.py --attack-hold-tail-sec 0` | re-arms or scraps the tail in place, no re-export |
+
+The bin prints nothing about the tail; to read a model's setting, look at its
+`decode.attack.hold_tail_sec` metadata prop (absent = the 0.25 s fallback). Note
+the python decode has never implemented a hold-tail, so offline eval and every
+decode-fit already modelled the tail-free world — `0.0` closes that live/offline
+asymmetry rather than widening it.
+
 **Where the decode CODE lives** (a cross-gen split, not a version): the
 cross-gen-stable readout primitives (sampling, attack-bit, per-axis move) are in
 `src/qnn/model/decode.py`; each generation's *choices* (its decode geometry and
@@ -186,7 +216,8 @@ whole load set. `wire.8` is a reconstructed id — the native exporter postdates
 `look_delta`, so no 43-input graph was ever exported. `wire.11` = `wire.9` (native
 44-obs split + in-graph decided `move`/`weapon` + the move-decode state pair) **+
 the in-graph ATTACK decode** (decided `attack` bit instead of `fire_logit`, plus
-the `attack_state` hold-tail loop-back) — so ALL four actions decode in-graph and
+the `attack_state` loop-back — which carries `weapon.af_lockout` today, NOT a
+hold-tail; see the wire.11 correction note) — so ALL four actions decode in-graph and
 the engine is decode-agnostic. `wire.11` REPLACES `wire.9` for the a24 gen
 (re-export); `wire.10` stays burned. The legacy `wire.7` logit path is unchanged.
 See [`wire/wire.11.md`](wire/wire.11.md). Spatial-v2 replaces the spatial

@@ -1,29 +1,33 @@
-"""The a25 decode-time guard set — a25-owned, NARROWED clone.
+"""The a25/a28 decode-time guard set — a25-owned, NARROWED clone.
 
-Cloned from the a24 lineage (``qnn.model.bench.a24.guard``) so the a25 arch
+Cloned from the a24 lineage (``qnn.model.bench.a24.guard``) so the a25+ arch
 executes its OWN guard vetoes and never imports/executes a24 code (cross-arch
-decode-coupling ban). The a25 guard set is deliberately NARROWER than a24 — it
-keeps ONLY the two vetoes the a25 seg+attack_with operating point uses:
+decode-coupling ban). The guard set keeps the vetoes the seg+attack_with
+operating point uses:
 
   1. RL EHR self-splash veto (:func:`rocket_self_splash_guard_mask`) — "don't
      rocket yourself to death": suppress an RL attack whose self-splash would be
-     lethal given the current effective health.
+     lethal given the current effective health. Always ON (no config knob).
   2. Gate B projectile move-hold release (:func:`projectile_release_mask_rocket`
      / :func:`projectile_release_mask_any`, mode-selected) — force an fb/lr hold
      release when an inbound projectile is projected to hit if movement continues.
-
-DROPPED from the a24 set (NOT cloned — the a25 operating point does not use them):
+DROPPED from the a24 set (NOT cloned — the operating point does not use them):
   * ``attack_splash_guard_mask`` (square-wall waste veto),
-  * ``lg_range_guard_mask`` (LG beam range/cone veto),
   * ``attack_alignment_logit_bias`` / ``attack_align_strength`` (angle-conditioned
     fire discrimination), and ``_actor_min_angle_rad``.
 
-The kept functions are wired into the :func:`make_guard` adapter the a25 policy /
-ONNX export consume. The self-splash veto is the ONLY OR-in in
-:func:`guard_attack_logit_for_export`; the a25 ``attack_with_decode`` reads that
-veto via its zeros-probe (align_bias is then always zero for a25). BIT-IDENTICAL
-to the a24 originals for Gate B; the self-splash veto's wall/floor terms now go
-through :func:`_atlas_conservative_depth` (2026-07-22 fix for the atlas's
+ALSO REMOVED 2026-08-26 with the post-a26 attack surface: the LG
+range+alignment veto (``guard.lg_range*``, ``guard.lg_veto_unseen``,
+``guard.lg_range_mode``) and its selection-mask form. Those keys now FAIL LOUD
+— see qnn.model.decode_config's "REMOVED DECODE LAWS" comment.
+
+The kept functions are wired into the :func:`make_guard` adapter the policy /
+ONNX export consume. ``attack_with_decode`` reads the self-splash veto via its
+zeros-probe (align_bias is then always zero — no alignment-conditioned bias in
+this guard set).
+BIT-IDENTICAL to the a24 originals for Gate B and (when enabled) LG range; the
+self-splash veto's wall/floor terms now go through
+:func:`_atlas_conservative_depth` (2026-07-22 fix for the atlas's
 nearest-rounding quantization letting truly-close surfaces read as safe — see
 its docstring), so it is a deliberate behavior change from the a24 original,
 not a clone.
@@ -31,6 +35,8 @@ not a clone.
 
 from __future__ import annotations
 
+import functools
+import math
 import types
 from collections.abc import Mapping
 from typing import Any
@@ -39,7 +45,11 @@ import torch
 
 from qnn.actions import MOVE_AXES
 from qnn import engine_norm as en
-from qnn.bc.weapon_physics import WEAPON_PHYSICS
+from qnn.bc.weapon_physics import (
+    ACTOR_TEAM_OFFSET as _ACTOR_TEAM_OFFSET,
+    TEAM_TEAMMATE_VALUE as _TEAM_TEAMMATE_VALUE,
+    WEAPON_PHYSICS,
+)
 from qnn.vocab import ENTITY_IDS, SPATIAL_BAND_IDS, TOKEN_ACTOR, TOKEN_PROJECTILE
 
 
@@ -55,6 +65,68 @@ _SP_FWD_DEPTH: int = 0
 _ATLAS_SIN75: float = 0.9659258262890683
 _ACTOR_DIST: int = 6
 _ACTOR_REL_FWD: int = 3   # ACTOR_REL_OFFSET; view-frame rel x = forward component
+
+
+
+# ── LG (thunderbolt) range feasibility ───────────────────────────────────────
+# The lightning bolt is a traceline of ~600u; beyond that it connects with
+# nothing. This marks LG INFEASIBLE for the tick (the same layer ammo/ownership
+# already ride) so the network picks a weapon that can actually reach — it does
+# NOT veto the shot, and it does not decide which weapon replaces LG.
+#
+# Restored 2026-08-26 after being swept into the post-a26 cut in error: a24
+# templates (decode.a24rc1m..a24rc4) and a28rc1c/d/e all set guard.lg_range*,
+# so it is an a24-lineage world-geometry rail, not post-a26 machinery. The
+# alignment cone and the veto/mask mode switch are NOT restored — the cone was
+# inert at 180deg in every a28 config that shipped it, and the mode switch put
+# a fire veto and a selection mask behind one key.
+#
+# guard.lg_range IS the range, in Quake units: 0 disables the guard, any
+# positive value arms it at that distance. One key, no separate on/off flag and
+# no code-side default. WEAPON_PHYSICS[8]["range"] (600.0) remains the physical
+# reference for what a sane value looks like; it is NOT a fallback.
+LG_IMPULSE: int = 8
+LG_RANGE_U: float = float(WEAPON_PHYSICS[LG_IMPULSE]["range"])       # 600.0, reference only
+
+
+def lg_out_of_range(
+    obs_tensors: Mapping[str, torch.Tensor],
+    rows: int,
+    *,
+    device: torch.device | None = None,
+    range_u: float,
+) -> torch.Tensor:
+    """(B,) rows where no enemy actor is within ``range_u`` — LG cannot reach.
+
+    Pure range, no alignment cone: the beam is hitscan, so where the crosshair
+    points is the model's problem, not the guard's. Fails loud rather than
+    silently shipping an unguarded LG when the obs cannot answer.
+    """
+    device = torch.device(device) if device is not None else None
+    entity_types = obs_tensors.get("entity_types")
+    entity_scalars = obs_tensors.get("entity_scalars_raw")
+    if entity_types is None or entity_scalars is None:
+        raise KeyError(
+            "guard.lg_range is enabled but the obs lacks 'entity_types' / "
+            "'entity_scalars_raw' — the LG range guard cannot be derived from "
+            "this observation source (fail loud rather than silently shipping "
+            "an unprotected LG)")
+    if device is None:
+        device = entity_types.device
+    if entity_types.numel() == 0 or entity_scalars.numel() == 0:
+        return torch.zeros(rows, dtype=torch.bool, device=device)
+
+    entity_types = entity_types.to(device=device).reshape(-1, entity_types.shape[-1])
+    entity_scalars = entity_scalars.to(device=device).reshape(
+        -1, entity_scalars.shape[-2], entity_scalars.shape[-1])
+
+    range_norm = float(range_u) / en.DIST_SCALE
+    dist = entity_scalars[:, :, _ACTOR_DIST]
+    team = entity_scalars[:, :, _ACTOR_TEAM_OFFSET]
+    enemy = (entity_types == TOKEN_ACTOR) & (team != _TEAM_TEAMMATE_VALUE)
+    reachable = (enemy & (dist <= range_norm)).any(dim=1)
+    return ~reachable
+
 
 # ── Gate B: inbound-projectile move-hold release trigger ─────────────────────
 # Release the move hold when a perceived projectile is projected to strike the player
@@ -348,7 +420,7 @@ def policy_decode_action_postprocess(
         return fire
     # The split attack/weapon path has no joint firing intent. It is retained
     # only as a compatibility hook and cannot safely apply a weapon-specific
-    # guard without recreating held-weapon state.
+    # guard without recreating engine-equipped-weapon state.
     return fire
 
 
@@ -358,11 +430,13 @@ def guard_attack_logit_for_export(
     weapon_impulse: torch.Tensor,
     attack_logit: torch.Tensor,
 ) -> torch.Tensor:
-    """ONNX export / attack-with helper: force RL self-splash rows' logit to -1e9.
+    """ONNX export / attack-with helper: force veto rows' logit to -1e9.
 
-    The a25 attack_with decode probes this on a zeros logit to recover a hard-veto
-    mask; there is no alignment bias in the a25 guard set, so non-veto rows return the
-    input logit unchanged (align_bias resolves to zero)."""
+    The attack_with decode probes this on a zeros logit to recover a hard-veto
+    mask; there is no alignment bias in this guard set, so non-veto rows return
+    the input logit unchanged (align_bias resolves to zero). Always ORs in the
+    RL self-splash veto. The LG range/alignment guards were removed 2026-08-26
+    with the rest of the post-a26 attack surface."""
     move_flat = move_logits.reshape(-1, MOVE_AXES, move_logits.shape[-1])
     move_classes = move_flat.argmax(dim=-1)
     mask = rocket_self_splash_guard_mask(obs_tensors, move_classes, weapon_impulse)
@@ -371,21 +445,62 @@ def guard_attack_logit_for_export(
 
 
 def make_guard(params: Mapping[str, Any]) -> types.SimpleNamespace:
-    """Bind a decode config's ``params`` to the a25 guard adapter.
+    """Bind a decode config's ``params`` to the a25/a28 guard adapter.
 
-    Keeps the Gate B ``projectile_release_mode`` selection ("off"/"rocket"/"any") and
-    the always-present RL self-splash veto. Drops the a24 attack-splash / LG-range /
-    alignment-bias wiring (not in the a25 guard set). ``projectile_release_mask`` is set
-    ONLY when the dodge-release is enabled (mode != "off")."""
-    mode    = str(params.get("guard.projectile_release_mode", "rocket"))
-    enabled = bool(params.get("guard.projectile_release", True)) and mode != "off"
+    ``guard.projectile_release`` IS the Gate B dodge mode ("off" / "rocket" /
+    "any"): one key, no separate on/off flag and no code-side default. The RL
+    self-splash veto is always present. ``projectile_release_mask`` is set only
+    when the mode is not "off".
 
+    """
+    if "guard.projectile_release" not in params:
+        raise ValueError(
+            "guard.projectile_release is REQUIRED — it is the Gate B dodge MODE "
+            "('off' | 'rocket' | 'any'), not a flag. No code-side default: "
+            "'off' disables it, omission is not a way to say so. See "
+            "src/docs/decode-config-defaults.md.")
+    mode = params["guard.projectile_release"]
+    if isinstance(mode, bool):
+        raise ValueError(
+            "guard.projectile_release is a MODE ('off' | 'rocket' | 'any'), not "
+            "a bool — it absorbed the old guard.projectile_release_mode. Write "
+            "'off' to disable, or the dodge subject.")
+    mode = str(mode)
+    if mode not in ("off", "rocket", "any"):
+        raise ValueError(
+            f"guard.projectile_release must be 'off', 'rocket' or 'any', got {mode!r}")
+    enabled = mode != "off"
+    if "guard.lg_range" not in params:
+        raise ValueError(
+            "guard.lg_range is REQUIRED — it is the LG range in Quake units "
+            "(0 = guard off). No code-side default: omission cannot be "
+            "distinguished from 'off' by anything but an explicit 0. See "
+            "src/docs/decode-config-defaults.md.")
+    _raw = params["guard.lg_range"]
+    if isinstance(_raw, bool):
+        raise ValueError(
+            "guard.lg_range is a RANGE IN UNITS, not a flag — a bool would "
+            "silently mean 1u. Write 0 to disable, or the range (e.g. 600).")
+    lg_range_u = float(_raw)
+    if lg_range_u < 0.0:
+        raise ValueError(f"guard.lg_range must be >= 0, got {lg_range_u}")
+    lg_enabled = lg_range_u > 0.0
     adapter = types.SimpleNamespace(
         guard_attack_logit_for_export=guard_attack_logit_for_export,
         policy_decode_action_postprocess=policy_decode_action_postprocess,
         apply_self_splash_guard=apply_self_splash_guard,
         rocket_self_splash_guard_mask=rocket_self_splash_guard_mask,
+        # Self-reported execution truth for the export provenance gate
+        # (tools.export_onnx._assert_decode_wired): a config asking for
+        # guard.lg_range=1 against an adapter without it is an UN-WIRED request
+        # and must be refused loudly, not shipped unguarded.
+        lg_range_enabled=lg_enabled,
     )
+    if lg_enabled:
+        # Published only when armed; attack_with_decode keys the feasibility
+        # mask on hasattr, so an unarmed config is bit-identical.
+        adapter.lg_select_mask = functools.partial(
+            lg_out_of_range, range_u=lg_range_u)
     if enabled:
         adapter.projectile_release_mask = (
             projectile_release_mask_any if mode == "any"

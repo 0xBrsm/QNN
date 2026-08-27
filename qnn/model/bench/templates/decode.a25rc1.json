@@ -14,12 +14,17 @@
     "look.lead_hold_cap_radial_frames": 5.0,
     "look.hold_passthrough": true,
     "weapon_ban": [],
-    "move.commitment": true,
-    "move.commit_interrupt": false,
-    "move.commit_dur_tilt": [0.0, 0.0],
-    "attack.bias": 0.0,
-    "guard.projectile_release": true,
-    "guard.projectile_release_mode": "any",
-    "guard.attack_align_strength": 0.0
+    "move.commit_dur_tilt": [
+      0.0,
+      0.0
+    ],
+    "guard.projectile_release": "any",
+    "guard.lg_range": 0,
+    "move.idle_none_bias": [
+      0.0,
+      0.0
+    ],
+    "move.idle_engagement_base": 0.5,
+    "move.idle_cooldown_ticks": 20
   }
 }

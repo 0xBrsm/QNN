@@ -24,9 +24,16 @@ from qnn.decode_fit.context import (CALIBRATION_FAMILY_KEY, IMPULSE_NAME,
                                     read_json)
 from qnn.decode_fit.events import EventTable
 from qnn.decode_fit.human_refs import hbw_to_pct
-from qnn.decode_fit.occupancy import (RC1B_REFIRE_SEC,  # noqa: F401
-                                      selection_profile as _selection_profile)
+from qnn.decode_fit.occupancy import (
+    CHOICE_PROB_TOL,
+    CONTINUE_PROB_TOL,
+    RC1B_REFIRE_SEC,  # noqa: F401
+    human_weapon_behavior_reference,
+    selection_profile as _selection_profile,
+    weapon_behavior_report,
+)
 from qnn.decode_fit.response import GainResponse, WeaponPlan
+from qnn.human import attack_conditional as attack_ref
 
 # the 4 family representatives the botpin instrument measures directly.
 INSTRUMENT_ABBRS = tuple(MODELNAME_TO_ABBR[w] for w in INSTRUMENT_WEAPONS)
@@ -62,6 +69,8 @@ TRIM_STICK_STEP_CLAMP = (-0.75, 1.0)
 # vector restores the reference. Shares below 1% on both sides are too noisy
 # to steer; the 0.3% floor and 0.25 log tolerance are the rc1b values.
 TRIM_PREF_STEP_CLAMP = (-0.75, 0.75)
+TRIM_CONTINUE_STEP_CLAMP = (-0.75, 0.75)
+TRIM_TRANSITION_BIAS_CLAMP = (-8.0, 8.0)
 TRIM_SELECTION_MIN_SHARE = 0.01
 TRIM_SELECTION_SHARE_FLOOR = 0.003
 TRIM_SELECTION_LOG_TOL = 0.25
@@ -84,6 +93,28 @@ HUMAN_REACTIVITY_HAZARD = 1.143
 # verdict bar (ANCHOR_RATIO_MAX = 0.2); finalize once several v5-scored fits
 # exist.
 STYLE_REGRESSION_MARGIN = 0.05
+
+# ── ATTACK-GATE RESPEC (Brian 2026-08-15) ───────────────────────────────────
+# op_attack (marginal fires/s-while-engaged) is a SKILL x STYLE product: a
+# model with human-conditional trigger behavior (fires more readily exactly
+# when well-aligned, same as a human) plus ELITE aim availability (well
+# aligned far more often than a human) is CORRECTLY expected to exceed the
+# human marginal ARITHMETICALLY — E12/E13
+# (agents/plans/a26-superiority-decomposition.md) caught exactly this case:
+# a28p90floor refused on op_attack (LG 6.89 vs human 2.92 fires/s engaged)
+# while decisively beating a26rc1b and every human-band channel it was
+# scored against. The marginal is demoted to REPORT-ONLY below; the
+# CONDITIONAL trigger shape (P(discharge | aim-error bin, op-ready), the E7
+# instrument) and HOLD TEXTURE (discharge run-length / inter-burst-gap
+# shape, engaged-conditioned) carry the humanness content instead — style
+# (how the trigger behaves given aim quality) separated from skill (how good
+# the aim is, never capped — feedback_aim_above_human_ceiling).
+# Thin-data floor shared with the human reference builder (qnn.human.
+# attack_conditional.THIN_DATA_MIN_TICKS) — a family under this many bot
+# op-ready ticks falls back to the POOLED comparison; pooled itself under the
+# floor is UNSCORED (never FAIL — a gate arm must never adjudicate a weapon
+# it barely observed, the same doctrine as CONFIRM_MIN_DISCHARGES above).
+ATTACK_ARM_MIN_TICKS = attack_ref.THIN_DATA_MIN_TICKS
 
 _IMPULSE_NAME = IMPULSE_NAME
 
@@ -370,22 +401,47 @@ def _op_shot_rates(npz: Path,
                    targets: dict[str, Any]) -> dict[str, Any] | None:
     """WORLD-RESULTS attack pair for the trim/gate (owner directive: match
     what firing delivers, not button hygiene). Port of v1
-    decode_fit_pipeline.py:1202, semantics unchanged.
+    decode_fit_pipeline.py:1202, LOS-gated 2026-08-07 (blind-fire-cadence.md).
 
-    Bot: attack pulses per engaged second per held weapon from the eval action
+    Bot: attack pulses per engaged second per equipped weapon from the eval action
     streams (a25 attack is single-tick, so pulses ARE shots at decision
     granularity). SG/SSG and NG/SNG are pooled before rate and coverage
     decisions. Human: corpus op-attack rate per calibration family evaluated
     at the BOT's family mix, so weapon preference cannot confound the attack
     trim. Weapons without human coverage drop out of both sides. Returns
     {h_att, b_att} in fires/s plus descriptive per-weapon and load-bearing
-    per-family detail, or None when the npz is unreadable."""
+    per-family detail, or None when the npz is unreadable.
+
+    DENOMINATOR, matched to the human side: ``keep`` alone (any actor-type
+    token present, ANY modality — SIGHT, SOUND, MEMORY, or PROXIMITY;
+    ``qnn.eval.run``'s ``_keep = (entity_types == ACTOR).any()``) is a strict
+    SUPERSET of the ``target_rate_per_s`` this compares against
+    (``qnn.human.op_attack``, gated on an in-LOS actor at recency 0). Scoring
+    ``keep`` alone against an LOS-gated human target is the asymmetric-gate
+    bug agents/plans/blind-fire-cadence.md flags: the bot side counts ticks
+    (remembered/heard/PVS-only targets) the human side structurally cannot.
+    ``engaged`` (band-v5's strict in-LOS flag, the same underlying engine fact
+    ``AlignHbw.los`` reads) is ANDed in so both sides require an actor being
+    actively SIGHTed this exact tick."""
     try:
         z = np.load(npz)
         hz = float(z["tick_hz"][0])
         att = z["attack"].astype(bool)
-        wpn = z["weapon"].astype(np.int64)
-        keep = z["keep"].astype(bool)
+        # Equipped weapon (schema 6 `self_weapon_id`; schema-5 name
+        # `weapon_held`) — the denominator stream: engaged time attributed
+        # to the weapon that would fire, a state attribution, not a
+        # behavioral signal. The legacy `weapon` column is the attack-with
+        # DECISION class (0 off fire ticks): reading it here makes
+        # fires/held ≡ hz for every weapon (the a28rc1 trim stall).
+        # Old-schema npz are unmeasurable, which re-produces the wave
+        # rather than passing a broken ruler.
+        if "self_weapon_id" in z:
+            wpn = z["self_weapon_id"].astype(np.int64)
+        elif "weapon_held" in z:
+            wpn = z["weapon_held"].astype(np.int64)
+        else:
+            return None
+        keep = z["keep"].astype(bool) & z["engaged"].astype(bool)
     except Exception:
         return None
     t = targets["weapons"]
@@ -526,9 +582,11 @@ def _reactivity_hazard(npz: Path, *, n_boot: int = 0,
 def _rc_rates(ctx, npz: Path,
               human_cache: dict[str, float] | None = None) -> dict[str, float]:
     """Commensurate rate pair for the trim loop: engaged attack on/off switch
-    rate + weapon selection switch rate, human and bot computed by the SAME
+    rate + weapon-PREFERENCE switch rate (switches per consecutive-discharge
+    pair; core.preference_pairs), human and bot computed by the SAME
     rc_humanlikeness code path. Human side cached across iterations.
-    Port of v1 decode_fit_pipeline.py:1345."""
+    Port of v1 decode_fit_pipeline.py:1345; weapon ruler re-based 2026-08-09
+    (held-weapon churn retired — weapon scripting fallacy)."""
     from qnn.eval.humanlikeness import rc
     bot = rc.collect_bot(npz)
     if human_cache is not None:
@@ -561,26 +619,54 @@ def _score_human_band(ctx, npz: Path) -> dict[str, Any]:
                     "note": (f"band bank artifact missing: {bank_path} — the "
                              "band arm is unscored (does not fail); build the "
                              "bank via qnn.human.band_bank.load_or_build_bank")}
-        subj = hb.featurize(eps, hz, 15.0)
-        bank, _ = hb.load_or_build_bank(ctx.corpus_dir, "precomputed_val", hz, 15.0)
-        bctx = hb.band_context(bank, 17)
-        # Null cohort split is RANDOM-only (the per-player skill map was a coh
-        # heuristic, retired) — a valid, unbiased null (v1 comment carried).
-        skill_map: dict[int, float] = {}
-        counts = [int(subj[ch]["X"].shape[0]) for ch in hb.CHANNELS
-                  if subj[ch]["X"].shape[0] >= 8]
-        if not counts:
-            return {"status": "unscored",
-                    "error": "no usable behavior windows in npz"}
-        n_use = min(256, min(counts))
-        null = hb.build_null(bank, bctx, n_use, 300, 17, skill=skill_map)
-        res = hb.score_subject(subj, bank, bctx, null, n_use, 30, 17)
-        res["hz"] = hz
-        res["status"] = "scored"
-        res["contract"] = ("research/human-band.md: v5 discharge attack, "
-                           "engaged conditioning; verdict = anchored ratio "
-                           "≤ ANCHOR_RATIO_MAX (null pct report-only); "
-                           "family = worst channel")
+        # v6 ENCOUNTER unit is the ADOPTED verdict instrument (Brian
+        # 2026-08-15, research/human-band.md §v6, bar ENCOUNTER_RATIO_MAX);
+        # the v5 15s row rides along as `unit_15s` for continuity with
+        # pre-8/15 subjects. Same missing-bank guard for both units.
+        def _score_unit(encounter: bool) -> dict:
+            if encounter:
+                bank_path = hb.bank_cache_path_encounters(ctx.corpus_dir, hz,
+                                                          2.2)
+            else:
+                bank_path = hb.bank_cache_path(ctx.corpus_dir, hz, 15.0)
+            if not bank_path.exists():
+                return {"status": "unscored",
+                        "note": (f"band bank artifact missing: {bank_path} — "
+                                 "unscored (does not fail); build via "
+                                 "qnn.human.band_bank")}
+            if encounter:
+                subj = hb.featurize_encounters(eps, hz)
+                bank, _ = hb.load_or_build_bank_encounters(
+                    ctx.corpus_dir, "precomputed_val", hz)
+                bar = hb.ENCOUNTER_RATIO_MAX
+            else:
+                subj = hb.featurize(eps, hz, 15.0)
+                bank, _ = hb.load_or_build_bank(
+                    ctx.corpus_dir, "precomputed_val", hz, 15.0)
+                bar = hb.ANCHOR_RATIO_MAX
+            bctx = hb.band_context(bank, 17)
+            # Null cohort split is RANDOM-only (the per-player skill map was
+            # a coh heuristic, retired) — a valid, unbiased null (v1 carried).
+            counts = [int(subj[ch]["X"].shape[0]) for ch in hb.CHANNELS
+                      if subj[ch]["X"].shape[0] >= 8]
+            if not counts:
+                return {"status": "unscored",
+                        "error": "no usable behavior windows in npz"}
+            n_use = min(256, min(counts))
+            null = hb.build_null(bank, bctx, n_use, 300, 17, skill={})
+            res = hb.score_subject(subj, bank, bctx, null, n_use, 30, 17,
+                                   ratio_max=bar)
+            res["hz"] = hz
+            res["status"] = "scored"
+            return res
+
+        res = _score_unit(encounter=True)
+        res["contract"] = ("research/human-band.md §v6 (ADOPTED 8/15): "
+                           "ENCOUNTER-unit scoring, verdict = anchored ratio "
+                           "≤ ENCOUNTER_RATIO_MAX 0.364 (null pct "
+                           "report-only); family = worst channel; 15s v5 row "
+                           "under unit_15s for continuity")
+        res["unit_15s"] = _score_unit(encounter=False)
         return res
     except Exception as e:
         return {"status": "unscored", "error": f"human_band scoring failed: {e!r}"}
@@ -658,19 +744,249 @@ def _eval_summary_intercept(npz: Path) -> float | None:
 
 
 def _weapon_switch_diag(ctx, npz: Path) -> dict[str, Any]:
-    """Weapon-selection switch rate diag (per second, both sides via
-    rc_humanlikeness — port of the v1 _score_eval_npz weapon_switch block,
-    decode_fit_pipeline.py:1630). Never blocks the gate."""
+    """Weapon-PREFERENCE switch rate diag: switches per counted
+    consecutive-discharge pair, both sides via rc_humanlikeness
+    (core.preference_pairs — equip-state churn is retired; weapon scripting
+    makes it a fallacy). Pairs are gated to STATIONARY-MENU windows by the
+    SAME rule on both sides (rc._invalidated_pairs: weapon-feasibility-mask
+    change or death in the pair window — a menu change says nothing about
+    preference): human from the corpus items/ammo/health streams, bot from
+    the schema-6 ``weapon_feas``/``health`` columns. On pre-6 npz the bot
+    side has no gate streams and reports ungated pairs (upper bound) — the
+    ``feas_gated`` flags say which ruler ran. Never blocks the gate."""
     try:
         from qnn.eval.humanlikeness import rc
         bot = rc.collect_bot(npz)
         human = rc.collect_human(ctx.corpus_dir, "precomputed_val")
         return {
-            "human": round(float(human.get("weapon_switch", 0.0)) * human["hz"], 3),
-            "bot": round(float(bot.get("weapon_switch", 0.0)) * bot["hz"], 3),
+            "human": round(float(human.get("weapon_switch", 0.0)), 4),
+            "bot": round(float(bot.get("weapon_switch", 0.0)), 4),
+            "pairs": {"human": int(human.get("weapon_pairs", 0)),
+                      "bot": int(bot.get("weapon_pairs", 0))},
+            "feas_gated": {
+                "human": bool(human.get("weapon_feas_gated", False)),
+                "bot": bool(bot.get("weapon_feas_gated", False))},
+            "units": ("preference switches per consecutive-discharge pair "
+                      "(stationary-menu gated)"),
         }
     except Exception as e:  # pragma: no cover — diagnostic row only
         return {"error": repr(e)}
+
+
+# ══ 2.5 ATTACK-GATE RESPEC arms (Brian 2026-08-15) ═══════════════════════════
+
+def _load_attack_streams(npz: Path) -> dict[str, Any] | None:
+    """The RESPEC's per-tick streams from a wave npz: ``aim_err_deg`` +
+    ``op_ready`` (both new, qnn.eval.run._log_streams / qnn.eval.h2h) plus the
+    pre-existing ``discharge`` / ``engaged`` / weapon-identity columns. None
+    when the npz is unreadable OR predates the respec (missing aim_err_deg or
+    op_ready) — a PRE-RESPEC WAVE, the case both new arms must report
+    unscored (never fail) rather than silently score a zero-filled stream.
+
+    ``discharge_collapsed`` (2026-08-15 hold-texture fix #2, coordinator
+    iteration 3): the bot's raw ``discharge`` lane fires on the engine's
+    LITERAL per-shot re-entry cadence for a held continuous weapon, not the
+    EFFECTIVE cadence the human corpus's op-attack convention already
+    collapses to (qnn.human.attack_conditional.collapse_to_effective_events)
+    — computed ONCE here (needs ``imp`` + ``tick_hz``) so
+    ``attack_hold_texture_arm``'s per-family loop never repeats the O(events)
+    collapse; ``None`` when unresolvable (no weapon-identity stream). Used
+    ONLY by the hold-texture arm — ``attack_conditional_arm`` still reads
+    the raw ``discharge`` lane (out of this fix's scope)."""
+    try:
+        z = np.load(npz)
+    except Exception:
+        return None
+    if "aim_err_deg" not in z or "op_ready" not in z:
+        return None
+    imp = None
+    if "self_weapon_id" in z:
+        imp = z["self_weapon_id"].astype(np.int64)
+    elif "weapon_imp" in z:
+        imp = z["weapon_imp"].astype(np.int64)
+    tick_hz = float(z["tick_hz"][0]) if "tick_hz" in z else 20.0
+    discharge = z["discharge"].astype(bool) if "discharge" in z else None
+    discharge_collapsed = None
+    if discharge is not None and imp is not None:
+        discharge_collapsed = attack_ref.collapse_to_effective_events(
+            discharge, imp, tick_hz)
+    return {
+        "err": z["aim_err_deg"].astype(np.float64),
+        "ready": z["op_ready"].astype(bool),
+        "engaged": (z["engaged"].astype(bool) if "engaged" in z
+                    else np.zeros(0, bool)),
+        "discharge": discharge,
+        "discharge_collapsed": discharge_collapsed,
+        "imp": imp,
+        "tick_hz": tick_hz,
+    }
+
+
+def _bot_family_curve(streams: dict[str, Any],
+                      family_impulses: "tuple[int, ...] | None",
+                      ) -> dict[str, np.ndarray] | None:
+    """Bot (ready, fire) counts per ``attack_ref.EDGES`` bin for one family
+    (``None`` = pooled, no weapon-identity stream required). ``None`` when a
+    per-family curve is requested but no weapon-identity stream exists (the
+    caller falls back to pooled)."""
+    err, ready, disch = streams["err"], streams["ready"], streams["discharge"]
+    if disch is None:
+        return None
+    if family_impulses is None:
+        fam_mask = np.ones_like(ready, dtype=bool)
+    else:
+        if streams["imp"] is None:
+            return None
+        fam_mask = np.isin(streams["imp"], family_impulses)
+    nb = attack_ref.NBINS
+    sel = ready & fam_mask & np.isfinite(err)
+    if not sel.any():
+        return {"ready": np.zeros(nb, np.int64), "fire": np.zeros(nb, np.int64)}
+    idx = np.digitize(err[sel], attack_ref.EDGES) - 1
+    good = (idx >= 0) & (idx < nb)
+    idx = idx[good]
+    f = disch[sel][good]
+    r = np.bincount(idx, minlength=nb)
+    fi = np.bincount(idx[f], minlength=nb) if f.any() else np.zeros(nb, np.int64)
+    return {"ready": r, "fire": fi}
+
+
+def _bot_family_hold(streams: dict[str, Any],
+                     family_impulses: "tuple[int, ...] | None",
+                     ) -> dict[str, Any] | None:
+    """Bot discharge run-length / inter-burst GAP-EXCESS samples (ticks over
+    the exact weapon's own effective refire cooldown), engaged-conditioned —
+    the hold-texture population, unlike the curve above NOT gated on
+    op_ready (matches qnn.human.attack_conditional's own engaged-only
+    hold-texture conditioning). Uses the PRE-COLLAPSED discharge stream
+    (``_load_attack_streams``'s ``discharge_collapsed`` — fix #2) and the
+    truncation-safe ``attack_ref.hold_texture_samples`` extractor (fix #1);
+    both new 2026-08-15 (coordinator iteration 3). ``imp`` is required even
+    in POOLED mode now (the gap-excess computation needs each tick's exact
+    weapon to look up its own cooldown, not just family membership) — a
+    wave with no weapon-identity stream is unresolvable for hold-texture
+    entirely, pooled included."""
+    engaged, disch = streams["engaged"], streams["discharge_collapsed"]
+    if disch is None or engaged.size == 0 or streams["imp"] is None:
+        return None
+    imp = streams["imp"]
+    if family_impulses is None:
+        fam_mask = np.ones_like(engaged, dtype=bool)
+    else:
+        fam_mask = np.isin(imp, family_impulses)
+    keep = engaged & fam_mask
+    n_ticks = int(keep.sum())
+    if not n_ticks:
+        return {"runs": np.zeros(0, np.int64),
+                "gaps": np.zeros(0, np.float64), "n_ticks": 0}
+    runs, gap_excess = attack_ref.hold_texture_samples(
+        disch, imp, keep, streams["tick_hz"])
+    return {"runs": runs, "gaps": gap_excess, "n_ticks": n_ticks}
+
+
+_ATTACK_PRE_RESPEC_NOTE = (
+    "wave predates the ATTACK-GATE RESPEC (no aim_err_deg/op_ready streams "
+    "in the npz) — re-run the freeplay leg on the current stream writer; a "
+    "pre-respec wave is unscored, never a fail")
+
+
+def attack_conditional_arm(npz: Path, ctx) -> dict[str, Any]:
+    """GATED arm: bot P(discharge | aim-error bin, op-ready) vs the human
+    corpus reference's NORMALIZED curve (qnn.human.attack_conditional),
+    per family (SG+SSG/NG+SNG/GL/RL/LG) — the conditional-trigger half of
+    the ATTACK-GATE RESPEC. Gated on ``attack_ref.curve_deviation`` (MASS-
+    WEIGHTED over mutually-populated bins) <= the human reference's own
+    BETWEEN-DEMO p95 deviation (v2, 2026-08-15: replaces v1's split-half-of-
+    the-pool deviation, an Axiom-3 violation that shrank with corpus size).
+    A family under ``ATTACK_ARM_MIN_TICKS`` bot op-ready ticks falls back to
+    the pooled comparison; pooled itself too thin, or a comparison spanning
+    fewer than ``attack_ref.MIN_BINS_FOR_VERDICT`` populated bins (a curve
+    concentrated into 1-2 bins — the alignment-law weapons' steady-tracking
+    failure mode, 2026-08-15 bin-collapse fix — cannot characterize a SHAPE
+    regardless of tick mass), is UNSCORED (never fails)."""
+    streams = _load_attack_streams(npz)
+    if streams is None:
+        return {"ok": None, "note": _ATTACK_PRE_RESPEC_NOTE}
+    human = attack_ref.load_or_build_reference(ctx.corpus_dir)["families"]
+    families_out: dict[str, Any] = {}
+    for fam, imps in attack_ref.FAMILY_IMPULSES.items():
+        bot = _bot_family_curve(streams, imps)
+        used_fallback = False
+        if bot is None:
+            families_out[fam] = {
+                "ok": None,
+                "note": ("no per-tick weapon-identity stream (self_weapon_id/"
+                         "weapon_imp) — family membership unresolvable")}
+            continue
+        n_ready = int(bot["ready"].sum())
+        href = human.get(fam)
+        if n_ready < ATTACK_ARM_MIN_TICKS:
+            pooled_bot = _bot_family_curve(streams, None)
+            if (pooled_bot is None
+                    or int(pooled_bot["ready"].sum()) < ATTACK_ARM_MIN_TICKS):
+                families_out[fam] = {
+                    "ok": None, "n_ready_ticks": n_ready,
+                    "note": (f"< {ATTACK_ARM_MIN_TICKS} op-ready ticks in "
+                            "family AND pooled — unscored")}
+                continue
+            bot, used_fallback = pooled_bot, True
+            href = human.get(attack_ref.POOLED)
+        if not href:
+            families_out[fam] = {"ok": None, "n_ready_ticks": n_ready,
+                                 "note": "no human reference for this family"}
+            continue
+        card = attack_ref.score_curve(bot["ready"], bot["fire"], href)
+        families_out[fam] = {**card, "n_ready_ticks": n_ready,
+                             "used_pooled_fallback": used_fallback}
+    scored_ok = [v["ok"] for v in families_out.values() if v.get("ok") is not None]
+    return {"ok": (all(scored_ok) if scored_ok else None),
+            "n_families_scored": len(scored_ok), "families": families_out}
+
+
+def attack_hold_texture_arm(npz: Path, ctx) -> dict[str, Any]:
+    """GATED arm: bot discharge-run-length / inter-burst-gap p50/p90
+    (ticks, engaged-conditioned) vs the human corpus reference, per family —
+    the hold-texture half of the ATTACK-GATE RESPEC. A metronomic hold at
+    the right marginal rate and a human-shaped burst pattern read
+    differently here even when attack_conditional's curve matches. Gated on
+    the human reference's BETWEEN-DEMO p95 deviation (v2, 2026-08-15 — see
+    ``attack_conditional_arm``'s docstring). Same thin-data / pooled-
+    fallback rule as ``attack_conditional_arm``."""
+    streams = _load_attack_streams(npz)
+    if streams is None:
+        return {"ok": None, "note": _ATTACK_PRE_RESPEC_NOTE}
+    human = attack_ref.load_or_build_reference(ctx.corpus_dir)["families"]
+    families_out: dict[str, Any] = {}
+    for fam, imps in attack_ref.FAMILY_IMPULSES.items():
+        bot = _bot_family_hold(streams, imps)
+        used_fallback = False
+        if bot is None:
+            families_out[fam] = {
+                "ok": None,
+                "note": ("no per-tick weapon-identity stream (self_weapon_id/"
+                         "weapon_imp) — family membership unresolvable")}
+            continue
+        href = human.get(fam)
+        if bot["n_ticks"] < ATTACK_ARM_MIN_TICKS:
+            pooled_bot = _bot_family_hold(streams, None)
+            if pooled_bot is None or pooled_bot["n_ticks"] < ATTACK_ARM_MIN_TICKS:
+                families_out[fam] = {
+                    "ok": None, "n_engaged_ticks": bot["n_ticks"],
+                    "note": (f"< {ATTACK_ARM_MIN_TICKS} engaged ticks in "
+                            "family AND pooled — unscored")}
+                continue
+            bot, used_fallback = pooled_bot, True
+            href = human.get(attack_ref.POOLED)
+        if not href:
+            families_out[fam] = {"ok": None, "n_engaged_ticks": bot["n_ticks"],
+                                 "note": "no human reference for this family"}
+            continue
+        card = attack_ref.score_hold(bot["runs"], bot["gaps"], href)
+        families_out[fam] = {**card, "n_engaged_ticks": bot["n_ticks"],
+                             "used_pooled_fallback": used_fallback}
+    scored = [v["ok"] for v in families_out.values() if v.get("ok") is not None]
+    return {"ok": (all(scored) if scored else None),
+            "n_families_scored": len(scored), "families": families_out}
 
 
 # ══ 3. style gate (decision 4) ════════════════════════════════════════════════
@@ -683,20 +999,45 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
 
     GATED arms — world-results invariants only (ALL must be True for PASS;
     an unmeasurable gated arm is ``None`` and cannot PASS — fail loud):
-      * op-attack WORLD-RESULTS ruler — bot operative fires/s while engaged vs
-        the bot-mix-weighted human target (ported ``_op_shot_rates`` /
-        ``_load_op_attack_targets``; op-filter semantics unchanged),
-        rel-delta ≤ ``rel_tol``.
+      * ATTACK-CONDITIONAL trigger shape (``attack_conditional_arm``) — bot
+        P(discharge | aim-error bin, op-ready) vs the human corpus reference's
+        NORMALIZED curve (qnn.human.attack_conditional), per weapon family;
+        gated on max per-bin deviation <= the human reference's own
+        split-half p95 deviation (ATTACK-GATE RESPEC, Brian 2026-08-15 —
+        replaces the demoted ``op_attack`` marginal below).
+      * ATTACK HOLD-TEXTURE (``attack_hold_texture_arm``) — bot discharge
+        run-length / inter-burst-gap p50/p90 (ticks, engaged-conditioned) vs
+        the same human reference, per family; gated the same way. Distinct
+        from the curve above: a metronomic hold at the right marginal rate
+        and a human-shaped burst pattern can share the same conditional
+        curve but not the same hold texture.
       * threat-reactivity hazard — the LIFT criterion the trim converged on,
         re-checked at the deployable operating point.
-      * weapon-switch rate — per-second both sides via rc_humanlikeness,
-        rel-delta ≤ ``rel_tol``;
-      * rc1b active-fire occupancy (operative discharges weighted by refire
-        duration) remains within the rc1b log tolerance per meaningful weapon
-        of the model's own zero-margin final-aim reference.
+      * weapon CHOICE — destination probability conditional on the previous
+        exact discharge weapon after leaving it, matched against humans;
+      * weapon CONTINUATION — per-exact-weapon probability that the next
+        stationary-menu discharge uses the same weapon, matched against
+        humans.  These two conditional decisions replace the pooled switch
+        rate and model-self occupancy, whose aggregate could pass while SG/GL
+        under-continued and LG over-continued.
+
+    REPORT-ONLY, EXCLUDED from the gate verdict (ATTACK-GATE RESPEC,
+    Brian 2026-08-15): op-attack WORLD-RESULTS ruler — bot operative fires/s
+    while engaged vs the bot-mix-weighted human target (``_op_shot_rates`` /
+    ``_load_op_attack_targets``; op-filter semantics unchanged). This
+    MARGINAL is a skill x style PRODUCT: a model with human-conditional
+    trigger behavior (fires more readily exactly when well-aligned) plus
+    elite aim availability (well aligned far more often than a human) is
+    CORRECTLY expected to exceed the human marginal arithmetically
+    (agents/plans/a26-superiority-decomposition.md E12/E13). Still computed
+    and reported every fit (the report card is useful), but ``gated: false``
+    and never enters ``status``.
 
     FLAGGED, never gating (doctrine, Brian 2026-07-16: skill placement is
     never capped for style — style spend is the TRAINING-TARGET register):
+      * occupancy vs the HUMAN corpus profile — the rc1b anti-camp
+        comparison (``occupancy.human_occupancy_report``), in every fit
+        report as of 2026-08-09 (it previously only ran by hand);
       * fitted-vs-native style spend (Axiom 3) — per channel, band-v5
         anchored ratio at the operating point vs the native reference
         (``native_npz``, the last styletrim wave: same style values, aim
@@ -716,31 +1057,50 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
     report: dict[str, Any] = {
         "npz": str(npz),
         "rel_tol": float(rel_tol),
-        "contract": ("gated = world invariants ONLY (op-attack, reactivity, "
-                     "weapon-switch); style spend + band membership are "
+        "contract": ("gated = world invariants ONLY (attack_conditional, "
+                     "attack_hold_texture, reactivity, human weapon-choice, "
+                     "per-weapon continuation); style spend + band membership are "
                      "FLAGGED/tracked, never gating — skill is never capped "
                      "for style (human-band.md axioms + Brian 2026-07-16); "
-                     "per-weapon free-play hbw is a REPORT CARD (decision 4 "
-                     "/ skill-curves §1.7b)"),
+                     "op_attack (the marginal) is REPORT-ONLY since "
+                     "2026-08-15 — demoted per Brian's ATTACK-GATE RESPEC "
+                     "(skill x style product; conditional+hold arms carry "
+                     "the humanness content now); per-weapon free-play hbw "
+                     "is a REPORT CARD (decision 4 / skill-curves §1.7b)"),
     }
 
-    # ── GATED arm 1: op-attack world-results ruler ────────────────────────
+    # ── GATED arm: attack-conditional trigger shape + hold texture ────────
+    # (ATTACK-GATE RESPEC, Brian 2026-08-15 — see qnn.human.attack_conditional
+    # and the two functions above this one.)
+    cond = attack_conditional_arm(npz, ctx)
+    hold = attack_hold_texture_arm(npz, ctx)
+    report["attack_conditional"] = cond
+    report["attack_hold_texture"] = hold
+
+    # ── REPORT-ONLY (excluded from the gate verdict): op-attack marginal ──
     targets = _load_op_attack_targets(ctx.op_attack_path)
     op = _op_shot_rates(npz, targets=targets)
+    _op_would_fail = False
     if op is None:
-        opattack_ok: bool | None = None
         report["op_attack"] = {
-            "ok": None,
+            "ok": None, "gated": False,
+            "report_only_since": "2026-08-15",
             "note": ("op-shot ruler unmeasurable (npz unreadable or no engaged "
-                     "human-covered weapon mass) — a gated arm that cannot be "
-                     "measured cannot PASS"),
+                     "human-covered weapon mass); marginal = skill x style "
+                     "product — demoted per Brian 8/15, conditional+hold arms "
+                     "carry the humanness content"),
         }
     else:
         rel = (abs(op["b_att"] - op["h_att"]) / op["h_att"]
                if op["h_att"] else float("inf"))
         opattack_ok = bool(rel <= rel_tol)
+        _op_would_fail = not opattack_ok
         report["op_attack"] = {
-            "ok": opattack_ok,
+            "ok": opattack_ok, "gated": False,
+            "report_only_since": "2026-08-15",
+            "note": ("marginal = skill x style product; demoted per Brian "
+                     "8/15 — conditional+hold arms carry the humanness "
+                     "content"),
             "bot_fire_per_s": round(op["b_att"], 4),
             "human_fire_per_s": round(op["h_att"], 4),
             "rel_delta": round(rel, 3) if np.isfinite(rel) else None,
@@ -750,6 +1110,16 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
             "coverage": op["coverage"],
             "units": op["units"],
         }
+    if cond["ok"] is None and hold["ok"] is None and _op_would_fail:
+        report["attack_arms_warning"] = (
+            "attack arms unscorable on this wave generation — the demoted "
+            "op_attack marginal would have FAILED (bot vs human fires/s "
+            "while engaged) but neither replacement arm "
+            "(attack_conditional/attack_hold_texture) has data on this wave "
+            "(pre-respec npz or unresolvable weapon identity); re-run the "
+            "freeplay leg on the current stream writer before trusting this "
+            "deploy")
+        _log(f"WARNING: {report['attack_arms_warning']}")
 
     # ── GATED arm 2: threat-reactivity hazard at the operating point ──────
     # CI, not a bare point estimate: a frozen config's hazard_ratio swung
@@ -780,47 +1150,36 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
                                 "lift_tol": TRIM_REACT_LIFT_TOL,
                                 "lift_band": [round(_lift_lo, 4), round(_lift_hi, 4)]}
 
-    # ── GATED arm 3: weapon-switch rate (the LG-park detector) ────────────
-    wsw = _weapon_switch_diag(ctx, npz)
-    if "error" in wsw or not wsw.get("human"):
-        wsw_ok: bool | None = None
-        report["weapon_switch_per_sec"] = {
-            **wsw, "ok": None,
-            "note": "switch rate unmeasurable — cannot PASS",
-        }
+    # ── GATED arms 3/4: the two actual weapon decisions ───────────────────
+    href = human_weapon_behavior_reference(ctx.corpus_dir)
+    behavior = (weapon_behavior_report(npz, href)
+                if href is not None else None)
+    if behavior is None:
+        choice_ok: bool | None = None
+        continue_ok: bool | None = None
+        report["weapon_choice"] = {
+            "ok": None, "note": "human/bot choice matrix unmeasurable — cannot PASS"}
+        report["weapon_continuation"] = {
+            "ok": None, "note": "human/bot continuation matrix unmeasurable — cannot PASS"}
     else:
-        _rel = abs(wsw["bot"] - wsw["human"]) / wsw["human"]
-        wsw_ok = bool(_rel <= rel_tol)
-        report["weapon_switch_per_sec"] = {
-            **wsw, "ok": wsw_ok,
-            "rel_delta": round(_rel, 3), "rel_tol": float(rel_tol),
-        }
+        report["weapon_choice"] = behavior["choice"]
+        report["weapon_continuation"] = behavior["continuation"]
+        choice_ok = bool(behavior["choice"]["ok"])
+        continue_ok = bool(behavior["continuation"]["ok"])
 
-    # ── GATED arm 4: hysteresis may not rewrite learned weapon occupancy ──
+    # Retain the two superseded aggregate rulers as diagnostics so before/after
+    # reports show the cancellation explicitly.  Neither enters the verdict.
+    report["weapon_pref_switch_aggregate"] = {
+        **_weapon_switch_diag(ctx, npz), "gated": False,
+        "note": ("diagnostic only — pooled continuation can hide opposite "
+                 "per-weapon errors")}
     selection = _selection_profile(npz)
-    if selection is None or selection_target is None:
-        selection_ok: bool | None = None
-        report["weapon_occupancy"] = {
-            "ok": None,
-            "note": "selection profile/reference unmeasurable — cannot PASS",
-        }
-    else:
-        target_shares = selection_target.get("shares") or {}
-        observed_shares = selection.get("shares") or {}
-        ratios = _selection_log_ratios(target_shares, observed_shares)
-        worst = max((abs(v) for v in ratios.values()), default=0.0)
-        selection_ok = bool(worst <= TRIM_SELECTION_LOG_TOL)
-        report["weapon_occupancy"] = {
-            "ok": selection_ok,
-            "metric": "refire-weighted operative-discharge share (a26rc1b)",
-            "target_shares": {w: round(float(v), 4)
-                              for w, v in target_shares.items()},
-            "observed_shares": {w: round(float(v), 4)
-                                for w, v in observed_shares.items()},
-            "log_ratio": {w: round(v, 3) for w, v in ratios.items()},
-            "max_abs_log_ratio": round(worst, 3),
-            "tol": round(TRIM_SELECTION_LOG_TOL, 4),
-        }
+    report["weapon_occupancy_legacy"] = {
+        "gated": False,
+        "selection_target": selection_target,
+        "observed": selection,
+        "note": ("legacy model-self active-fire occupancy; superseded by "
+                 "human switch-choice + per-weapon continuation")}
 
     # ── FLAGGED (never gates): fitted-vs-native style spend (Axiom 3) ─────
     # Doctrine (Brian 2026-07-16): skill placement is NEVER capped for
@@ -914,11 +1273,27 @@ def style_gate(ctx, npz_path: Path, plans: dict[str, WeaponPlan], *,
         })
     report["aggregate_intercept"] = agg_row
 
-    gated = {"opattack_ok": opattack_ok, "reactivity_ok": react_ok,
-             "wsw_ok": wsw_ok, "selection_ok": selection_ok}
+    # op_attack (opattack_ok) is DELIBERATELY EXCLUDED — report-only since
+    # 2026-08-15 (ATTACK-GATE RESPEC); attack_conditional/attack_hold_texture
+    # carry the humanness content the marginal used to gate on.
+    #
+    # attack_conditional_ok / attack_hold_texture_ok get a DIFFERENT
+    # unmeasurable rule than the other three gated arms (spec, 2026-08-15):
+    # "too-thin data = unscored, never FAIL" / "a pre-respec wave ... does
+    # not fail the gate". So None (unscored: no aim_err/op_ready streams, or
+    # every family+pooled too thin) does NOT block PASS — only an explicit
+    # measured False (a real deviation) does. The pre-existing three keep
+    # the original "unmeasurable cannot PASS" contract unchanged.
+    gated = {"attack_conditional_ok": cond["ok"],
+             "attack_hold_texture_ok": hold["ok"],
+             "reactivity_ok": react_ok,
+             "weapon_choice_ok": choice_ok,
+             "weapon_continuation_ok": continue_ok}
     report["gated"] = gated
-    report["status"] = ("PASS" if all(v is True for v in gated.values())
-                        else "FAIL")
+    _new_arms_ok = (cond["ok"] is not False and hold["ok"] is not False)
+    _rest_ok = all(v is True for v in
+                   (react_ok, choice_ok, continue_ok))
+    report["status"] = "PASS" if (_new_arms_ok and _rest_ok) else "FAIL"
     if style_flags and report["status"] == "PASS":
         # flags never demote the verdict; they only annotate it
         report["status_note"] = f"PASS with style flags: {style_flags}"
@@ -932,22 +1307,23 @@ def attack_trim(ctx, config_path: Path,
                 max_iters: int = TRIM_MAX_ITERS) -> dict[str, Any]:
     """Closed-loop final-behavior calibration at the deployable aim point.
 
-    The a26/a27 reconciliation gives each estimand one explicit control:
+    Each estimand has one explicit control:
 
     * ``attack.fire_bias_vec`` is fixed by the forced-family cadence pins and
       is never rewritten from selection-starved free play;
-    * ``weapon.switch_margin`` fits human switch rate;
-    * ``weapon.preference_bias_vec`` restores the model's own zero-margin,
-      final-aim refire-weighted discharge occupancy after hysteresis is added;
     * ``move.threat_break_hazard`` fits threat reactivity.
 
-    A mandatory reference wave measures that active-fire occupancy before the
-    loop with rc1b's discharge×refire estimator. This operationalizes the
-    successful rc1b hand repair, avoids the human weapon-scripting confound,
-    and prevents
-    rate correction from becoming an LG/RL preference optimizer. All controls
-    are then iterated jointly because changing the selected weapon legitimately
-    changes its conditional fire response. Eval launch is injected as
+    The human weapon-TRANSITION estimands (``weapon.choice_prob_matrix`` /
+    ``weapon.continue_prob_vec``) were removed 2026-08-26 with the decode law
+    they fitted. Weapon selection belongs to the network, and fitted preference
+    vectors stay rejected (bias-opt conclusion), so threat reactivity is the
+    only estimand this trim still owns.
+
+    The old scalar switch-rate + model-self occupancy targets are diagnostics
+    only: a28rc1b matched their aggregate while SG/GL and LG were wrong in
+    opposite directions.  The two human conditional decisions are iterated
+    jointly because preference and continuation affect one another in closed
+    loop. Eval launch is injected as
     ``launch_eval(config_path, tag) → npz path | None``.
 
     BACKTRACKING: every knob keeps a step scale that HALVES when its
@@ -965,38 +1341,27 @@ def attack_trim(ctx, config_path: Path,
     }
     requested = read_json(config_path)
     p0 = requested.get("params") or {}
-    legacy = [float(x) for x in (p0.get("attack.bias_vec") or [0.0] * 8)]
-    if p0.get("attack.vector_semantics") != "split_v1" or any(abs(x) > 1e-9 for x in legacy):
-        report.update(
-            status="INVALID-SEMANTICS", converged=False,
-            note=("reconciled trim requires attack.vector_semantics=split_v1 "
-                  "and zero legacy attack.bias_vec; refusing to reinterpret an "
-                  "a26/a27 artifact whose vector had branch-specific meaning"))
-        return report
 
-    # Reference = this model at its FINAL aim operating point, with selection
-    # controls neutral. Fire pins stay active because they are part of the
-    # observable substrate whose learned weapon mix we are preserving.
-    reference_cfg = Path(str(config_path) + ".selectionref.json")
-    ref = json.loads(json.dumps(requested))
-    ref["params"]["weapon.switch_margin"] = 0.0
-    ref["params"]["weapon.preference_bias_vec"] = [0.0] * 8
-    reference_cfg.write_text(json.dumps(ref, indent=2) + "\n")
-    reference_npz = launch_eval(reference_cfg, "selectionref")
-    reference_cfg.unlink(missing_ok=True)
-    selection_target = (_selection_profile(Path(reference_npz))
-                        if reference_npz is not None else None)
-    if selection_target is None:
+    human_weapon = human_weapon_behavior_reference(ctx.corpus_dir)
+    if human_weapon is None:
         report.update(
             status="EVAL-FAILED", converged=False,
-            selection_reference_npz=(str(reference_npz) if reference_npz else None),
-            note="zero-margin rc1b discharge-occupancy reference was unmeasurable")
+            note="human weapon choice/continuation reference was unmeasurable")
         return report
-    report["selection_reference_npz"] = str(reference_npz)
-    report["selection_target"] = selection_target
+    _ht = np.asarray(human_weapon["transitions"])
+    report["human_weapon_reference"] = {
+        "split": human_weapon.get("split"),
+        "n_episodes": human_weapon.get("n_episodes"),
+        "continuation": {
+            _IMPULSE_NAME[w]: round(float(_ht[w, w]) /
+                                    max(float(_ht[w, 1:].sum()), 1.0), 4)
+            for w in range(1, 9) if _ht[w, 1:].sum() > 0},
+    }
     # working clone at the REQUESTED operating point (aim knobs kept)
     style_cfg = Path(str(config_path) + ".styletrim.json")
-    style_cfg.write_text(json.dumps(read_json(config_path), indent=2) + "\n")
+    working = json.loads(json.dumps(requested))
+    wp = working["params"]
+    style_cfg.write_text(json.dumps(working, indent=2) + "\n")
 
     back: dict[str, dict[str, float]] = {}
 
@@ -1041,20 +1406,13 @@ def attack_trim(ctx, config_path: Path,
         rates = {"h_att": op["h_att"], "b_att": op["b_att"],
                  "h_wsw": rc_pair["h_wsw"], "b_wsw": rc_pair["b_wsw"]}
         att_ratio = rates["h_att"] / max(rates["b_att"], 1e-6)
-        wsw_ratio = rates["b_wsw"] / max(rates["h_wsw"], 1e-6)
         react = _reactivity_hazard(npz)
-        selection = _selection_profile(npz)
-        if selection is None:
+        behavior = weapon_behavior_report(npz, human_weapon)
+        if behavior is None:
             report.update(status="EVAL-FAILED", iterations=iters,
-                          note=(f"iteration {it} lacks the rc1b operative-"
-                                "discharge occupancy stream"))
+                          note=(f"iteration {it} lacks the weapon preference/"
+                                "feasibility transition streams"))
             return report
-        target_shares = selection_target["shares"]
-        observed_shares = selection["shares"]
-        selection_log_ratio = _selection_log_ratios(
-            target_shares, observed_shares)
-        selection_max_log = max((abs(v) for v in selection_log_ratio.values()),
-                                default=0.0)
         # Per-family ratios are report-only here. The four forced-weapon pins
         # own conditional cadence because natural selection can starve a family.
         per_w = op.get("per_family") or op.get("per_weapon") or {}
@@ -1065,24 +1423,17 @@ def attack_trim(ctx, config_path: Path,
         _tol_log = float(np.log(1.0 + TRIM_TOL))
         aggregate_att_ok = abs(float(np.log(att_ratio))) <= _tol_log
         row = {"iter": it, **{k: round(v, 5) for k, v in rates.items()},
-               "att_ratio": round(att_ratio, 3), "wsw_ratio": round(wsw_ratio, 3),
+               "att_ratio": round(att_ratio, 3),
                "att_ratio_per_family": {w: round(r, 3) for w, r in w_ratio.items()},
                "aggregate_attack_gate_ok": aggregate_att_ok,
                "reactivity": react,
-               "selection_shares": {w: round(v, 4)
-                                    for w, v in observed_shares.items()},
-               "selection_target_shares": {w: round(v, 4)
-                                           for w, v in target_shares.items()},
-               "selection_log_ratio": {w: round(v, 3)
-                                       for w, v in selection_log_ratio.items()},
-               "selection_max_abs_log_ratio": round(selection_max_log, 3),
+               "weapon_choice": behavior["choice"],
+               "weapon_continuation": behavior["continuation"],
                "att_units": op["units"],
                "att_per_family": op.get("per_family", per_w),
                "att_per_weapon": op["per_weapon"],
                "att_transitions_diag": {"h": round(rc_pair["h_att"], 5),
                                         "b": round(rc_pair["b_att"], 5)}}
-        wsw_ok = abs(float(np.log(wsw_ratio))) <= _tol_log
-        selection_ok = selection_max_log <= TRIM_SELECTION_LOG_TOL
         react_ok = True
         r_meas = None
         if react is not None:
@@ -1090,40 +1441,13 @@ def attack_trim(ctx, config_path: Path,
             _h_lift = HUMAN_REACTIVITY_HAZARD - 1.0
             react_ok = (abs((r_meas - 1.0) - _h_lift)
                         <= TRIM_REACT_LIFT_TOL * _h_lift)
-        if wsw_ok and selection_ok and react_ok:
+        if react_ok:
             iters.append({**row, "action": "converged"})
             converged = True
             break
         cfg = read_json(style_cfg)
         p = cfg["params"]
         updates: dict[str, Any] = {}
-        if not wsw_ok:
-            d = _step("switch_margin", float(np.log(wsw_ratio)),
-                      TRIM_STICK_STEP_CLAMP)
-            p["weapon.switch_margin"] = round(
-                max(0.0, float(p.get("weapon.switch_margin", 0.0)) + d), 4)
-            updates["weapon.switch_margin"] = p["weapon.switch_margin"]
-        if not selection_ok:
-            pref = list(p.get("weapon.preference_bias_vec") or [0.0] * 8)
-            stepped_pref: dict[str, float] = {}
-            for w, raw in sorted(selection_log_ratio.items()):
-                impulse = next((i for i, name in _IMPULSE_NAME.items()
-                                if name == w), None)
-                if impulse is None:
-                    continue
-                d = _step(f"preference_bias_vec.{w}", raw,
-                          TRIM_PREF_STEP_CLAMP)
-                pref[impulse - 1] = float(pref[impulse - 1]) + d
-            # A constant offset is selection-invariant; center it so the vector
-            # has a unique, auditable representation and clip runaway attractors.
-            center = float(np.mean(pref))
-            pref = [round(float(np.clip(v - center, -8.0, 8.0)), 4)
-                    for v in pref]
-            for impulse, name in _IMPULSE_NAME.items():
-                if name in selection_log_ratio:
-                    stepped_pref[name] = pref[impulse - 1]
-            p["weapon.preference_bias_vec"] = pref
-            updates["weapon.preference_bias_vec"] = stepped_pref
         if react is not None and not react_ok:
             d = _step("threat_break",
                       (HUMAN_REACTIVITY_HAZARD - r_meas) * TRIM_REACT_STEP_SLOPE,
@@ -1144,7 +1468,8 @@ def attack_trim(ctx, config_path: Path,
         style_cfg.write_text(json.dumps(cfg, indent=2) + "\n")
         iters.append({**row, "action": updates})
         _log(f"attack trim it{it}: att {rates['b_att']:.3f}/{rates['h_att']:.3f} "
-             f"wsw {rates['b_wsw']:.3f}/{rates['h_wsw']:.3f} "
+             f"choiceΔ {behavior['choice']['max_abs_prob_delta']:.3f} "
+             f"continueΔ {behavior['continuation']['max_abs_prob_delta']:.3f} "
              f"react {(react or {}).get('hazard_ratio', '-')}"
              f"/{HUMAN_REACTIVITY_HAZARD} → {updates}")
 
@@ -1152,7 +1477,6 @@ def attack_trim(ctx, config_path: Path,
     _style = read_json(style_cfg)["params"]
     cfg = read_json(config_path)
     for k in ("attack.fire_bias_vec", "weapon.preference_bias_vec",
-              "weapon.switch_margin",
               "move.threat_break_hazard"):
         if k in _style:
             cfg["params"][k] = _style[k]
@@ -1166,7 +1490,6 @@ def attack_trim(ctx, config_path: Path,
         "style_values": {k: cfg["params"].get(k)
                          for k in ("attack.fire_bias_vec",
                                    "weapon.preference_bias_vec",
-                                   "weapon.switch_margin",
                                    "move.threat_break_hazard")},
     })
     # NATIVE reference (aim knobs zeroed, converged style values) for the

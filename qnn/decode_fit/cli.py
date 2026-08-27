@@ -5,6 +5,12 @@
         [--eval-template <dir>] [--offline-retrofit]
     python -m qnn.decode_fit --run-dir runs/head_probe/<run> \
         --assign-rc aXXrcNx [--config <promoted.json>] [--replace]
+    python -m qnn.decode_fit --run-dir runs/head_probe/<run> \
+        --trim-config <existing decode config> --eval-template <dir>
+        (re-run the free-play attack-trim + style gate on an EXISTING config
+        at its own substrate — a copy is staged/trimmed, the input is never
+        mutated; use case: a deployed config was hand-edited post-promotion
+        and its selection layer is off the trim's converged equilibrium)
 
 Fits stage + promote under a PROVISIONAL version derived from the run id —
 rc names are EARNED, never pre-assigned (src/docs/model-versioning.md): the
@@ -51,6 +57,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +75,11 @@ _log = lambda m: print(f"[decode-fit] {m}", flush=True)  # noqa: E731
 TMS_EXTEND_STEP = 0.3
 TMS_RANGE = (0.1, 3.0)
 ACQ_TARGET_PCT = 50.0
+# The transition gate adjudicates eight previous-weapon rows separately. The
+# historical 32-episode free-play sample could expose fewer than 20 leave
+# events for Axe/NG and turn a correct conditional law into LOW_N. Four arena
+# batches retain enough tail support without changing any forced-pin budget.
+TRANSITION_TRIM_EPISODES = 128
 
 
 def parse_skill_vector(spec: str) -> dict[str, float] | str:
@@ -133,8 +145,7 @@ def move_commit_pins(ctx: FitContext) -> dict[str, Any]:
 def _wave_substrate(ctx: FitContext) -> dict[str, Any]:
     """The shared wave substrate: a25 base template, aim levers OFF (per-lane
     overrides carry the full operating point), attack operating point NATIVE —
-    the template's zero legacy/joint and explicit fire/preference vectors plus
-    default ``weapon.switch_margin``
+    the template's zero legacy/joint and explicit fire/preference vectors
     stand until the live-pins round bakes its fitted bias vector (no offline
     pins: qnn.decode_fit.live_pins)."""
     template = Path(__file__).resolve().parents[2] / "qnn" / "model" / "bench" \
@@ -192,11 +203,24 @@ def fit_tms(ctx: FitContext, substrate: dict, ledger: design.BudgetLedger,
                 + (", after a seed-replicate extension" if rep_dirs else "")
                 + ") — the lever does not move the axis "
                 "(face-away spawn missing?)")
+        floor_dead = min(tms_values) in {
+            d["turn_mag_scale"] for d in fit.get("dropped_tms", [])}
         if fit["sweep_floor_bound"] and min(tms_values) > TMS_RANGE[0] + 1e-9:
-            lo = max(TMS_RANGE[0], min(tms_values) - TMS_EXTEND_STEP)
-            _log(f"acq sweep floor-bound; extending down to {lo}")
-            tms_values = sorted({lo, *tms_values})
-            continue
+            if floor_dead:
+                # the current floor already settled-collapsed (response.
+                # ACQ_SETTLED_COLLAPSE_FRAC) — slower turning only completes
+                # FEWER acquisitions, never more, so a level below it cannot
+                # be informative either. Walking on toward TMS_RANGE[0]
+                # would only spend episodes on more dead cells; accept the
+                # reliable floor instead (fit["reliable_tms_range"]).
+                _log(f"acq sweep floor-bound at tms={min(tms_values)}, but "
+                     "that level is already settled-collapsed — not "
+                     "extending further into the dead regime")
+            else:
+                lo = max(TMS_RANGE[0], min(tms_values) - TMS_EXTEND_STEP)
+                _log(f"acq sweep floor-bound; extending down to {lo}")
+                tms_values = sorted({lo, *tms_values})
+                continue
         if fit["sweep_ceil_bound"] and max(tms_values) < TMS_RANGE[1] - 1e-9:
             hi = min(TMS_RANGE[1], max(tms_values) + TMS_EXTEND_STEP)
             _log(f"acq sweep ceil-bound; extending up to {hi}")
@@ -221,6 +245,7 @@ def run_intercept_rounds(ctx: FitContext, substrate: dict, tms_star: float,
                          targets: dict[str, float],
                          ledger: design.BudgetLedger,
                          alpha_cap: float | None = None,
+                         no_demote: bool = False,
                          ) -> dict[str, Any]:
     from qnn.decode_fit import instruments
     # THE aim ladder rides the window-sampled TRACKING statistic (trigger-
@@ -306,7 +331,8 @@ def run_intercept_rounds(ctx: FitContext, substrate: dict, tms_star: float,
 
     plans = response.build_plan(gain_fits, alpha_fits, tremor_fit, ladder,
                                 reach, targets, tms=tms_star,
-                                alpha_style_cap=alpha_cap)
+                                alpha_style_cap=alpha_cap,
+                                no_demote=no_demote)
     # measurements outrank curves at the PLAN stage too: a refusal cannot
     # stand on a parametric floor that well-measured cells beat (the SG
     # plateau-basin class) — re-anchor such plans on the best measured cell.
@@ -335,7 +361,8 @@ def run_intercept_rounds(ctx: FitContext, substrate: dict, tms_star: float,
                 alpha_fits[abbr] = afit
         plans = response.build_plan(gain_fits, alpha_fits, tremor_fit, ladder,
                                     reach, targets, tms=tms_star,
-                                    alpha_style_cap=alpha_cap)
+                                    alpha_style_cap=alpha_cap,
+                                    no_demote=no_demote)
         plans = response.apply_measured_frontier(plans, table, gain_fits,
                                                  ladder, pinw)
     return {"table": table, "gain_fits": gain_fits, "alpha_fits": alpha_fits,
@@ -412,6 +439,61 @@ def _anchor_stamp(ctx: FitContext) -> dict[str, Any]:
                         for w, e in (node.get("weapons") or {}).items()}}
 
 
+_REPLAN_MANIFEST_KEYS = ("model_id", "checkpoint_sha256", "corpus_dir",
+                        "corpus_fingerprint", "look_grid_sha256")
+
+
+def _instrument_contract() -> dict[str, Any]:
+    """Fingerprint of the wave/scoring contract a ``--replan-from`` sidecar
+    must still match: the frozen aim-statistic geometry + look-applier regime
+    baked into every wave's env signature (``instruments._env_sig``) plus the
+    scored-table ``events.SCORER_VERSION`` — a code change to either
+    invalidates a saved fit exactly like a live wave's substrate/env
+    staleness check (``instruments.build_wave_dir``)."""
+    from qnn.decode_fit import events, instruments
+    sig = instruments._env_sig(0, 0, 1)
+    sig.pop("episodes_per_cell", None)   # a replan-policy knob, not a lever
+    sig["scorer_version"] = events.SCORER_VERSION
+    return sig
+
+
+def _replan_manifest(ctx: FitContext) -> dict[str, Any]:
+    prov = ctx.provenance()
+    return {**{k: prov.get(k) for k in _REPLAN_MANIFEST_KEYS},
+            "instrument_contract": _instrument_contract()}
+
+
+def _guard_replan(ctx: FitContext, saved_manifest: dict[str, Any]) -> None:
+    """Refuse ``--replan-from`` when the saved fit-state was not fit against
+    THIS checkpoint/corpus/look-grid/instrument contract — replan must never
+    cross a model or instrument change (a stale sidecar's fitted responses
+    describe a different physics/geometry)."""
+    current = _replan_manifest(ctx)
+    mismatched = [k for k in current if current[k] != saved_manifest.get(k)]
+    if mismatched:
+        detail = "; ".join(
+            f"{k}: saved={saved_manifest.get(k)!r} current={current[k]!r}"
+            for k in mismatched)
+        raise RuntimeError(
+            "--replan-from refused: saved fit-state manifest does not match "
+            f"this run — {detail}. Replan never crosses a model, corpus, "
+            "look-grid, or instrument change; run the full fit instead.")
+
+
+def _resolve_fit_state_path(p: Path) -> Path:
+    """``--replan-from`` accepts the sidecar itself, its owning run dir
+    (``runs/decode_fit/<model>/``), or that run's ``decode_fit_v2_report.json``
+    (the report does not itself carry bootstrap draws — see the module
+    docstring in response.py's fit-state section — so this always resolves to
+    the ``.npz`` sidecar written alongside it)."""
+    p = Path(p)
+    if p.is_dir():
+        return p / response.FIT_STATE_NPZ
+    if p.suffix == ".json":
+        return p.parent / response.FIT_STATE_NPZ
+    return p
+
+
 def _assign_rc_cmd(args) -> int:
     """``--assign-rc``: mark a gate-promoted provisional config with its
     earned rc name (emit.assign_rc) and exit. Source = ``--config``, else the
@@ -447,15 +529,233 @@ def _assign_rc_cmd(args) -> int:
     return 0
 
 
+def _load_plans_for_trim(ctx, cfg: dict[str, Any]
+                         ) -> tuple[dict[str, "response.WeaponPlan"] | None, str]:
+    """Best-effort ``WeaponPlan`` reconstruction for style_gate's plan-keyed
+    report-card sections (``freeplay_intercept``/``aggregate_intercept``) on
+    a ``--trim-config`` invocation — which runs no fitting stage of its own,
+    so there is no live ``plans`` dict to hand it. Never blocks the trim:
+    style_gate's gated arms never touch ``plans`` (only report cards do), so
+    the worst case is an honestly-unscored report, not a refusal.
+
+    Preference order:
+      1. this model's ``decode_fit_v2_report.json`` ``plans`` block — EXACT:
+         it is ``vars(p) for w, p in plans.items()`` (this module's
+         ``_report``) and already self-carries its ``weapon`` key, so
+         ``WeaponPlan(**d)`` losslessly reconstructs it, including post-build
+         overrides a bare refit would miss (measured-frontier reanchor, α
+         reanchor — response.apply_measured_frontier / design.
+         plan_alpha_reanchor). Used only
+         when its provenance checkpoint matches THIS run (never a stale or
+         foreign fit); a skill-target mismatch against the trim-config's own
+         ``skill_vector`` is logged loud but does not block.
+      2. the fit-state sidecar (``response.FIT_STATE_NPZ``), rebuilt via
+         ``response.build_plan`` at the trim-config's own
+         ``skill_vector.targets`` — coarser (no measured-frontier / α-reanchor
+         post-processing) but still a real fit.
+      3. ``None`` — the plan-keyed report cards go UNSCORED.
+    """
+    report_path = ctx.out_dir / "decode_fit_v2_report.json"
+    if report_path.exists():
+        doc = read_json(report_path)
+        raw = doc.get("plans")
+        prov = doc.get("provenance") or {}
+        if raw and prov.get("checkpoint_sha256") == ctx.checkpoint_sha:
+            try:
+                # report plans are ``vars(p)`` (this module's ``_report``) —
+                # already carry their own ``weapon`` key, unlike a config's
+                # ``skill_vector.placed`` table (emit._placed_table, keyed by
+                # weapon but not self-carrying it).
+                plans = {w: response.WeaponPlan(**d) for w, d in raw.items()}
+            except TypeError as e:
+                _log(f"decode_fit_v2_report.json plans block malformed "
+                     f"({e}) — falling back to the fit-state sidecar")
+            else:
+                cfg_targets = (cfg.get("skill_vector") or {}).get("targets") or {}
+                if cfg_targets and any(
+                        abs(float(cfg_targets.get(w, p.target_pct))
+                            - p.target_pct) > 1e-6
+                        for w, p in plans.items()):
+                    _log("WARNING: decode_fit_v2_report.json plans targets "
+                         "differ from this config's skill_vector.targets — "
+                         "using the report's plans anyway (report cards "
+                         "only, never gates)")
+                return plans, f"reconstructed from {rel_to_repo(report_path)}"
+        elif raw:
+            _log(f"decode_fit_v2_report.json provenance checkpoint does not "
+                 f"match this run — not this run's fit; falling back to the "
+                 f"fit-state sidecar")
+
+    sidecar = ctx.out_dir / response.FIT_STATE_NPZ
+    if sidecar.exists():
+        try:
+            state = response.load_fit_state(sidecar)
+            _guard_replan(ctx, state["manifest"])
+        except Exception as e:
+            _log(f"fit-state sidecar unusable for retrim plans: {e}")
+        else:
+            targets = (cfg.get("skill_vector") or {}).get("targets")
+            if targets:
+                plans = response.build_plan(
+                    state["gain_fits"], state["alpha_fits"],
+                    state["tremor_fit"], state["ladder"], state["reachable"],
+                    targets, tms=state["tms_star"])
+                return plans, (
+                    f"rebuilt from fit-state sidecar {rel_to_repo(sidecar)} "
+                    "at this config's skill_vector.targets (no "
+                    "measured-frontier / α-reanchor post-processing)")
+            _log("fit-state sidecar present but the trim-config has no "
+                 "skill_vector.targets to rebuild plans from")
+
+    return None, ("no usable plans source (no checkpoint-matching "
+                  "decode_fit_v2_report.json, no fit-state sidecar) — "
+                  "style_gate's plan-keyed report cards are UNSCORED")
+
+
+def _trim_config_cmd(ctx: FitContext, args) -> int:
+    """``--trim-config``: re-run the free-play attack-trim + style gate on an
+    EXISTING decode config at its own substrate, without re-fitting anything.
+
+    Use case: a deployed config was hand-edited post-promotion (guard/idle/
+    jump keys added) and its conditional weapon transition layer is off the
+    trim's converged equilibrium for the edited substrate — decode/guards
+    don't transfer across checkpoints, but a
+    style re-trim on the SAME checkpoint's own substrate is exactly what
+    ``gates.attack_trim`` already does; this mode just points it at an
+    already-promoted config instead of a freshly-staged one.
+
+    ``attack_trim`` WRITES its converged style values back into the config
+    path it is handed, so this operates on a COPY, never the input file:
+    ``decode.<version>.retrim.staged.json`` under ``ctx.out_dir``, ``version``
+    re-stamped ``f"{orig_version}-retrim"`` with a provenance note recording
+    the source path, invocation UTC, and reason. No promote/assign step here
+    — rc letters are earned separately via ``--assign-rc`` once a human has
+    looked at the retrim report."""
+    from qnn.decode_fit import gates, instruments
+    from qnn.model.decode_config import resolve_decode_config
+
+    src = Path(args.trim_config)
+    if not src.is_file():
+        raise FileNotFoundError(f"--trim-config: no such file: {src}")
+    cfg = read_json(src)
+
+    # decode fits (and their guard/style layers) never transfer across
+    # checkpoints — refuse loudly rather than re-trim a config fit against a
+    # different model (feedback_decode_guards_dont_transfer_across_arch.md).
+    cfg_sha = (cfg.get("provenance") or {}).get("checkpoint_sha256")
+    if cfg_sha != ctx.checkpoint_sha:
+        raise RuntimeError(
+            f"--trim-config refused: {rel_to_repo(src)} provenance."
+            f"checkpoint_sha256={cfg_sha!r} does not match --run-dir "
+            f"{rel_to_repo(ctx.run_dir)}'s checkpoint "
+            f"({ctx.checkpoint_sha!r}, {rel_to_repo(ctx.checkpoint)}) — "
+            "decode fits never transfer across checkpoints; point "
+            "--run-dir at the run that actually produced this config")
+    # attack_trim's own INVALID-SEMANTICS check covers split_v1 / zero legacy
+    # attack.bias_vec — no need to duplicate it here (gates.py:1358-1366).
+
+    orig_version = cfg.get("version")
+    if not orig_version:
+        raise RuntimeError(f"{rel_to_repo(src)} has no 'version' field — "
+                            "cannot stage a retrim")
+    retrim_version = f"{orig_version}-retrim"
+    staged_cfg = json.loads(json.dumps(cfg))     # deep copy — NEVER mutate src
+    staged_cfg["version"] = retrim_version
+    staged_cfg.setdefault("provenance", {})["retrim"] = {
+        "source_path": rel_to_repo(src),
+        "invocation_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "reason": "post-promotion substrate edit re-trim",
+    }
+    staged_path = ctx.out_dir / f"decode.{orig_version}.retrim.staged.json"
+    ctx.out_dir.mkdir(parents=True, exist_ok=True)
+    staged_path.write_text(json.dumps(staged_cfg, indent=2) + "\n")
+    try:
+        resolve_decode_config(staged_path)
+    except Exception as e:
+        staged_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"staged retrim copy failed resolve_decode_config and was "
+            f"removed ({staged_path.name}): {e!r}") from e
+    _log(f"retrim staged copy ← {rel_to_repo(src)} → "
+         f"{rel_to_repo(staged_path)} (version={retrim_version})")
+
+    trim = gates.attack_trim(
+        ctx, staged_path,
+        lambda cfg_path, tag: instruments.run_freeplay(
+            ctx, cfg_path, args.eval_template, tag=tag,
+            episodes=TRANSITION_TRIM_EPISODES))
+    _log(f"attack trim: {trim.get('status')}")
+
+    plans, plans_note = _load_plans_for_trim(ctx, cfg)
+    _log(f"style-gate plans source: {plans_note}")
+    style: dict[str, Any]
+    npz = trim.get("npz")
+    if npz is None:
+        style = {"status": "SKIPPED",
+                 "note": "attack_trim produced no scoreable npz "
+                         f"(trim status {trim.get('status')})"}
+    elif plans is None:
+        style = {"status": "UNSCORED", "note": plans_note}
+    else:
+        native_npz = trim.get("native_npz")
+        style = gates.style_gate(
+            ctx, Path(npz), plans,
+            native_npz=Path(native_npz) if native_npz else None,
+            selection_target=trim.get("selection_target"))
+    _log(f"style gate: {style.get('status')}")
+
+    trim_status = trim.get("status")
+    result = {
+        "mode": "trim-config",
+        "source_config": rel_to_repo(src),
+        "staged_path": rel_to_repo(staged_path),
+        "plans_source": plans_note,
+        "attack_trim": trim,
+        "style_gate": style,
+        "status": trim_status,
+    }
+    out = ctx.out_dir / f"retrim_{orig_version}_report.json"
+    out.write_text(json.dumps(result, indent=2, default=str) + "\n")
+    _log(f"wrote {rel_to_repo(out)} — attack_trim={trim_status} "
+         f"style_gate={style.get('status')}")
+    return 0 if trim_status == "CONVERGED" else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="qnn.decode_fit", description=__doc__)
     ap.add_argument("--run-dir", required=True, type=Path)
     ap.add_argument("--skill", default="native")
+    ap.add_argument("--no-demote", action="store_true",
+                    help="pXX targets are FLOORS: a weapon whose post-fix "
+                         "NATIVE landing already meets/beats its target is "
+                         "placed at native (no tremor demotion). The "
+                         "demotion arm stays available without the flag.")
+    ap.add_argument("--replan-from", type=Path, default=None, metavar="PATH",
+                    help="skip ACQ/live-pins/collection/fitting entirely: "
+                         "load a previous run's fitted responses + ladder/"
+                         "reachable state from its _fit_state.npz sidecar "
+                         "(PATH = the sidecar itself, its run dir, or its "
+                         "decode_fit_v2_report.json), rebuild plans fresh "
+                         "against THIS invocation's --skill/--no-demote, run "
+                         "the placement gate, then proceed straight to trim/"
+                         "validate as normal (those stay live evals). "
+                         "Refuses on any checkpoint/corpus/look-grid/"
+                         "instrument mismatch — replan never crosses a model "
+                         "or instrument change. The sidecar is written "
+                         "unconditionally at the end of every normal fit.")
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--validate", action="store_true",
                     help="run the free-play attack-trim + style gate "
                          "(needs --eval-template)")
     ap.add_argument("--eval-template", type=Path, default=None)
+    ap.add_argument("--pins", choices=("fit", "report"), default="fit",
+                    help="live-pins stage mode: 'fit' = damped-secant cadence "
+                         "repair (default); 'report' = round-0 observation "
+                         "only, fire_bias_vec stays ZERO — for checkpoints "
+                         "whose cadence is model-owned (crest-line occupancy "
+                         "regulator; agents/plans/decode-fit-pins-crest-"
+                         "mismatch.md option A). Cadence stays gated by the "
+                         "stage-5 free-play arms.")
     ap.add_argument("--version", default=None,
                     help="override the staged config's PROVISIONAL version "
                          "(ablation arms etc.). rc / bare-tier names are "
@@ -471,6 +771,17 @@ def main(argv: list[str] | None = None) -> int:
                     help="with --assign-rc: overwrite an existing "
                          "decode.<rc>.json — ONLY for re-emitting a "
                          "superseded NEVER-deployed artifact")
+    ap.add_argument("--trim-config", type=Path, default=None, metavar="PATH",
+                    help="re-run the free-play attack-trim + style gate on "
+                         "an EXISTING decode config at its own substrate "
+                         "(post-promotion hand-edit case: guard/idle/jump "
+                         "keys added and the conditional weapon transition "
+                         "layer is off the trim's converged equilibrium). PATH "
+                         "is copied to decode.<version>.retrim.staged.json "
+                         "under this run's decode_fit dir and re-trimmed "
+                         "there — the input file is NEVER mutated. Requires "
+                         "--eval-template. No fitting, no promote/assign; "
+                         "exit 0 only on attack_trim CONVERGED")
     ap.add_argument("--acq-target", default=f"p{ACQ_TARGET_PCT:.0f}")
     ap.add_argument("--budget", type=int, default=design.MAX_EPISODES)
     ap.add_argument("--offline-retrofit", action="store_true",
@@ -492,6 +803,17 @@ def main(argv: list[str] | None = None) -> int:
                          "stamped into provenance)")
     args = ap.parse_args(argv)
 
+    if args.trim_config is not None:
+        if args.eval_template is None:
+            ap.error("--trim-config requires --eval-template: the free-play "
+                     "attack-trim launches evals against a template run-dir")
+        if args.write or args.offline_retrofit or args.replan_from \
+                or args.assign_rc:
+            ap.error("--trim-config is mutually exclusive with --write, "
+                     "--offline-retrofit, --replan-from, and --assign-rc — "
+                     "it re-trims an EXISTING config at its own substrate, "
+                     "never the fit/emit/assign pipeline")
+
     from qnn.decode_fit import emit
     if args.assign_rc:
         return _assign_rc_cmd(args)
@@ -508,61 +830,127 @@ def main(argv: list[str] | None = None) -> int:
             f"version; on gate PASS assign the name with --assign-rc "
             f"(src/docs/model-versioning.md)")
 
+    if args.offline_retrofit and args.replan_from:
+        ap.error("--offline-retrofit and --replan-from are mutually "
+                 "exclusive fitting paths")
+
     ctx = resolve_fit_context(args.run_dir)
     from qnn.human import ensure_from_collect
     ensure_from_collect(ctx.corpus_dir)
     _log(f"run={ctx.model_id} ckpt={ctx.checkpoint.name} skill={args.skill!r}")
 
+    if args.trim_config is not None:
+        return _trim_config_cmd(ctx, args)
+
     if args.offline_retrofit:
         return _offline_retrofit(ctx, args)
 
     from qnn.decode_fit import gates, instruments
-    ledger = design.BudgetLedger(max_episodes=args.budget)
-    substrate = _wave_substrate(ctx)
-
-    # ACQ first, on the NATIVE substrate: acquisition throughput is
-    # target-free (flick/settle geometry off the obs streams — no discharge
-    # in the ruler), so the attack operating point cannot starve it.
-    acq_pct = parse_skill_vector(args.acq_target)
-    acq_pct = ACQ_TARGET_PCT if isinstance(acq_pct, str) else \
-        float(np.mean(list(acq_pct.values())))
-    tms_fit = fit_tms(ctx, substrate, ledger, target_pct=acq_pct)
-    tms_star = float(tms_fit["turn_mag_scale"])
-    _log(f"turn_mag_scale = {tms_star} (ci {tms_fit['tms_ci']}, "
-         f"acq p{tms_fit['achieved_acq_percentile']}, in_band={tms_fit['in_band']})")
-
-    # LIVE PINS round 0 at the fitted dampener — the exact regime SCREEN runs
-    # at — before any gain arm is swept (invariants-before-skills, d46104d7;
-    # the invariant is now MEASURED in-regime instead of corpus-forward).
-    live = live_pins.fit_live_pins(ctx, substrate, tms_star, ledger)
-    _log("live pins: fire_bias_vec=" + str(live["fire_bias_vec"]) + "  " + " ".join(
-        f"{w}[{v['native_rate_per_s']:.2f}"
-        + (f"→{v['fitted_rate_per_s']:.2f}@{v['bias']:+.2f}"
-           f"/{v['secant_steps']}s]" if v["secant_steps"] else "]")
-        for w, v in sorted(live["weapons"].items())))
-    substrate = {**substrate,
-                 "params": {**substrate["params"],
-                            "attack.fire_bias_vec": live["fire_bias_vec"]}}
-
-    sk = parse_skill_vector(args.skill)
+    no_demote = bool(getattr(args, "no_demote", False))
     alpha_cap = args.alpha_cap if args.alpha_cap and args.alpha_cap > 0 else None
-    # native targets are only known after the fits — run the rounds with a
-    # placeholder, then re-target at the measured native placements.
+    sk = parse_skill_vector(args.skill)
     targets0 = sk if isinstance(sk, dict) else \
         {w: 50.0 for w in INTERCEPT_WEAPONS}
-    state = run_intercept_rounds(ctx, substrate, tms_star, targets0, ledger,
-                                 alpha_cap=alpha_cap)
-    if not isinstance(sk, dict):    # --skill native
-        ladder = state["ladder"]
-        natives = {}
-        for w in INTERCEPT_WEAPONS:
-            src = w if w in state["gain_fits"] else TRANSFER_ALIAS.get(w, w)
-            natives[w] = round(human_refs.hbw_to_pct(
-                state["gain_fits"][src].native_at(tms_star), ladder[w]), 1)
-        state["plans"] = response.build_plan(
-            state["gain_fits"], state["alpha_fits"], state["tremor_fit"],
-            state["ladder"], state["reachable"], natives, tms=tms_star,
-            alpha_style_cap=alpha_cap)
+
+    if args.replan_from is not None:
+        # ── replan-only: skip ACQ/live-pins/collection/fitting entirely ────
+        sidecar = _resolve_fit_state_path(args.replan_from)
+        if not sidecar.exists():
+            ap.error(f"--replan-from: no fit-state sidecar at {sidecar} — "
+                     "it is written at the end of every normal (non-replan) "
+                     "fit; run one first")
+        replan = response.load_fit_state(sidecar)
+        _guard_replan(ctx, replan["manifest"])
+        tms_star = replan["tms_star"]
+        tms_fit = replan["tms_fit"]
+        live = replan["live"]
+        ledger = design.BudgetLedger(max_episodes=args.budget)
+        substrate = _wave_substrate(ctx)
+        substrate = {**substrate,
+                     "params": {**substrate["params"],
+                                "attack.fire_bias_vec": live["fire_bias_vec"]}}
+        _log(f"--replan-from {rel_to_repo(sidecar)}: manifest verified — "
+             f"skipping collection/fit (tms*={tms_star}); rebuilding plans "
+             f"for skill={args.skill!r} no_demote={no_demote}")
+        plans = response.build_plan(
+            replan["gain_fits"], replan["alpha_fits"], replan["tremor_fit"],
+            replan["ladder"], replan["reachable"], targets0, tms=tms_star,
+            alpha_style_cap=alpha_cap, no_demote=no_demote)
+        state: dict[str, Any] = {
+            "table": None, "gain_fits": replan["gain_fits"],
+            "alpha_fits": replan["alpha_fits"],
+            "tremor_fit": replan["tremor_fit"], "plans": plans,
+            "ladder": replan["ladder"], "reachable": replan["reachable"],
+            "pin_weights": {}, "wave_dirs": [], "alpha_cap": alpha_cap}
+        if not isinstance(sk, dict):    # --skill native
+            ladder = state["ladder"]
+            natives = {}
+            for w in INTERCEPT_WEAPONS:
+                src = w if w in state["gain_fits"] else TRANSFER_ALIAS.get(w, w)
+                natives[w] = round(human_refs.hbw_to_pct(
+                    state["gain_fits"][src].native_at(tms_star), ladder[w]), 1)
+            state["plans"] = response.build_plan(
+                state["gain_fits"], state["alpha_fits"], state["tremor_fit"],
+                state["ladder"], state["reachable"], natives, tms=tms_star,
+                alpha_style_cap=alpha_cap)
+    else:
+        ledger = design.BudgetLedger(max_episodes=args.budget)
+        substrate = _wave_substrate(ctx)
+
+        # ACQ first, on the NATIVE substrate: acquisition throughput is
+        # target-free (flick/settle geometry off the obs streams — no
+        # discharge in the ruler), so the attack operating point cannot
+        # starve it.
+        acq_pct = parse_skill_vector(args.acq_target)
+        acq_pct = ACQ_TARGET_PCT if isinstance(acq_pct, str) else \
+            float(np.mean(list(acq_pct.values())))
+        tms_fit = fit_tms(ctx, substrate, ledger, target_pct=acq_pct)
+        tms_star = float(tms_fit["turn_mag_scale"])
+        _log(f"turn_mag_scale = {tms_star} (ci {tms_fit['tms_ci']}, "
+             f"acq p{tms_fit['achieved_acq_percentile']}, in_band={tms_fit['in_band']})")
+
+        # LIVE PINS round 0 at the fitted dampener — the exact regime SCREEN
+        # runs at — before any gain arm is swept (invariants-before-skills,
+        # d46104d7; the invariant is now MEASURED in-regime instead of
+        # corpus-forward).
+        live = live_pins.fit_live_pins(ctx, substrate, tms_star, ledger,
+                                       mode=args.pins)
+        _log(f"live pins ({live['status']}): fire_bias_vec="
+             + str(live["fire_bias_vec"]) + "  " + " ".join(
+            f"{w}[{v['native_rate_per_s']:.2f}"
+            + (f"→{v['fitted_rate_per_s']:.2f}@{v['bias']:+.2f}"
+               f"/{v['secant_steps']}s]" if v["secant_steps"] else "]")
+            for w, v in sorted(live["weapons"].items())))
+        substrate = {**substrate,
+                     "params": {**substrate["params"],
+                                "attack.fire_bias_vec": live["fire_bias_vec"]}}
+
+        # native targets are only known after the fits — run the rounds with
+        # a placeholder, then re-target at the measured native placements.
+        state = run_intercept_rounds(ctx, substrate, tms_star, targets0, ledger,
+                                     alpha_cap=alpha_cap, no_demote=no_demote)
+        if not isinstance(sk, dict):    # --skill native
+            ladder = state["ladder"]
+            natives = {}
+            for w in INTERCEPT_WEAPONS:
+                src = w if w in state["gain_fits"] else TRANSFER_ALIAS.get(w, w)
+                natives[w] = round(human_refs.hbw_to_pct(
+                    state["gain_fits"][src].native_at(tms_star), ladder[w]), 1)
+            state["plans"] = response.build_plan(
+                state["gain_fits"], state["alpha_fits"], state["tremor_fit"],
+                state["ladder"], state["reachable"], natives, tms=tms_star,
+                alpha_style_cap=alpha_cap)
+
+        # fit-state sidecar: written unconditionally so a LATER invocation
+        # that only changes a planning flag (--skill, --no-demote) can
+        # --replan-from this run instead of re-collecting/re-fitting.
+        sidecar = ctx.out_dir / response.FIT_STATE_NPZ
+        response.save_fit_state(
+            sidecar, manifest=_replan_manifest(ctx), tms_star=tms_star,
+            tms_fit=tms_fit, live=live, gain_fits=state["gain_fits"],
+            alpha_fits=state["alpha_fits"], tremor_fit=state["tremor_fit"],
+            ladder=state["ladder"], reachable=state["reachable"])
+        _log(f"fit-state sidecar written: {rel_to_repo(sidecar)}")
 
     for w, p in state["plans"].items():
         _log(f"  {w}: band={p.band} gain={p.gain} α={p.alpha} pred={p.pred_hbw} "
@@ -589,21 +977,26 @@ def main(argv: list[str] | None = None) -> int:
     # swept operating points (report card + the attack-head RL target; the
     # human reference lives in _aim_tracking_window.json crest_capture:
     # SG/RL ≈ 0.83-0.86, spray weapons ≈ 0.94-0.98; an alignment-blind
-    # trigger reads ≈ 1).
-    _disch = instruments.collect_events(state["wave_dirs"])
+    # trigger reads ≈ 1). Replan mode has no wave dirs (nothing was
+    # collected this invocation) — the report card is skipped, not faked.
     crest: dict[str, Any] = {}
-    for _w in sorted(set(p.alias_of or w for w, p in plans.items())):
-        _td = state["table"].where(weapon=_w)
-        _dd = _disch.where(weapon=_w)
-        if len(_td) and len(_dd):
-            _mt = float(np.median(_td["hbw"]))
-            _md = float(np.median(_dd["hbw"]))
-            crest[_w] = {"window_median_hbw": round(_mt, 4),
-                         "discharge_median_hbw": round(_md, 4),
-                         "capture_ratio": round(_md / max(_mt, 1e-9), 4)}
-    if crest:
-        _log("crest capture (model, pooled): " + "  ".join(
-            f"{w}={v['capture_ratio']}" for w, v in sorted(crest.items())))
+    if state["table"] is not None:
+        _disch = instruments.collect_events(state["wave_dirs"])
+        for _w in sorted(set(p.alias_of or w for w, p in plans.items())):
+            _td = state["table"].where(weapon=_w)
+            _dd = _disch.where(weapon=_w)
+            if len(_td) and len(_dd):
+                _mt = float(np.median(_td["hbw"]))
+                _md = float(np.median(_dd["hbw"]))
+                crest[_w] = {"window_median_hbw": round(_mt, 4),
+                             "discharge_median_hbw": round(_md, 4),
+                             "capture_ratio": round(_md / max(_mt, 1e-9), 4)}
+        if crest:
+            _log("crest capture (model, pooled): " + "  ".join(
+                f"{w}={v['capture_ratio']}" for w, v in sorted(crest.items())))
+    else:
+        _log("crest capture skipped (replan mode: no wave dirs collected "
+             "this invocation)")
 
     def _fit_stamp(f) -> dict[str, Any]:
         return {k: v for k, v in dataclasses.asdict(f).items() if k != "_boot"}
@@ -635,6 +1028,8 @@ def main(argv: list[str] | None = None) -> int:
         },
         **({"seed_replicates": seed_reps} if seed_reps else {}),
         **({"crest_capture": crest} if crest else {}),
+        **({"replanned_from": rel_to_repo(_resolve_fit_state_path(args.replan_from))}
+           if args.replan_from is not None else {}),
         "plans": {w: vars(p) for w, p in plans.items()},
         "provenance": ctx.provenance(),
     }
@@ -645,14 +1040,11 @@ def main(argv: list[str] | None = None) -> int:
     version = args.version or emit.provisional_version(ctx.model_id, args.skill)
     vectors = response.build_vectors(plans)
     # Non-lever pins: the live-fitted fire-only vector (the exact vector every
-    # wave ran on) + the move-commit dur_tilt. weapon.switch_margin is NOT
-    # pinned — the template default stands; switch-rate parity is owned by
+    # wave ran on) + the move-commit dur_tilt. Switch-rate parity is owned by
     # the free-play attack trim (gates.attack_trim) + its warm start.
     emit_pins = {
-        "attack.bias_vec": [0.0] * 8,
         "attack.fire_bias_vec": live["fire_bias_vec"],
         "weapon.preference_bias_vec": [0.0] * 8,
-        "attack.vector_semantics": "split_v1",
         **move_commit_pins(ctx),
     }
     staged = emit.stage_decode_config(ctx, plans, vectors, emit_pins, tms_star,
@@ -669,7 +1061,8 @@ def main(argv: list[str] | None = None) -> int:
         trim = gates.attack_trim(
             ctx, staged,
             lambda cfg, tag: instruments.run_freeplay(
-                ctx, cfg, args.eval_template, tag=tag))
+                ctx, cfg, args.eval_template, tag=tag,
+                episodes=TRANSITION_TRIM_EPISODES))
         result["attack_trim"] = trim
         npz = trim.get("npz")            # trim's final-eval npz, reused (dedup)
         if npz:

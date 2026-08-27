@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -25,18 +25,31 @@ from qnn.decode_fit.events import (
     INTERCEPT_EVENTS_NPZ as _INTERCEPT_EVENTS_NPZ,
     RAW_FIELDS as _EVENT_RAW_FIELDS,
 )
+# Contiguous per-tick align-hbw trace — the DECLINED-tick companion to the two
+# discharge-anchored instruments above. Schema/writer pinned in one module so
+# the emitter and qnn.diag.crest_frontier's reader cannot drift.
+from qnn.eval.intercept_trace import (
+    TRACE_CAP as _TRACE_CAP,
+    TRACE_FIELDS as _TRACE_FIELDS,
+    write_intercept_trace as _write_intercept_trace,
+)
 from qnn.run.metrics import (
     EpisodeStatAccumulator,
     append_metric_values,
     build_eval_summary_aliases,
     mean_metric_values,
 )
-from qnn.model.decode_actions import commit_reset_lanes as _commit_reset_lanes
+from qnn.model.decode_actions import (
+    ATTACK_STATE_DIM as _ATTACK_STATE_DIM,
+    commit_reset_lanes as _commit_reset_lanes,
+)
 from qnn.model.look_seg_decode import (
     LOOK_COMMIT_STATE_DIM,
     look_commit_reset_lanes as _look_commit_reset_lanes)
 from qnn.model.decode import BatchedRNG
+from qnn.eval.stage_profile import StageProfile
 from qnn.model.policy import QNNPolicy
+from qnn.engine_norm import ITEMS_WEAPON_MASK, weapon_feasibility_bits
 from qnn.schema import GATE_STREAM_SCHEMA_VERSION, SELF_SCALAR_DIM
 from qnn.vocab import TOKEN_ACTOR, self_weapon_id_to_impulse
 from qnn.env.world import NativeWorldEnv
@@ -81,7 +94,7 @@ class EvalConfig:
     # Per-model weapon BAN (csv impulses 1..8) — the SAME spec the ONNX export
     # path applies (tools/export_onnx --weapon-ban / decode.weapon_ban). Set so
     # offline eval predicts deployed behavior: banned classes can never be
-    # decided and a held banned weapon force-switches. Empty () → no ban
+    # decided and an equipped banned weapon force-switches. Empty () → no ban
     # (historical behavior). Set via the run config's optional eval_weapon_ban
     # so the arm is recorded in the frozen run dir.
     weapon_ban: tuple[int, ...] = ()
@@ -105,10 +118,15 @@ class EvalConfig:
     # Optional release-candidate decode regime for Python eval parity with
     # in-graph exports. Example: "a25rc1" or a decode-config path.
     decode_regime: str | None = None
-    # OPT-IN batched-forward decode (eval_batched_forward). Default False keeps
-    # the per-env B=1 forward path, whose action streams are bit-identical to
-    # the sequential (num_envs=1) protocol — every regression/replication eval
-    # depends on that. When True, all ACTIVE envs' obs are stacked into ONE
+    # Batched-forward decode (eval_batched_forward). DEFAULT TRUE: the 8/05
+    # profile measured the per-env B=1 path 4.5x slower end-to-end (35.5 vs
+    # 7.9 ms/macro-step at 8 lanes), because act() carries a ~4.4 ms FIXED
+    # per-call cost that B=1 pays once PER LANE rather than once per tick.
+    # Setting it False restores the B=1 forward path, whose action streams are
+    # bit-identical to the sequential (num_envs=1) protocol — that is what
+    # bit-exact replication of a historical run needs, and the ONLY reason to
+    # choose it; it must never be the operative path for new work.
+    # When True, all ACTIVE envs' obs are stacked into ONE
     # batch and decoded with a single model.act(B=N) per macro-step, so the
     # CPU saturates instead of idling in the python<->engine ping-pong. The
     # env returns variable-length entity_* fields (sized to the live
@@ -125,7 +143,26 @@ class EvalConfig:
     # which forks sampled trajectories at the float level — fine for the aim
     # grid, whose coh_5deg over thousands of LOS ticks is robust to that. Use
     # only where per-frame bit-reproducibility is not required.
-    batched_forward: bool = False
+    batched_forward: bool = True
+    # Discharge-window instrument (intercept_windows.npz): "<pre>,<post>"
+    # tick counts, e.g. "16,4" (decode-fit's frozen geometry); "" disables.
+    # Config-carried so eval run dirs are SELF-CONTAINED — this previously
+    # lived only in the QNN_EVAL_INTERCEPT_WINDOW env var, which made the
+    # instrument invisible to config diffs and unreproducible from the run
+    # dir (8/5: a 40-minute judge eval completed without its key artifact).
+    # The env var still OVERRIDES when set.
+    intercept_window: str = ""
+    # Contiguous per-tick align-hbw trace (intercept_trace.npz): ONE ROW PER
+    # LANE-TICK, including the ticks the policy DECLINED to fire on. The two
+    # discharge-anchored instruments above cannot answer "could a different
+    # trigger have done better on this same aim trajectory?", because the ticks
+    # that question is about are exactly the ones they omit (at SG cadence
+    # discharges sit ~13 ticks apart). Same _LeadRuler.hbw stream the window
+    # instrument samples, so the two cannot drift. train.json
+    # `eval_intercept_trace`; QNN_EVAL_INTERCEPT_TRACE overrides. OFF by
+    # default: ~20x the row count of the window instrument, and only the
+    # counterfactual-frontier analysis (qnn.diag.crest_frontier) reads it.
+    intercept_trace: bool = False
     # PER-LANE decode overrides (the aim-grid closed-loop widener). One dict per
     # ENV SLOT (index 0..num_envs-1), each mapping supported decode-config keys
     # (qnn.model.policy._PER_ROW_DECODE_KEYS: look.aim_prior_gain / aim_mag_gain /
@@ -188,10 +225,14 @@ class _EpisodeState:
     rng: torch.Generator | None = None
     hidden: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
     metrics: EpisodeStatAccumulator = field(default_factory=EpisodeStatAccumulator)
-    # Per-episode ATTACK state slots. The a25 attack_with decode is STATELESS —
-    # these pass through policy.act untouched — but the wire keeps the slots for
-    # parity with the deployed graph, so the eval threads them the same way.
-    attack_state: np.ndarray = field(default_factory=lambda: np.zeros((1, 1), dtype=np.float32))
+    # Per-episode ATTACK state slots (lane 0 = crest countdown latch; lanes 1/2
+    # = the a28+ evidence-accumulator law's last-fired anchor + accumulator A,
+    # live only when weapon.switch_evidence_decay is set — see
+    # qnn.model.decode_actions.ATTACK_STATE_DIM / attack_with_decode). The eval
+    # threads them exactly like move_commit_state; with the key absent, lanes
+    # 1/2 are dead zeros the decode never touches (compat gate).
+    attack_state: np.ndarray = field(
+        default_factory=lambda: np.zeros((1, _ATTACK_STATE_DIM), dtype=np.float32))
     attack_rng: np.ndarray = field(default_factory=lambda: np.array([0x6C078965], dtype=np.int64))
     # a25 commitment decode state — the FULL COMMIT_STATE_DIM lanes from the
     # decode module's reset init (fb/lr commit + rel + water-ud + spare lanes;
@@ -206,6 +247,12 @@ class _EpisodeState:
     # scattered back per env — the move_commit precedent.
     look_commit: np.ndarray = field(default_factory=lambda: np.asarray(
         _look_commit_reset_lanes(), dtype=np.float32))
+    # Alignment-edge state (rung-3 A′): the previous tick's per-weapon
+    # alignment vector; zeros = episode start (Δ-invalid first tick). Mutated
+    # in place by policy.act (the _alignment aux readback), scattered back
+    # per env — the move_commit precedent.
+    alignment_prev: np.ndarray = field(
+        default_factory=lambda: np.zeros(8, dtype=np.float32))
     # Per-tick decoded move classes, filled only when log_action_streams.
     move_trace: List[tuple] = field(default_factory=list)
     # Per-tick threat flags (bit0=damage, bit1=INCOMING-projectile appeared
@@ -219,6 +266,29 @@ class _EpisodeState:
     # when the model has no look_seg head — plus the 2 look-TANGENT components
     # (schema 4). Filled only when log_action_streams.
     gate_trace: List[tuple] = field(default_factory=list)
+    # Per-tick WORLD-frame vertical offset (game units, +up) of the SIGHT
+    # actor that made the tick `engaged`, NaN otherwise — the E7 in-vivo
+    # instrument (P(discharge | engaged, opponent above)). h2h fills it in
+    # _log_lane_tick and writes it as its own npz array next to the gate
+    # row; qnn.eval.run leaves it empty (the gate-row schema is untouched).
+    relz_trace: List[float] = field(default_factory=list)
+    # Per-tick (total, horiz, vert, op_ready) angular-aim-error + readiness
+    # quad, view-basis (crosshair = +x; the E7 instrument,
+    # scripts/analysis/human_fire_tolerance_by_axis.py) — current-position
+    # anchor, ADDITIVE stream (never touches the gate-row tuple /
+    # GATE_STREAM_SCHEMA_VERSION, same convention as relz_trace). Angular
+    # errors are DEGREES: total = angle between +x and the rel direction
+    # (atan2(hypot(ry, rz), rx)); horiz = atan2(ry, rx); vert =
+    # atan2(rz, hypot(rx, ry)); NaN on all three when not engaged or
+    # entity_rel absent. ``op_ready`` (0.0/1.0) = engine attack_finished
+    # cooldown expired (<= 1e-6) — the SAME op-filter predicate the human
+    # corpus reference (qnn.human.attack_conditional) applies, needed so the
+    # decode-fit attack_conditional/attack_hold_texture gate arms
+    # (qnn.decode_fit.gates) condition the bot exactly like the human side;
+    # 0.0 when attack_finished is absent from the obs (never a silent 1.0).
+    # Filled by both qnn.eval.run._log_streams and qnn.eval.h2h._log_lane_tick
+    # (feature-parity mirror — ATTACK-GATE RESPEC, Brian 2026-08-15).
+    aim_err_trace: List[tuple] = field(default_factory=list)
     # Per-tick raw entity obs (n, entity_types, entity_rel, entity_vel,
     # entity LOS state and attack-with weapon choice) for ACQUISITION, filled only when
     # log_acq_streams — the closed-loop analog of the human collect cache the
@@ -347,11 +417,20 @@ def _declaration_for_checkpoint(checkpoint_path: str) -> object:
 
     The eval must attach the declaration the model TRAINED on — the
     engine's no-attach default plan tracks the branch head, not any
-    given checkpoint. Checkpoints live at <run_dir>/checkpoints/*.pth,
-    so the run dir (which declaration_for_run resolves stamps and
-    bare-stamp corpus fallbacks against) is two levels up.
+    given checkpoint. BC checkpoints live at <run_dir>/checkpoints/*.pth
+    (run dir two levels up); PPO best checkpoints one level deeper
+    (<run_dir>/checkpoints/best/best_model.pth) — so walk up to the
+    nearest ancestor that actually carries the run.json manifest instead
+    of hard-coding the depth.
     """
     from qnn.obs_api import declaration_for_run
+
+    p = Path(checkpoint_path).resolve().parent
+    for candidate in (p, *p.parents):
+        if (candidate / "run.json").exists():
+            return declaration_for_run(candidate)
+    # No manifest found — keep the historical two-levels-up behavior so
+    # bare checkpoint layouts fail with declaration_for_run's own error.
     return declaration_for_run(Path(checkpoint_path).resolve().parent.parent)
 
 
@@ -400,9 +479,13 @@ def _episode_rng(config: EvalConfig, mode: str, episode_index: int, device: torc
 
 
 # Optional per-tick model-internals dump (debug). Set from --model-diag-log;
-# closed-loop diagnostics (weapon desired-vs-held echo-lock, look/move streams)
+# closed-loop diagnostics (weapon desired-vs-equipped echo-lock, look/move streams)
 # go straight to JSONL from Python. Single-mode runs only (no thread race).
 _MODEL_DIAG_LOG: str | None = None
+
+# Shared disabled profile so the instrumented helpers need no None-checks in the
+# hot loop (a disabled stage's __enter__/__exit__ are empty).
+_NULL_PROFILE = StageProfile(enabled=False)
 
 
 def _select_actions_batch(
@@ -437,11 +520,15 @@ def _select_actions_batch(
         # is mutated in place by the commitment decode.
         sticky_kw = {"attack_state": state.attack_state,
                      "attack_rng": state.attack_rng}
-        if getattr(model, "move_commitment", False):
+        if getattr(model, "move_commitment", False) or getattr(
+                model, "move_sticky", False):
             # view, not copy: policy.act mutates the commitment state in place
             sticky_kw["move_commit_state"] = state.move_commit[None, :]
         if getattr(model, "look_commitment", False):
             sticky_kw["look_commit_state"] = state.look_commit[None, :]
+        if getattr(getattr(model, "model", None), "aim_edge", False):
+            # view, not copy: act() writes this tick's alignment back through.
+            sticky_kw["alignment_prev"] = state.alignment_prev[None, :]
         if mode == "greedy":
             action_batch = model.act(obs_b, mode=mode, hidden=hidden_b,
                                      diag_log_path=_MODEL_DIAG_LOG, **sticky_kw)
@@ -580,13 +667,19 @@ def _select_actions_batched(
     # a25 commitment decode state — threaded when the model opts in; mutated
     # in place by act(), scattered back per env below.
     commit_batch: np.ndarray | None = None
-    if getattr(model, "move_commitment", False):
+    if getattr(model, "move_commitment", False) or getattr(
+            model, "move_sticky", False):
         commit_batch = np.stack([s.move_commit for s in states], axis=0)
         sticky_kw["move_commit_state"] = commit_batch
     look_commit_batch: np.ndarray | None = None
     if getattr(model, "look_commitment", False):
         look_commit_batch = np.stack([s.look_commit for s in states], axis=0)
         sticky_kw["look_commit_state"] = look_commit_batch
+    alignment_prev_batch: np.ndarray | None = None
+    if getattr(getattr(model, "model", None), "aim_edge", False):
+        alignment_prev_batch = np.stack(
+            [s.alignment_prev for s in states], axis=0)
+        sticky_kw["alignment_prev"] = alignment_prev_batch
 
     # Per-lane decode overrides (aim-grid widener): one operating point per row,
     # applied inside the single act() (the forward stays shared). None ⇒ scalar.
@@ -614,6 +707,9 @@ def _select_actions_batched(
     if look_commit_batch is not None:
         for i, s2 in enumerate(states):
             s2.look_commit = look_commit_batch[i].copy()
+    if alignment_prev_batch is not None:
+        for i, s2 in enumerate(states):
+            s2.alignment_prev = alignment_prev_batch[i].copy()
     # Scatter the ATTACK wire slots back (pass-through on a25; kept for parity).
     for i, s in enumerate(states):
         s.attack_state[...] = attack_state_batch[i:i + 1].astype(
@@ -671,6 +767,7 @@ def _submit_batched_raw(
 def _receive_batched_raw(
     envs: Mapping[int, NativeWorldEnv],
     idx_ids: Sequence[int],
+    prof: "StageProfile | None" = None,
 ) -> List[Tuple[Dict[str, np.ndarray], float, bool, Dict[str, object]]]:
     """Phase 2 (receive) of the split-phase raw-bytes batched step.
 
@@ -683,6 +780,11 @@ def _receive_batched_raw(
     downstream masks already ignore), row-aligned with ``idx_ids`` exactly like
     the old per-lane ``results`` list — so episode budgeting, resets, per-scenario
     bucketing and result ordering are byte-for-byte unchanged.
+
+    ``prof`` (optional :class:`StageProfile`) splits the two halves that look
+    alike from outside but mean opposite things: ``recv_drain`` is time BLOCKED
+    on the engines (the wave is engine-bound — no Python win available) while
+    ``recv_unpack`` is the vectorized wire parse (Python-bound).
     """
     n = len(idx_ids)
     # Frame size + field layout follow the lanes' negotiated declaration
@@ -695,16 +797,20 @@ def _receive_batched_raw(
         dtype=np.uint8,
     )
     meta: List[Tuple[float, bool, Dict[str, object]]] = []
-    for row, idx in enumerate(idx_ids):
-        raw, reward, done, info = envs[idx].step_recv_raw()
-        raws[row] = np.frombuffer(raw, dtype=np.uint8)
-        meta.append((float(reward), bool(done), dict(info)))
-    if layout is None:
-        obs_b = unpack_obs_buffer_native_batch(raws)
-    else:
-        obs_b = unpack_frame_batch(raws, layout)
-    return [({k: obs_b[k][row] for k in obs_b}, m[0], m[1], m[2])
-            for row, m in enumerate(meta)]
+    _p = prof if prof is not None else _NULL_PROFILE
+    with _p.stage("recv_drain"):
+        for row, idx in enumerate(idx_ids):
+            raw, reward, done, info = envs[idx].step_recv_raw()
+            raws[row] = np.frombuffer(raw, dtype=np.uint8)
+            meta.append((float(reward), bool(done), dict(info)))
+    with _p.stage("recv_unpack"):
+        if layout is None:
+            obs_b = unpack_obs_buffer_native_batch(raws)
+        else:
+            obs_b = unpack_frame_batch(raws, layout)
+        out = [({k: obs_b[k][row] for k in obs_b}, m[0], m[1], m[2])
+               for row, m in enumerate(meta)]
+    return out
 
 
 def _step_batched_raw(
@@ -822,12 +928,26 @@ _INTERCEPT_HBW_LABELS = tuple(
 _INTERCEPT_PCTS = (5, 10, 25, 50, 75, 90, 95, 99)
 
 
-def _intercept_hbw(lead_ang_deg: float, range_u: float) -> float:
-    """Lead-corrected discharge angle (deg) → hitbox-half-widths (range-invariant:
+def _intercept_hbw_array(lead_ang_deg: np.ndarray, range_u: np.ndarray) -> np.ndarray:
+    """Vectorized hbw law — THE implementation (the closed-loop eval scores every
+    lane's discharge alignment through this, one array op per tick).
+
+    Lead-corrected discharge angle (deg) → hitbox-half-widths (range-invariant:
     angle / atan(halfw/dist)). Mirrors aim_intercept_skill._episode with the fixed
-    actor half-width; lower = better (crosshair nearer the enemy body)."""
-    ang_radius = float(np.degrees(np.arctan2(_ACTOR_HALFW_U, max(float(range_u), 1e-3))))
-    return float(lead_ang_deg) / max(ang_radius, 1e-6)
+    actor half-width; lower = better (crosshair nearer the enemy body). Cross-
+    referenced as "the _intercept_hbw law" by qnn.bc.cache_align_hbw (the training
+    label), qnn.model.decode_actions (the crest-gate decode) and
+    qnn.ppo.crest_reward — all four must stay one law, which is why the scalar
+    entry point below DELEGATES here instead of restating the arithmetic.
+    """
+    ang_radius = np.degrees(np.arctan2(_ACTOR_HALFW_U, np.maximum(range_u, 1e-3)))
+    return lead_ang_deg / np.maximum(ang_radius, 1e-6)
+
+
+def _intercept_hbw(lead_ang_deg: float, range_u: float) -> float:
+    """Scalar view of :func:`_intercept_hbw_array` (one law, two shapes)."""
+    return float(_intercept_hbw_array(
+        np.float64(lead_ang_deg), np.float64(range_u)))
 
 
 def _hbw_percentiles(counts: "list[int]") -> "dict | None":
@@ -1002,12 +1122,62 @@ def _fire_aim_best_cos(obs: object) -> float | None:
     return float((r[valid, 0] / n[valid]).max())
 
 
+def _fire_aim_best_cos_batched(obs_list: Sequence[object]) -> np.ndarray:
+    """Lane-aligned array of :func:`_fire_aim_best_cos`; NaN where it returns None.
+
+    One masked array op over all lanes instead of ~6 numpy round-trips per lane
+    per tick. The batched closed-loop path already hands every lane the SAME
+    entity width (``_receive_batched_raw`` pads to MAX_TOKEN_OBJECTS), which is
+    what makes the stack possible; ragged obs (the B=1 replication path, whose
+    entity arrays are sized to the live count) fall back to the per-lane function
+    so both paths stay available and identical.
+
+    Identical values to the per-lane path: the selection mask (actor tokens with
+    |rel| > 1e-6) and the reduction (max of rel_x/|rel|) are per ROW, so batching
+    changes no row's float32 arithmetic. Pad slots carry entity_types = -1 and
+    zeroed rel, so they fail both the actor mask and the norm gate.
+    """
+    n_lanes = len(obs_list)
+    out = np.full(n_lanes, np.nan, dtype=np.float64)
+    if not n_lanes:
+        return out
+    widths = set()
+    for o in obs_list:
+        if not (isinstance(o, MappingABC) and "entity_rel" in o
+                and "entity_types" in o):
+            widths.add(-1)
+            break
+        widths.add(int(np.asarray(o["entity_types"]).reshape(-1).shape[0]))
+    if len(widths) != 1 or -1 in widths:
+        for i, o in enumerate(obs_list):
+            c = _fire_aim_best_cos(o)
+            if c is not None:
+                out[i] = c
+        return out
+    rel = np.stack([np.asarray(o["entity_rel"], dtype=np.float32).reshape(-1, 3)
+                    for o in obs_list], axis=0)                       # (B, E, 3)
+    et = np.stack([np.asarray(o["entity_types"]).reshape(-1)
+                   for o in obs_list], axis=0).astype(np.int64)       # (B, E)
+    norm = np.linalg.norm(rel, axis=-1)                               # (B, E)
+    ok = (et == TOKEN_ACTOR) & (norm > 1e-6)
+    if not ok.any():
+        return out
+    # rel_x/|rel| only where selected; -inf elsewhere so the row max ignores it
+    # (and a row with no selected token stays NaN, matching the None return).
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cosr = np.where(ok, rel[:, :, 0] / np.where(norm > 0, norm, 1.0), -np.inf)
+    best = cosr.max(axis=1)
+    rows = ok.any(axis=1)
+    out[rows] = best[rows].astype(np.float64)
+    return out
+
+
 # --- engine-side LEAD-POINT-referenced aim coherence --------------------------
 # tracking_cos bins the bearing to the enemy's RAW ORIGIN (no lead). The swept
 # aim-prior gain aims at the velocity-led intercept (ground/splash anchor for
 # RL), so for projectiles the raw-origin angle mis-scores a correctly-leading
 # bot. The v3 QTRN extension exposes the nearest in-LOS actor's view-frame rel
-# pos + ABSOLUTE world velocity + the currently-held weapon; from those we
+# pos + ABSOLUTE world velocity + the currently-equipped weapon; from those we
 # recompute the crosshair→LEAD-POINT angle via the LIVE aim-prior geometry
 # (qnn.model.lead_aim.compute_lead_aim/weapon_trajectory) — the
 # very physics the human coh_5deg curve and the deployed prior use — so
@@ -1055,7 +1225,11 @@ def _lead_aim_cos_from_info(
         return None
     ws, zdrop = _build_lead_physics_tables()
     rel = np.asarray(info.get("lead_rel", (0.0, 0.0, 0.0)), dtype=np.float32) / _LEAD_DIST_SCALE
-    vel = np.asarray(info.get("lead_vel", (0.0, 0.0, 0.0)), dtype=np.float32) / _LEAD_VEL_SCALE
+    # DISCHARGE LAW ANCHOR = current position (rev E, 8/6): lead_vel stays on
+    # the wire for the look decode's aim prior, but the discharge/coherence
+    # rulers zero it — humans aim at the current position on every projectile
+    # family at every range (runs/head_probe/_human_lead_*.json).
+    vel = np.zeros(3, dtype=np.float32)
     raw_wid = int(info.get("lead_weapon_id", 0))
     imp = raw_wid if 1 <= raw_wid <= 8 else 0
 
@@ -1093,49 +1267,71 @@ def _lead_aim_cos_from_info(
     return cos, feet_pitch_deg, origin_pitch_deg, range_u
 
 
-def _lead_aim_cos_batched(
+# Raw engine weapon id → abbr, the key of every per-weapon ruler bucket
+# (engine_intercept_hbw_per_weapon, engine_turn_by_los_angle_per_weapon, the
+# intercept event rows). Module scope: the batched ruler resolves the names once
+# per tick, so both it and the metric fold read ONE table.
+_LEAD_WEAPON_NAMES = {1: "Axe", 2: "SG", 3: "SSG", 4: "NG", 5: "SNG",
+                      6: "GL", 7: "RL", 8: "LG"}
+
+
+def _lead_geometry_batched(
     infos: Sequence[Mapping[str, object]],
-) -> "list[tuple[float, float, float, float] | None]":
-    """Batched, row-aligned equivalent of per-lane :func:`_lead_aim_cos_from_info`.
+) -> "tuple[list[int], np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
+    """``(valid_idx, cos, feet_pitch, origin_pitch, range_u)`` over the lanes that
+    have a participating in-LOS actor — the shared lead kernel run ONCE per tick.
 
-    Runs the shared lead kernel ONCE over every lane that has a participating
-    in-LOS actor (lead_valid) instead of one torch round-trip per lane per tick —
-    the dominant per-macro-step serial cost of the batched closed-loop eval.
+    The four returned arrays are indexed by POSITION IN ``valid_idx`` (length
+    ``len(valid_idx)``), not by lane; callers scatter. This is the single
+    implementation of the model-side lead geometry — :func:`_lead_aim_cos_batched`
+    (list-of-tuples view) and :func:`_lead_ruler_batched` (array view for the
+    metric fold) are both thin wrappers, so the two consumers cannot drift.
 
-    BIT-IDENTICAL to the per-lane path (up to float32 vs float64 rounding in the
-    trailing scalar trig, < 1e-5): ``compute_lead_aim`` / ``weapon_trajectory``
-    are elementwise/broadcast over the batch dim — the only reductions are over the
-    xyz axis, PER ROW — so batching cannot change any row's float result. Returns a
-    list aligned with ``infos``; None for lanes with lead_valid=0 (no actor), exactly
-    like the per-lane function's None return.
+    BIT-IDENTICAL to the per-lane :func:`_lead_aim_cos_from_info` (up to float32
+    vs float64 rounding in the trailing trig, < 1e-5): ``compute_lead_aim`` /
+    ``weapon_trajectory`` are elementwise/broadcast over the batch dim — the only
+    reductions are over the xyz axis, PER ROW — so batching cannot change any
+    row's float result.
     """
-    out: list = [None] * len(infos)
     valid_idx = [i for i, info in enumerate(infos) if info.get("lead_valid", False)]
+    empty = np.empty((0,), dtype=np.float64)
     if not valid_idx:
-        return out
+        return valid_idx, empty, empty, empty, empty
     from qnn.model.lead_aim import compute_lead_aim, weapon_trajectory
     ws, _zdrop = _build_lead_physics_tables()
     v = len(valid_idx)
-    rel = np.empty((v, 3), dtype=np.float32)
-    vel = np.empty((v, 3), dtype=np.float32)
-    imps = np.empty((v,), dtype=np.int64)
-    for k, i in enumerate(valid_idx):
-        info = infos[i]
-        rel[k] = np.asarray(info.get("lead_rel", (0.0, 0.0, 0.0)), dtype=np.float32) / _LEAD_DIST_SCALE
-        vel[k] = np.asarray(info.get("lead_vel", (0.0, 0.0, 0.0)), dtype=np.float32) / _LEAD_VEL_SCALE
-        raw_wid = int(info.get("lead_weapon_id", 0))
-        imps[k] = raw_wid if 1 <= raw_wid <= 8 else 0
+    # ONE array build per field instead of three np.asarray calls per lane: the
+    # engine hands lead_rel/lead_vel over as 3-tuples, so a single np.array over
+    # the gathered rows is the whole marshal.
+    rel = np.array([infos[i].get("lead_rel", (0.0, 0.0, 0.0)) for i in valid_idx],
+                   dtype=np.float32).reshape(v, 3) / _LEAD_DIST_SCALE
+    # DISCHARGE LAW ANCHOR = current position (rev E, 8/6): lead_vel stays on
+    # the wire for the look decode's aim prior, but the discharge/coherence
+    # rulers zero it (runs/head_probe/_human_lead_*.json — humans aim at the
+    # current position on every projectile family at every range).
+    vel = np.zeros((v, 3), dtype=np.float32)
+    imps = np.array([int(infos[i].get("lead_weapon_id", 0)) for i in valid_idx],
+                    dtype=np.int64)
+    imps[(imps < 1) | (imps > 8)] = 0
     ws_t = torch.from_numpy(np.ascontiguousarray(ws, dtype=np.float32))
     imp_t = torch.from_numpy(imps)
     v_horiz, drop_const, drop_rate = weapon_trajectory(ws_t, imp_t)   # (v,) each
     rel_t = torch.from_numpy(rel).reshape(v, 1, 3)
     vel_t = torch.from_numpy(vel).reshape(v, 1, 3)
-    # feet-anchored (per-weapon z-drop) and origin/center-mass (drop zeroed) — the
-    # SAME two compute_lead_aim calls the per-lane function makes, batched over v.
-    aim = compute_lead_aim(rel_t, vel_t, v_horiz, drop_const, drop_rate)[:, 0].numpy().astype(np.float64)
-    aim_o = compute_lead_aim(
-        rel_t, vel_t, v_horiz,
-        torch.zeros_like(drop_const), torch.zeros_like(drop_rate))[:, 0].numpy().astype(np.float64)
+    # feet-anchored (per-weapon z-drop) and origin/center-mass (drop zeroed) in ONE
+    # kernel call over a 2v-row batch instead of two v-row calls: compute_lead_aim
+    # is elementwise/broadcast per row, so stacking the drop-zeroed rows under the
+    # feet-anchored ones cannot change either half's floats — it just halves the
+    # torch dispatch, which is what this kernel's cost actually is at eval batch
+    # sizes (the FLOPs are negligible; ~10 op launches are not).
+    rel2 = torch.cat((rel_t, rel_t), dim=0)
+    vel2 = torch.cat((vel_t, vel_t), dim=0)
+    vh2 = torch.cat((v_horiz, v_horiz), dim=0)
+    zero = torch.zeros_like(drop_const)
+    dc2 = torch.cat((drop_const, zero), dim=0)
+    dr2 = torch.cat((drop_rate, torch.zeros_like(drop_rate)), dim=0)
+    aim2 = compute_lead_aim(rel2, vel2, vh2, dc2, dr2)[:, 0].numpy().astype(np.float64)
+    aim, aim_o = aim2[:v], aim2[v:]
     norm = np.maximum(np.linalg.norm(aim, axis=-1), 1e-9)
     cos = np.clip(aim[:, 0] / norm, -1.0, 1.0)
     horiz = np.sqrt(aim[:, 0] ** 2 + aim[:, 1] ** 2)
@@ -1143,10 +1339,110 @@ def _lead_aim_cos_batched(
     horiz_o = np.sqrt(aim_o[:, 0] ** 2 + aim_o[:, 1] ** 2)
     origin_pitch = np.degrees(np.arctan2(aim_o[:, 2], np.maximum(horiz_o, 1e-9)))
     range_u = np.linalg.norm(rel.astype(np.float64), axis=-1) * _LEAD_DIST_SCALE
+    return valid_idx, cos, feet_pitch, origin_pitch, range_u
+
+
+def _lead_aim_cos_batched(
+    infos: Sequence[Mapping[str, object]],
+) -> "list[tuple[float, float, float, float] | None]":
+    """List-of-tuples view of :func:`_lead_geometry_batched`, row-aligned with
+    ``infos``; None for lanes with lead_valid=0 (no actor), exactly like the
+    per-lane :func:`_lead_aim_cos_from_info`'s None return.
+
+    Kept as the readable reference form the parity test pins; the eval loop
+    itself consumes :func:`_lead_ruler_batched`'s arrays so no per-lane Python
+    tuple is built in the hot path.
+    """
+    out: list = [None] * len(infos)
+    valid_idx, cos, feet_pitch, origin_pitch, range_u = _lead_geometry_batched(infos)
     for k, i in enumerate(valid_idx):
         out[i] = (float(cos[k]), float(feet_pitch[k]),
                   float(origin_pitch[k]), float(range_u[k]))
     return out
+
+
+class _LeadRuler(NamedTuple):
+    """Per-tick ruler quantities as LANE-ALIGNED arrays (length = active lanes).
+
+    Everything the metric fold used to recompute per lane with scalar numpy calls
+    (``np.degrees(np.arccos(...))``, :func:`_intercept_hbw`, two ``np.digitize``
+    calls) is computed once here as whole-array ops. ``np.digitize`` on an array
+    equals the per-scalar call element-for-element and the trig is the same
+    formula on the same float64 inputs, so the fold's numbers are UNCHANGED — the
+    per-lane Python is what's gone.
+
+    Invalid lanes (no participating in-LOS actor) carry ``valid=False`` with
+    ``hbw``/``lead_ang`` = NaN and zeroed geometry; the fold gates on ``valid``
+    exactly as it used to gate on ``_lead is None``.
+    """
+    valid: np.ndarray          # bool (n,) — lead_valid
+    cos: np.ndarray            # float64 (n,) crosshair→lead-point cosine
+    feet_pitch: np.ndarray     # float64 (n,) deg
+    origin_pitch: np.ndarray   # float64 (n,) deg
+    range_u: np.ndarray        # float64 (n,) engine units
+    lead_ang: np.ndarray       # float64 (n,) deg, NaN where invalid
+    lead_bin: np.ndarray       # int (n,) _FIRE_ANGLE_LABELS index
+    hbw: np.ndarray            # float64 (n,) hitbox half-widths, NaN where invalid
+    hbw_bin: np.ndarray        # int (n,) _INTERCEPT_HBW_LABELS index
+    los_cos: np.ndarray        # float64 (n,) tracking_cos
+    los_bin: np.ndarray        # int (n,)
+    turn_bin: np.ndarray       # int (n,)
+    attacked: np.ndarray       # int (n,) decoded attack class
+    fired: np.ndarray          # bool (n,) OPERATIVE fire (shots_fired > 0)
+    offcone_lead: np.ndarray   # bool (n,) valid & lead_ang > _FIRE_CONE_DEG
+    weapon_names: "list[str | None]"   # (n,) lead weapon abbr or None
+    weapon_is_rl: np.ndarray   # bool (n,) raw lead_weapon_id == 7
+    weapon_id: np.ndarray      # int64 (n,) raw EQUIPPED weapon id 1..8 (0 = none)
+
+
+def _lead_ruler_batched(
+    infos: Sequence[Mapping[str, object]],
+    actions: Sequence[Mapping[str, object]],
+) -> _LeadRuler:
+    """Every per-tick ruler quantity for all lanes, as arrays. See :class:`_LeadRuler`."""
+    n = len(infos)
+    valid = np.zeros(n, dtype=bool)
+    cos = np.zeros(n, dtype=np.float64)
+    feet_pitch = np.zeros(n, dtype=np.float64)
+    origin_pitch = np.zeros(n, dtype=np.float64)
+    range_u = np.zeros(n, dtype=np.float64)
+    valid_idx, v_cos, v_feet, v_origin, v_range = _lead_geometry_batched(infos)
+    if valid_idx:
+        sel = np.asarray(valid_idx, dtype=np.intp)
+        valid[sel] = True
+        cos[sel] = v_cos
+        feet_pitch[sel] = v_feet
+        origin_pitch[sel] = v_origin
+        range_u[sel] = v_range
+
+    # lead angle + its bucket; NaN on invalid lanes so a stray consumer cannot
+    # silently read 0° ("perfectly aligned") for "no actor".
+    lead_ang = np.where(valid, np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))), np.nan)
+    lead_bin = np.minimum(
+        np.digitize(np.where(valid, lead_ang, 0.0), _FIRE_ANGLE_EDGES_DEG,
+                    right=False),
+        len(_FIRE_ANGLE_LABELS) - 1)
+    # discharge-anchored intercept in hitbox half-widths — the shared hbw law.
+    hbw = np.where(valid, _intercept_hbw_array(lead_ang, range_u), np.nan)
+    hbw_bin = np.minimum(
+        np.digitize(np.where(valid, hbw, 0.0), _INTERCEPT_HBW_EDGES, right=False),
+        len(_INTERCEPT_HBW_LABELS) - 1)
+
+    los_cos, los_bin, turn_bin = _batched_los_turn_bins(infos, actions)
+    attacked = np.array(
+        [int(a.get("attack", 0) or 0) if isinstance(a, MappingABC) else 0
+         for a in actions], dtype=np.int64)
+    fired = np.array([int(i.get("shots_fired", 0)) > 0 for i in infos], dtype=bool)
+    wid = np.array([int(i.get("lead_weapon_id", 0)) for i in infos], dtype=np.int64)
+    return _LeadRuler(
+        valid=valid, cos=cos, feet_pitch=feet_pitch, origin_pitch=origin_pitch,
+        range_u=range_u, lead_ang=lead_ang, lead_bin=lead_bin, hbw=hbw,
+        hbw_bin=hbw_bin, los_cos=los_cos, los_bin=los_bin, turn_bin=turn_bin,
+        attacked=attacked, fired=fired,
+        offcone_lead=valid & (np.where(valid, lead_ang, 0.0) > _FIRE_CONE_DEG),
+        weapon_names=[_LEAD_WEAPON_NAMES.get(int(w)) for w in wid],
+        weapon_id=wid,
+        weapon_is_rl=(wid == 7))
 
 
 def _batched_los_turn_bins(
@@ -1218,6 +1514,10 @@ def _evaluate_mode(
     episode_specs: Sequence[Tuple[int, int | None]],
 ) -> Dict[str, float]:
     del episode_specs
+    # Per-tick stage accounting (QNN_EVAL_PROFILE=1); a disabled profile's
+    # stages are empty context managers, so this is the same code path in
+    # production runs.
+    prof = StageProfile.from_env()
     num_envs = max(1, min(config.num_envs, config.num_episodes))
     move_streams: Dict[str, np.ndarray] = {}
     # acquisition obs streams (log_acq_streams): per-episode concatenated entity
@@ -1324,7 +1624,7 @@ def _evaluate_mode(
     # that is really a weapon-mix / per-weapon-calibration artifact, not a
     # uniform under-attack. Keyed by impulse; named in the summary.
     weapon_attack_ticks: dict[int, int] = {}
-    weapon_held_ticks: dict[int, int] = {}
+    weapon_equip_ticks: dict[int, int] = {}
     # obs-feeder sanity: capture the raw attack_finished the model receives
     # closed-loop, to compare against the offline corpus distribution (catches
     # a live obs-assembly bug that offline (cached corpus) can't show).
@@ -1358,14 +1658,13 @@ def _evaluate_mode(
     # angle is crosshair→velocity-led intercept (ground anchor for RL) via the
     # shared lead kernel — the metric comparable to the human coh_5deg curve.
     lead_tick_bucket = [0] * len(_FIRE_ANGLE_LABELS)
-    # Per-weapon lead-angle buckets (raw engine weapon id → name): closes the
-    # loop with the fit's per-weapon coh targets (RL included since 7/07 —
-    # its feet-anchored pitch is part of the coh fit, not a separate check).
-    _LEAD_WEAPON_NAMES = {1: "Axe", 2: "SG", 3: "SSG", 4: "NG", 5: "SNG",
-                          6: "GL", 7: "RL", 8: "LG"}
+    # Per-weapon lead-angle buckets, keyed by _LEAD_WEAPON_NAMES (module scope,
+    # since the batched ruler resolves the names): closes the loop with the fit's
+    # per-weapon coh targets (RL included since 7/07 — its feet-anchored pitch is
+    # part of the coh fit, not a separate check).
     lead_weapon_buckets: Dict[str, list] = {}
-    # per-weapon turn-by-LOS (held-keyed — MUST match the human reference's
-    # keying; the decode may key on intent, the RULER stays held): the
+    # per-weapon turn-by-LOS (equip-keyed — MUST match the human reference's
+    # keying; the decode may key on intent, the RULER stays keyed on equip state): the
     # per-weapon EMD input for the (gain, alpha) split optimizer.
     los_turn_hist_w: Dict[str, list] = {}
     lead_fire_bucket = [0] * len(_FIRE_ANGLE_LABELS)
@@ -1394,11 +1693,13 @@ def _evaluate_mode(
     # fire at its local alignment crest the way the elite-anchor humans do?)
     # and the alignment-LEAD profile (how far ahead of the trigger does the
     # crosshair converge?), which is why the pre-roll is the long side.
-    # Env-gated so wave config hashes are untouched; emitted as
-    # intercept_windows.npz. QNN_EVAL_INTERCEPT_WINDOW is "<pre>,<post>";
-    # a single int is the symmetric shorthand "<k>,<k>".
+    # Config-carried (EvalConfig.intercept_window / train.json
+    # eval_intercept_window) with QNN_EVAL_INTERCEPT_WINDOW as the launch-time
+    # OVERRIDE; emitted as intercept_windows.npz. "<pre>,<post>"; a single int
+    # is the symmetric shorthand "<k>,<k>".
     _win_pre, _win_post = _parse_intercept_window(
-        os.environ.get("QNN_EVAL_INTERCEPT_WINDOW", ""))
+        os.environ.get("QNN_EVAL_INTERCEPT_WINDOW", "")
+        or getattr(config, "intercept_window", ""))
     _win_rows: Dict[str, list] = {"scenario_id": [], "weapon": [],
                                   "episode": [], "env_idx": [], "tick": [],
                                   "hbw_win": []}
@@ -1414,6 +1715,19 @@ def _evaluate_mode(
         _win_rows["env_idx"].append(_ei)
         _win_rows["tick"].append(_tk)
         _win_rows["hbw_win"].append(row)
+    # CONTIGUOUS per-tick trace (intercept_trace.npz) — the declined ticks the
+    # window instrument above cannot carry. Columns are appended as WHOLE
+    # LANE-ALIGNED ARRAY CHUNKS, one per macro-step, straight off the same
+    # `_rl` ruler the window rows are sampled from: no per-lane Python in the
+    # hot path, and no second copy of the hbw geometry. Schema + writer live in
+    # qnn.eval.intercept_trace.
+    _trace_on = bool(
+        os.environ.get("QNN_EVAL_INTERCEPT_TRACE", "").strip()
+        or getattr(config, "intercept_trace", False))
+    _trace_cols: Dict[str, list] = {k: [] for k in _TRACE_FIELDS}
+    _trace_scen: Dict[str, int] = {}             # scenario_id → codebook index
+    _trace_rows = 0
+    _trace_truncated = False
     _win_trail: Dict[tuple, deque] = {}          # lane key → trailing hbw deque
     _win_pending: Dict[tuple, list] = {}         # lane key → [bufs to fill fwd]
     _WIN_CAP = 100_000
@@ -1570,6 +1884,18 @@ def _evaluate_mode(
         # obs lacks them the flat keys are OMITTED so the band scorer fails loud
         # (pre-v5 npz) instead of scoring an all-zeros discharge stream.
         _v5_gate_fields = {"ok": None}
+        # schema-6 stationary-menu streams: raw health + the weapon-
+        # feasibility inputs (self_items weapon bits + the four ammo pools),
+        # traced per tick and folded at flatten into the per-tick
+        # `weapon_feas` bitmask (engine_norm.weapon_feasibility_bits — the
+        # ownership/ammo half of the model's own choice-set predicate) that
+        # rc's weapon-PREFERENCE ruler needs to invalidate preference carry
+        # on decision-space changes, with the exact rule the human side
+        # uses. Decided once on the first logged tick; when the obs lacks
+        # any input the flat keys are OMITTED so the ruler falls back to
+        # ungated pairs (upper bound) instead of gating against a
+        # zero-filled stream.
+        _v6_state_fields = {"ok": None}
         # LOOK COMMIT trace (gate schema 3): the LOOK_COMMIT_STATE_DIM lanes
         # policy.act's look-commitment decode just left in state.look_commit —
         # logged tick-aligned with the gate row so stroke class/direction sit on
@@ -1648,6 +1974,8 @@ def _evaluate_mode(
                         _tan_y, _tan_z = 0.0, 0.0
                     _keep = 0
                     _engaged = 0
+                    _sight_mask_g = None
+                    _n_g = 0
                     if isinstance(_st.obs, dict) and "entity_types" in _st.obs:
                         _et_g = np.asarray(_st.obs["entity_types"]).reshape(-1)
                         _keep = int((_et_g == TOKEN_ACTOR).any())
@@ -1661,19 +1989,57 @@ def _evaluate_mode(
                                 _mod_g = np.asarray(
                                     _st.obs["entity_modality_id"]
                                 ).reshape(-1)[:_n_g]
-                                _engaged = int(((_et_g[:_n_g] == TOKEN_ACTOR)
-                                                & (_mod_g == 0)).any())
+                                _sight_mask_g = ((_et_g[:_n_g] == TOKEN_ACTOR)
+                                                & (_mod_g == 0))
                             elif "entity_recency" in _st.obs:
                                 _rec_g = np.asarray(
                                     _st.obs["entity_recency"],
                                     dtype=np.float64,
                                 ).reshape(-1)[:_n_g]
-                                _engaged = int(((_et_g[:_n_g] == TOKEN_ACTOR)
-                                                & (_rec_g <= 0.0)).any())
+                                _sight_mask_g = ((_et_g[:_n_g] == TOKEN_ACTOR)
+                                                & (_rec_g <= 0.0))
+                            if _sight_mask_g is not None:
+                                _engaged = int(_sight_mask_g.any())
+                    # AIM ERROR (E7 instrument, ATTACK-GATE RESPEC 2026-08-15):
+                    # angle (deg) to the most-aligned in-SIGHT actor,
+                    # view-basis (crosshair = +x), current-position anchor.
+                    # entity_rel is wire-quantized int16 game units — cast to
+                    # float64 BEFORE any arithmetic (int16 hypot/square would
+                    # silently overflow/truncate). NaN when not engaged or
+                    # entity_rel absent. ADDITIVE stream: never touches the
+                    # gate-row tuple or GATE_STREAM_SCHEMA_VERSION.
+                    _aim_t = _aim_h = _aim_v = float("nan")
+                    if (_engaged and _sight_mask_g is not None
+                            and isinstance(_st.obs, dict)
+                            and "entity_rel" in _st.obs):
+                        _rel_g = np.asarray(
+                            _st.obs["entity_rel"], dtype=np.float64
+                        ).reshape(-1, 3)[:_n_g]
+                        if _sight_mask_g.any():
+                            _rx, _ry, _rz = _rel_g[:, 0], _rel_g[:, 1], _rel_g[:, 2]
+                            _h_arr = np.degrees(np.arctan2(_ry, _rx))
+                            _v_arr = np.degrees(np.arctan2(_rz, np.hypot(_rx, _ry)))
+                            _t_arr = np.degrees(
+                                np.arctan2(np.hypot(_ry, _rz), _rx))
+                            _best_g = int(np.argmin(
+                                np.where(_sight_mask_g, _t_arr, np.inf)))
+                            _aim_t = float(_t_arr[_best_g])
+                            _aim_h = float(_h_arr[_best_g])
+                            _aim_v = float(_v_arr[_best_g])
+                    # op-ready = the SAME predicate _disch_g uses below
+                    # (attack_finished expired), independent of whether the
+                    # model actually attacked this tick — the denominator the
+                    # attack_conditional gate arm needs to match the human
+                    # corpus's op-filter.
+                    _ready_g = 0.0
+                    if isinstance(_st.obs, dict) and "attack_finished" in _st.obs:
+                        _ready_g = 1.0 if float(np.asarray(
+                            _st.obs["attack_finished"]).reshape(-1)[0]) <= 1e-6 else 0.0
+                    _st.aim_err_trace.append((_aim_t, _aim_h, _aim_v, _ready_g))
                     if "weapon" in _act:
                         # a26 action convention: attack is the fire BIT and
                         # the per-tick weapon INTENT rides its own channel;
-                        # the discharging weapon is the HELD one
+                        # the discharging weapon is the EQUIPPED one
                         # (self_weapon_id), mirroring the a26-line gate row.
                         _attack_g = int(int(np.asarray(
                             _act["attack"]).reshape(-1)[0]) > 0)
@@ -1689,6 +2055,39 @@ def _evaluate_mode(
                         _wimp_g = int(_act.get("attack", 0) or 0)
                         _attack_g = int(_wimp_g > 0)
                         _wsel_g = _wimp_g
+                    # Equipped weapon per tick (schema 6, née weapon_held):
+                    # raw engine equip state, impulse-coded — the op-shot
+                    # denominator and the label source for the discharge-
+                    # anchored weapon_pref events column. Equip state is NOT
+                    # a behavioral signal (weapon scripting churns it without
+                    # expressing choice) — behavioral rulers read weapon_pref.
+                    # The attack-with columns above are events-only (0 off
+                    # fire ticks), which starved gates.py's per-weapon
+                    # denominators into rate ≡ tick_hz (the a28rc1 trim
+                    # stall). 0 when the wire carries no self_weapon_id
+                    # (pure-combat a27).
+                    _swid_g = 0
+                    if isinstance(_st.obs, dict) and "self_weapon_id" in _st.obs:
+                        _swid_g = int(self_weapon_id_to_impulse(int(np.asarray(
+                            _st.obs["self_weapon_id"]).reshape(-1)[0])))
+                    # schema-6 stationary-menu inputs (see _v6_state_fields):
+                    # raw counts, -1 sentinel when the obs lacks the field.
+                    # self_items is masked to the weapon bits (≤ 1<<12) so
+                    # the float32 trace holds it exactly (rune/sigil bits
+                    # exceed float32's exact-integer range).
+                    _state_g = tuple(
+                        int(np.asarray(_st.obs[k]).reshape(-1)[0]) & _m
+                        if isinstance(_st.obs, dict) and k in _st.obs else -1
+                        for k, _m in (("health", -1),
+                                      ("self_items", ITEMS_WEAPON_MASK),
+                                      ("ammo_shells", -1), ("ammo_nails", -1),
+                                      ("ammo_rockets", -1), ("ammo_cells", -1)))
+                    if _v6_state_fields["ok"] is None:
+                        _v6_state_fields["ok"] = bool(
+                            isinstance(_st.obs, dict)
+                            and all(k in _st.obs for k in (
+                                "health", "self_items", "ammo_shells",
+                                "ammo_nails", "ammo_rockets", "ammo_cells")))
                     # engine-visible DISCHARGE (band v5 attack channel): the
                     # engine honors an attack only when QC attack_finished has
                     # expired — the mirror of the human op-attack decision
@@ -1714,7 +2113,7 @@ def _evaluate_mode(
                     _st.gate_trace.append(
                         (_attack_g, _wsel_g, _turn,
                          _keep, _disch_g, _wimp_g, _engaged) + _lc_g
-                        + (_tan_y, _tan_z))
+                        + (_tan_y, _tan_z, _swid_g) + _state_g)
 
             # ACQUISITION obs capture: per-tick RAW entity obs (the SAME fields
             # the human collect cache feeds the acq_submovement flick kernel —
@@ -1760,12 +2159,29 @@ def _evaluate_mode(
             nonlocal fire_cos_sum, fire_cos_n, _dbg_obs_keys
             # obs-side fire discrimination: at each fire tick, score the model's
             # crosshair alignment to the nearest-aligned actor in its OWN obs.
+            # The geometry + the angle bucketing are BATCHED over lanes (one masked
+            # array op + one digitize per tick instead of ~8 numpy round-trips per
+            # lane); what stays per-lane is dict-keyed counter bumps, which have no
+            # array form.
+            _obs_l = [_st.obs for _st in states]
+            _cos_a = _fire_aim_best_cos_batched(_obs_l)
+            _has = ~np.isnan(_cos_a)
+            _ang_a = np.degrees(np.arccos(np.clip(np.where(_has, _cos_a, 0.0),
+                                                 -1.0, 1.0)))
+            _bin_a = np.minimum(
+                np.digitize(_ang_a, _FIRE_ANGLE_EDGES_DEG, right=False),
+                len(_FIRE_ANGLE_LABELS) - 1)
+            _w_a = np.array([int(a.get("attack", 0) or 0) for a in actions],
+                            dtype=np.int64)
+            if _dbg_obs_keys is None:
+                for _st in states:
+                    if isinstance(_st.obs, dict):
+                        _dbg_obs_keys = sorted(_st.obs.keys())
+                        break
             for _i, _st in enumerate(states):
-                _w = int(actions[_i].get("attack", 0) or 0)
+                _w = int(_w_a[_i])
                 if 1 <= _w <= 8:
-                    weapon_held_ticks[_w] = weapon_held_ticks.get(_w, 0) + 1
-                if _dbg_obs_keys is None and isinstance(_st.obs, dict):
-                    _dbg_obs_keys = sorted(_st.obs.keys())
+                    weapon_equip_ticks[_w] = weapon_equip_ticks.get(_w, 0) + 1
                 if isinstance(_st.obs, dict) and "attack_finished" in _st.obs:
                     try:
                         _dbg_af.append(float(np.asarray(_st.obs["attack_finished"]).reshape(-1)[0]))
@@ -1776,18 +2192,15 @@ def _evaluate_mode(
                 fire_ticks += 1
                 if 1 <= _w <= 8:
                     weapon_attack_ticks[_w] = weapon_attack_ticks.get(_w, 0) + 1
-                _cos = _fire_aim_best_cos(_st.obs)
-                if _cos is None:
+                if not _has[_i]:
                     blind_no_actor += 1
                     fire_angle_hist[-1] += 1  # no actor → treat as widest bin
                     continue
-                _ang = float(np.degrees(np.arccos(np.clip(_cos, -1.0, 1.0))))
-                fire_cos_sum += _cos
+                fire_cos_sum += float(_cos_a[_i])
                 fire_cos_n += 1
-                if _ang > _FIRE_CONE_DEG:
+                if _ang_a[_i] > _FIRE_CONE_DEG:
                     blind_offcone += 1
-                _b = int(np.digitize(_ang, _FIRE_ANGLE_EDGES_DEG, right=False))
-                fire_angle_hist[min(_b, len(_FIRE_ANGLE_LABELS) - 1)] += 1
+                fire_angle_hist[int(_bin_a[_i])] += 1
 
         def _accumulate_metrics(infos, actions, scenario_ids, env_idxs,
                                 episode_ords, tick):
@@ -1808,15 +2221,45 @@ def _evaluate_mode(
             nonlocal lead_pitch_fire_rl_sum, lead_fire_rl_n
             nonlocal attack_disc_ticks, blind_attack_no_los, blind_attack_offcone_lead
             nonlocal intercept_events_truncated
+            nonlocal _trace_rows, _trace_truncated
             # BATCHED per-tick rulers (computed once over all lanes instead of one
             # torch/np round-trip per lane — the serial Python that capped core
             # utilization). Row i ↔ infos[i] ↔ actions[i] ↔ scenario_ids[i]
             # ↔ env_idxs[i] ↔ episode_ords[i].
-            _lead_batch = _lead_aim_cos_batched(infos)
-            _los_cos_a, _los_bin_a, _turn_bin_a = _batched_los_turn_bins(infos, actions)
+            with prof.stage("ruler_lead"):
+                _rl = _lead_ruler_batched(infos, actions)
+            _los_cos_a, _los_bin_a, _turn_bin_a = _rl.los_cos, _rl.los_bin, _rl.turn_bin
+            if _trace_on and not _trace_truncated:
+                if _trace_rows + len(infos) > _TRACE_CAP:
+                    _trace_truncated = True      # torn lane-episodes from here
+                else:
+                    _trace_rows += len(infos)
+                    for _sid in scenario_ids:
+                        _trace_scen.setdefault(_sid, len(_trace_scen))
+                    _trace_cols["env_idx"].append(np.asarray(env_idxs))
+                    _trace_cols["episode"].append(np.asarray(episode_ords))
+                    _trace_cols["tick"].append(
+                        np.full(len(infos), int(tick), dtype=np.int64))
+                    # the SAME per-tick array the window instrument samples
+                    _trace_cols["hbw"].append(_rl.hbw)
+                    _trace_cols["fired"].append(_rl.fired)
+                    _trace_cols["attacked"].append(_rl.attacked)
+                    _trace_cols["weapon_id"].append(_rl.weapon_id)
+                    _trace_cols["scenario_idx"].append(
+                        np.array([_trace_scen[s] for s in scenario_ids],
+                                 dtype=np.int64))
+            # Whole-tick reductions the fold used to accumulate one lane at a
+            # time. Sums over a tick are order-independent, so folding them as
+            # array reductions is numerically the same accumulation the loop did
+            # (float addition order within ONE tick changes the last ulp at most,
+            # and these feed means/correlations over millions of ticks).
+            _n_lanes = len(infos)
+            total_steps += _n_lanes
+            los_n += _n_lanes
+            los_cos_sum += float(_los_cos_a.sum())
+            los_cos2_sum += float((_los_cos_a * _los_cos_a).sum())
             for batch_idx, info in enumerate(infos):
                 scenario_id = scenario_ids[batch_idx]
-                total_steps += 1
                 _sc_los = scenario_los_tick_bucket.setdefault(
                     scenario_id, [0] * len(_FIRE_ANGLE_LABELS))
                 _sc_lead = scenario_lead_tick_bucket.setdefault(
@@ -1829,10 +2272,7 @@ def _evaluate_mode(
                 # Using the raw model attack output would inflate p_fire by
                 # 2-3x (model fires on cooldown frames the engine ignores).
                 _los_cos = float(_los_cos_a[batch_idx])
-                _los_fired = int(info.get("shots_fired", 0)) > 0
-                los_n += 1
-                los_cos_sum += _los_cos
-                los_cos2_sum += _los_cos * _los_cos
+                _los_fired = bool(_rl.fired[batch_idx])
                 _lb = int(_los_bin_a[batch_idx])
                 los_tick_bucket[_lb] += 1
                 _sc_los[_lb] += 1
@@ -1843,7 +2283,7 @@ def _evaluate_mode(
                 if _lk is not None:
                     _tb = int(_turn_bin_a[batch_idx])
                     los_turn_hist[_lb][_tb] += 1
-                    _twn = _LEAD_WEAPON_NAMES.get(int(info.get("lead_weapon_id", 0)))
+                    _twn = _rl.weapon_names[batch_idx]
                     if _twn is not None:
                         _twh = los_turn_hist_w.setdefault(
                             _twn, [[0] * len(_TURN_MAG_LABELS)
@@ -1857,32 +2297,25 @@ def _evaluate_mode(
                 # but the angle is to the velocity-led intercept (ground anchor
                 # for RL) via the shared lead kernel — comparable to the human
                 # coh_5deg curve. Only on ticks where an actor participated.
-                _lead = _lead_batch[batch_idx]
+                _valid = bool(_rl.valid[batch_idx])
                 # LEAD-CORRECTED blind-attack discrimination: on attack ticks,
                 # classify against the crosshair→lead-point angle (not the raw
                 # crosshair→origin angle the obs-side offcone uses), so a correct
                 # aim-ahead shot is not miscounted as blind. LOS-gated: lead_valid=0
                 # (no in-LOS actor participating) is the "no actor" analog.
-                _attacked = (int(actions[batch_idx].get("attack", 0) or 0)
-                             if isinstance(actions[batch_idx], Mapping) else 0)
-                if _attacked:
+                if _rl.attacked[batch_idx]:
                     attack_disc_ticks += 1
-                    if _lead is None:
+                    if not _valid:
                         blind_attack_no_los += 1
-                    elif float(np.degrees(np.arccos(np.clip(_lead[0], -1.0, 1.0)))) > _FIRE_CONE_DEG:
+                    elif _rl.offcone_lead[batch_idx]:
                         blind_attack_offcone_lead += 1
                 if _win_pre or _win_post:
                     # per-tick hbw stream for the crest window (NaN when no
-                    # in-LOS actor); trailing buffer + forward fills per lane
+                    # in-LOS actor); trailing buffer + forward fills per lane.
+                    # _rl.hbw already carries the NaN for invalid lanes.
                     _wkey = (int(env_idxs[batch_idx]),
                              int(episode_ords[batch_idx]))
-                    if _lead is not None:
-                        _wl_cos, _, _, _wl_rng = _lead
-                        _wl_ang = float(np.degrees(np.arccos(
-                            np.clip(_wl_cos, -1.0, 1.0))))
-                        _hbw_t = _intercept_hbw(_wl_ang, _wl_rng)
-                    else:
-                        _hbw_t = float("nan")
+                    _hbw_t = float(_rl.hbw[batch_idx])
                     _tr = _win_trail.get(_wkey)
                     if _tr is None:
                         _tr = _win_trail[_wkey] = deque(maxlen=_win_pre + 1)
@@ -1898,11 +2331,12 @@ def _evaluate_mode(
                         for _buf in _done_bufs:
                             _pend.remove(_buf)
                             _win_emit(_buf)
-                if _lead is not None:
-                    _lead_cos, _feet_pitch, _origin_pitch, _range_u = _lead
-                    _lead_ang = float(np.degrees(np.arccos(np.clip(_lead_cos, -1.0, 1.0))))
-                    _ldb = min(int(np.digitize(_lead_ang, _FIRE_ANGLE_EDGES_DEG, right=False)),
-                               len(_FIRE_ANGLE_LABELS) - 1)
+                if _valid:
+                    _lead_cos = float(_rl.cos[batch_idx])
+                    _feet_pitch = float(_rl.feet_pitch[batch_idx])
+                    _origin_pitch = float(_rl.origin_pitch[batch_idx])
+                    _range_u = float(_rl.range_u[batch_idx])
+                    _ldb = int(_rl.lead_bin[batch_idx])
                     lead_n += 1
                     lead_cos_sum += _lead_cos
                     lead_pitch_sum += _feet_pitch
@@ -1910,7 +2344,7 @@ def _evaluate_mode(
                     scenario_lead_pitch_n[scenario_id] = scenario_lead_pitch_n.get(scenario_id, 0) + 1
                     lead_tick_bucket[_ldb] += 1
                     _sc_lead[_ldb] += 1
-                    _wname = _LEAD_WEAPON_NAMES.get(int(info.get("lead_weapon_id", 0)))
+                    _wname = _rl.weapon_names[batch_idx]
                     if _wname is not None:
                         _wb = lead_weapon_buckets.setdefault(
                             _wname, [0] * len(_FIRE_ANGLE_LABELS))
@@ -1922,9 +2356,10 @@ def _evaluate_mode(
                         lead_fire_bucket[_ldb] += 1
                         # discharge-anchored INTERCEPT: this operative fire's
                         # alignment in hitbox-half-widths (§14 model-side ruler).
-                        _hbw = _intercept_hbw(_lead_ang, _range_u)
-                        _hb = min(int(np.digitize(_hbw, _INTERCEPT_HBW_EDGES, right=False)),
-                                  len(_INTERCEPT_HBW_LABELS) - 1)
+                        # _rl.hbw/_rl.hbw_bin carry the _intercept_hbw law and its
+                        # bucket, computed for every lane in one array op.
+                        _hbw = float(_rl.hbw[batch_idx])
+                        _hb = int(_rl.hbw_bin[batch_idx])
                         intercept_hbw_hist[_hb] += 1
                         scenario_intercept_hbw.setdefault(
                             scenario_id, [0] * len(_INTERCEPT_HBW_LABELS))[_hb] += 1
@@ -1970,7 +2405,7 @@ def _evaluate_mode(
                                            int(episode_ords[batch_idx]),
                                            int(env_idxs[batch_idx]),
                                            int(tick))] + _twin)
-                        if int(info.get("lead_weapon_id", 0)) == 7:   # RL (raw id)
+                        if _rl.weapon_is_rl[batch_idx]:   # RL (raw id 7)
                             lead_pitch_fire_rl_sum += _feet_pitch
                             lead_fire_rl_n += 1
                             lead_pitch_fire_rl_vals.append(float(_feet_pitch))
@@ -1990,16 +2425,18 @@ def _evaluate_mode(
         # act+step tick) — the event log's `tick` column. Distinct from
         # total_steps, which sums PER-LANE steps across the batch.
         macro_step = -1
+        prof.loop_start()
         while active:
             macro_step += 1
             idx_ids = sorted(active.keys())
             states = [active[idx] for idx in idx_ids]
-            actions, next_hidden = select_actions(
-                model=model,
-                mode=mode,
-                states=states,
-                batched_rng_gen=batched_rng_gen,
-            )
+            with prof.stage("act"):
+                actions, next_hidden = select_actions(
+                    model=model,
+                    mode=mode,
+                    states=states,
+                    batched_rng_gen=batched_rng_gen,
+                )
             if arena_pool is not None:
                 # ARENA backend: the grouped engine does its own server-side batched
                 # step (arena_pool.step_many), so there is no split-phase submit /
@@ -2007,36 +2444,47 @@ def _evaluate_mode(
                 # tick's deferred metric fold inline, then step synchronously. The
                 # deferred pattern is kept (order-independent) for parity with the
                 # process backend; it just loses the sim-overlap it can't have here.
-                _log_streams(states, actions)
-                _obs_fire_disc(states, actions)
+                with prof.stage("log_streams"):
+                    _log_streams(states, actions)
+                with prof.stage("obs_fire_disc"):
+                    _obs_fire_disc(states, actions)
                 if _deferred is not None:
-                    _accumulate_metrics(*_deferred)
+                    with prof.stage("metrics"):
+                        _accumulate_metrics(*_deferred)
                     _deferred = None
-                results = arena_pool.step_many(idx_ids, actions)
+                with prof.stage("engine_step_many"):
+                    results = arena_pool.step_many(idx_ids, actions)
             elif config.batched_forward:
                 # SUBMIT — every engine starts simming this tick concurrently.
-                _submit_batched_raw(envs, idx_ids, actions)
+                with prof.stage("submit"):
+                    _submit_batched_raw(envs, idx_ids, actions)
                 # OVERLAP WINDOW (engines simming): this tick's pre-step stream
                 # logging + obs-side fire discrimination (both read the PRE-step
                 # obs), then the PREVIOUS tick's deferred metric accumulation.
-                _log_streams(states, actions)
-                _obs_fire_disc(states, actions)
+                with prof.stage("log_streams"):
+                    _log_streams(states, actions)
+                with prof.stage("obs_fire_disc"):
+                    _obs_fire_disc(states, actions)
                 if _deferred is not None:
-                    _accumulate_metrics(*_deferred)
+                    with prof.stage("metrics"):
+                        _accumulate_metrics(*_deferred)
                     _deferred = None
                 # RECEIVE — drain + batch-unpack once the engines are done.
-                results = _receive_batched_raw(envs, idx_ids)
+                results = _receive_batched_raw(envs, idx_ids, prof=prof)
             else:
-                _log_streams(states, actions)
-                _obs_fire_disc(states, actions)
-                if executor is None:
-                    results = [_step_env(envs[idx], action) for idx, action in zip(idx_ids, actions)]
-                else:
-                    futures = [
-                        executor.submit(_step_env, envs[idx], action)
-                        for idx, action in zip(idx_ids, actions)
-                    ]
-                    results = [future.result() for future in futures]
+                with prof.stage("log_streams"):
+                    _log_streams(states, actions)
+                with prof.stage("obs_fire_disc"):
+                    _obs_fire_disc(states, actions)
+                with prof.stage("engine_step_pingpong"):
+                    if executor is None:
+                        results = [_step_env(envs[idx], action) for idx, action in zip(idx_ids, actions)]
+                    else:
+                        futures = [
+                            executor.submit(_step_env, envs[idx], action)
+                            for idx, action in zip(idx_ids, actions)
+                        ]
+                        results = [future.result() for future in futures]
 
             # ── Pass A (inline; must precede the next select_actions) ──────────
             # State advance + episode budgeting / lane resets / per-scenario
@@ -2054,6 +2502,7 @@ def _evaluate_mode(
             # alone can't recover the lane.
             _cap_env: list = []
             _cap_ep: list = []
+            _t_pass_a = prof.mark()
             for batch_idx, (idx, result) in enumerate(zip(idx_ids, results)):
                 obs, reward, done, info = result
                 state = active[idx]
@@ -2085,6 +2534,9 @@ def _evaluate_mode(
                         if state.gate_trace:
                             move_streams[f"gate_ep_{state.episode_index:04d}"] = np.asarray(
                                 state.gate_trace, dtype=np.float32)
+                        if state.aim_err_trace:
+                            move_streams[f"aimerr_ep_{state.episode_index:04d}"] = np.asarray(
+                                state.aim_err_trace, dtype=np.float32)
                     if config.log_acq_streams and state.acq_trace:
                         # collect-cache layout: (T,) per-frame count + entity
                         # arrays concatenated over the episode (the same shape
@@ -2151,6 +2603,7 @@ def _evaluate_mode(
                 else:
                     _advance_obs_delay(state, obs, config.obs_lag_ticks)
 
+            prof.add("pass_a", _t_pass_a)
             # Dispatch this tick's metric pass. Batched: DEFER so it overlaps the
             # NEXT submit's engine sim (flushed after the loop for the final tick).
             # Non-batched: fold inline (no submit/receive split to overlap).
@@ -2158,12 +2611,16 @@ def _evaluate_mode(
                 _deferred = (_cap_infos, _cap_actions, _cap_scn,
                              _cap_env, _cap_ep, macro_step)
             else:
-                _accumulate_metrics(_cap_infos, _cap_actions, _cap_scn,
-                                    _cap_env, _cap_ep, macro_step)
+                with prof.stage("metrics"):
+                    _accumulate_metrics(_cap_infos, _cap_actions, _cap_scn,
+                                        _cap_env, _cap_ep, macro_step)
+            prof.tick(lanes=len(idx_ids))
 
         # Flush the final tick's deferred metrics (no dropped last tick).
         if _deferred is not None:
-            _accumulate_metrics(*_deferred)
+            with prof.stage("metrics"):
+                _accumulate_metrics(*_deferred)
+        prof.loop_done()
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
@@ -2215,8 +2672,57 @@ def _evaluate_mode(
                 flat["discharge"] = gt_cat[:, 4].astype(np.int8)
                 flat["weapon_imp"] = gt_cat[:, 5].astype(np.int8)
                 flat["engaged"] = gt_cat[:, 6].astype(bool)
+                # schema 6: per-tick equipped-weapon impulse (0 = none/
+                # unknown; née weapon_held) — the op-shot denominator and a
+                # DIAGNOSTIC stream only. Equip state is not preference
+                # (weapon scripting); behavioral rulers read weapon_pref:
+                # the equipped impulse at DISCHARGE ticks, 0 elsewhere — the
+                # bot-side analog of the corpus attack class (the weapon
+                # that physically fired; the `weapon` DECISION can lead
+                # equip by a tick under switch latency).
+                _swid_col = gt_cat[:, 14].astype(np.int8)
+                flat["self_weapon_id"] = _swid_col
+                flat["weapon_pref"] = np.where(
+                    gt_cat[:, 4] > 0, _swid_col, 0).astype(np.int8)
+                # schema 6: stationary-menu streams — the per-tick
+                # weapon-feasibility bitmask (folded here from the traced
+                # self_items weapon bits + ammo pools via the SAME
+                # engine_norm.weapon_feasibility_bits derivation the human
+                # walk uses) plus raw health for the death invalidator.
+                # The raw inputs are not emitted; feasibility is the
+                # instrument. Omitted when the obs never carried the
+                # inputs (the ruler then reports ungated pairs, an upper
+                # bound).
+                if _v6_state_fields["ok"]:
+                    flat["health"] = gt_cat[:, 15].astype(np.int16)
+                    flat["weapon_feas"] = weapon_feasibility_bits(
+                        gt_cat[:, 16].astype(np.int64),
+                        gt_cat[:, 17].astype(np.int64),
+                        gt_cat[:, 18].astype(np.int64),
+                        gt_cat[:, 19].astype(np.int64),
+                        gt_cat[:, 20].astype(np.int64))
                 flat["gate_stream_schema"] = np.asarray(
                     [GATE_STREAM_SCHEMA_VERSION])
+            # AIM ERROR — ADDITIVE named arrays (ATTACK-GATE RESPEC,
+            # 2026-08-15): never folded into gt_cat / GATE_STREAM_SCHEMA_VERSION,
+            # same convention as h2h's rel_z. Present whenever aim_err_trace was
+            # populated (unconditional per-tick append — see _log_streams), so
+            # this always lines up 1:1 with every other episode-concatenated
+            # array above; per-tick NaN (not array omission) marks unengaged /
+            # entity_rel-absent ticks.
+            aimerr_keys = {k.replace("aimerr_", "").replace("ep_", ""): k
+                          for k in move_streams if k.startswith("aimerr_ep_")}
+            if all(k.replace("ep_", "") in aimerr_keys for k in ep_keys):
+                ae_cat = np.concatenate(
+                    [move_streams[aimerr_keys[k.replace("ep_", "")]]
+                     for k in ep_keys], axis=0)
+                flat["aim_err_deg"] = ae_cat[:, 0].astype(np.float32)
+                flat["aim_err_h_deg"] = ae_cat[:, 1].astype(np.float32)
+                flat["aim_err_v_deg"] = ae_cat[:, 2].astype(np.float32)
+                # op_ready: attack_finished expired (<= 1e-6), independent of
+                # whether the model fired — the attack_conditional gate arm's
+                # denominator, matched to the human corpus op-filter.
+                flat["op_ready"] = ae_cat[:, 3].astype(bool)
         np.savez_compressed(streams_path,
                             tick_hz=np.asarray([float(config.fixed_tick_hz)]),
                             **flat, **move_streams)
@@ -2231,6 +2737,11 @@ def _evaluate_mode(
             acq_episode_keys=np.asarray(_keys),
             acq_episode_scenarios=np.asarray([acq_scenarios[k] for k in _keys]),
             **acq_streams)
+
+    # Per-tick stage accounting (QNN_EVAL_PROFILE=1). Written per MODE so
+    # parallel_policy_modes runs don't overwrite each other.
+    prof.write(Path(config.output_dir) / f"stage_profile_{mode}.json",
+               tick_hz=float(config.fixed_tick_hz))
 
     stuck_rate = float(stuck_steps / max(total_steps, 1))
     episode_metric_means = mean_metric_values(episode_metric_values)
@@ -2266,15 +2777,15 @@ def _evaluate_mode(
     _atk_tot = max(sum(weapon_attack_ticks.values()), 1)
     summary["obs_weapon_occupancy"] = {
         _WID2N.get(w, f"w{w}"): float(c / max(total_steps, 1))
-        for w, c in sorted(weapon_held_ticks.items())}
+        for w, c in sorted(weapon_equip_ticks.items())}
     summary["obs_attack_share_per_weapon"] = {
         _WID2N.get(w, f"w{w}"): float(c / _atk_tot)
         for w, c in sorted(weapon_attack_ticks.items())}
-    # per-weapon attack rate = attacks-with-w / frames-holding-w (the propensity
+    # per-weapon attack rate = attacks-with-w / frames-equipped-with-w (the propensity
     # the aggregate rate averages over the occupancy mix).
     summary["obs_attack_rate_per_weapon"] = {
         _WID2N.get(w, f"w{w}"): float(weapon_attack_ticks.get(w, 0) / c)
-        for w, c in sorted(weapon_held_ticks.items()) if c}
+        for w, c in sorted(weapon_equip_ticks.items()) if c}
     summary["obs_blind_attack_raw_rate"] = float(_blind / max(fire_ticks, 1))
     summary["obs_blind_attack_raw_no_actor_rate"] = float(blind_no_actor / max(fire_ticks, 1))
     summary["obs_blind_attack_raw_offcone_rate"] = float(blind_offcone / max(fire_ticks, 1))
@@ -2386,6 +2897,17 @@ def _evaluate_mode(
                 _win_emit(_buf, pad_to=_win_pre + _win_post + 1)
         _write_intercept_windows(config.output_dir, _win_pre, _win_post,
                                  _win_rows)
+    if _trace_on:
+        # Contiguous per-tick trace. Written from the SAME _rl.hbw stream the
+        # window rows above were sampled from, so slicing +/-k around a
+        # discharge in the trace reproduces that discharge's hbw_win row by
+        # construction (tests/test_intercept_trace.py pins it).
+        _scen_book = [s for s, _ in sorted(_trace_scen.items(),
+                                           key=lambda kv: kv[1])]
+        _write_intercept_trace(config.output_dir, _trace_cols, _scen_book,
+                               truncated=_trace_truncated)
+        summary["intercept_trace_rows"] = int(_trace_rows)
+        summary["intercept_trace_truncated"] = bool(_trace_truncated)
     # Decoded turn-magnitude distribution per LOS-angle zone (the lock-on curve):
     # {los_angle_bin: {turn_mag_bin: p}} normalized within each LOS zone. Matched
     # against the human reference to calibrate the turn_mag_scale dampener.
@@ -2464,38 +2986,8 @@ def _install_decode_regime(model: QNNPolicy, regime: str | None):
     caller can source move/look decode params FROM the config — even when
     ``guard_module == "none"`` (then ``_regime_mod`` is None but the resolved
     params still drive the move/look operating point, matching export)."""
-    if regime is None or str(regime).strip() in ("", "none"):
-        model.decode_action_postprocess = None
-        model._regime_mod = None
-        # NO default decode facade exists: leaving _decode_mod unset means act()
-        # RAISES if it needs the facade. Evals that decode must name a regime /
-        # config (or resolve the run's arch via qnn.diag.loader.resolve_decode_module).
-        model._decode_mod = None
-        return None
-    from qnn.model import decode_config as _dc
-    resolved = _dc.resolve_decode_config(_dc.config_path_for(str(regime).strip()))
-    adapter = resolved.guard_module
-    if adapter is None:
-        # guard_module="none" (scrubbed study bases): no guard layer, but
-        # the regime still provides the geometry decode module + params. Install the
-        # decode geometry, leave the guard/fire-postprocess off (act() already guards
-        # every _regime_mod use with `is not None`). The resolved params still drive
-        # the move/look operating point via _apply_decode_config_params on `resolved`.
-        model.decode_action_postprocess = None
-        model._regime_mod = None
-        model._decode_mod = resolved.decode_module
-        return resolved
-    # Stash the raw params on the adapter so callers can read decode-config
-    # values (e.g. look.turn_mag_scale) without re-parsing the JSON.
-    adapter._params = resolved.params
-    model.decode_action_postprocess = adapter.policy_decode_action_postprocess
-    # Store the resolved guard adapter so QNNPolicy.act can call its
-    # projectile_release_mask(obs) (Gate B forced fb/lr hold release) inside the
-    # shared move decode — exactly as tools/export_onnx.ExportWrapper does.
-    model._regime_mod = adapter
-    # Use the decode config's geometry module in act() (explicit injection).
-    model._decode_mod = resolved.decode_module
-    return resolved
+    from qnn.model.decode_config import install_policy_decode_modules
+    return install_policy_decode_modules(model, regime)
 
 
 def _apply_decode_config_params(config: "EvalConfig", model: QNNPolicy, resolved) -> None:
@@ -2514,17 +3006,8 @@ def _apply_decode_config_params(config: "EvalConfig", model: QNNPolicy, resolved
     and substitutes the registry default — never a second, drifting copy of it —
     for every optional knob.
     """
-    for attr, value in resolved.policy_attrs().items():
-        if not hasattr(model, attr):
-            # A registry row naming an attribute QNNPolicy does not define would
-            # otherwise setattr() a DEAD knob: silently inert in eval, live in
-            # the export. Fail loud instead (no silent defaults).
-            raise AttributeError(
-                f"decode-param registry maps a config key onto QNNPolicy.{attr}, "
-                f"which does not exist on {type(model).__name__}. Fix the "
-                f"`name` in qnn.model.decode_config.DECODE_PARAMS (it is BOTH "
-                f"the policy attribute and the ExportWrapper kwarg).")
-        setattr(model, attr, value)
+    from qnn.model.decode_config import apply_policy_decode_params
+    apply_policy_decode_params(model, resolved)
     # The one EvalConfig-side mirror: config.look_aim_prior_gain is provenance
     # only and holds a scalar or None (a (9,) per-impulse vector has no scalar
     # form). There is no config.look_aim_ffwd field.
@@ -2538,8 +3021,30 @@ def _apply_decode_config_params(config: "EvalConfig", model: QNNPolicy, resolved
     # construction (tools/export_onnx derives the same flag the same way).
     # NOTE: head-shape flags live on the NETWORK (model.model), not the QNNPolicy.
     _net = getattr(model, "model", model)
-    model.look_commitment = (getattr(_net, "_has_look_seg_head", False)
-                             and not getattr(_net, "_has_look_head", False))
+    # BENCH A/B OVERRIDE (seg-vs-frame cell C2, agents/plans/seg-vs-frame-
+    # decision.md): a DUAL-head checkpoint (canonical polar look + a look_seg
+    # co-head, the a28 C2 arms) routes to polar by the shape rule above, so its
+    # seg head never decodes — and a decode-fit on it would calibrate the wrong
+    # arm. QNN_FORCE_LOOK_COMMIT=1 flips the routing AFTER the shape derivation:
+    # the eval-runner twin of h2h's --force-look-commit (qnn.eval.h2h.
+    # _force_look_commit), same semantics, same fail-loud contract. It is an
+    # INSTRUMENT knob for same-checkpoint A/Bs — never a deploy path (the export
+    # derives the flag from shape, so a forced fit is only comparable to a
+    # forced eval).
+    if os.environ.get("QNN_FORCE_LOOK_COMMIT") == "1":
+        if not getattr(_net, "_has_look_seg_head", False):
+            raise ValueError(
+                "QNN_FORCE_LOOK_COMMIT=1 but this checkpoint has NO look_seg "
+                "head — there is no commitment decode to force, and the eval "
+                "would silently keep decoding the per-frame polar readout")
+        model.look_commitment = True
+    # BENCH ARM (cell C3, agents/plans/seg-vs-frame-decision.md): the revived
+    # per-tick move head decodes through the sticky-tau + dwell-hazard law and
+    # needs the SAME move_state lanes threaded (different column semantics —
+    # see qnn.model.move_tick_decode). Derived from model SHAPE for the same
+    # reason look_commitment is: a move_tick head has no other move decode to
+    # fall back to. Its params are adopted from the run's pinned hazard table
+    # by the caller (policy.move_tick_params), not from a decode-config key.
     # NOTE: the a24 move keys (move.sticky_tau_*, move.switchback_eps,
     # move.stop_onset, move.tau_engagement_gated, move.jump_*), the inline
     # move_hazard table, and attack.threshold are RETIRED with the a24 arch —
@@ -2564,8 +3069,57 @@ def _evaluate_policy_mode(
     # _install_decode_regime still returns the resolved params.
     if resolved is not None:
         _apply_decode_config_params(config, model, resolved)
+    if getattr(getattr(model, "model", model), "_has_move_tick_head", False):
+        # BENCH ARM C3: adopt the eval run dir's pinned hazard table (same
+        # corpus pin the BC run trained against; run.init writes it).
+        from qnn.model.move_tick_decode import params_from_run_dir
+        _dev = next(getattr(model, "model", model).parameters()).device
+        model.move_tick_params = params_from_run_dir(
+            Path(config.output_dir).parent.parent, device=_dev)
+    _maybe_compile_act_model(model, config)
     summary = _evaluate_mode(config, model, mode, _episode_specs(config))
     return mode, summary, model
+
+
+def _maybe_compile_act_model(model: QNNPolicy, config: EvalConfig) -> None:
+    """EXPERIMENTAL, opt-in (``QNN_EVAL_COMPILE=1``): torch.compile the whole act
+    model, the way the PPO collector already does for its fixed-B CPU forward
+    (qnn.ppo.train: ``collect_policy.model.compile(dynamic=False)``, measured
+    11.8 → 4.1 ms at B=128).
+
+    Why it is opt-in rather than the default: the 8/05 eval profile puts
+    ``act`` at 74% of loop wall with a ~4.4 ms FIXED per-call cost — tiny-matmul
+    dispatch overhead, exactly what compile collapses — so this is the largest
+    remaining lever. But it is NOT metric-neutral: fusing reorders float
+    reductions, which forks sampled trajectories the same way batching already
+    does, so it cannot be turned on under a load-bearing ruler until it has been
+    through the parity gate (agents/plans/eval-vecenv-port.md phase 4) with a
+    DISTRIBUTIONAL tolerance rather than a bit-exact one. Memory
+    `feedback_bc_compile_divergence` applies.
+
+    Unlike PPO's collector, eval's batch shrinks as lanes retire, so
+    ``dynamic=False`` recompiles once per distinct active-lane count (bounded by
+    num_envs). That is a fixed startup tax paid against a per-tick win, so it
+    only pays on long schedules — which is exactly where eval wall-clock hurts.
+
+    NEEDS A C++ TOOLCHAIN, which the `cpu` container does NOT have: Inductor
+    fails there with ``InvalidCxxCompiler: No working C++ compiler found``
+    (the same reason tests/test_quake_worker.py cannot build its worker). With
+    ``suppress_errors`` that degrades to eager per graph rather than killing the
+    run, so setting the flag in the cpu container is merely a no-op that spams
+    warnings. Evaluate it in the trainer container (or add g++ to the cpu image)
+    before drawing any conclusion about the lever's size.
+    """
+    if (os.environ.get("QNN_EVAL_COMPILE", "").strip() or "0") in ("0", "", "false"):
+        return
+    if str(config.device) != "cpu":
+        return
+    try:
+        torch._dynamo.config.suppress_errors = True
+        getattr(model, "model", model).compile(dynamic=False)
+        print("[eval] torch.compile: whole act model (dynamic=False) — EXPERIMENTAL")
+    except Exception as exc:  # pragma: no cover - backend-dependent
+        print(f"[eval] torch.compile unavailable, staying eager: {exc}")
 
 
 def _checkpoint_run_id(checkpoint_path: str) -> str:

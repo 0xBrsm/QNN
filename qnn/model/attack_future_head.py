@@ -155,7 +155,8 @@ from qnn.model.node_registry import register_head  # noqa: E402
 def _build_attack_future(head, dims, d_model):
     # Same readout-first prefix-slice contract as move_seg / jump: dropping
     # target.feat from inputs shrinks the consumed prefix.
-    in_dim = dims["base_features_dim"]
+    in_dim = (dims["coord_features_dim"] if "intent" in head.inputs
+              else dims["base_features_dim"])
     if "target.feat" not in head.inputs:
         in_dim -= d_model
     # Spec default pos_weight=0.0 means "unset" → no reweighting (1.0).

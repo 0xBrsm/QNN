@@ -15,6 +15,8 @@ the seed43 grids (Phase 1 acceptance) before any new compute is spent.
 from __future__ import annotations
 
 import json
+import os
+import time
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +24,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from qnn.decode_fit.context import FRIKBOT_TO_PIN, MODELNAME_TO_ABBR, read_json
+from qnn.decode_fit.context import (FRIKBOT_TO_PIN, MODELNAME_TO_ABBR,
+                                    read_json, sha256_file)
 
 # ── the eval-side npz schema (written by qnn.eval.run) ────────────────────────
 EVENT_SCHEMA_VERSION = 1
@@ -160,38 +163,134 @@ def _lane_ops(wave_dir: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
+# ── per-wave SCORED-TABLE cache ───────────────────────────────────────────────
+#
+# The v2 pipeline re-ran collect_tracking/collect_events (raw npz → EventTable)
+# on EVERY wave, on EVERY call — and collect_tracking is called once per round
+# (screen, extend, ciext, alphaanchor) over the ACCUMULATING wave-dir list, so
+# a late-round call re-scores every earlier round's waves from scratch. A
+# wave's raw npz only changes when the wave itself is rebuilt (the substrate/
+# env staleness check in instruments.build_wave_dir; a rebuilt wave gets a
+# fresh directory whose old cache file is gone with it — nothing extra to
+# invalidate). So the SCORED rows are cached alongside the wave, keyed on
+# content: the wave's scenario-env signature (_sweep_env.json — the same
+# levers instruments._done/staleness already treats as load-bearing) + the
+# raw npz's sha256 (it's read in full to score anyway) + SCORER_VERSION (bump
+# on ANY change to the scoring law below — dedup rule, cluster-id scheme,
+# column set, _lane_ops resolution). A hit is a single npz read; the columns
+# it returns are byte-for-byte what a fresh score would produce (np.savez/
+# np.load round-trips float64/int64/bool/fixed-width-unicode losslessly), so
+# the cache is pure performance — the default no-flag fit is bit-identical
+# with or without it.
+SCORER_VERSION = 1
+_SCORED_EVENTS_CACHE = "_scored_events_v1.npz"
+_SCORED_TRACKING_CACHE = "_scored_tracking_v1.npz"
+_CACHE_META_KEYS = ("schema_version", "env_sig_json", "src_sha256")
+# per-process counters load_waves/load_waves_tracking diff to log hit/miss
+# totals + scoring wall-clock; reset is unnecessary (callers diff before/after).
+_CACHE_STATS = {"events_hit": 0, "events_miss": 0,
+                "tracking_hit": 0, "tracking_miss": 0}
+
+
+def _cache_disabled() -> bool:
+    return bool(os.environ.get("DECODEFIT_NO_SCORE_CACHE"))
+
+
+def _cache_key(wave_dir: Path, src: Path) -> tuple[str, str]:
+    """(env_sig_json, src_sha256) — the two invalidation levers. ``src`` must
+    exist (callers check first; hashing a missing file is a caller bug, not a
+    cache-miss)."""
+    sig_path = wave_dir / "_sweep_env.json"
+    sig = read_json(sig_path) if sig_path.exists() else {}
+    return (json.dumps(sig, sort_keys=True), sha256_file(src))
+
+
+def _load_scored_cache(cache_path: Path, key: tuple[str, str]) -> EventTable | None:
+    if not cache_path.exists():
+        return None
+    try:
+        with np.load(cache_path, allow_pickle=False) as z:
+            if int(z["schema_version"]) != SCORER_VERSION:
+                return None
+            if str(z["env_sig_json"].item()) != key[0]:
+                return None
+            if str(z["src_sha256"].item()) != key[1]:
+                return None
+            cols = {k: z[k] for k in z.files if k not in _CACHE_META_KEYS}
+        return EventTable(cols)
+    except Exception:
+        return None      # a corrupt/partial/foreign-schema cache is a MISS
+
+
+def _save_scored_cache(cache_path: Path, table: EventTable,
+                       key: tuple[str, str]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_name(cache_path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        np.savez(fh, schema_version=np.int64(SCORER_VERSION),
+                 env_sig_json=np.array(key[0]), src_sha256=np.array(key[1]),
+                 **table.cols)
+    tmp.replace(cache_path)
+
+
 def wave_event_table(wave_dir: Path) -> EventTable:
     """One wave run-dir → the annotated EventTable (raw discharges joined to
-    their lane operating points). Empty table when the wave logged no events."""
+    their lane operating points). Empty table when the wave logged no events.
+    Resume-cached: see the SCORED-TABLE CACHE section above."""
     wave_dir = Path(wave_dir)
+    src = wave_dir / "metrics" / "eval" / INTERCEPT_EVENTS_NPZ
+    key: tuple[str, str] | None = None
+    if src.exists() and not _cache_disabled():
+        key = _cache_key(wave_dir, src)
+        cached = _load_scored_cache(
+            wave_dir / "metrics" / "eval" / _SCORED_EVENTS_CACHE, key)
+        if cached is not None:
+            _CACHE_STATS["events_hit"] += 1
+            return cached
+    _CACHE_STATS["events_miss"] += 1
     raw = load_run_events(wave_dir)
     if raw is None or len(raw["hbw"]) == 0:
-        return EventTable()
-    ops = _lane_ops(wave_dir)
-    n = len(raw["hbw"])
-    cols: dict[str, np.ndarray] = {
-        "weapon": raw["weapon"].astype("U8"),
-        "hbw": raw["hbw"].astype(np.float64),
-        "range_u": raw["range_u"].astype(np.float64),
-        "cluster": _cluster_ids(wave_dir.name, raw["env_idx"], raw["episode"]),
-        "weight": np.ones(n, dtype=np.float64),
-        "is_median": np.zeros(n, dtype=bool),
-    }
-    for k in OP_KEYS + ("pin",):
-        default = "" if k == "pin" else np.nan
-        vals = [ops.get(str(sid), {}).get(k, default) for sid in raw["scenario_id"]]
-        cols[k] = (np.array(vals, dtype="U8") if k == "pin"
-                   else np.array(vals, dtype=np.float64))
-    unknown = ~np.isin(raw["scenario_id"], list(ops))
-    if unknown.any():
-        raise ValueError(
-            f"{wave_dir}: {int(unknown.sum())} events carry scenario_ids absent "
-            "from config/scenario.json — wave dir is inconsistent, rebuild it")
-    return EventTable(cols)
+        table = EventTable()
+    else:
+        ops = _lane_ops(wave_dir)
+        n = len(raw["hbw"])
+        cols: dict[str, np.ndarray] = {
+            "weapon": raw["weapon"].astype("U8"),
+            "hbw": raw["hbw"].astype(np.float64),
+            "range_u": raw["range_u"].astype(np.float64),
+            "cluster": _cluster_ids(wave_dir.name, raw["env_idx"], raw["episode"]),
+            "weight": np.ones(n, dtype=np.float64),
+            "is_median": np.zeros(n, dtype=bool),
+        }
+        for k in OP_KEYS + ("pin",):
+            default = "" if k == "pin" else np.nan
+            vals = [ops.get(str(sid), {}).get(k, default) for sid in raw["scenario_id"]]
+            cols[k] = (np.array(vals, dtype="U8") if k == "pin"
+                       else np.array(vals, dtype=np.float64))
+        unknown = ~np.isin(raw["scenario_id"], list(ops))
+        if unknown.any():
+            raise ValueError(
+                f"{wave_dir}: {int(unknown.sum())} events carry scenario_ids "
+                "absent from config/scenario.json — wave dir is inconsistent, "
+                "rebuild it")
+        table = EventTable(cols)
+    if key is not None:
+        _save_scored_cache(wave_dir / "metrics" / "eval" / _SCORED_EVENTS_CACHE,
+                           table, key)
+    return table
 
 
 def load_waves(wave_dirs: Iterable[Path]) -> EventTable:
-    return EventTable.concat([wave_event_table(d) for d in wave_dirs])
+    dirs = [Path(d) for d in wave_dirs]
+    h0, m0 = _CACHE_STATS["events_hit"], _CACHE_STATS["events_miss"]
+    t0 = time.perf_counter()
+    tables = [wave_event_table(d) for d in dirs]
+    dt = time.perf_counter() - t0
+    print(f"[decode-fit] events table: {len(dirs)} wave(s), "
+          f"{_CACHE_STATS['events_hit'] - h0} cache hit(s), "
+          f"{_CACHE_STATS['events_miss'] - m0} miss(es), "
+          f"scored in {dt:.2f}s", flush=True)
+    return EventTable.concat(tables)
 
 
 # ── tracking windows (the trigger-free aim statistic) ─────────────────────────
@@ -257,62 +356,91 @@ def wave_tracking_table(wave_dir: Path) -> EventTable:
     not to this ladder); rows explode into per-tick samples, deduped across
     overlapping burst windows by nearest-discharge (the human baseline's rule),
     annotated with the lane operating point exactly like discharge events.
-    ``hbw`` is the window-tick alignment; clusters stay (run, lane, episode)."""
+    ``hbw`` is the window-tick alignment; clusters stay (run, lane, episode).
+    Resume-cached: see the SCORED-TABLE CACHE section above — a cache hit
+    skips ``_load_window_npz`` entirely (so a missing/mismatched-geometry npz
+    still fails loud, exactly as before, whenever there is no valid cache)."""
     wave_dir = Path(wave_dir)
+    src = wave_dir / "metrics" / "eval" / TRACKING_WINDOWS_NPZ
+    key: tuple[str, str] | None = None
+    if src.exists() and not _cache_disabled():
+        key = _cache_key(wave_dir, src)
+        cached = _load_scored_cache(
+            wave_dir / "metrics" / "eval" / _SCORED_TRACKING_CACHE, key)
+        if cached is not None:
+            _CACHE_STATS["tracking_hit"] += 1
+            return cached
+    _CACHE_STATS["tracking_miss"] += 1
     raw = _load_window_npz(wave_dir)
     n = len(raw["tick"])
     if n == 0:
-        return EventTable()
-    k = TRACKING_K
-    hbw_win = raw["hbw_win"].astype(np.float64)[
-        :, TRACKING_K_PRE - k:TRACKING_K_PRE + k + 1]   # (n, 2k+1)
-    offs = np.arange(-k, k + 1, dtype=np.int64)
-    abs_tick = raw["tick"].astype(np.int64)[:, None] + offs[None, :]
-    fin = np.isfinite(hbw_win)
-    # nearest-discharge dedup over overlapping burst windows: for identical
-    # (lane, episode, abs_tick) keep the smallest |offset| (its anchor is the
-    # nearest discharge); ties → earlier row. One sample per real tick.
-    lane = raw["env_idx"].astype(np.int64)[:, None]
-    epi = np.maximum(raw["episode"].astype(np.int64), 0)[:, None]
-    key = ((lane << 44) + (epi << 24) + abs_tick).ravel()
-    a_off = np.abs(np.broadcast_to(offs[None, :], hbw_win.shape)).ravel()
-    row_i = np.broadcast_to(np.arange(n)[:, None], hbw_win.shape).ravel()
-    valid = np.flatnonzero(fin.ravel())      # finite FIRST, then dedup — a
-    if not len(valid):                       # NaN slot must never shadow a
-        return EventTable()                  # finite duplicate of its tick
-    order = valid[np.lexsort((row_i[valid], a_off[valid], key[valid]))]
-    sk = key[order]
-    first = np.ones(len(sk), bool)
-    first[1:] = sk[1:] != sk[:-1]
-    sel = order[first]
-    ops = _lane_ops(wave_dir)
-    sid = raw["scenario_id"].astype("U64")
-    unknown = ~np.isin(sid, list(ops))
-    if unknown.any():
-        raise ValueError(
-            f"{wave_dir}: {int(unknown.sum())} window rows carry scenario_ids "
-            "absent from config/scenario.json — wave dir is inconsistent, "
-            "rebuild it")
-    r = sel // hbw_win.shape[1]
-    cols: dict[str, np.ndarray] = {
-        "weapon": raw["weapon"].astype("U8")[r],
-        "hbw": hbw_win.ravel()[sel],
-        "range_u": np.full(len(sel), np.nan),
-        "cluster": _cluster_ids(wave_dir.name, raw["env_idx"][r],
-                                raw["episode"][r]),
-        "weight": np.ones(len(sel), dtype=np.float64),
-        "is_median": np.zeros(len(sel), dtype=bool),
-    }
-    for kk in OP_KEYS + ("pin",):
-        default = "" if kk == "pin" else np.nan
-        vals = [ops.get(str(s), {}).get(kk, default) for s in sid[r]]
-        cols[kk] = (np.array(vals, dtype="U8") if kk == "pin"
-                    else np.array(vals, dtype=np.float64))
-    return EventTable(cols)
+        table = EventTable()
+    else:
+        k = TRACKING_K
+        hbw_win = raw["hbw_win"].astype(np.float64)[
+            :, TRACKING_K_PRE - k:TRACKING_K_PRE + k + 1]   # (n, 2k+1)
+        offs = np.arange(-k, k + 1, dtype=np.int64)
+        abs_tick = raw["tick"].astype(np.int64)[:, None] + offs[None, :]
+        fin = np.isfinite(hbw_win)
+        # nearest-discharge dedup over overlapping burst windows: for identical
+        # (lane, episode, abs_tick) keep the smallest |offset| (its anchor is
+        # the nearest discharge); ties → earlier row. One sample per real tick.
+        lane = raw["env_idx"].astype(np.int64)[:, None]
+        epi = np.maximum(raw["episode"].astype(np.int64), 0)[:, None]
+        dedup_key = ((lane << 44) + (epi << 24) + abs_tick).ravel()
+        a_off = np.abs(np.broadcast_to(offs[None, :], hbw_win.shape)).ravel()
+        row_i = np.broadcast_to(np.arange(n)[:, None], hbw_win.shape).ravel()
+        valid = np.flatnonzero(fin.ravel())    # finite FIRST, then dedup — a
+        if not len(valid):                     # NaN slot must never shadow a
+            table = EventTable()               # finite duplicate of its tick
+        else:
+            order = valid[np.lexsort(
+                (row_i[valid], a_off[valid], dedup_key[valid]))]
+            sk = dedup_key[order]
+            first = np.ones(len(sk), bool)
+            first[1:] = sk[1:] != sk[:-1]
+            sel = order[first]
+            ops = _lane_ops(wave_dir)
+            sid = raw["scenario_id"].astype("U64")
+            unknown = ~np.isin(sid, list(ops))
+            if unknown.any():
+                raise ValueError(
+                    f"{wave_dir}: {int(unknown.sum())} window rows carry "
+                    "scenario_ids absent from config/scenario.json — wave "
+                    "dir is inconsistent, rebuild it")
+            r = sel // hbw_win.shape[1]
+            cols: dict[str, np.ndarray] = {
+                "weapon": raw["weapon"].astype("U8")[r],
+                "hbw": hbw_win.ravel()[sel],
+                "range_u": np.full(len(sel), np.nan),
+                "cluster": _cluster_ids(wave_dir.name, raw["env_idx"][r],
+                                        raw["episode"][r]),
+                "weight": np.ones(len(sel), dtype=np.float64),
+                "is_median": np.zeros(len(sel), dtype=bool),
+            }
+            for kk in OP_KEYS + ("pin",):
+                default = "" if kk == "pin" else np.nan
+                vals = [ops.get(str(s), {}).get(kk, default) for s in sid[r]]
+                cols[kk] = (np.array(vals, dtype="U8") if kk == "pin"
+                            else np.array(vals, dtype=np.float64))
+            table = EventTable(cols)
+    if key is not None:
+        _save_scored_cache(wave_dir / "metrics" / "eval" / _SCORED_TRACKING_CACHE,
+                           table, key)
+    return table
 
 
 def load_waves_tracking(wave_dirs: Iterable[Path]) -> EventTable:
-    return EventTable.concat([wave_tracking_table(d) for d in wave_dirs])
+    dirs = [Path(d) for d in wave_dirs]
+    h0, m0 = _CACHE_STATS["tracking_hit"], _CACHE_STATS["tracking_miss"]
+    t0 = time.perf_counter()
+    tables = [wave_tracking_table(d) for d in dirs]
+    dt = time.perf_counter() - t0
+    print(f"[decode-fit] tracking table: {len(dirs)} wave(s), "
+          f"{_CACHE_STATS['tracking_hit'] - h0} cache hit(s), "
+          f"{_CACHE_STATS['tracking_miss'] - m0} miss(es), "
+          f"scored in {dt:.2f}s", flush=True)
+    return EventTable.concat(tables)
 
 
 # ── crest windows (the θ-replay sample unit) ─────────────────────────────────

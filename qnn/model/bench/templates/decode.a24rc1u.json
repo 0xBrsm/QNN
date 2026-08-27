@@ -72,39 +72,14 @@
     "guard.lg_range": true,
     "guard.lg_range_u": 600.0,
     "guard.lg_align_half_angle_deg": 15.0,
-    "guard.projectile_release": true,
-    "guard.projectile_release_mode": "any",
+    "guard.projectile_release": "any",
     "guard.projectile_release_horizon_s": 1.0,
     "guard.projectile_hit_radius_u": 45.0,
     "guard.projectile_release_splash": true,
     "guard.projectile_release_arc": true,
-    "look.weapon_pitch_gain": [
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      1.0,
-      0.0
-    ],
     "move.jump_sample": false,
     "move.jump_bias": -0.21,
     "move.jump_temp": 1.0,
-    "look.weapon_pitch_bias": [
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0
-    ],
-    "attack.threshold": 0.25,
-    "look.weapon_pitch_mode": "shift",
-    "look.weapon_pitch_shift_strength": 0.8
+    "attack.threshold": 0.25
   }
 }

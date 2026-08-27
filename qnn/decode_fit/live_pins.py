@@ -101,13 +101,47 @@ def _run_probe_waves(ctx, substrate: dict[str, Any],
 def fit_live_pins(ctx, substrate: dict[str, Any], tms: float,
                   ledger: design.BudgetLedger, *,
                   wave_runner: Callable[..., dict[str, dict[str, float]]]
-                  | None = None
+                  | None = None,
+                  mode: str = "fit",
                   ) -> dict[str, Any]:
-    """Fit family cadence in the four forced-weapon pin cells."""
+    """Fit family cadence in the four forced-weapon pin cells.
+
+    ``mode="fit"`` (default): the damped-secant cadence repair, loud
+    failure at the cap. ``mode="report"``: run round 0 ONCE at bias 0 and
+    record the observations WITHOUT fitting — for checkpoints whose fire
+    cadence is model-owned (the crest-line occupancy regulator trained it;
+    agents/plans/decode-fit-pins-crest-mismatch.md option A, Brian
+    2026-08-09). The orbit-pin instrument's bias-walk assumes a
+    context-flat trigger; a trough-selective trigger saturates below any
+    human anchor there, and a converged bias would repair the wrong
+    domain. Cadence remains gated by the stage-5 free-play arms."""
+    if mode not in ("fit", "report"):
+        raise ValueError(f"live-pins mode must be 'fit' or 'report', got {mode!r}")
     runner = wave_runner or (
         lambda sub, cells, step: _run_probe_waves(ctx, sub, cells, step))
     pin_weights = human_refs.range_pin_weights(ctx.range_path)
+    # NARROW population (LOS + target_probs-labeled engagement) — the correct
+    # ruler for THIS forced-cadence fit, since the bot-side forced-cell
+    # measurement (instruments.collect_forced_attack_rate's `keep & engaged`
+    # band-v5 mask) is population-matched to it.
     targets = human_refs.family_attack_rates(ctx.op_attack_path)
+    # PURE-LOS population (no target_probs label) — NOT used to fit this
+    # cell's bias; recorded alongside `targets` purely so
+    # qnn.ppo.pfire_target.FireOccupancyTarget (whose consumer mask,
+    # qnn.ppo.learner._fire_occupancy_loss, IS pure-LOS) has a
+    # correctly-scoped rate to load instead of `targets`' narrower one
+    # (blind-fire-cadence.md's three-denominator bug).
+    los_targets = human_refs.family_aimed_rates_los(ctx.blind_fire_path)
+    # Continuous-weapon (NG/SNG/LG) HOLD-TRAIN ONSET rate — the family event
+    # correction's cadence target (agents/plans/crest-finetune-allweapons.md
+    # "The objective"): these three weapons' occupancy target must match how
+    # often a human STARTS firing, not the bolt rate `los_targets` measures.
+    # Read separately (never pooled) and kept in its own report section
+    # (`onset_rates`) rather than folded into `weapons`, since NG has no
+    # entry of its own there (the forced-cadence instrument only fits SG/
+    # SNG/RL/LG; NG inherits SNG's bias but not its onset rate — the
+    # corrected-events artifact measured NG directly).
+    onset_targets = human_refs.family_onset_rates_los(ctx.corrected_events_path)
     abbrs = [MODELNAME_TO_ABBR[w] for w in INSTRUMENT_WEAPONS]
     matchups = {
         abbr: (ABBR_TO_MODELNAME[abbr],
@@ -141,6 +175,11 @@ def fit_live_pins(ctx, substrate: dict[str, Any], tms: float,
                  f"{row['rate_per_s']:.3f}/{targets[abbr]:.3f} fires/s, "
                  f"mass {row['mass']:.0f}, ticks {row['engaged_ticks']} "
                  f"({'pass' if _within_contract(row, targets[abbr]) else 'retry'})")
+        if mode == "report":
+            # Round 0 recorded; the vector stays zero by design. Contract
+            # checks are informational only in this mode.
+            active = set()
+            break
         active = {abbr for abbr in active
                   if not _within_contract(history[abbr][-1], targets[abbr])}
         if not active:
@@ -156,7 +195,8 @@ def fit_live_pins(ctx, substrate: dict[str, Any], tms: float,
             bias[abbr] = _next_bias(history[abbr], targets[abbr])
 
     return {
-        "status": "PASS",
+        "status": "PASS" if mode == "fit" else "NATIVE_REPORT_ONLY",
+        "mode": mode,
         "floor": MASS_FLOOR,
         "min_engaged_ticks": MIN_ENGAGED_TICKS,
         "rate_rel_tol": RATE_REL_TOL,
@@ -172,6 +212,7 @@ def fit_live_pins(ctx, substrate: dict[str, Any], tms: float,
                 "matchup": {"model_weapon": matchups[abbr][0],
                             "frikbot_pin": matchups[abbr][1]},
                 "target_rate_per_s": targets[abbr],
+                "target_rate_per_s_los_engaged": los_targets[abbr],
                 "native_mass": history[abbr][0]["mass"],
                 "native_rate_per_s": history[abbr][0]["rate_per_s"],
                 "fitted_rate_per_s": history[abbr][-1]["rate_per_s"],
@@ -181,10 +222,24 @@ def fit_live_pins(ctx, substrate: dict[str, Any], tms: float,
             }
             for abbr in abbrs
         },
+        "onset_rates": {
+            abbr: {
+                "impulse": WEAPON_IMPULSE[abbr],
+                "target_onset_rate_per_s_los_engaged": onset_targets[abbr],
+                "source": (
+                    "runs/head_probe/_human_crest_by_skill_corrected_events"
+                    f".json:families.{abbr}"
+                    ".pooled_onset_rate_per_engaged_los_tick"
+                ),
+            }
+            for abbr in ("NG", "SNG", "LG")
+        },
         "unprobed_impulses": sorted(
             set(WEAPON_IMPULSE.values())
             - {WEAPON_IMPULSE[m]
                for abbr in abbrs for m in calibration_members(abbr)}),
         "unprobed_note": ("Axe/GL are not held by the cadence instrument; "
-                          "SSG/NG inherit their SG/SNG family bias"),
+                          "SSG/NG inherit their SG/SNG family bias — but NOT "
+                          "their onset_rates entry, which is measured "
+                          "directly per weapon (see onset_rates)."),
     }

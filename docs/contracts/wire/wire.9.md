@@ -32,11 +32,28 @@ metadata.
 
 ## The in-graph MOVE decode
 
+> **CORRECTION (2026-08-26) — the hold-tail was never part of this migration.**
+> The sentence below lists the continuous-weapon fire hold-tail alongside the
+> `fb`/`lr` sticky gate as something that "once ran engine-side" and "now runs
+> IN-GRAPH." That was never true: `qnn_onnx_apply_continuous_hold_tail` has run
+> **engine-side for every wire generation**, `wire.9` included, both before and
+> after this MOVE-decode migration — there is no in-graph twin. It is now gated
+> per model by the `decode.attack.hold_tail_sec` stamp (0 = off, the default
+> for every fresh export); an artifact exported before that key existed —
+> every `wire.9`/`wire.11` artifact — inherits the historical 0.25 s. See the
+> [`wire.11` correction note](wire.11.md) and
+> [`contracts/README.md`](../README.md#decode-config--the-decodeguard-layer).
+> The "Notes" section below, which says the export **discards** the in-graph
+> hold-tail scratch value and the engine remains the "single attack-decode
+> site," already states this correctly — only the sentence immediately below
+> is the stale one.
+
 The **a24 stateful MOVE decode** — the `fb`/`lr` sticky gate, switch-back
-watermark, dwell-hazard release, stop-onset suppression, and the
-continuous-weapon fire hold-tail — once ran **engine-side** (a
-`qnn_onnx_decode_core` state machine + the `decode.move_*` metadata params).
-It now runs **IN-GRAPH** (the export wrapper bakes
+watermark, dwell-hazard release, and stop-onset suppression — once ran
+**engine-side** (a `qnn_onnx_decode_core` state machine + the `decode.move_*`
+metadata params; the continuous-weapon fire hold-tail was never part of this
+state machine — see the correction above). The MOVE decode now runs
+**IN-GRAPH** (the export wrapper bakes
 `qnn.model.decode_a24.move_decode_step_graph`, with the taus/eps/hazard table as
 graph constants). The engine carries no move state machine; it just:
 

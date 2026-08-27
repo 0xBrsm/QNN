@@ -348,7 +348,7 @@ def _stable_weapon_metrics_from_counts(result: Dict[str, float]) -> None:
     result["precision_weapon_macro_global"] = macro_precision
     result["recall_weapon_macro_global"] = macro_recall
     # Mirror balanced_acc_target naming: macro-averaged per-class recall.
-    # Answers "for each weapon, what fraction of demonstrator-held frames
+    # Answers "for each weapon, what fraction of demonstrator-equipped frames
     # did the model match? Averaged across all 8 weapons equally."
     # Insensitive to the SG/RL frequency dominance that biases acc_weapon.
     result["balanced_acc_weapon"] = macro_recall
@@ -420,9 +420,33 @@ def _humanlike_look_metrics_from_sums(result: Dict[str, float]) -> None:
     """
     import math as _math
 
+    _EPS_TV = 1e-8
+
     def _f(x):
         return float(x.item()) if hasattr(x, "item") else float(x)
 
+    # XM best-of-K head (qnn.model.look_head_xm): a SAMPLE distribution with no
+    # closed-form likelihood, so there is no look_dll to derive. Its score is the
+    # energy score (lower=better) plus the collapse/occupancy diagnostics; the
+    # binned histograms become the label-vs-model total-variation distance.
+    # NOTE: no look_skill — BC epoch selection falls back to raw loss_look for an
+    # XM run, which is NOT arm-comparable with a polar run's (1 − look_skill).
+    if "lookdist_xm_energy_sum" in result:
+        import numpy as _np
+        from qnn.model.look_bins import N_BINS
+        n = max(_f(result.pop("lookdist_n")), 1.0)
+        turn_n = max(_f(result.pop("lookdist_xm_turn_n")), 1.0)
+        result["look_energy"] = _f(result.pop("lookdist_xm_energy_sum")) / turn_n
+        result["xm_spread"] = _f(result.pop("lookdist_xm_spread_sum")) / turn_n
+        result["xm_hold_rate_pred"] = _f(result.pop("lookdist_xm_hold_pred_sum")) / n
+        result["xm_hold_rate_label"] = _f(result.pop("lookdist_xm_hold_label_sum")) / n
+        tv = 0.0
+        for a in (0, 1):
+            h = _np.array([_f(result.pop(f"lookdist_h_{a}_{b}")) for b in range(N_BINS)])
+            p = _np.array([_f(result.pop(f"lookdist_p_{a}_{b}")) for b in range(N_BINS)])
+            tv += 0.5 * float(_np.abs(h / max(h.sum(), _EPS_TV) - p / max(p.sum(), _EPS_TV)).sum())
+        result["look_hist_tv"] = tv / 2.0
+        return
     # Continuous (vMF) heads: look_dll = log(4π) − mean_NLL (uniform-on-sphere
     # baseline NLL = log 4π). Linear in NLL, so the raw-summed stats combine exactly.
     if "lookdist_nll_sum" in result:
@@ -1428,7 +1452,6 @@ class StreamingSource:
         prefetch_depth: int = 4,
         n_workers: int = 1,
         engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
-        needs_move_hazard: bool = False,
         resample_ratio: int = 1,
     ) -> None:
         self._ll = ll
@@ -1436,10 +1459,6 @@ class StreamingSource:
         self._resample_ratio = int(resample_ratio)
         self._resampled_cache: dict[int, Any] = {}
         self._engagement_ema_alpha = float(engagement_ema_alpha)
-        # a25 move-hazard (WHEN-law) opt-in. When False (every run that doesn't
-        # train the hazard head) the derivation + injection are skipped entirely
-        # — byte-identical to before.
-        self._needs_move_hazard = bool(needs_move_hazard)
         orig_eps = list(ll.episodes)
         if self._resample_ratio > 1:
             # Load-time temporal resample (qnn.bc.resample): remap each episode to
@@ -1510,16 +1529,8 @@ class StreamingSource:
         # a27 MTP aux label (censored time-to-next-op-discharge bucket), derived
         # per episode alongside the other attack-derived columns.
         self._attack_future: torch.Tensor | None = None
-        # a25 hazard columns (held_class/dwell_age → obs, release/valid → act),
-        # per-frame and indexed by the same global order as self._jump_dist.
-        self._hz_held: torch.Tensor | None = None
-        self._hz_dwell: torch.Tensor | None = None
-        self._hz_release: torch.Tensor | None = None
-        self._hz_valid: torch.Tensor | None = None
         if self.episodes:
             self._precompute_distances()
-            if self._needs_move_hazard:
-                self._precompute_move_hazard()
 
     def _open_shard(self, shard_idx: int):
         """``open_shard`` wrapper that lazily unpacks the packed ``move`` byte.
@@ -1644,34 +1655,6 @@ class StreamingSource:
             self._attack_shifted = torch.from_numpy(np.concatenate(att_shift_parts, axis=0)).to(self.device)
         if any_attack_future:
             self._attack_future = torch.from_numpy(np.concatenate(att_future_parts, axis=0)).to(self.device)
-
-    def _precompute_move_hazard(self) -> None:
-        """a25: derive the per-frame move-hazard columns from act_move, episode
-        by episode (no recollect, no disk cache). Held on device and injected in
-        ``_make_batch`` exactly like ``_jump_dist``. Gated by needs_move_hazard.
-
-        held_class/dwell_age describe the semi-Markov decode state entering each
-        frame; release is the binary switch-next-tick target; valid masks the
-        episode start (no prior frame). See
-        qnn.model.hazard_labels.derive_hazard_labels.
-        """
-        from qnn.model.hazard_labels import derive_hazard_labels
-        held_parts: list[np.ndarray] = []
-        dwell_parts: list[np.ndarray] = []
-        release_parts: list[np.ndarray] = []
-        valid_parts: list[np.ndarray] = []
-        for ep in self.episodes:
-            view = self._open_shard(int(ep.shard_idx))
-            move = np.asarray(view.actions["move"][int(ep.row_start):int(ep.row_end)])
-            cols = derive_hazard_labels(move.reshape(move.shape[0], -1))
-            held_parts.append(cols["held_class"])
-            dwell_parts.append(cols["dwell_age"])
-            release_parts.append(cols["release"])
-            valid_parts.append(cols["valid"])
-        self._hz_held = torch.from_numpy(np.concatenate(held_parts, axis=0)).to(self.device)
-        self._hz_dwell = torch.from_numpy(np.concatenate(dwell_parts, axis=0)).to(self.device)
-        self._hz_release = torch.from_numpy(np.concatenate(release_parts, axis=0)).to(self.device)
-        self._hz_valid = torch.from_numpy(np.concatenate(valid_parts, axis=0)).to(self.device)
 
     def _ensure_dequant(self) -> None:
         if not self._needs_dequant or self._dequant_chain:
@@ -1815,13 +1798,6 @@ class StreamingSource:
             act_t["attack_shifted"] = self._attack_shifted.index_select(0, indices)
         if self._attack_future is not None:
             act_t["attack_future_bucket"] = self._attack_future.index_select(0, indices)
-        if self._hz_held is not None:
-            # a25 hazard: held_class/dwell_age feed the head (obs); release/valid
-            # are its loss labels (act). Same global indexing as _jump_dist.
-            obs_t["move_held_class"] = self._hz_held.index_select(0, indices)
-            obs_t["move_dwell_age"] = self._hz_dwell.index_select(0, indices)
-            act_t["move_hazard_release"] = self._hz_release.index_select(0, indices)
-            act_t["move_hazard_valid"] = self._hz_valid.index_select(0, indices)
         return obs_t, act_t
 
     def _to_device(self, v: np.ndarray) -> torch.Tensor:
@@ -1906,11 +1882,6 @@ class StreamingSource:
         view._attack_future = (
             self._attack_future[:n_rows_head] if self._attack_future is not None else None
         )
-        view._needs_move_hazard = self._needs_move_hazard
-        view._hz_held = self._hz_held[:n_rows_head] if self._hz_held is not None else None
-        view._hz_dwell = self._hz_dwell[:n_rows_head] if self._hz_dwell is not None else None
-        view._hz_release = self._hz_release[:n_rows_head] if self._hz_release is not None else None
-        view._hz_valid = self._hz_valid[:n_rows_head] if self._hz_valid is not None else None
         return view
 
 
@@ -1923,7 +1894,6 @@ def make_streaming_source(
     prefetch_depth: int = 4,
     n_workers: int = 1,
     engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
-    needs_move_hazard: bool = False,
     resample_ratio: int = 1,
 ) -> StreamingSource:
     """Build a :class:`StreamingSource` from a sharded BC cache directory."""
@@ -1934,7 +1904,6 @@ def make_streaming_source(
         prefetch_depth=prefetch_depth,
         n_workers=n_workers,
         engagement_ema_alpha=engagement_ema_alpha,
-        needs_move_hazard=needs_move_hazard,
         resample_ratio=resample_ratio,
     )
 
@@ -1949,7 +1918,6 @@ def make_resident_source_from_cache(
     engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
     compact_dequantized: bool = True,
     progress_interval_seconds: float = 5.0,
-    needs_move_hazard: bool = False,
     resample_ratio: int = 1,
 ) -> ResidentSource:
     """Materialize a device-resident source directly from sharded cache files.
@@ -1957,7 +1925,7 @@ def make_resident_source_from_cache(
     This is the streaming=false low-RAM preload path (the DEFAULT). It reuses the
     streaming mmap gatherer as an ingestion engine, copying fixed-size chunks
     into final resident tensors on ``device`` — so ``gather``'s derived columns
-    (incl. the a25 hazard columns when ``needs_move_hazard``) are materialized
+    are materialized
     into the resident tensors and need no separate resident-side derivation.
     """
     import time as _time
@@ -1970,7 +1938,6 @@ def make_resident_source_from_cache(
         prefetch_depth=0,
         n_workers=0,
         engagement_ema_alpha=engagement_ema_alpha,
-        needs_move_hazard=needs_move_hazard,
         resample_ratio=resample_ratio,
     )
     n_rows = streaming.n_total_rows

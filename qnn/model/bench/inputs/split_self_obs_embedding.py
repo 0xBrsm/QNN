@@ -12,7 +12,7 @@ expressed as a :class:`TokenBuilder` over named ``obs_fields``:
                 (PENT / RING / MEGAHEALTH)
 * ``arsenal``  per-weapon readiness×subject sum (inventory), arsenal
                 powerups (QUAD). Pure inventory — what the weapon head reads.
-                Held-weapon id (incumbent leak) and attack_finished (held-weapon
+                Equipped-weapon id (incumbent leak) and attack_finished (equipped-weapon
                 refire state → weapon token) are deliberately NOT here.
 * ``motion``   vel_xyz, view_pitch, look_delta, movement_id, motion powerups
                 (SUIT) — the canonical ``MOTION_FIELDS`` list.
@@ -57,8 +57,8 @@ class SplitSelfObsEmbedding(ObsEmbedding):
         # Arsenal = pure INVENTORY: per-weapon readiness (ownership×ammo) +
         # arsenal powerup (QUAD). This is what the weapon head reads.
         # Deliberately excluded:
-        #   - held-weapon id      → incumbent leak for the weapon head.
-        #   - attack_finished     → first-class on the held-weapon token and
+        #   - equipped-weapon id  → incumbent leak for the weapon head.
+        #   - attack_finished     → first-class on the equipped-weapon token and
         #                           nowhere else (its single home); never in
         #                           the arsenal/inventory token.
         arsenal_fields = [WeaponReadiness(), VocabSum("powerup_arsenal")]

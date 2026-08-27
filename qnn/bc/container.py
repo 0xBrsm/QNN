@@ -120,6 +120,59 @@ def validate_cache_for_training(
             )
 
 
+# Head names whose HeadNodeSpec.hz is meaningful today (mirrors the "hz"
+# override key qnn.model.graph.spec.HeadNodeSpec.from_dict allows only for
+# name == "look_seg"). Every other head's hz field is unreachable from JSON
+# (from_dict rejects the key) and stays at the dataclass default 0, so
+# checking it would false-positive on every graph. Add a name here if another
+# head type gains its own hz parameterization.
+_HZ_BEARING_HEADS = ("look_seg",)
+
+
+def validate_head_hz_against_fixed_tick_hz(graph: Any, fixed_tick_hz: int) -> None:
+    """Fail loud if a head's corpus-tick-rate parameter disagrees with the
+    run's ``fixed_tick_hz``.
+
+    Two independent Hz paths exist and nothing else cross-checks them: this
+    train config's ``fixed_tick_hz`` (drives the load-time corpus resample,
+    qnn.bc.resample, and what the loader actually feeds the model) and each
+    head's own ``HeadNodeSpec.hz`` (drives which ``look_seg_bins`` table
+    ``look_seg`` labels/decodes against, resolved via
+    ``look_seg_bins.resolve_hz``). A probe.json that adds a ``look_seg`` head
+    without stamping ``"hz"`` silently resolves to ``LEGACY_HZ`` (10) — this
+    exact bug class (wrong-Hz quantiles) shipped once already (commit
+    7836cac1) before ``hz`` existed at all.
+
+    ``graph`` is ``None`` for the plain (non-bench) BC path, which has no
+    ``look_seg`` head to check — nothing to validate.
+
+    Deliberately RESOLVES hz (via ``resolve_hz``) before comparing, rather
+    than exempting raw ``hz == 0``: exempting it would just re-open the same
+    silent-default hole this guard exists to close. ``resolve_hz(0)`` is only
+    correct for a head that was actually trained at ``LEGACY_HZ`` — if this
+    run's ``fixed_tick_hz`` differs, an unstamped head is exactly as wrong as
+    a mis-stamped one, and must fail the same way.
+    """
+    if graph is None:
+        return
+    from qnn.model.look_seg_bins import resolve_hz
+
+    target = int(fixed_tick_hz)
+    for head in getattr(graph, "heads", ()):
+        if head.name not in _HZ_BEARING_HEADS:
+            continue
+        raw_hz = int(getattr(head, "hz", 0) or 0)
+        resolved = resolve_hz(raw_hz)
+        if resolved != target:
+            raise ValueError(
+                f"head {head.name!r} hz={raw_hz} resolves to {resolved} Hz, "
+                f"but this run trains at fixed_tick_hz={target}. Stamp "
+                f'"hz": {target} on heads.{head.name} in probe.json (or fix '
+                "fixed_tick_hz) — an unresolved mismatch silently trains "
+                "this head's labels against the wrong look_seg_bins table."
+            )
+
+
 def _bc_cache_paths(config: Any) -> tuple[Path, Path, Path]:
     bc_data_dir = Path(config.bc_data_dir) if hasattr(config, "bc_data_dir") else Path(config.output_dir).parent
     return (
@@ -132,27 +185,27 @@ def _bc_cache_paths(config: Any) -> tuple[Path, Path, Path]:
 def _required_actions_for_config(
     config: Any,
     head_loss_weights: Mapping[str, float],
+    *,
+    graph: Any = None,
 ) -> frozenset[str]:
     required_actions_set: set[str] = set()
-    if config.model.use_weapon_head and float(head_loss_weights.get("attack", 1.0)) > 0.0:
+    if float(head_loss_weights.get("attack", 1.0)) > 0.0:
         required_actions_set.add("attack")
     # input_mask is required when labels/derived loss targets depend on
     # op-frame semantics. Corpora without it still train cleanly when
     # those toggles are off.
     if config.input_mask or config.attack_label_shift:
         required_actions_set.add("input_mask")
+    # Fire-at-alignment objective (agents/plans/fire-at-alignment-objective.md):
+    # the attack_with selector's align_weight_gamma knob reads
+    # actions["align_hbw"] (qnn.bc.cache_align_hbw). Fail loud at container
+    # startup rather than silently training with the knob inert — the plain
+    # (non-bench) BC path has no graph/head specs to inspect, so this only
+    # ever fires for bench probes that set the knob.
+    for head in getattr(graph, "heads", ()):
+        if head.name == "attack" and float(getattr(head, "align_weight_gamma", 0.0)) > 0.0:
+            required_actions_set.add("align_hbw")
     return frozenset(required_actions_set)
-
-
-def _needs_move_hazard(config: Any, head_loss_weights: Mapping[str, float] | None = None) -> bool:
-    """a25: does this run train the move-hazard head? Derived from the run's
-    head_loss_weights so it is correct even when the caller (e.g. the ablation
-    daemon's source-bundle build) passes only ``config`` — config.head_loss_weights
-    is a raw JSON string, so parse it via effective_head_loss_weights."""
-    weights = head_loss_weights if head_loss_weights is not None else effective_head_loss_weights(
-        config.head_loss_weights
-    )
-    return bool(float((weights or {}).get("move_hazard", 0.0)) > 0.0)
 
 
 def _source_compatibility_key(
@@ -174,9 +227,6 @@ def _source_compatibility_key(
         _json_key(config.token_mask),
         tuple(sorted(required_actions)),
         float(config.engagement_ema_alpha),
-        # a25: hazard runs carry extra derived obs/act columns, so they must not
-        # share a cached source bundle with hazard-less runs (and vice versa).
-        _needs_move_hazard(config),
         # The pinned corpus identity. build_behavior_cloning_sources verifies
         # this against the corpus's fingerprint.json — but ONLY when it builds.
         # On the daemon's reuse path the build is skipped, so without this a run
@@ -194,9 +244,9 @@ def _source_compatibility_key(
     )
 
 
-def source_compatibility_key_for_config(config: Any) -> tuple[Any, ...]:
+def source_compatibility_key_for_config(config: Any, *, graph: Any = None) -> tuple[Any, ...]:
     head_loss_weights = effective_head_loss_weights(config.head_loss_weights)
-    required_actions = _required_actions_for_config(config, head_loss_weights)
+    required_actions = _required_actions_for_config(config, head_loss_weights, graph=graph)
     return _source_compatibility_key(config, required_actions=required_actions)
 
 
@@ -205,9 +255,10 @@ def validate_source_bundle_compatible(
     bundle: BCSourceBundle,
     *,
     head_loss_weights: Mapping[str, float] | None = None,
+    graph: Any = None,
 ) -> None:
     weights = head_loss_weights if head_loss_weights is not None else effective_head_loss_weights(config.head_loss_weights)
-    required_actions = _required_actions_for_config(config, weights)
+    required_actions = _required_actions_for_config(config, weights, graph=graph)
     expected = _source_compatibility_key(config, required_actions=required_actions)
     if bundle.compatibility_key != expected:
         raise RuntimeError(
@@ -227,21 +278,43 @@ def validate_source_bundle_compatible(
     if baked is not None:
         bc_data_dir, _train_cache, _val_cache = _bc_cache_paths(config)
         current = collection_fingerprint.load(bc_data_dir)
-        if current is not None and current.get("fingerprint") != baked.get("fingerprint"):
-            raise RuntimeError(
-                "BC source bundle was built from a different collect than the "
-                f"corpus now on disk at {bc_data_dir}: bundle baked "
-                f"{baked.get('fingerprint')!r}, disk now has "
-                f"{current.get('fingerprint')!r}. The corpus was recollected "
-                "while this bundle was cached — reset the daemon (or restart it) "
-                "so the next submit rebuilds from the current data."
-            )
+        if current is not None:
+            # Schema-aware: baked and current can legitimately be different
+            # fingerprint SCHEMA versions (e.g. the corpus was recollected
+            # under a newer qnn.collection_fingerprint that added
+            # components) without the underlying corpus having changed at
+            # all. A raw composite-hash `!=` can't tell those apart and
+            # would misreport every schema bump as corpus drift.
+            cmp = collection_fingerprint.compare(baked, current)
+            if not cmp["equivalent"]:
+                detail = (
+                    f"schema v{cmp['schema_a']} vs v{cmp['schema_b']}, "
+                    f"differing components: {cmp['differing_components']}"
+                    if cmp["schema_mismatch"] else
+                    f"differing components: {cmp['differing_components']}"
+                )
+                raise RuntimeError(
+                    "BC source bundle was built from a different collect than the "
+                    f"corpus now on disk at {bc_data_dir}: bundle baked "
+                    f"{baked.get('fingerprint')!r}, disk now has "
+                    f"{current.get('fingerprint')!r} ({detail}). The corpus was "
+                    "recollected while this bundle was cached — reset the daemon "
+                    "(or restart it) so the next submit rebuilds from the current data."
+                )
+            elif cmp["schema_mismatch"]:
+                print(
+                    "  [bc] note: collection fingerprint schema upgraded "
+                    f"(v{cmp['schema_a']} -> v{cmp['schema_b']}) on disk at "
+                    f"{bc_data_dir}, but the corpus content is unchanged "
+                    "(common components match) — not treated as drift"
+                )
 
 
 def build_behavior_cloning_sources(
     config: Any,
     *,
     head_loss_weights: Mapping[str, float] | None = None,
+    graph: Any = None,
 ) -> BCSourceBundle:
     """Build reusable train/val sources for BC.
 
@@ -271,7 +344,7 @@ def build_behavior_cloning_sources(
     )
     print(f"  [bc] collection fingerprint: {actual_fp['fingerprint']}")
 
-    required_actions = _required_actions_for_config(config, weights)
+    required_actions = _required_actions_for_config(config, weights, graph=graph)
     validate_cache_for_training(train_cache, required_actions=required_actions)
     if val_cache.exists():
         validate_cache_for_training(val_cache, required_actions=required_actions)
@@ -299,11 +372,6 @@ def build_behavior_cloning_sources(
     _t0 = _time.monotonic()
     eng_alpha = float(config.engagement_ema_alpha)
     device = resolve_torch_device(str(config.device)).device
-    # a25: derive the move-hazard columns on the fly only when the run trains
-    # that head. Derived from config so it is correct even when called WITHOUT
-    # head_loss_weights (the ablation daemon's source-bundle build passes only
-    # config) — that gap is exactly what KeyError'd 'move_held_class' before.
-    needs_move_hazard = _needs_move_hazard(config, head_loss_weights)
     if bool(config.streaming):
         print(f"  [bc] streaming=true: lazy mmap reads from {train_cache}")
         train_source = make_streaming_source(
@@ -311,7 +379,6 @@ def build_behavior_cloning_sources(
             segment_mask=config.segment_mask, token_mask=config.token_mask,
             prefetch_depth=max(2, int(config.prefetch)),
             engagement_ema_alpha=eng_alpha,
-            needs_move_hazard=needs_move_hazard,
             resample_ratio=resample_ratio,
         )
         val_source = (
@@ -320,8 +387,7 @@ def build_behavior_cloning_sources(
                 segment_mask=config.segment_mask, token_mask=config.token_mask,
                 prefetch_depth=max(2, int(config.prefetch)),
                 engagement_ema_alpha=eng_alpha,
-                needs_move_hazard=needs_move_hazard,
-                resample_ratio=resample_ratio,
+                    resample_ratio=resample_ratio,
             ) if val_cache.exists()
             else make_resident_source([], device, engagement_ema_alpha=eng_alpha)
         )
@@ -336,7 +402,6 @@ def build_behavior_cloning_sources(
             chunk_rows=int(os.environ.get("QNN_BC_RESIDENT_PRELOAD_CHUNK_ROWS", "65536")),
             engagement_ema_alpha=eng_alpha,
             compact_dequantized=True,
-            needs_move_hazard=needs_move_hazard,
             resample_ratio=resample_ratio,
         )
         _gc.collect()
@@ -351,8 +416,7 @@ def build_behavior_cloning_sources(
                 chunk_rows=int(os.environ.get("QNN_BC_RESIDENT_PRELOAD_CHUNK_ROWS", "65536")),
                 engagement_ema_alpha=eng_alpha,
                 compact_dequantized=True,
-                needs_move_hazard=needs_move_hazard,
-                resample_ratio=resample_ratio,
+                    resample_ratio=resample_ratio,
             )
         else:
             val_source = make_resident_source([], device, engagement_ema_alpha=eng_alpha)

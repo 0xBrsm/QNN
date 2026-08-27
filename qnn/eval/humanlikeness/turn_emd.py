@@ -4,7 +4,7 @@ Report-card ruler (retired from every gate — acquisition-band membership
 replaced it there) shared by the decode-fit style report and the
 turn-fidelity analysis. Moved verbatim from the retired
 ``qnn.eval.skill_vector`` (decode-fit v2). NG/SNG score against POOLED nail
-reference mass (kinematics-identical and individually thin). Held-keyed both
+reference mass (kinematics-identical and individually thin). Equip-keyed both
 sides — never compare to pre-repair (pre-atan2-comb, 7/08) EMD numbers.
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ def _pooled_nail_ref(reference: dict) -> dict:
 def perweapon_emd_from_eval(summary: dict, reference: dict) -> dict[str, float | None]:
     """Score per-weapon turn-EMD (repaired ruler) from an eval_summary's
     ``engine_turn_by_los_angle_per_weapon``. NG/SNG scored against the POOLED
-    nail reference mass. Held-keyed both sides (the ruler stays held)."""
+    nail reference mass. Equip-keyed both sides (the ruler stays keyed on equip state)."""
     per_w = summary.get("engine_turn_by_los_angle_per_weapon") or {}
     turn_bins = reference["turn_bins"]
     los_bins = reference["los_bins"]

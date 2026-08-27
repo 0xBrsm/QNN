@@ -54,7 +54,6 @@ from qnn.decode_fit.context import (
     _git_sha,
     INSTRUMENT_WEAPONS,
     MODELNAME_TO_ABBR,
-    WEAPON_IMPULSE,
     read_json,
     rel_to_repo,
 )
@@ -321,7 +320,14 @@ def _env_sig(spawn_face_away: int, fov: int, episodes_per_cell: int) -> dict:
             # asymmetric window (events.TRACKING_WINDOW_ENV). Waves without the
             # window npz (pre-instrument) or on the old symmetric ±4 capture
             # must not be resumed.
-            "aim_stat": "tracking-window-k16pre4post"}
+            "aim_stat": "tracking-window-k16pre4post",
+            # constant, but IN the signature: every wave built before the
+            # E9/E10 look-applier fix (04ee17de — atan2 pitch + increment
+            # apply replaced by the exact basis inverse) ran the bot through
+            # a broken pitch actuator; every closed-loop aim measurement from
+            # that regime is contaminated (a26-superiority-decomposition.md
+            # E10 blast radius) and must not be resumed.
+            "look_applier": "e9e10-exact-inverse"}
 
 
 # Each PROCESS shard spawns its own full engine set (eval_num_envs pairs), so
@@ -692,8 +698,16 @@ def collect_tracking(wave_dirs: list[Path]) -> EventTable:
 
 def collect_forced_attack_rate(wave_dirs: list[Path],
                                abbr: str) -> dict[str, float]:
-    """Conditional attack-pulse rate for one forced-weapon pin cell."""
-    impulse = WEAPON_IMPULSE[abbr]
+    """Conditional attack-pulse rate for one forced-weapon pin cell.
+
+    Weapon attribution is BY THE PIN: the cell forces ``abbr`` with infinite
+    ammo, so every tick of the wave is that weapon's exposure by construction
+    — no held-weapon lane is read. (The gate ``weapon`` column is the intent
+    channel on a26 and the fired attack-with class — zero on holds — on a27+;
+    neither is "held", and the human reference this rate is fit against
+    (qnn.human.op_attack) attributes by attack context, never held weapon.)
+    Denominator = keep ∧ engaged ticks, the model-side mirror of the human
+    engaged-LOS conditional."""
     fires = 0
     engaged = 0
     tick_hz: float | None = None
@@ -707,10 +721,14 @@ def collect_forced_attack_rate(wave_dirs: list[Path],
                 raise ValueError(
                     f"forced cadence tick_hz mismatch: {tick_hz} vs {hz} in {p}")
             tick_hz = hz
+            if "engaged" not in z:
+                raise ValueError(
+                    f"forced cadence stream {p} lacks the band-v5 'engaged' "
+                    "lane (pre-v5 wave) — rebuild the wave")
             keep = np.asarray(z["keep"]).astype(bool)
-            weapon = np.asarray(z["weapon"]).astype(np.int64)
+            eng = np.asarray(z["engaged"]).astype(bool)
             attack = np.asarray(z["attack"]).astype(bool)
-            mask = keep & (weapon == impulse)
+            mask = keep & eng
             engaged += int(mask.sum())
             fires += int((attack & mask).sum())
     if tick_hz is None or engaged == 0:
@@ -760,14 +778,25 @@ def collect_acq_throughput(ctx, wave_dirs: list[Path]) -> list[dict]:
 # ── free play (deployment-report instrument) ──────────────────────────────────
 
 def run_freeplay(ctx, decode_config: Path, template_run_dir: Path, *,
-                 tag: str) -> Path | None:
+                 tag: str, episodes: int | None = None,
+                 num_envs: int | None = None) -> Path | None:
     """Free-play arena eval at an emitted decode config (the v1
     ``_launch_validation_eval`` port): clone the template eval run-dir into
     ``ctx.waves_dir/freeplay_<tag>``, point ``eval_decode_regime`` at
     ``decode_config``, force the action + acq stream logs, run the router
     (timeout ``FREEPLAY_TIMEOUT_S``), and return
     ``metrics/eval/move_streams_sampled.npz`` — or None on failure/timeout.
-    A completed dir (npz present) is reused without relaunching."""
+    A completed dir (npz present) is reused without relaunching.
+
+    ``episodes``/``num_envs`` optionally override the template's own
+    ``machine.json`` ``eval_num_episodes``/``eval_num_envs`` (budget-
+    conscious sample sizing — e.g. the weapon-switch-evidence phase-2 fit's
+    per-candidate round count, or a smoke test's tiny sample). ``None``
+    (the default, every pre-existing call site) leaves the template's own
+    values untouched and the dir name unchanged. When either is set it rides
+    the CONTENT key (dir-name suffix) too — otherwise a later full-size call
+    reusing the same tag+config sha would silently resume the SMALLER
+    override sample as if it were the real one."""
     template = Path(template_run_dir)
     # CONTENT-keyed dir: the trim mutates the decode config between
     # iterations under reused tags — resuming on npz existence alone would
@@ -778,9 +807,14 @@ def run_freeplay(ctx, decode_config: Path, template_run_dir: Path, *,
     # scorer a stale-schema npz it can only refuse.
     from qnn.decode_fit.context import sha256_file
     from qnn.schema import GATE_STREAM_SCHEMA_VERSION
+    override_suffix = ""
+    if episodes is not None:
+        override_suffix += f"_e{int(episodes)}"
+    if num_envs is not None:
+        override_suffix += f"_w{int(num_envs)}"
     dst = Path(ctx.waves_dir) / (
         f"freeplay_{tag}_{sha256_file(Path(decode_config))[:8]}"
-        f"_g{GATE_STREAM_SCHEMA_VERSION}")
+        f"_g{GATE_STREAM_SCHEMA_VERSION}{override_suffix}")
     npz_out = dst / "metrics" / "eval" / "move_streams_sampled.npz"
     if npz_out.exists():
         return npz_out
@@ -808,6 +842,15 @@ def run_freeplay(ctx, decode_config: Path, template_run_dir: Path, *,
     t["eval_log_acq_streams"] = True
     t["eval_batched_forward"] = True
     (dst / "config" / "train.json").write_text(json.dumps(t, indent=1) + "\n")
+
+    if episodes is not None or num_envs is not None:
+        mc = read_json(dst / "config" / "machine.json")
+        if episodes is not None:
+            mc["eval_num_episodes"] = int(episodes)
+        if num_envs is not None:
+            mc["eval_num_envs"] = int(num_envs)
+        (dst / "config" / "machine.json").write_text(
+            json.dumps(mc, indent=2) + "\n")
 
     run = read_json(template / "run.json")
     run["name"] = dst.name

@@ -547,10 +547,6 @@ class EncoderOutput:
     self_readout: torch.Tensor   # (B*, D)
     entity_outs: torch.Tensor    # (B*, N, D)
     entity_mask: torch.Tensor    # (B*, N) bool — True at actor slots
-    # Per-self-token outputs (CLS at index 0), in GraphSpec self-token order, so a
-    # head can read one token as its readout via a ``token.<name>`` edge. Optional:
-    # encoders/scaffolds that don't expose it leave it None (only token edges need it).
-    self_block: torch.Tensor | None = None  # (B*, N_self, D)
 
 
 class TransformerEncoder(nn.Module):
@@ -611,7 +607,6 @@ class TransformerEncoder(nn.Module):
             self_readout=transformed[:, inp.self_slice.start, :],
             entity_outs=transformed[:, inp.entity_slice, :],
             entity_mask=inp.entity_mask,
-            self_block=transformed[:, inp.self_slice, :],
         )
 
 

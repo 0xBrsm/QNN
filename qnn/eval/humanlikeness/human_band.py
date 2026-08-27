@@ -48,7 +48,7 @@ Calibration (all must hold before a verdict is trusted):
   * label-encoded holdout      -> IN band  (Axiom-1 control: the holdout
                                             re-encoded through BC training-label
                                             semantics — op-event attack,
-                                            attack-with held weapon, look-grid
+                                            attack-with last-fired weapon, look-grid
                                             quantized turn)
   * top/bottom skill quartile  -> IN band  (band is skill-invariant)
   * frame-shuffled human       -> OUT      (the anchor class itself: ratio ~1)
@@ -63,7 +63,7 @@ Usage:
 Model streams: the flat behavior block written by qnn.eval.run with
 eval_log_action_streams=true (move_streams_*.npz): fb/lr/ud {0,1,2},
 attack {0,1}, weapon byte, turn_deg, keep, plus the v5 fields discharge
-(attack ∧ cooldown-ready), weapon_imp (held weapon impulse 0..8) and engaged
+(attack ∧ cooldown-ready), weapon_imp (equipped weapon impulse 0..8) and engaged
 (LOS actor present), episode_offsets, tick_hz. Pre-v5 npz FAIL LOUD (the
 attack/engagement conditioning cannot be reconstructed from them); an explicit
 --legacy-engaged-keep maps engaged:=keep and drops the attack channel, stamped
@@ -92,21 +92,32 @@ from qnn.eval.humanlikeness.core import mmd2_rbf, _median_heuristic_gamma
 from qnn.human.band_bank import (  # noqa: F401
     BANK_VERSION,
     CHANNELS,
+    DEFAULT_ENCOUNTER_MIN_SEC,
+    ENCOUNTER_BANK_VERSION,
     FEATURE_NAMES,
     FLICK_DEG,
     HUMAN_HZ,
     ZERO_TURN_DEG,
     bank_cache_path,
+    bank_cache_path_encounters,
     bank_filter,
     decimate2,
+    encounter_spans_for_episode,
     featurize,
+    featurize_encounters,
+    featurize_spans,
     load_human_episodes,
+    load_human_episodes_for_encounters,
     load_or_build_bank,
+    load_or_build_bank_encounters,
     shuffle_episode,
+    shuffle_within_encounters,
     window_features,
 )
 
 DEFAULT_OUT = Path("runs/head_probe/_human_band.json")
+# v6 REPORT-ONLY candidate output — never overwrites the frozen v5 default above.
+ENCOUNTER_DEFAULT_OUT = Path("runs/head_probe/_band_v6_encounter_calibration.json")
 
 # Anchored-ratio verdict bar (Axiom 3): in-band iff
 # mmd2_subject / mmd2_shuffled_anchor <= ANCHOR_RATIO_MAX, per channel and for
@@ -118,6 +129,11 @@ DEFAULT_OUT = Path("runs/head_probe/_human_band.json")
 # ~2.5x margin on BOTH sides, the widest defensible bar. The decode-fit lead
 # finalizes the gate bar; this constant is the scorer's default.
 ANCHOR_RATIO_MAX = 0.2
+# v6 ENCOUNTER-unit bar (ADOPTED Brian 2026-08-15; research/human-band.md §v6):
+# geometric midpoint of the encounter-unit calibration's worst legitimate-IN
+# (label-encoded 0.131) and lowest corrupted-OUT (shuffled 1.011), 2.78x
+# margins — runs/head_probe/_band_v6_encounter_calibration.json.
+ENCOUNTER_RATIO_MAX = 0.364
 
 _V5_FIELDS = ("discharge", "weapon_imp", "engaged")
 
@@ -282,7 +298,8 @@ def anchor_mmd2s(ref_bank: dict, ctx: dict, n: int, repeats: int,
 
 
 def score_subject(subj_bank: dict, ref_bank: dict, ctx: dict, null: dict,
-                  n: int, repeats: int, seed: int) -> dict:
+                  n: int, repeats: int, seed: int,
+                  ratio_max: float = ANCHOR_RATIO_MAX) -> dict:
     """Score a subject bank against the band. Returns per-channel + family
     verdicts. The decision field is ``anchored_ratio`` (Axiom 3):
     mmd2_subject / mmd2_shuffled_anchor, in-band iff ≤ ANCHOR_RATIO_MAX; the
@@ -312,7 +329,7 @@ def score_subject(subj_bank: dict, ref_bank: dict, ctx: dict, null: dict,
             "mmd2": obs,
             "anchored_ratio": round(float(ratio), 4),
             "anchor_mmd2": round(float(anchors[ch]), 6),
-            "in_band": bool(ratio <= ANCHOR_RATIO_MAX),
+            "in_band": bool(ratio <= ratio_max),
             # report-only null context (Axiom 3: never the decision)
             "pct": round(pct, 2),
             "null_p50": float(np.percentile(nul, 50)),
@@ -331,8 +348,8 @@ def score_subject(subj_bank: dict, ref_bank: dict, ctx: dict, null: dict,
     if fam_defined and fam_ratio is not None:
         res["family"] = {
             "worst_anchored_ratio": round(float(fam_ratio), 4),
-            "ratio_max": ANCHOR_RATIO_MAX,
-            "in_band": bool(fam_ratio <= ANCHOR_RATIO_MAX),
+            "ratio_max": ratio_max,
+            "in_band": bool(fam_ratio <= ratio_max),
             # report-only max-rank context
             "worst_channel_rank": round(float(fam_rank), 4),
             "null_p95_rank": (round(float(np.percentile(fam_null, 95)), 4)
@@ -379,6 +396,19 @@ PERTURBATIONS = {
 }
 
 
+def perturb_shuffle_encounters(ep: dict, hz: float,
+                               rng: np.random.Generator) -> dict:
+    """v6 encounter-unit counterpart of ``perturb_shuffle``: shuffle WITHIN
+    this episode's own encounter spans rather than globally — a global
+    shuffle destroys the pid/engaged structure the spans are defined on, so
+    it can't be re-sliced afterward. This mirrors exactly how the v6 anchor
+    itself is built (``qnn.human.band_bank.shuffle_within_encounters``); the
+    calibration "shuffled" row at the encounter unit is expected to land
+    near the anchor's own ratio (~1) as a self-consistency check."""
+    spans = encounter_spans_for_episode(ep, hz)
+    return shuffle_within_encounters(ep, spans, rng)
+
+
 def _look_grid_mag_centers(data_dir: Path) -> tuple[np.ndarray, float]:
     """(mag_centers_rad incl. hold 0, hold_max_rad) from the collect's pinned
     corpus-fit look grid — the grid every run pins (qnn.human.look_grid)."""
@@ -394,8 +424,8 @@ def label_encode_episode(ep: dict, mag_centers: np.ndarray,
     semantics (a perfect imitator's output). Recipe validated against v4 by the
     axiom1_control harness:
       attack : the op-event stream (== discharge; single-tick decisions)
-      weapon : a25 attack-with — held weapon changes only AT a discharge, to
-               the label weapon there (forward-fill)
+      weapon : a25 attack-with — the last-fired-weapon label changes only AT
+               a discharge, to the label weapon there (forward-fill)
       turn   : magnitude snapped to the pinned polar look grid (θ < hold_max →
                0, else nearest non-hold mag center)
       fb/lr, discharge/wimp/keep/engaged : label == raw (identity).
@@ -466,16 +496,44 @@ def main() -> None:
     ap.add_argument("--profile", type=Path,
                     default=Path("runs/head_probe/_player_profile.json"),
                     help="player profile JSON for the skill-invariance check")
-    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--encounter", action="store_true",
+                    help="v6 REPORT-ONLY candidate: score at the ENCOUNTER unit "
+                         "(qnn.human.encounters) instead of fixed 15s windows. "
+                         "The v5 default path (this flag omitted) is untouched.")
+    ap.add_argument("--min-sec", type=float, default=DEFAULT_ENCOUNTER_MIN_SEC,
+                    help="--encounter admission: encounter length >= this many "
+                         "seconds (PLUS window_features' own engaged-mass rule)")
     args = ap.parse_args()
+    if args.out is None:
+        args.out = ENCOUNTER_DEFAULT_OUT if args.encounter else DEFAULT_OUT
+
+    def _featurize_unit(eps, hz, demos=None):
+        if args.encounter:
+            return featurize_encounters(eps, hz, args.min_sec, demos)
+        return featurize(eps, hz, args.window_sec, demos)
+
+    def _load_ref_bank(hz, human_eps_in=None):
+        if args.encounter:
+            return load_or_build_bank_encounters(
+                args.data_dir, args.split, hz, args.min_sec, human_eps_in)
+        return load_or_build_bank(
+            args.data_dir, args.split, hz, args.window_sec, human_eps_in)
+
+    def _load_corpus_eps():
+        if args.encounter:
+            return load_human_episodes_for_encounters(args.data_dir, args.split)
+        return load_human_episodes(args.data_dir, args.split)
 
     report: dict = {
         "_meta": {
             "split": args.split, "data_dir": str(args.data_dir),
-            "window_sec": args.window_sec, "n_win": args.n_win,
+            "encounter_unit": args.encounter,
+            "window_sec": args.window_sec, "min_sec": args.min_sec,
+            "n_win": args.n_win,
             "n_null": args.n_null, "repeats": args.repeats, "seed": args.seed,
             "channels": list(CHANNELS), "features": FEATURE_NAMES,
-            "bank_version": BANK_VERSION,
+            "bank_version": ENCOUNTER_BANK_VERSION if args.encounter else BANK_VERSION,
             "verdict_rule": ("per-channel in-band iff anchored_ratio = "
                              "MMD^2/anchor <= "
                              f"{ANCHOR_RATIO_MAX} (anchor = frame-shuffled "
@@ -486,10 +544,13 @@ def main() -> None:
         "subjects": {},
     }
 
-    print(f"human_band: building 20 Hz v{BANK_VERSION} bank (split={args.split}, "
-          f"window={args.window_sec}s) ...")
-    bank20, human_eps = load_or_build_bank(args.data_dir, args.split,
-                                           HUMAN_HZ, args.window_sec)
+    if args.encounter:
+        print(f"human_band: building 20 Hz v6 ENCOUNTER bank (split={args.split}, "
+              f"min_sec={args.min_sec}s) [REPORT-ONLY candidate] ...")
+    else:
+        print(f"human_band: building 20 Hz v{BANK_VERSION} bank (split={args.split}, "
+              f"window={args.window_sec}s) ...")
+    bank20, human_eps = _load_ref_bank(HUMAN_HZ)
     n_win20 = {ch: int(bank20[ch]["X"].shape[0]) for ch in CHANNELS}
     print(f"  windows: {n_win20}")
 
@@ -504,7 +565,7 @@ def main() -> None:
     # ---------------- calibration ----------------------------------------
     if args.calibrate:
         if human_eps is None:
-            human_eps = load_human_episodes(args.data_dir, args.split)
+            human_eps = _load_corpus_eps()
         rng = np.random.default_rng(args.seed)
         all_demos = np.unique([d for d, _ in human_eps])
         hold = set(rng.choice(all_demos, args.holdout_demos, replace=False).tolist())
@@ -528,20 +589,33 @@ def main() -> None:
         # labels must also pass (perfect imitation scores human).
         mc, hold_max = _look_grid_mag_centers(args.data_dir)
         eps_l = [label_encode_episode(ep, mc, hold_max) for _, ep in hold_eps]
-        subj_l = featurize(eps_l, HUMAN_HZ, args.window_sec,
-                           [d for d, _ in hold_eps])
+        subj_l = _featurize_unit(eps_l, HUMAN_HZ, [d for d, _ in hold_eps])
         res = score_subject(subj_l, band_bank, ctx, null,
                             args.n_win, args.repeats, args.seed)
         res["expect"] = "in_band"
         report["calibration"]["label_encoded_holdout"] = res
         print_result("label_encoded_holdout (expect IN)", res)
 
-        # 3) perturbed holdout humans must fail
+        # 3) perturbed holdout humans must fail. At the encounter unit, the
+        # "shuffled" case shuffles WITHIN each episode's own (pre-shuffle)
+        # encounter spans and is scored on those SAME fixed spans — a global
+        # shuffle would destroy the pid/engaged structure spans are defined
+        # on, so it can't be re-sliced afterward (see
+        # perturb_shuffle_encounters); this mirrors exactly how the v6 anchor
+        # itself is built, so this row is the anchor-class self-consistency
+        # check (expect ratio ~1).
         for pname, pfun in PERTURBATIONS.items():
             prng = np.random.default_rng(args.seed + 1)
-            eps_p = [pfun(ep, prng) for _, ep in hold_eps]
-            subj_p = featurize(eps_p, HUMAN_HZ, args.window_sec,
-                               [d for d, _ in hold_eps])
+            if args.encounter and pname == "shuffled":
+                spans_h = [encounter_spans_for_episode(ep, HUMAN_HZ)
+                          for _, ep in hold_eps]
+                eps_p = [shuffle_within_encounters(ep, sp, prng)
+                        for (_, ep), sp in zip(hold_eps, spans_h)]
+                subj_p = featurize_spans(eps_p, spans_h, HUMAN_HZ, args.min_sec,
+                                         [d for d, _ in hold_eps])
+            else:
+                eps_p = [pfun(ep, prng) for _, ep in hold_eps]
+                subj_p = _featurize_unit(eps_p, HUMAN_HZ, [d for d, _ in hold_eps])
             res = score_subject(subj_p, band_bank, ctx, null,
                                 args.n_win, args.repeats, args.seed)
             res["expect"] = "out_of_band"
@@ -588,7 +662,7 @@ def main() -> None:
             except ValueError as e:
                 print(f"SKIP {e}")
                 continue
-            subj = featurize(eps, hz, args.window_sec)
+            subj = _featurize_unit(eps, hz)
             if args.legacy_engaged_keep:
                 # legacy npz: the zeroed discharge stream would score as a
                 # maximal under-fire artifact — drop the channel VISIBLY.
@@ -599,8 +673,7 @@ def main() -> None:
             else:
                 if bank10 is None:
                     print(f"building {hz:g} Hz decimated bank ...")
-                    bank10, human_eps = load_or_build_bank(
-                        args.data_dir, args.split, hz, args.window_sec, human_eps)
+                    bank10, human_eps = _load_ref_bank(hz, human_eps)
                     ctx10 = band_context(bank10, args.seed)
                 ref, ctx, hzkey = bank10, ctx10, 10
             counts = [int(subj[ch]["X"].shape[0]) for ch in CHANNELS

@@ -25,19 +25,68 @@ from pathlib import Path
 import numpy as np
 
 from qnn.eval.humanlikeness.core import (  # noqa: E402
-    dwell_times, switch_rate, onset_intervals, compare_samples,
-    mmd2_rbf_permutation_test, describe,
+    dwell_times, switch_rate, onset_intervals, preference_pairs,
+    compare_samples, mmd2_rbf_permutation_test, describe,
 )
 from qnn.eval.humanlikeness.human_reference import _episodes, AXES, FLICK_DEG  # noqa: E402
 
 HUMAN_HZ = 20.0  # qwd corpus is labeled/downsampled to 20 Hz (labeler GBT + relabel table)
 
+def _preference_events(attack_class: np.ndarray, keep: np.ndarray):
+    """Operative discharge events for the weapon-preference ruler:
+    ``(frame_idx, weapon_label)`` at engaged discharges (a27 labels
+    ``attack`` only when a discharge occurs; impulse-coded 1..8)."""
+    ac = np.asarray(attack_class).reshape(-1)
+    idx = np.flatnonzero((ac >= 1) & (ac <= 8))
+    idx = idx[np.asarray(keep).reshape(-1)[idx]]
+    return idx, ac[idx]
+
+
+def _invalidated_pairs(idx: np.ndarray,
+                       streams: dict[str, np.ndarray] | None) -> np.ndarray | None:
+    """Stationary-menu gate per consecutive-discharge pair ``(i, i+1)``:
+    True (pair excluded) when the preference carry was invalidated by a
+    STATE CHANGE anywhere in ``(t_i, t_{i+1}]`` —
+
+      * the weapon-feasibility mask changed (``streams["feas"]``,
+        engine_norm.weapon_feasibility_bits: owned & pool non-empty, the
+        model's own choice-set predicate): a weapon entering or leaving
+        the decision space means the two discharges chose from different
+        menus, which says nothing about preference (dry-outs, pickups,
+        respawn loadout resets); or
+      * a death tick (``streams["health"]`` ≤ 0): a fixed-loadout respawn
+        can be mask-invisible but still resets the equipped weapon and the
+        whole tactical context.
+
+    Returns None when the streams are unavailable (pairs then count
+    ungated — an upper bound on the preference switch rate)."""
+    if streams is None:
+        return None
+    if idx.size < 2:
+        return np.zeros(max(idx.size - 1, 0), dtype=bool)
+    # prefix[j] = count of flagged ticks in [0, j); flags in (a, b] =
+    # prefix[b+1] - prefix[a+1].
+    def _prefix(flag):
+        return np.concatenate([[0], np.cumsum(flag.astype(np.int64))])
+    feas = np.asarray(streams["feas"]).reshape(-1)
+    changed = _prefix(np.concatenate([[False], feas[1:] != feas[:-1]]))
+    dead = _prefix(np.asarray(streams["health"]).reshape(-1) <= 0)
+    a, b = idx[:-1], idx[1:]
+    return ((changed[b + 1] - changed[a + 1]) > 0) \
+        | ((dead[b + 1] - dead[a + 1]) > 0)
+
 
 def collect_human(data_dir: Path, split: str) -> dict:
-    """Raw human samples per channel (engaged frames), units = frames."""
+    """Raw human samples per channel (engaged frames), units = frames.
+
+    ``weapon_switch`` is the PREFERENCE switch rate: switches per counted
+    consecutive-discharge pair (dimensionless), pairs gated to
+    stationary-menu windows (``_invalidated_pairs``);
+    ``weapon_dwell`` = frames spanned by same-weapon discharge streaks."""
     move_dwell = {ax: [] for ax in AXES}
     move_sw = {ax: [0, 0] for ax in AXES}
     wpn_dwell, wpn_sw = [], [0, 0]
+    wpn_feas_gated = False
     atk_run, atk_onset, atk_sw = [], [], [0, 0]
     turn_all = []
     for ep in _episodes(data_dir, split):
@@ -47,9 +96,16 @@ def collect_human(data_dir: Path, split: str) -> dict:
             d = dwell_times(lab, keep)
             if d.size: move_dwell[ax].append(d)
             _, ns, nt = switch_rate(lab, keep); move_sw[ax][0] += ns; move_sw[ax][1] += nt
-        d = dwell_times(ep["attack_context"], keep)
+        # Weapon channel = PREFERENCE ruler: consecutive engaged discharges,
+        # did the weapon change — pairs whose menu changed (feasibility-mask
+        # change / death) excluded from numerator and denominator
+        # (core.preference_pairs).
+        ev, wlab = _preference_events(ep["attack_class"], keep)
+        inv = _invalidated_pairs(ev, ep["pref_streams"])
+        wpn_feas_gated = wpn_feas_gated or inv is not None
+        ns, npair, d = preference_pairs(wlab, ev, inv)
+        wpn_sw[0] += ns; wpn_sw[1] += npair
         if d.size: wpn_dwell.append(d)
-        _, ns, nt = switch_rate(ep["attack_context"], keep); wpn_sw[0] += ns; wpn_sw[1] += nt
         r = dwell_times(ep["attack"], keep, only_value=1)
         if r.size: atk_run.append(r)
         oi = onset_intervals(ep["attack"], keep, onset_value=1)
@@ -63,6 +119,8 @@ def collect_human(data_dir: Path, split: str) -> dict:
         "move_switch": {ax: (move_sw[ax][0] / move_sw[ax][1] if move_sw[ax][1] else 0.0) for ax in AXES},
         "weapon_dwell": cat(wpn_dwell),
         "weapon_switch": wpn_sw[0] / wpn_sw[1] if wpn_sw[1] else 0.0,
+        "weapon_pairs": wpn_sw[1],
+        "weapon_feas_gated": wpn_feas_gated,
         "attack_run": cat(atk_run), "attack_onset": cat(atk_onset),
         "attack_switch": atk_sw[0] / atk_sw[1] if atk_sw[1] else 0.0,
         "turn": cat(turn_all).astype(np.float64),
@@ -71,12 +129,39 @@ def collect_human(data_dir: Path, split: str) -> dict:
 
 
 def collect_bot(npz_path: Path) -> dict:
-    """Raw bot samples per channel (engaged frames = actor visible), units = frames."""
+    """Raw bot samples per channel (engaged frames = actor visible), units = frames.
+
+    Weapon channel = the PREFERENCE ruler (core.preference_pairs), same
+    construction as collect_human: events are engaged discharge ticks, the
+    event label is the weapon that physically discharged. Sources by
+    schema: ≥6 ``weapon_pref`` (equip impulse at discharge ticks, emitted
+    by the writer); 5 equip-at-discharge (``weapon_held``; the ``weapon``
+    DECISION can lead equip by a tick under switch latency); pre-5 the
+    ``weapon`` column (a26-era per-tick selection, which equals the
+    discharging weapon on discharge ticks). Equip-state dwell/switch is
+    retired: equip churn is not preference (weapon scripting), and the
+    events-only a27 ``weapon`` column measured the fire toggle (the a28rc1
+    trim stall). At schema ≥ 6 the npz carries the per-tick
+    ``weapon_feas`` bitmask (the model's own choice-set predicate) plus
+    ``health``, and pairs are gated to stationary-menu windows by the
+    SAME ``_invalidated_pairs`` rule as the human side; on older npz
+    pairs are ungated — an upper bound."""
     z = np.load(npz_path)
     hz = float(z["tick_hz"][0])
     offs = z["episode_offsets"]
     move = {ax: z[ax] for ax in AXES}
-    wpn, atk, turn, keep = z["weapon"], z["attack"], z["turn_deg"], z["keep"]
+    if "weapon_pref" in z:
+        wpn = z["weapon_pref"]
+    elif "weapon_held" in z:
+        wpn = z["weapon_held"]
+    else:
+        wpn = z["weapon"]
+    disch = z["discharge"] if "discharge" in z else None
+    pref_streams_all = (
+        {"feas": np.asarray(z["weapon_feas"]),
+         "health": np.asarray(z["health"], dtype=np.int64)}
+        if ("weapon_feas" in z and "health" in z) else None)
+    atk, turn, keep = z["attack"], z["turn_deg"], z["keep"]
     md = {ax: [] for ax in AXES}; msw = {ax: [0, 0] for ax in AXES}
     wd, wsw = [], [0, 0]
     ar, ao, asw = [], [], [0, 0]
@@ -89,9 +174,17 @@ def collect_bot(npz_path: Path) -> dict:
             d = dwell_times(lab, k)
             if d.size: md[ax].append(d)
             _, ns, nt = switch_rate(lab, k); msw[ax][0] += ns; msw[ax][1] += nt
-        d = dwell_times(wpn[sl], k)
+        ev_src = disch[sl] if disch is not None else wpn[sl]
+        ev = np.flatnonzero(np.asarray(ev_src) != 0)
+        ev = ev[np.asarray(k)[ev]]
+        wlab = np.asarray(wpn[sl])[ev]
+        ev, wlab = ev[wlab != 0], wlab[wlab != 0]
+        streams_ep = ({key: v[sl] for key, v in pref_streams_all.items()}
+                      if pref_streams_all is not None else None)
+        ns, npair, d = preference_pairs(
+            wlab, ev, _invalidated_pairs(ev, streams_ep))
+        wsw[0] += ns; wsw[1] += npair
         if d.size: wd.append(d)
-        _, ns, nt = switch_rate(wpn[sl], k); wsw[0] += ns; wsw[1] += nt
         r = dwell_times(atk[sl], k, only_value=1)
         if r.size: ar.append(r)
         oi = onset_intervals(atk[sl], k, onset_value=1)
@@ -105,6 +198,8 @@ def collect_bot(npz_path: Path) -> dict:
         "move_switch": {ax: (msw[ax][0] / msw[ax][1] if msw[ax][1] else 0.0) for ax in AXES},
         "weapon_dwell": cat(wd),
         "weapon_switch": wsw[0] / wsw[1] if wsw[1] else 0.0,
+        "weapon_pairs": wsw[1],
+        "weapon_feas_gated": pref_streams_all is not None,
         "attack_run": cat(ar), "attack_onset": cat(ao),
         "attack_switch": asw[0] / asw[1] if asw[1] else 0.0,
         "turn": cat(turn_keep).astype(np.float64),
@@ -155,8 +250,9 @@ def main():
                 "dwell": cmp_dist(H["move_dwell"][ax], Hhz, B["move_dwell"][ax], B["hz"]),
             } for ax in AXES},
             "weapon": {
-                "switch_per_frame": {"human": round(H["weapon_switch"], 4), "bot": round(B["weapon_switch"], 4)},
-                "switch_per_sec": {"human": round(H["weapon_switch"] * Hhz, 3), "bot": round(B["weapon_switch"] * B["hz"], 3)},
+                "pref_switch_per_pair": {"human": round(H["weapon_switch"], 4), "bot": round(B["weapon_switch"], 4)},
+                "pairs": {"human": H["weapon_pairs"], "bot": B["weapon_pairs"]},
+                "feas_gated": {"human": H["weapon_feas_gated"], "bot": B["weapon_feas_gated"]},
                 "dwell": cmp_dist(H["weapon_dwell"], Hhz, B["weapon_dwell"], B["hz"]),
             },
             "attack": {

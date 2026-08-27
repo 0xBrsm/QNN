@@ -138,8 +138,17 @@ PPO / Optuna trials:
 | `seat_mode` | grouped-arena opponents: `bot` or shared-current-policy `self_play` |
 | `arena_server_binary` / `arena_client_binary` | grouped-arena engine executables |
 | `arena_map_id` / `arena_base_port` / `arena_bot_skill` | grouped-arena map, first server port, and FrikBot skill |
-| `eval_num_envs` | post-train eval env count |
-| `eval_num_episodes` | post-train eval episode count |
+| `eval_num_envs` | post-train eval env/LANE count — **use 24** (see below) |
+| `eval_num_episodes` | post-train eval episode count (keep it a multiple of `eval_num_envs` so no wave runs short) |
+
+Eval lane count is the biggest free throughput knob: `model.act()` costs ~4.4 ms
+FIXED per call plus ~0.18 ms per lane, so lanes amortize it. Measured 8 → 24
+lanes is **1.86× on wall clock** (240 episodes: 380.8 s → 205.2 s), and the knee
+is soft past 24 (32 lanes buys another 7% while raising per-tick latency). Also
+leave `eval_batched_forward` at its **default true** — setting it false pays that
+fixed cost once per lane instead of once per tick (measured 4.5× slower) and is
+only correct when you need bit-exact replication of a historical run. Full
+profile: research/performance-tuning.md, `agents/plans/eval-vecenv-port.md`.
 
 `arena_grid` is an optional dense-match backend; `process` remains the promoted
 throughput default. Build its reproducible artifacts inside the trainer

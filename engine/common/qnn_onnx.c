@@ -477,21 +477,23 @@ struct qnn_onnx_ctx
 	 * stamp is absent (pre-attack-threshold exports unchanged). Fit offline by
 	 * qnn.bc.decode_fit.fit_attack. */
 	float    attack_threshold;
-	/* Continuous-weapon fire hold-tail (all wire generations; the attack
-	 * sigmoid+hold-tail is decoded engine-side from `fire_logit` regardless of
-	 * move format). NG/SNG/LG fire from the 0.1s player_nail/player_light QC
-	 * think-chain while button0 stays held, but the policy is trained on the
-	 * ~0.2s op-fire (W_Attack re-entry) cadence. Armed to QNN_FIRE_HOLD_SEC worth
-	 * of decision ticks (round(QNN_FIRE_HOLD_SEC * tick_hz)) on each model fire of
-	 * a continuous weapon and counted down per tick; while >0
-	 * the attack bit is forced so button0 stays pressed and the server
-	 * think-chain streams the in-between nails/bolts. Keyed to the MODEL's fire
-	 * (NOT attack_finished) so it cannot feed back into an unbounded hold, and
-	 * self-limits ~one op-cadence after the model stops choosing fire. See
-	 * src/docs/mvd-fire-audit.md (QWD think-chain). Fixed in f687cb1d.
-	 * (wire.9's in-graph decode computes an equivalent hold-tail in move_state but
-	 * the export discards that attack bit and still emits fire_logit, so the engine
-	 * remains the single attack-decode site for every wire format.) */
+	/* Continuous-weapon fire hold-tail — a PER-MODEL decode param, read from
+	 * `decode.attack.hold_tail_sec` at load. NG/SNG/LG fire from the 0.1s
+	 * player_nail/player_light QC think-chain while button0 stays held, but the
+	 * policy is trained on the ~0.2s op-fire (W_Attack re-entry) cadence, so
+	 * holding button0 across the gap lets the chain stream the in-between
+	 * nails/bolts. `fire_hold_sec` is armed as that many seconds' worth of
+	 * decision ticks (round(sec * tick_hz)) on each model fire of a continuous
+	 * weapon and counted down per tick; while >0 the attack bit is forced.
+	 * Keyed to the MODEL's fire (NOT attack_finished) so it cannot feed back
+	 * into an unbounded hold, and self-limits ~one op-cadence after the model
+	 * stops choosing fire. See src/docs/mvd-fire-audit.md (QWD think-chain).
+	 *
+	 * 0 = OFF (the law from 2026-08-26 on: every fresh export stamps the
+	 * resolved value, and the base configs stamp 0). QNN_FIRE_HOLD_SEC is the
+	 * ABSENT-STAMP fallback only — see its definition for why it is 0.25 and
+	 * why that is load-bearing forever. */
+	float    fire_hold_sec;
 	int      fire_hold_ticks;
 };
 
@@ -1236,27 +1238,42 @@ static int qnn_onnx_weapon_from_logits(const qnn_onnx_ctx_t *ctx, int self_weapo
 	return chosen_class + 1;   /* class 0..7 → impulse 1..8 */
 }
 
-/* Continuous-weapon (NG/SNG/LG) hold-tail, as a WALL-CLOCK duration: bridges the
- * model's ~0.2s op-fire cadence plus a little sampling jitter so a sustained
- * burst never drops button0 between the model's fires (which would stall the
- * server's player_nail/player_light think-chain). The tick COUNT is derived
- * from the model's stamped decision cadence (ctx->tick_hz) so it's the same
- * wall-clock hold at any rate — 5 ticks @20Hz, 2-3 @10Hz — instead of a
- * tick-rate-varying hardcoded constant. Over-extension on disengage is bounded
- * to this duration. */
+/* Continuous-weapon (NG/SNG/LG) hold-tail FALLBACK, in wall-clock seconds, used
+ * ONLY when a model carries no `decode.attack.hold_tail_sec` stamp. It is the
+ * duration that shipped unconditionally before the stamp existed (2026-08-26),
+ * so every already-exported .onnx keeps its live behavior bit-for-bit without a
+ * re-export. That is load-bearing FOREVER, not a migration window: archived
+ * models cannot be re-exported (their generations are era-locked to their own
+ * branches), so an unstamped graph is the only signal that it predates the law.
+ * Freshly exported models always carry an explicit stamp — 0 on the base
+ * configs — so this constant never decides their behavior.
+ *
+ * The tick COUNT is derived from the model's stamped decision cadence
+ * (ctx->tick_hz) so it's the same wall-clock hold at any rate — 5 ticks @20Hz,
+ * 2-3 @10Hz. Over-extension on disengage is bounded to the duration. */
 #define QNN_FIRE_HOLD_SEC 0.25f
 
-/* Continuous-weapon (NG/SNG/LG) hold-tail, applied uniformly across wire
- * generations: bridges the model's ~0.2s op-fire cadence (a single skipped
- * discharge opportunity) so a sustained engagement doesn't drop button0
- * between fires. Wire.11's in-graph attack decode is memoryless (no
- * persistence across ticks — attack_with_decode_step, one independent
- * decision per tick), so it needs this exactly as much as the legacy
- * sigmoid+threshold path does; there is no separate in-graph equivalent.
- * ctx is mutable: updates ctx->fire_hold_ticks across ticks. */
+/* Continuous-weapon (NG/SNG/LG) hold-tail, applied across every wire generation
+ * but gated PER MODEL by its own `decode.attack.hold_tail_sec` stamp: bridges
+ * the model's ~0.2s op-fire cadence (a single skipped discharge opportunity) so
+ * a sustained engagement doesn't drop button0 between fires. Wire.11+'s in-graph
+ * attack decode is memoryless (no persistence across ticks —
+ * attack_with_decode_step, one independent decision per tick), so it would need
+ * this exactly as much as the legacy sigmoid+threshold path does; there is no
+ * separate in-graph equivalent (`attack_state` carries weapon.af_lockout, NOT a
+ * hold-tail).
+ *
+ * The gate is a decode param, not a wire version or a build flag: one bin serves
+ * every registered codec, so a binary-wide switch (the 2026-08-26 test build's
+ * QNN_CONTINUOUS_HOLD_TAIL env, now deleted) silently changes every OTHER model
+ * on the share, not just the one under test. ctx->fire_hold_sec <= 0 makes this a
+ * pure passthrough. ctx is mutable: updates ctx->fire_hold_ticks across ticks. */
 static int qnn_onnx_apply_continuous_hold_tail(qnn_onnx_ctx_t *ctx, int attack_bit)
 {
-	int wid = ctx->self_weapon_id;
+	int wid;
+	if (ctx->fire_hold_sec <= 0.0f)
+		return attack_bit;   /* model stamped the tail OFF */
+	wid = ctx->self_weapon_id;
 	/* Hold-tail covers all three continuous weapons.  Each one's think-chain
 	 * (player_nail* / player_light*) re-fires every 0.1s while button0 is
 	 * held, but the model's op-fire tracks the ~0.2s W_Attack re-entry
@@ -1275,10 +1292,10 @@ static int qnn_onnx_apply_continuous_hold_tail(qnn_onnx_ctx_t *ctx, int attack_b
 		 || wid == QNN_SUBJECT_SUPER_NAILGUN
 		 || wid == QNN_SUBJECT_THUNDERBOLT);
 	if (is_continuous && attack_bit) {
-		/* hold-tail length = wall-clock QNN_FIRE_HOLD_SEC at the model's
+		/* hold-tail length = the model's stamped wall-clock duration at its
 		 * decision cadence (≥1 tick); tick_hz is the stamped, validated
 		 * cadence (no default) read at load. */
-		int hold = (int)lroundf(QNN_FIRE_HOLD_SEC * (float)ctx->tick_hz);
+		int hold = (int)lroundf(ctx->fire_hold_sec * (float)ctx->tick_hz);
 		ctx->fire_hold_ticks = hold > 0 ? hold : 1;
 	} else if (is_continuous && ctx->fire_hold_ticks > 0) {
 		attack_bit = 1;
@@ -1364,8 +1381,8 @@ static void qnn_onnx_decode_core(qnn_onnx_ctx_t *ctx, qnn_action_t *out)
 				p_fire = 1.0f / (1.0f + expf(-ctx->fire_logit));
 				attack_bit = (p_fire > ctx->attack_threshold) ? 1 : 0;
 			}
-			/* Continuous-weapon hold-tail: default engine behavior for every
-			 * wire generation, unconditionally — no wire gate. */
+			/* Continuous-weapon hold-tail: every wire generation, gated per
+			 * model by decode.attack.hold_tail_sec — no wire gate. */
 			attack_bit = qnn_onnx_apply_continuous_hold_tail(ctx, attack_bit);
 		}
 		out->move = QNN_PackInputMask(
@@ -2385,6 +2402,16 @@ static int qnn_onnx_select_codec(qnn_onnx_ctx_t *ctx)
 	 * historical cut) when `decode.attack_threshold` is absent, so pre-attack-
 	 * threshold exports are byte-unchanged. Fit via qnn.bc.decode_fit.fit_attack. */
 	ctx->attack_threshold = qnn_onnx_decode_param(ctx, alloc, "attack_threshold", 0.5f);
+
+	/* Continuous-weapon hold-tail duration (seconds; 0 = OFF) — ALL wire
+	 * generations, engine-applied (Pattern B: there is no in-graph twin). The
+	 * key is the decode config's own `attack.hold_tail_sec`, so the stamped
+	 * name carries its dot. Default QNN_FIRE_HOLD_SEC when the stamp is absent:
+	 * a model exported before the key existed keeps the behavior it shipped
+	 * with, byte-unchanged (the decode.attack_threshold precedent), while every
+	 * fresh export stamps its resolved value explicitly. */
+	ctx->fire_hold_sec = qnn_onnx_decode_param(
+		ctx, alloc, "attack.hold_tail_sec", QNN_FIRE_HOLD_SEC);
 
 	/* The recurrent-state RNG (move_state_rng) is no longer seeded by a named
 	 * special case here: it is one OPAQUE loop-back entry declared with

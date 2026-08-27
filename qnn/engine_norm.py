@@ -167,7 +167,7 @@ import numpy as np
 #             decode: the RECURRENT MOVE-DECODE STATE pair (move_state (B,11 f32)
 #             + move_state_rng (B, i64)) is threaded as I/O, and the a24 stateful
 #             MOVE decode (sticky gate / switch-back watermark / hazard /
-#             stop-onset + the continuous-fire hold-tail) runs IN-GRAPH — so
+#             stop-onset) runs IN-GRAPH — so
 #             `move` is the DECIDED 3-axis class (B,3 i64), NOT raw logits, and
 #             the engine threads move_state frame-to-frame like hidden/next_hidden.
 #             Current HEAD; what this exporter produces; the deployed full_4head.
@@ -179,14 +179,29 @@ import numpy as np
 #             and the old engine-argmax wire.9 has no surviving artifact. Net:
 #             wire.9 now means the in-graph-decode native contract; wire.10 is gone.
 #     wire.11 = wire.9 + the IN-GRAPH ATTACK decode. The recurrent ATTACK-decode
-#             state — the continuous-fire hold-tail (attack_state, B,1 f32) AND
-#             attack's own xorshift rng (attack_rng, B,i64) — is threaded as I/O,
-#             and the SAMPLED attack decode (Bernoulli on sigmoid((fire_logit+bias)
-#             /temp) off attack_rng, + hold-tail) runs IN-GRAPH — so `attack` is the
-#             DECIDED bit (B,1 i64), the `fire_logit` output is REMOVED, and the
-#             engine ORs the bit into the Quake press byte and runs NO attack
-#             sigmoid/threshold/hold-tail of its own. (move_state also dropped its
-#             two dead trailing slots → (B,9).) With
+#             state (attack_state) AND attack's own xorshift rng (attack_rng,
+#             B,i64) are threaded as I/O, and the SAMPLED attack decode (Bernoulli
+#             on sigmoid((fire_logit+bias)/temp) off attack_rng) runs IN-GRAPH —
+#             so `attack` is the DECIDED bit (B,1 i64), the `fire_logit` output is
+#             REMOVED, and the engine ORs the bit into the Quake press byte and
+#             runs NO attack sigmoid/threshold of its own. (move_state also dropped
+#             its two dead trailing slots → (B,9).)
+#             CORRECTION 2026-08-26: the continuous-weapon HOLD-TAIL never moved
+#             in-graph on either line. It has always run engine-side
+#             (qnn_onnx_apply_continuous_hold_tail) for EVERY wire generation, and
+#             `attack_state` today carries weapon.af_lockout (4 lanes: y,
+#             locked_weapon, af_prev, dt — ATTACK_STATE_DIM), not a hold-tail. The
+#             tail is now a per-model decode stamp (`decode.attack.hold_tail_sec`,
+#             0 = off) rather than unconditional engine behavior. The SAMPLED
+#             Bernoulli attack decode described above is also gone: the decode at
+#             HEAD is a deterministic greedy argmax (attack_with_decode_step,
+#             qnn/model/decode_actions.py), `attack.bias`/`attack.bias_vec` are
+#             removed keys that now FAIL LOUD, and `attack_rng` is INERT —
+#             threaded only as wire/state scaffolding whose seed literals are
+#             mirrored in qnn_onnx.c. What holds from the paragraph above is the
+#             SHAPE of the contract, not its sampling law: `attack` is still the
+#             DECIDED bit, `fire_logit` is still removed, and the engine still
+#             runs no sigmoid/threshold of its own. With
 #             this, all three actions (move/look/attack) are decided in-graph
 #             → the engine is decode-agnostic and decode-regime changes no longer
 #             touch the wire. wire.11 REPLACES wire.9 for the a24 gen (re-export);
@@ -283,6 +298,44 @@ ITEMS_WEAPON_MASK   = (IT_SHOTGUN | IT_SUPER_SHOTGUN | IT_NAILGUN
 ITEMS_ARMOR_MASK    = IT_ARMOR1 | IT_ARMOR2 | IT_ARMOR3
 ITEMS_POWERUP_MASK  = IT_INVISIBILITY | IT_INVULNERABILITY | IT_SUIT | IT_QUAD
 ITEMS_MEANINGFUL    = ITEMS_WEAPON_MASK | ITEMS_ARMOR_MASK | ITEMS_POWERUP_MASK
+
+
+def weapon_feasibility_bits(self_items: np.ndarray,
+                            ammo_shells: np.ndarray,
+                            ammo_nails: np.ndarray,
+                            ammo_rockets: np.ndarray,
+                            ammo_cells: np.ndarray) -> np.ndarray:
+    """Per-tick weapon-feasibility bitmask: bit (impulse−1) set when the
+    weapon is in the DECISION SPACE — owned AND its ammo pool non-empty
+    (axe: ownership alone). uint8, impulses 1..8 → bits 0..7.
+
+    This is the ownership/ammo half of the model's own choice-set
+    predicate (``Network._weapon_feasibility_mask``: readiness >
+    ``_FEAS_OWNED_AMMO``, where the dequant's readiness floor 0.1 encodes
+    owned-but-dry) — numpy so corpus walks and the eval gate-stream writer
+    share one derivation; bit-parity is pinned by
+    ``tests/test_weapon_preference_ruler.py``. The predicate's
+    attack_finished cooldown term is deliberately NOT included: cooldown
+    is a within-weapon refractory that flips on every discharge, not a
+    decision-space change."""
+    items = np.asarray(self_items, dtype=np.int64).reshape(-1)
+    pools = {
+        "shells": np.asarray(ammo_shells, dtype=np.int64).reshape(-1) > 0,
+        "nails": np.asarray(ammo_nails, dtype=np.int64).reshape(-1) > 0,
+        "rockets": np.asarray(ammo_rockets, dtype=np.int64).reshape(-1) > 0,
+        "cells": np.asarray(ammo_cells, dtype=np.int64).reshape(-1) > 0,
+    }
+    spec = ((1, IT_AXE, None), (2, IT_SHOTGUN, "shells"),
+            (3, IT_SUPER_SHOTGUN, "shells"), (4, IT_NAILGUN, "nails"),
+            (5, IT_SUPER_NAILGUN, "nails"), (6, IT_GRENADE_LAUNCHER, "rockets"),
+            (7, IT_ROCKET_LAUNCHER, "rockets"), (8, IT_LIGHTNING, "cells"))
+    bits = np.zeros(items.shape[0], dtype=np.uint8)
+    for imp, it_bit, pool in spec:
+        feas = (items & it_bit) != 0
+        if pool is not None:
+            feas = feas & pools[pool]
+        bits |= (feas.astype(np.uint8) << (imp - 1))
+    return bits
 
 
 # ── Movement category IDs ────────────────────────────────────────

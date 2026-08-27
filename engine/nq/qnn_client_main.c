@@ -55,6 +55,36 @@ static double qnn_client_next_tick_time = 0.0;
 static char qnn_client_map_id[QNN_MAX_MAP_ID];
 static FILE *qnn_client_engine_log = NULL;
 static FILE *qnn_client_action_log = NULL;
+/* QNN_CLIENT_OBS_DUMP: framed QOBS stream of the exact per-tick obs the
+ * model saw (canonical wire packer), for offline pytorch replay with full
+ * logit/decode introspection. Same record layout as QNN_EmitTick (which
+ * lives in qnn_collect_helpers.c, not linked here): "QOBS" + 16-byte
+ * header + obs buffer + action struct. No jitter filtering — raw ticks. */
+static FILE *qnn_client_obs_dump = NULL;
+
+static void QNN_ClientDumpObs(const qnn_snapshot_t *snapshot,
+	int tick, int tick_hz, qboolean reset_flag)
+{
+	uint8_t obs[QNN_OBS_BUFFER_SIZE];
+	uint8_t header[16];
+	qnn_tick_result_t result;
+	int steps = 0;
+	uint16_t flags = reset_flag ? 0x01 : 0;
+	uint16_t asize = (uint16_t)sizeof(qnn_action_t);
+
+	QNN_IOEmit(snapshot, &result);
+	QNN_IOPackObsBuffer(obs, &result);
+	memcpy(header + 0,  &tick,    4);
+	memcpy(header + 4,  &steps,   4);
+	memcpy(header + 8,  &tick_hz, 4);
+	memcpy(header + 12, &flags,   2);
+	memcpy(header + 14, &asize,   2);
+	fwrite("QOBS", 1, 4, qnn_client_obs_dump);
+	fwrite(header, 1, sizeof(header), qnn_client_obs_dump);
+	fwrite(obs, 1, QNN_OBS_BUFFER_SIZE, qnn_client_obs_dump);
+	fwrite(&snapshot->action_label, 1, sizeof(qnn_action_t), qnn_client_obs_dump);
+	fflush(qnn_client_obs_dump);
+}
 static int qnn_client_tick_index = 0;
 
 /* Set from a signal handler on SIGTERM/SIGINT (e.g. `docker stop`) so the
@@ -266,19 +296,30 @@ static void QNN_LogAction(const qnn_action_t *a)
 	turn_deg = (float)(acos((double)QNN_Clamp(a->look[0], -1.0f, 1.0f)) * 180.0 / M_PI);
 	heading_deg = (float)(atan2((double)a->look[2], (double)a->look[1]) * 180.0 / M_PI);
 
-	/* `held` must be the same 1..8 weapon id as a->weapon, so the
-	   decided!=held comparison is meaningful.  cl.stats[STAT_ACTIVEWEAPON]
-	   is an IT_ item bitflag (IT_AXE=4096, IT_SHOTGUN=1, ...), not a 1..8
-	   id — QNN_WeaponId() does the canonical mapping. */
+	/* `held` is the ENGINE-EQUIPPED weapon (cl.stats[STAT_ACTIVEWEAPON] is
+	   an IT_ item bitflag — IT_AXE=4096, IT_SHOTGUN=1, ... — not a 1..8 id,
+	   so QNN_WeaponId() does the canonical mapping).  It is logged for ONE
+	   purpose: detecting ENGINE-FORCED switches (ammo-out / pickup
+	   re-equips).  It is NOT the model's weapon choice and must never be
+	   used as weapon identity in analysis -- the model has no equip input
+	   and never sees this value.  Weapon identity exists only at
+	   discharges: read `att_imp` (the 9-way attack-with class, 0 = no
+	   attack, 1..8 = attack WITH that impulse).
+
+	   `weapon` (a->weapon) is the separate weapon slot of the retired a26
+	   two-output convention; the a27+ single-lane graph publishes no such
+	   output (qnn_onnx.c: out->weapon is 0 unless
+	   out_present[QNN_ONNX_OUT_WEAPON]), so it reads 0 on every tick here.
+	   Kept only so an a26-wire client logs the same schema. */
 	fprintf(qnn_client_action_log,
 		"{\"t\":%d,\"move\":[%d,%d,%d],\"attack\":%d,"
 		"\"turn_deg\":%.1f,\"heading_deg\":%.1f,"
-		"\"weapon\":%d,\"held\":%d}\n",
+		"\"weapon\":%d,\"att_imp\":%d,\"held\":%d}\n",
 		qnn_client_tick_index,
 		QNN_ActionAxisSign(a->move, 0), QNN_ActionAxisSign(a->move, 1),
 		QNN_ActionAxisSign(a->move, 2), (a->move & 1) ? 1 : 0,
 		turn_deg, heading_deg,
-		(int)a->weapon, QNN_WeaponId());
+		(int)a->weapon, (int)a->attack, QNN_WeaponId());
 	fflush(qnn_client_action_log);
 }
 
@@ -379,6 +420,9 @@ static qboolean QNN_BuildAndInfer(
 	QNN_DrainSounds(&snapshot);
 
 	QNN_IOUpdate(&snapshot, qnn_client_fixed_dt, reset_flag);
+	if (qnn_client_obs_dump != NULL)
+		QNN_ClientDumpObs(&snapshot, qnn_client_tick_index,
+			(int)(1.0 / qnn_client_fixed_dt + 0.5), reset_flag);
 	/* Emit through the loaded model's compiled obs plan (WS2): atlas
 	 * parameterization and oracle disclosure ride the plan, so the
 	 * engine computes EXACTLY this model's observation. */
@@ -428,6 +472,17 @@ int main(int argc, char **argv)
 				fprintf(stderr, "qnn_client: failed to open action log %s\n", action_log);
 			else
 				fprintf(stderr, "qnn_client: decoded-action log -> %s\n", action_log);
+		}
+		{
+			const char *obs_dump = getenv("QNN_CLIENT_OBS_DUMP");
+			if (obs_dump != NULL && obs_dump[0] != 0)
+			{
+				qnn_client_obs_dump = fopen(obs_dump, "wb");
+				if (qnn_client_obs_dump == NULL)
+					fprintf(stderr, "qnn_client: failed to open obs dump %s\n", obs_dump);
+				else
+					fprintf(stderr, "qnn_client: QOBS obs dump -> %s\n", obs_dump);
+			}
 		}
 	}
 

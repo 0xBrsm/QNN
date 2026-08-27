@@ -145,6 +145,58 @@ def switch_rate(labels: np.ndarray, keep: np.ndarray) -> tuple[float, int, int]:
     return rate, n_switch, n_trans
 
 
+def preference_pairs(
+    weapons: np.ndarray,
+    ticks: np.ndarray,
+    excluded_pair: np.ndarray | None = None,
+) -> tuple[int, int, np.ndarray]:
+    """Discharge-anchored weapon-PREFERENCE statistics for one episode.
+
+    "Held weapon" is a fallacy in competitive Quake: weapon scripting churns
+    equip state without expressing any choice. Preference is only observable
+    at discharges — cache the weapon that attacked and compare the next
+    attack against it. A pair whose transition was engine-FORCED (dry ammo
+    pool, death/respawn reset) says nothing about preference — a weapon left
+    the decision space — so ``excluded_pair`` removes it from numerator AND
+    denominator.
+
+    ``weapons``       (N,) weapon label at each discharge, time-ordered.
+    ``ticks``         (N,) frame index of each discharge.
+    ``excluded_pair`` (N-1,) bool; True drops pair ``(i, i+1)``.
+
+    Returns ``(n_switch, n_pairs, dwell_frames)``. ``dwell_frames`` are the
+    frame spans of same-weapon discharge streaks (first→last discharge of the
+    streak), for streaks of ≥2 discharges; streaks closed by an exclusion or
+    the episode end are included censored, matching the run-length convention
+    above.
+    """
+    w = np.asarray(weapons).reshape(-1)
+    t = np.asarray(ticks).reshape(-1)
+    if w.shape[0] != t.shape[0]:
+        raise ValueError(f"weapons {w.shape} vs ticks {t.shape} length mismatch")
+    if w.shape[0] < 2:
+        return 0, 0, np.empty(0)
+    if excluded_pair is None:
+        exc = np.zeros(w.shape[0] - 1, dtype=bool)
+    else:
+        exc = np.asarray(excluded_pair).reshape(-1).astype(bool)
+        if exc.shape[0] != w.shape[0] - 1:
+            raise ValueError(f"excluded_pair {exc.shape} != n_pairs {w.shape[0] - 1}")
+    counted = ~exc
+    n_pairs = int(counted.sum())
+    n_switch = int(((w[1:] != w[:-1]) & counted).sum())
+    dwell: list[float] = []
+    start = 0
+    for i in range(w.shape[0] - 1):
+        if exc[i] or w[i + 1] != w[i]:
+            if i > start:
+                dwell.append(float(t[i] - t[start]))
+            start = i + 1
+    if w.shape[0] - 1 > start:
+        dwell.append(float(t[-1] - t[start]))
+    return n_switch, n_pairs, np.asarray(dwell, dtype=float)
+
+
 def inter_event_intervals(labels: np.ndarray, keep: np.ndarray) -> np.ndarray:
     """Frames between consecutive switch events within a segment.
 

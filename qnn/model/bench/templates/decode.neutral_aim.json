@@ -1,0 +1,53 @@
+{
+  "decode_version": 1,
+  "version": "a28neutralaim",
+  "description": "decode.base with CODE-DEFAULT aim-prior terms restored (AIM_PRIOR_GAIN=0.015, AIM_FFWD_GAIN=1.0, lead_aim.py). Common non-degenerate operating point for commitment-vs-per-frame comparisons: open-loop commitment playout needs a nonzero intra-segment tracking term; zeroed knobs are structurally hostile to it (runs/decode_fit/lookseg_w122s1b_seed43/lsegcommit_debug.md, seg-vs-frame plan). NOT a fitted config.",
+  "decode_module": "qnn.model.decode_actions",
+  "guard_module": "qnn.model.guard",
+  "look_grid": "config/look_grid.json",
+  "params": {
+    "look.aim_prior_gain": 0.015,
+    "look.aim_ffwd_gain": 1.0,
+    "look.aim_mag_gain": 0.0,
+    "look.turn_mag_scale": 1.0,
+    "look.lead_hold_cap_frames": 4.0,
+    "look.lead_hold_cap_radial_frames": 5.0,
+    "look.hold_passthrough": true,
+    "look.aim_degrade_tremor_mag": 0.0,
+    "look.aim_degrade_tremor_tau": 5.0,
+    "weapon_ban": [],
+    "move.commit_dur_tilt": [
+      0.0,
+      0.0
+    ],
+    "attack.fire_bias_vec": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "weapon.preference_bias_vec": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "guard.projectile_release": "rocket",
+    "move.threat_break_hazard": 0.0,
+    "guard.lg_range": 0,
+    "move.idle_none_bias": [
+      0.0,
+      0.0
+    ],
+    "move.idle_engagement_base": 0.5,
+    "move.idle_cooldown_ticks": 20
+  }
+}

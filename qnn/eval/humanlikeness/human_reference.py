@@ -44,6 +44,7 @@ from qnn.eval.humanlikeness.core import (  # noqa: E402
     describe,
 )
 from qnn.eval.aim_kernel import action_attack_context  # noqa: E402
+import qnn.engine_norm as en  # noqa: E402
 
 # Canonical output path for the human reference fingerprint JSON.  Defined once
 # here so shell harnesses and sibling scripts can reference this constant instead
@@ -111,7 +112,7 @@ def _episodes(root: Path, split: str, *, with_demo: bool = False):
             ).reshape(-1)
         else:
             # a26 cache schema: the fire bit rides the packed move byte and
-            # the held weapon (impulse-coded 0..8) is its own channel — the
+            # the equipped weapon (impulse-coded 0..8) is its own channel — the
             # attack-with class is their product (0 = hold).
             wpn = np.asarray(
                 np.load(root / split / a["weapon"], mmap_mode="r"),
@@ -124,6 +125,25 @@ def _episodes(root: Path, split: str, *, with_demo: bool = False):
         target = np.argmax(tp, axis=1).astype(np.int64)
         keep = (1.0 - tp[:, 0]) != 0.0
         turn = _turn_deg(np.asarray(np.load(root / split / a["look"], mmap_mode="r")))
+        # Stationary-menu gate streams (weapon-preference ruler): the
+        # per-tick weapon-feasibility bitmask (engine_norm.
+        # weapon_feasibility_bits over self_items + ammo pools — the model's
+        # own choice-set predicate) plus raw health for the death
+        # invalidator. All-or-nothing: a partial set cannot gate.
+        ob = shard.get("obs", {})
+        _gate_keys = ("health", "self_items", "ammo_shells", "ammo_nails",
+                      "ammo_rockets", "ammo_cells")
+        pref_streams = None
+        if all(k in ob for k in _gate_keys):
+            _raw = {k: np.asarray(np.load(root / split / ob[k], mmap_mode="r"))
+                    for k in _gate_keys}
+            pref_streams = {
+                "feas": en.weapon_feasibility_bits(
+                    _raw["self_items"], _raw["ammo_shells"],
+                    _raw["ammo_nails"], _raw["ammo_rockets"],
+                    _raw["ammo_cells"]),
+                "health": _raw["health"].astype(np.int64).reshape(-1),
+            }
         demo_idxs = shard.get("demo_idxs") or [None] * len(shard["episode_lengths"])
         start = 0
         for ei, length in enumerate(shard["episode_lengths"]):
@@ -134,6 +154,9 @@ def _episodes(root: Path, split: str, *, with_demo: bool = False):
                 "attack_class": attack_class[sl],
                 "attack_context": attack_context[sl],
                 "target": target[sl], "turn": turn[sl], "keep": keep[sl],
+                "pref_streams": (
+                    {k: v[sl] for k, v in pref_streams.items()}
+                    if pref_streams is not None else None),
             }
             if with_demo:
                 ep["demo"] = demo_idxs[ei]
@@ -305,7 +328,7 @@ def main() -> None:
             WEAPON_NAMES.get(w, str(w)): describe(cat(d)) for w, d in sorted(ctx_dwell.items())
         },
         "switch_interval": describe(cat(ctx_switch_iei)),
-        "note": "nearest effective attack category; analysis-only, not held state or a label",
+        "note": "nearest effective attack category; analysis-only, not equip state or a label",
     }
 
     fp["attack"] = {

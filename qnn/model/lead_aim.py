@@ -47,6 +47,13 @@ from qnn.bc.weapon_physics import (
     TEAM_TEAMMATE_VALUE as _TEAM_TEAMMATE_VALUE,
 )
 
+# Crest-payout squash for the alignment edge AND the rung-3 crest reward:
+# payout = exp(−ALIGNMENT_GAMMA · hbw). A decode-contract constant like the
+# AIM_Z_DROP anchors: baked into the model's input feature, so the feature
+# and the reward stay ONE law (chosen so the aligned/wild payout ratio ≈ the
+# human p_fire slope 3.44 — fire-at-alignment-objective.md rung 3).
+ALIGNMENT_GAMMA: float = 0.4
+
 # Origin→feet height of the QW player hull (VEC_HULL_MIN.z = −24u), in /DIST_SCALE.
 # The RL/NG/SNG z-drop is clamped to never exceed this so the aim never points below
 # the target's feet (a straight rocket aimed below-feet hits the floor short — the
@@ -227,6 +234,168 @@ def pooled_aim_vec(
     pooled = pooled * has_candidate
     norm = torch.linalg.vector_norm(pooled, dim=-1, keepdim=True).clamp(min=1e-6)
     return pooled / norm * has_candidate
+
+
+def _per_weapon_payouts(
+    rel: torch.Tensor,          # (R, N, 3) anchor position, /DIST_SCALE
+    ang_radius: torch.Tensor,   # (R, N) half-width angular radius AT that anchor's range
+    enemy: torch.Tensor,        # (R, N) bool
+    probs: torch.Tensor,        # (R, N) softmax over candidates (pre-masked to enemy)
+    weapon_physics: torch.Tensor,   # (9, 7) build_model_weapon_scalars
+) -> torch.Tensor:
+    """``(R, 8)`` pooled crest payout per weapon 1..8 at the given anchor
+    geometry — the ONE hbw law (current-position-anchor, half-extents-
+    normalized, ``exp(-ALIGNMENT_GAMMA*hbw)`` squash), shared verbatim by
+    :func:`weapon_alignment` (anchor = current tick) and
+    :func:`weapon_alignment_projected` (anchor = a constant-velocity
+    extrapolated future tick). No second geometry — only the ``rel`` /
+    ``ang_radius`` anchor differs between callers."""
+    R = rel.shape[0]
+    zero_vel = torch.zeros_like(rel)   # current-position anchor (rev E)
+    cols = []
+    for k in range(1, 9):
+        imp = torch.full((R,), k, dtype=torch.long, device=rel.device)
+        v_horiz, drop_const, drop_rate = weapon_trajectory(weapon_physics, imp)
+        aim = compute_lead_aim(rel, zero_vel, v_horiz, drop_const, drop_rate)  # (R, N, 3)
+        norm = torch.linalg.vector_norm(aim, dim=-1).clamp_min(1e-9)
+        cos_a = (aim[..., 0] / norm).clamp(-1.0, 1.0)
+        angle = torch.arccos(cos_a)                                # (R, N) rad
+        hbw = angle / ang_radius.clamp_min(1e-9)
+        payout = torch.exp(-ALIGNMENT_GAMMA * hbw) * enemy.to(angle.dtype)
+        cols.append((probs * payout).sum(dim=-1))                  # (R,)
+    return torch.stack(cols, dim=-1)
+
+
+@torch.no_grad()
+def weapon_alignment(
+    entity_scalars_raw: torch.Tensor,   # (R, N, S) dequantized entity scalars
+    entity_types: torch.Tensor,         # (R, N)
+    target_logits: torch.Tensor,        # (R, N) pointer logits — DETACHED by caller
+    weapon_physics: torch.Tensor,       # (9, 7) build_model_weapon_scalars
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(alignment (R, 8), has_target (R,))`` — per-weapon expected crest payout.
+
+    For each weapon k∈1..8 and each in-LOS enemy actor a: the lead-law angular
+    error to a's intercept point for k's trajectory, hitbox-half-width
+    normalized (``hbw = angle / atan2(halfw, range)`` — the ``_intercept_hbw``
+    law on the CURRENT unlead range), squashed to the crest payout
+    ``exp(−ALIGNMENT_GAMMA·hbw)`` — then pooled by the target pointer's
+    softmax over enemy candidates: the EXPECTED payout of firing weapon k
+    this tick, given who the model believes it is engaging.
+
+    Pooling PAYOUTS (scalars) by belief, never aim POINTS: a split belief
+    yields an expected value, not a phantom mid-air aim point — and the
+    committed-target weighting is what keeps fire timing tied to the pursued
+    enemy instead of reticle opportunism (Brian 8/5). On single-enemy frames
+    this equals the reward's argmin-over-actors form exactly (test-pinned
+    against the rung-3 crest shaper).
+
+    DISCHARGE LAW ANCHOR = the target's CURRENT POSITION (rev E, 8/6):
+    velocity lead is zeroed — corpus-measured humans aim at the current
+    position (with z-drop) on every projectile family at every range
+    (runs/head_probe/_human_lead_*.json). One law with the sidecar, ruler,
+    and crest reward.
+
+    Rows with no perceived enemy return zeros with ``has_target = 0`` —
+    payouts are strictly positive whenever a target exists, so all-zero rows
+    are unambiguous."""
+    # Same layering precedent as qnn.model.decode_actions: ACTOR_HALFW_U's
+    # single source of truth is the eval kernel; deferred import, no cycle.
+    from qnn.eval.aim_kernel import ACTOR_HALFW_U
+
+    esc = entity_scalars_raw.float()
+    rel = esc[..., _ACTOR_REL_OFFSET:_ACTOR_REL_OFFSET + 3]        # (R, N, 3) /DIST_SCALE
+    team = esc[..., _ACTOR_TEAM_OFFSET]
+    from qnn.vocab import TOKEN_ACTOR
+    enemy = (entity_types.long() == TOKEN_ACTOR) & (team != _TEAM_TEAMMATE_VALUE)
+    has_target = enemy.any(dim=-1)
+
+    dist = torch.linalg.vector_norm(rel, dim=-1)                   # (R, N) module units
+    halfw_m = ACTOR_HALFW_U / 1000.0                               # /DIST_SCALE
+    ang_radius = torch.atan2(
+        torch.full_like(dist, halfw_m), dist.clamp_min(1e-6))      # (R, N) rad
+
+    probs = torch.softmax(
+        target_logits.float().masked_fill(~enemy, -1e9), dim=-1)   # (R, N)
+
+    alignment = _per_weapon_payouts(rel, ang_radius, enemy, probs, weapon_physics)
+    alignment = alignment * has_target.unsqueeze(-1).to(rel.dtype)
+    return alignment, has_target.to(rel.dtype)
+
+
+@torch.no_grad()
+def weapon_alignment_projected(
+    entity_scalars_raw: torch.Tensor,   # (R, N, S) dequantized entity scalars
+    entity_types: torch.Tensor,         # (R, N)
+    self_velocity: torch.Tensor,        # (R, 3) own velocity, SAME view-frame + /VEL_SCALE
+                                         # normalization as entity_vel (qnn.model.dequant
+                                         # self_motion_scalars[..., 0:3])
+    target_logits: torch.Tensor,        # (R, N) pointer logits — DETACHED by caller
+    weapon_physics: torch.Tensor,       # (9, 7) build_model_weapon_scalars
+    horizons_ticks: "Sequence[int]",    # e.g. (2, 5, 10, 16) @ 20 Hz
+) -> torch.Tensor:
+    """``(R, len(horizons_ticks) * 8)`` forward-projected per-weapon crest
+    payout at +k ticks, for each ``k`` in ``horizons_ticks``, concatenated in
+    that order (8 weapons per horizon block).
+
+    A″ forward-projected alignment (agents/plans/crest-ceiling-handoff.md
+    "Candidate next steps" §3): the trigger-blindness the ceiling localized
+    to is that the ``aim`` edge only sees CURRENT-tick payouts + BACKWARD
+    deltas, so the policy cannot tell "aligned now, about to leave alignment"
+    from "aligned now, about to IMPROVE" — both read identically at k=0. This
+    computes the CLOSED-FORM answer for a constant-velocity target: the
+    relative position ``k`` ticks from now, fed through the EXACT SAME
+    current-position-anchor hbw law :func:`weapon_alignment` uses (shared via
+    :func:`_per_weapon_payouts` — no second geometry).
+
+    RELATIVE VELOCITY: ``entity_vel`` is the OTHER actor's own world velocity
+    rotated into the shooter's CURRENT view basis (``qnn_oracle.c
+    QNN_ComputeVel``), not (target − shooter) velocity. The shooter's own
+    world velocity is rotated into the SAME view basis
+    (``self_motion_scalars[...,0:3]``), so ``entity_vel - self_velocity`` is
+    the TRUE relative velocity in that (assumed momentarily fixed) frame —
+    subtracting it here is required, not optional.
+
+    NO LEARNED DYNAMICS, NO OWN-ROTATION MODEL: the projection is pure
+    constant-velocity extrapolation of the RELATIVE position
+    (``rel + rel_vel * k * TICK_DT_MODULE``); the shooter's own future view
+    rotation is NOT modeled (no own-angular-rate field exists on the wire —
+    ``look_delta`` is the ACCELERATION of the realized look vector, not a
+    usable velocity — see agents/plans/crest-ceiling-handoff.md item 3 and
+    the aim2 bench probe's run.md for the scope call). This is the same
+    "hold current heading" simplification the base law already makes by
+    zeroing velocity lead for its OWN current-tick anchor.
+
+    GRADIENT ISOLATION: ``@torch.no_grad()``, detached pointer logits from
+    the caller — identical discipline to :func:`weapon_alignment`.
+
+    Rows with no perceived enemy return all-zeros (no NaN) for every
+    horizon, mirroring ``weapon_alignment``'s ``has_target`` gate."""
+    from qnn.eval.aim_kernel import ACTOR_HALFW_U, TICK_DT_MODULE
+    from qnn.vocab import TOKEN_ACTOR
+
+    esc = entity_scalars_raw.float()
+    rel = esc[..., _ACTOR_REL_OFFSET:_ACTOR_REL_OFFSET + 3]         # (R, N, 3)
+    ent_vel = esc[..., _ACTOR_VEL_OFFSET:_ACTOR_VEL_OFFSET + 3]     # (R, N, 3)
+    team = esc[..., _ACTOR_TEAM_OFFSET]
+    enemy = (entity_types.long() == TOKEN_ACTOR) & (team != _TEAM_TEAMMATE_VALUE)
+    has_target = enemy.any(dim=-1)
+
+    rel_vel = ent_vel - self_velocity.float().unsqueeze(1)          # (R, N, 3) TRUE relative vel
+
+    halfw_m = ACTOR_HALFW_U / 1000.0
+    probs = torch.softmax(
+        target_logits.float().masked_fill(~enemy, -1e9), dim=-1)   # (R, N)
+
+    cols = []
+    for k in horizons_ticks:
+        rel_k = rel + rel_vel * (float(k) * TICK_DT_MODULE)         # (R, N, 3)
+        dist_k = torch.linalg.vector_norm(rel_k, dim=-1)
+        ang_radius_k = torch.atan2(
+            torch.full_like(dist_k, halfw_m), dist_k.clamp_min(1e-6))
+        cols.append(_per_weapon_payouts(rel_k, ang_radius_k, enemy, probs, weapon_physics))
+    projected = torch.cat(cols, dim=-1)                             # (R, 8*len(horizons))
+    return projected * has_target.unsqueeze(-1).to(rel.dtype)
 
 
 def aim_prior_tangent_ffwd(

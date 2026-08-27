@@ -50,7 +50,7 @@ _POINTERS: dict[str, PointerBuilder] = {}
 _TEMPORALS: dict[str, TemporalBuilder] = {}
 
 # Named base-graph compositions (raw spec dicts), registered by each generation
-# (e.g. qnn.model.bench.a24.graphs registers "full_5head"). The arch composition
+# (e.g. qnn.model.graph.base_graphs registers "core"). The arch composition
 # lives with the generation, not in the generation-agnostic graph package.
 _BASE_GRAPHS: dict[str, dict] = {}
 
@@ -83,7 +83,7 @@ def register_base_graph(name: str, graph: dict) -> None:
     """Register a named base-graph composition (raw spec dict).
 
     Called by each generation's ``graphs`` module so the arch composition is
-    owned by the generation (e.g. ``qnn.model.bench.a24.graphs``), not the
+    owned by its module (e.g. ``qnn.model.graph.base_graphs``), not the
     graph machinery."""
     if name in _BASE_GRAPHS and _BASE_GRAPHS[name] != graph:
         raise RuntimeError(f"conflicting base graph registered for {name!r}")

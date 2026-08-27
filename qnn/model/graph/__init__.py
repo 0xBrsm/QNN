@@ -4,12 +4,10 @@ See ``src/docs/model-graph.md``. The spec is pure data
 (:class:`GraphSpec`), the builder (:func:`build_network`) is the single
 model factory shared by BC, bench probes, eval, PPO, and export.
 
-Base graphs name the validated model lines. Retired-generation bases still
-live with their generation (``qnn.model.bench.a24.graphs`` registers
-full_4head/full_5head, kept for legacy-checkpoint reload); bases that
-outlived their generation are promoted to :mod:`qnn.model.graph.base_graphs`
-(full_6head/full_movearch). Both register into :mod:`qnn.model.node_registry`;
+The canonical base graph is ``core`` (:mod:`qnn.model.graph.base_graphs`);
 bench probes are overrides merged onto a base via :func:`merge_overrides`.
+a28: there is no legacy flat-config migration — pre-a28 checkpoints load
+from their own branches.
 """
 
 from __future__ import annotations
@@ -20,7 +18,6 @@ from typing import Any, Mapping
 from qnn.model.graph.build import (
     HEAD_TYPES,
     build_network,
-    graph_from_model_config,
     model_config_from_graph,
 )
 from qnn.model.graph.embedding import GraphObsEmbedding
@@ -28,7 +25,7 @@ from qnn.model.graph.spec import GraphSpec, GraphSpecError
 
 __all__ = [
     "GraphSpec", "GraphSpecError", "GraphObsEmbedding", "HEAD_TYPES",
-    "build_network", "graph_from_model_config", "model_config_from_graph",
+    "build_network", "model_config_from_graph",
     "base_graph_dict", "load_base_graph", "merge_overrides",
 ]
 

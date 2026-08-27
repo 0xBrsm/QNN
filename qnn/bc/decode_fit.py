@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from qnn.diag.loader import load_policy as _diag_load_policy
-from qnn.model.network import WEAPON_HEAD
+from qnn.model.network import ATTACK_HEAD
 
 SEGMENT_MASK = {"act.target": {"$ne": 0}}   # the training subset the heads were fit on
 
@@ -79,7 +79,7 @@ def _committed_stream(probs: np.ndarray, seed: np.ndarray, offsets: np.ndarray,
     sticky gate (commit argmax iff conf>=C and margin>=M, else hold the last commit).
     Each episode start is force-seeded from ``seed`` (impulses 1..8) so the carry never
     crosses episodes. This is the closed-loop proxy for the deployed gate: the engine's
-    held weapon converges on the bot's own last commit, so the committed stream — not
+    committed weapon converges on the bot's own last commit, so the committed stream — not
     the human's demo-equipped weapon — is what the dwell distribution should be fit on.
     Same construction as _weapon_switch_threshold_eval._committed_stream."""
     pred_imp = probs.argmax(1) + 1
@@ -117,5 +117,5 @@ def _forward_attack_with_logits(policy, source) -> np.ndarray:
         obs_seq = {k: v.index_select(0, idx).reshape((1, T) + tuple(v.shape[1:]))
                    for k, v in source.obs.items()}
         _f, logits, _v, _nh, _tl = policy.model(obs_seq, hidden=None, reset_mask=None)
-        out[s:e] = logits[WEAPON_HEAD].reshape(T, ATTACK_WITH_SIZE).float().cpu().numpy()
+        out[s:e] = logits[ATTACK_HEAD].reshape(T, ATTACK_WITH_SIZE).float().cpu().numpy()
     return out
