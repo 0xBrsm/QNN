@@ -2,6 +2,7 @@
 #include "qnn_collect_helpers.h"
 #include "qnn_fault.h"
 #include "qnn_io.h"
+#include "qnn_obs_shim.h"
 #include "qnn_predict.h"
 #include "qnn_tick.h"
 #include "qnn_arena_observer.h"
@@ -21,6 +22,76 @@ static float qnn_arena_dt = 1.0f / 20.0f;
 static int qnn_arena_tick;
 static int qnn_arena_steps;
 
+/* This seat's compiled obs plan (OP_ATTACH_DECL between "signed_on"
+ * and OP_RESUME_SIGNON).  No attach = default plan — today's 864-byte
+ * frame, bit-identical. */
+static qnn_obs_plan_t qnn_arena_seat_plan;
+static qboolean qnn_arena_seat_has_plan;
+
+/* Consume + answer one OP_ATTACH_DECL (opcode byte already read).
+ * Blocking stdio reads — the driver writes the whole request before
+ * reading the reply.  Any validation failure replies the error frame,
+ * then exits: an unattachable seat must never silently serve the
+ * default plan. */
+static void QNN_ArenaClientHandleAttach(void)
+{
+	uint8_t header[5];
+	int seat_index;
+	uint32_t json_len;
+	char *json;
+	char error[256];
+	static char reply[4096];
+	qnn_obs_decl_t decl;
+
+	if (fread(header, 1, sizeof(header), stdin) != sizeof(header))
+		Sys_Error("Arena client stdin closed mid-attach-decl header");
+	seat_index = header[0];
+	json_len = (uint32_t)header[1] | ((uint32_t)header[2] << 8)
+		| ((uint32_t)header[3] << 16) | ((uint32_t)header[4] << 24);
+	if (json_len == 0 || json_len > QNN_OBS_DECL_JSON_MAX)
+		Sys_Error("Arena client attach-decl length %u out of range (1..%d)",
+			json_len, QNN_OBS_DECL_JSON_MAX);
+	json = malloc(json_len + 1);
+	if (json == NULL)
+		Sys_Error("Arena client attach-decl: out of memory (%u bytes)",
+			json_len);
+	if (fread(json, 1, json_len, stdin) != json_len)
+		Sys_Error("Arena client stdin closed mid-attach-decl JSON");
+	json[json_len] = 0;
+
+	if (seat_index != 0)
+	{
+		snprintf(error, sizeof(error),
+			"arena client is single-seat: seat_index must be 0 (got %d)",
+			seat_index);
+		goto reject;
+	}
+	if (qnn_arena_seat_has_plan)
+	{
+		snprintf(error, sizeof(error),
+			"obs declaration was already attached for this seat");
+		goto reject;
+	}
+	if (!QNN_ObsDeclParseJson(json, (int)json_len, &decl,
+			error, sizeof(error))
+		|| !QNN_ObsPlanCompile(&decl, &qnn_arena_seat_plan,
+			error, sizeof(error)))
+		goto reject;
+	free(json);
+	qnn_arena_seat_has_plan = true;
+
+	if (!QNN_ObsLayoutReplyJson(&qnn_arena_seat_plan, reply, sizeof(reply),
+			error, sizeof(error)))
+		Sys_Error("Arena client attach-decl reply failed: %s", error);
+	fprintf(stdout, "%s\n", reply);
+	fflush(stdout);
+	return;
+
+reject:
+	QNN_WriteError(error);
+	Sys_Error("Arena client obs declaration rejected: %s", error);
+}
+
 static const char *QNN_ArgString(const char *name, const char *fallback)
 {
 	int index = COM_CheckParm((char *)name);
@@ -31,8 +102,9 @@ static const char *QNN_ArgString(const char *name, const char *fallback)
 
 static void QNN_WriteObservation(const qnn_action_t *previous_action, qboolean reset_flag)
 {
-	QNN_ArenaObserverWrite(stdout, previous_action,
-		qnn_arena_tick, qnn_arena_steps, reset_flag);
+	QNN_ArenaObserverWrite(stdout,
+		qnn_arena_seat_has_plan ? &qnn_arena_seat_plan : NULL,
+		previous_action, qnn_arena_tick, qnn_arena_steps, reset_flag);
 }
 
 static void QNN_ReceiveServerFrame(const qnn_action_t *previous_action)
@@ -144,9 +216,23 @@ int main(int argc, char **argv)
 			/* Park this fully spawned client while the remaining seats complete
 			   stock NetQuake's serial sign-on.  Continuing Host_Frame here would
 			   flood the server with idle commands and destabilize later reliable
-			   handshakes. */
-			if (fgetc(stdin) != QNN_ARENA_CLIENT_OP_RESUME_SIGNON)
-				Sys_Error("Arena client sign-on barrier was not resumed");
+			   handshakes.  The park doubles as the OP_ATTACH_DECL window: the
+			   driver attaches this seat's obs declaration (if any) between
+			   "signed_on" and OP_RESUME_SIGNON. */
+			for (;;)
+			{
+				int barrier_op = fgetc(stdin);
+
+				if (barrier_op == QNN_ARENA_CLIENT_OP_RESUME_SIGNON)
+					break;
+				if (barrier_op == QNN_OBS_OP_ATTACH_DECL)
+				{
+					QNN_ArenaClientHandleAttach();
+					continue;
+				}
+				Sys_Error("Arena client sign-on barrier was not resumed "
+					"(opcode %d)", barrier_op);
+			}
 		}
 		if (QNN_ArenaObserverReady() && QNN_TrainingNetworkArenaReady())
 			break;

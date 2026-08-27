@@ -1,7 +1,7 @@
 """Torch-free duration-bucket constants for the a25 ``move_seg`` head.
 
 Single source of truth for the Fibonacci duration-bucket law shared by the
-torch head (``qnn.model.bench.a25.move_seg_head``) and torch-free consumers
+torch head (``qnn.model.move_seg_head``) and torch-free consumers
 (the labeler's segment-parity gate, ``qnn.labeler.seg_stats``).  Keep this
 module free of torch imports — the GBT labeler path is deliberately
 torch-free.

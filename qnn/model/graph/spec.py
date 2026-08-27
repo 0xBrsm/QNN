@@ -28,6 +28,10 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from qnn.model.tokens.obs_fields import SCALAR_FIELDS, VOCAB_FIELDS
+from qnn.vocab import (
+    ENTITY_STREAMS as _ENTITY_STREAMS,
+    ENTITY_STREAM_COMBAT as _ENTITY_STREAM_COMBAT,
+)
 from qnn.schema import (
     PROBE_SPATIAL_SOURCES as _PROBE_SOURCES,
     SPATIAL_SOURCE_EGO,
@@ -103,14 +107,34 @@ def _scalar_edge_name(edge: str) -> str:
 # vector (readout [+ target.feat]) like move/look/attack. Its additional
 # semi-Markov inputs (held_class / dwell_age) are NOT graph edges — they are
 # decode-state obs fields the Network passes straight through ``flat_obs`` (see
-# qnn.model.bench.a25.move_hazard_head and network.py), so the edge contract
+# qnn.model.move_hazard_head and network.py), so the edge contract
 # here is unchanged.
-_HEAD_NAMES = ("move", "look", "attack", "weapon", "move_hazard", "move_seg", "jump")
+# ``attack_future`` (a27 MTP aux) is deliberately NOT a motor head: it reads
+# the BASE feature vector (readout [+ target.feat]), never the motor vector
+# with weapon_context folded in, so the shared-inputs rule below must not bind
+# it to the motor heads' declared edges. See qnn.model.attack_future_head.
+_HEAD_NAMES = ("move", "look", "attack", "weapon", "move_hazard", "move_seg", "jump",
+               "look_seg", "attack_future")
 _MOTOR_HEADS = ("move", "look", "attack", "move_hazard")
 _ACTIVATIONS = ("none", "gelu", "relu")
 
-_WEAPON_DECODE_KEYS = ("sticky_confidence", "sticky_margin")
-
+# ── Legacy slot→label defaults ──────────────────────────────────────
+#
+# Every probe.json and checkpoint graph predating heads[*].label implied
+# its action-label contract from the (slot, type) pair. This table is that
+# implication, written down ONCE so those specs keep resolving and so the
+# mapping is reviewable instead of scattered across the loss dispatch.
+#
+# It is a MIGRATION, not a default for new work: a spec that omits `label`
+# gets its historical contract, and any NEW contract must be declared
+# explicitly. Rows are append-only for the same reason the contracts are —
+# a25/a26 checkpoints on disk resolve through here for cross-line eval.
+_LEGACY_SLOT_LABELS: dict[tuple[str, str], str] = {
+    ("attack", "attack_with"): "attack.v1",   # A27 discharge-only
+    ("weapon", "attack_with"): "weapon.v2",   # A25/A26 carried select-intent
+    ("weapon", "canonical"):   "weapon.v1",   # pre-A25 held-weapon 8-class
+    ("attack", "canonical"):   "attack.v0",   # binary attack + distance shoulder
+}
 
 class GraphSpecError(ValueError):
     """Raised for any structurally invalid graph spec."""
@@ -265,7 +289,7 @@ class TokenSpec:
         return out
 
 
-def monolithic_self_token(include_weapon_id: bool) -> TokenSpec:
+def monolithic_self_token() -> TokenSpec:
     """The production monolithic self token, in TokenSpec form.
 
     Single source for the canonical flat layout's self token
@@ -278,8 +302,7 @@ def monolithic_self_token(include_weapon_id: bool) -> TokenSpec:
     return TokenSpec(
         name="self",
         scalars=("self_scalars",),
-        vocab=("armor_type", "movement_id")
-        + (("weapon_id",) if include_weapon_id else ()),
+        vocab=("armor_type", "movement_id"),
         vocab_sum=("powerup_all",),
         kind_tag=True,
     )
@@ -386,70 +409,130 @@ class HeadNodeSpec:
     inputs: tuple[str, ...]
     d_hidden: int = 0
     activation: str = "gelu"
-    context_from_obs: bool = True            # weapon only
-    # weapon only — P1 feasibility-masking + rare-positive loss shaping
+    # categorical attack selector — feasibility masking + rare-positive shaping
     # (agents/plans/attack-finished-masking-refactor.md). All default-off ⇒
     # graphs without these keys build byte-identically to before.
     feasibility_mask: bool = False
     focal_gamma: float = 0.0
     pos_weight: float = 0.0
     water_ud: bool = False
-    # Stored as sorted (key, value) pairs — hashable and immutable like the
-    # rest of the spec. Construct with a plain dict; __post_init__ normalizes
-    # either form so direct construction compares equal to a from_dict
-    # round-trip.
-    decode: tuple[tuple[str, float], ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "decode",
-            tuple(sorted((str(k), float(v)) for k, v in dict(self.decode).items())),
-        )
-
+    # look_seg's corpus tick rate (qnn.model.look_seg_bins.bins_for_hz
+    # selector). 0 = unspecified — every probe.json predating this field, whose
+    # checkpoints resolve to LEGACY_HZ (10) at build time
+    # (look_seg_bins.resolve_hz), never guessed from the corpus. Not
+    # shape-bearing (JOINT is fixed across fits) so it does not gate any other
+    # head's tensor widths.
+    hz: int = 0
+    # Action-label contract this head's target is derived from
+    # (qnn.model.action_labels).  Empty = not a labelled selector.
+    #
+    # This exists because the 9-class attack-with selector is ONE module
+    # that has served three different label semantics across generations,
+    # and the binding used to be implied by the SLOT NAME: the `weapon`
+    # slot read act_weapon, the `attack` slot read act_attack, and nothing
+    # checked that the chosen column carried data.  A27 retired act_weapon,
+    # so an a27 probe naming the `weapon` slot trained the selector on an
+    # all-zero column — every positive masked to ignore_index, no error.
+    # Declaring the contract makes the binding reviewable in the config and
+    # checkable at build time.
+    label: str = ""
     @classmethod
     def from_dict(cls, name: str, raw: Mapping[str, Any]) -> "HeadNodeSpec":
         ctx = f"heads[{name!r}]"
         allowed = ("type", "inputs", "d_hidden", "activation")
-        if name == "weapon":
-            allowed += ("context_from_obs", "decode",
-                        "feasibility_mask", "focal_gamma", "pos_weight")
+        if name == "weapon" or (name == "attack" and raw.get("type") == "attack_with"):
+            allowed += ("feasibility_mask", "focal_gamma", "pos_weight",
+                        "context_from_obs", "label")
         if name == "jump":
+            allowed += ("pos_weight",)
+        if name == "attack_future":
+            # Escape hatch only (see attack_future_head): scales the event-class
+            # training terms, never the suffstats. The horizon/bucket grid is
+            # pinned in qnn.model.attack_future_bins, not spec'd here.
             allowed += ("pos_weight",)
         if name == "move_seg":
             allowed += ("water_ud",)
+        if name == "look_seg":
+            allowed += ("hz",)
         _reject_unknown(raw, allowed, ctx)
-        decode_raw = raw.get("decode", {})
-        if not isinstance(decode_raw, Mapping):
-            raise GraphSpecError(f"{ctx}: decode must be an object")
-        _reject_unknown(decode_raw, _WEAPON_DECODE_KEYS, f"{ctx}.decode")
+        # a26-line probes stamp weapon.context_from_obs (their spec's obs-fed
+        # weapon-context option). Every a26 rc checkpoint carries FALSE — the
+        # value this line's builder implements implicitly. TRUE selected a
+        # build path that does not exist here, so it fails loud rather than
+        # loading a model whose graph would silently differ from training.
+        if bool(raw.get("context_from_obs", False)):
+            raise GraphSpecError(
+                f"{ctx}: context_from_obs=true selects the a26 obs-fed weapon "
+                "context, which this line does not build; load that checkpoint "
+                "from its own line")
         spec = cls(
             name=name,
             type=str(_require(raw, "type", ctx)),
             inputs=_str_tuple(_require(raw, "inputs", ctx), ctx),
             d_hidden=int(raw.get("d_hidden", 0)),
             activation=str(raw.get("activation", "gelu")),
-            context_from_obs=bool(raw.get("context_from_obs", True)),
             feasibility_mask=bool(raw.get("feasibility_mask", False)),
             focal_gamma=float(raw.get("focal_gamma", 0.0)),
             pos_weight=float(raw.get("pos_weight", 0.0)),
             water_ud=bool(raw.get("water_ud", False)),
-            decode=dict(decode_raw),
+            hz=int(raw.get("hz", 0)),
+            label=str(raw.get("label", "")),
         )
         spec._validate()
         return spec
+
+    @property
+    def resolved_label(self) -> str:
+        """The action-label contract this head trains against.
+
+        An explicit ``label`` wins; otherwise the historical implication of
+        this (slot, type) pair. Builders use THIS, never ``label`` directly,
+        so a spec written before the field still resolves — while
+        :meth:`to_dict` keeps emitting only what the document declared.
+        """
+        return self.label or _LEGACY_SLOT_LABELS.get((self.name, self.type), "")
 
     def _validate(self) -> None:
         ctx = f"heads[{self.name!r}]"
         if self.name not in _HEAD_NAMES:
             raise GraphSpecError(f"{ctx}: unknown head; allowed: {list(_HEAD_NAMES)}")
+        if self.hz < 0:
+            raise GraphSpecError(f"{ctx}: hz must be >= 0 (0 = unspecified), got {self.hz}")
+        if self.label:
+            # Fail loud on an unknown contract: the alternative is a head
+            # that silently trains against whatever column its slot name
+            # happens to imply, which is the failure this field exists to
+            # prevent.
+            from qnn.model import action_labels
+            try:
+                contract = action_labels.contract(self.label)
+            except KeyError as exc:
+                raise GraphSpecError(f"{ctx}: {exc.args[0]}") from None
+            # The contract's kind must agree with the head's structural role.
+            # A categorical selector cannot carry the binary attack contract,
+            # and the binary attack head cannot carry a 9-class one — either
+            # mismatch means the graph and the label disagree about what this
+            # head predicts.
+            is_selector_head = self.name == "weapon" or (
+                self.name == "attack" and self.type == "attack_with")
+            if contract.selector != is_selector_head:
+                want = "a selector" if is_selector_head else "a non-selector"
+                raise GraphSpecError(
+                    f"{ctx}: head is {'a' if is_selector_head else 'not a'} "
+                    f"categorical selector but label {self.label!r} is "
+                    f"{'a selector' if contract.selector else 'not a selector'} "
+                    f"contract ({contract.label}); expected {want} contract")
         if self.activation not in _ACTIVATIONS:
             raise GraphSpecError(f"{ctx}: activation must be one of {list(_ACTIVATIONS)}")
         if not self.inputs:
             raise GraphSpecError(f"{ctx}: inputs must be non-empty")
         if len(set(self.inputs)) != len(self.inputs):
             raise GraphSpecError(f"{ctx}: duplicate input edge")
-        if self.name == "weapon":
-            # weapon may also read a single token as its readout (token.<name>)
+        is_selector = self.name == "weapon" or (
+            self.name == "attack" and self.type == "attack_with"
+        )
+        if is_selector:
+            # The categorical selector may read a token or raw scalar directly.
             # and/or a raw scalar obs field (scalar.<name>) straight into its
             # input cat; existence/eligibility is checked at GraphSpec level.
             bad = [e for e in self.inputs
@@ -462,14 +545,14 @@ class HeadNodeSpec:
             bad = [e for e in self.inputs if e not in allowed_edges]
         if bad:
             raise GraphSpecError(f"{ctx}: unknown edge(s) {bad}; allowed: {list(allowed_edges)}")
-        if self.name in _MOTOR_HEADS and EDGE_READOUT not in self.inputs:
+        if self.name in _MOTOR_HEADS and not is_selector and EDGE_READOUT not in self.inputs:
             raise GraphSpecError(f"{ctx}: motor heads must read {EDGE_READOUT!r}")
-        if self.name == "weapon" and not (
+        if is_selector and not (
             ({EDGE_GRU, EDGE_SELF_READOUT} & set(self.inputs))
             or any(_is_token_edge(e) for e in self.inputs)
         ):
             raise GraphSpecError(
-                f"{ctx}: weapon needs a readout — one of {EDGE_GRU!r} / "
+                f"{ctx}: attack selector needs a readout — one of {EDGE_GRU!r} / "
                 f"{EDGE_SELF_READOUT!r} or a {EDGE_TOKEN_PREFIX}<name> token edge"
             )
 
@@ -478,23 +561,30 @@ class HeadNodeSpec:
             "type": self.type, "inputs": list(self.inputs),
             "d_hidden": self.d_hidden, "activation": self.activation,
         }
-        if self.name == "weapon":
-            out["context_from_obs"] = self.context_from_obs
+        if self.name == "weapon" or (self.name == "attack" and self.type == "attack_with"):
             if self.feasibility_mask:
                 out["feasibility_mask"] = self.feasibility_mask
             if self.focal_gamma:
                 out["focal_gamma"] = self.focal_gamma
             if self.pos_weight:
                 out["pos_weight"] = self.pos_weight
-            if self.decode:
-                out["decode"] = {k: v for k, v in self.decode}
-        if self.name == "jump" and self.pos_weight:
+            # Emit only an EXPLICITLY declared contract. A legacy graph that
+            # implied its label through _LEGACY_SLOT_LABELS must round-trip
+            # byte-identically — checkpoint graph-equality checks compare
+            # these dicts, so silently gaining a key would fail cross-line
+            # loads. The implication is applied at build time instead
+            # (:attr:`resolved_label`).
+            if self.label:
+                out["label"] = self.label
+        if self.name in ("jump", "attack_future") and self.pos_weight:
             out["pos_weight"] = self.pos_weight
         if self.name == "move_seg" and self.water_ud:
             # Shape-bearing: a water_ud head is 3×JOINT wide. Dropping this
             # on serialization made checkpoints unloadable (p3/p3b reload
             # crash — 90-wide checkpoint vs 60-wide rebuilt head).
             out["water_ud"] = self.water_ud
+        if self.name == "look_seg" and self.hz:
+            out["hz"] = self.hz
         return out
 
 
@@ -509,6 +599,12 @@ class GraphSpec:
     pointers: tuple[PointerSpec, ...]
     heads: tuple[HeadNodeSpec, ...]
     graph_version: int = GRAPH_VERSION
+    # Entity-stream selector (qnn.vocab.ENTITY_STREAMS): "combat" (default,
+    # the A27 actor/projectile stream) or "full" (the a26-line stream —
+    # recency dims, live item/mover tokens, 4-way modality vocab). Optional
+    # spec key; a26 checkpoints predate it, so QNNPolicy.load sniffs the
+    # state dict (proj_projectile in-dim) and upgrades the default.
+    entity_stream: str = _ENTITY_STREAM_COMBAT
 
     # -- accessors ----------------------------------------------------
 
@@ -539,7 +635,8 @@ class GraphSpec:
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "GraphSpec":
         ctx = "graph"
-        _reject_unknown(raw, ("graph_version", "tokens", "encoder", "temporal", "pointers", "heads"), ctx)
+        _reject_unknown(raw, ("graph_version", "tokens", "encoder", "temporal",
+                              "pointers", "heads", "entity_stream"), ctx)
         version = int(_require(raw, "graph_version", ctx))
         if version != GRAPH_VERSION:
             raise GraphSpecError(f"{ctx}: unsupported graph_version {version}")
@@ -561,12 +658,18 @@ class GraphSpec:
             pointers=tuple(PointerSpec.from_dict(str(n), p) for n, p in pointers_raw.items()),
             heads=tuple(HeadNodeSpec.from_dict(str(n), h) for n, h in heads_raw.items()),
             graph_version=version,
+            entity_stream=str(raw.get("entity_stream", _ENTITY_STREAM_COMBAT)),
         )
         spec.validate()
         return spec
 
     def validate(self) -> None:
         ctx = "graph"
+        if self.entity_stream not in _ENTITY_STREAMS:
+            raise GraphSpecError(
+                f"{ctx}: unknown entity_stream {self.entity_stream!r}; "
+                f"allowed: {list(_ENTITY_STREAMS)}"
+            )
         names = [t.name for t in self.tokens]
         if len(set(names)) != len(names):
             raise GraphSpecError(f"{ctx}: duplicate token name")
@@ -625,7 +728,8 @@ class GraphSpec:
                             "fed straight into a head input cat"
                         )
         # Network feeds ONE motor feature vector to all motor heads.
-        motor = [h for h in self.heads if h.name in _MOTOR_HEADS]
+        motor = [h for h in self.heads
+                 if h.name in _MOTOR_HEADS and h.type != "attack_with"]
         if motor and len({h.inputs for h in motor}) != 1:
             raise GraphSpecError(
                 f"{ctx}: motor heads must declare identical inputs "
@@ -646,7 +750,7 @@ class GraphSpec:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "graph_version": self.graph_version,
             "tokens": {t.name: t.to_dict() for t in self.tokens},
             "encoder": self.encoder.to_dict(),
@@ -654,3 +758,10 @@ class GraphSpec:
             "pointers": {p.name: p.to_dict() for p in self.pointers},
             "heads": {h.name: h.to_dict() for h in self.heads},
         }
+        if self.entity_stream != _ENTITY_STREAM_COMBAT:
+            # Shape-bearing (like move_seg.water_ud): a full-stream model
+            # rebuilt without it would build the combat entity wiring and
+            # fail its own state dict. Combat stays key-free so existing
+            # graph documents round-trip byte-identically.
+            out["entity_stream"] = self.entity_stream
+        return out

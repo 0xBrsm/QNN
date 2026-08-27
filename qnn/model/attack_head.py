@@ -8,7 +8,7 @@ any new variant is a standalone ``nn.Module`` implementing the same
 ``Network(attack_head=<variant>)``.
 
 ``AttackHeadInput`` carries optional fields that variants may need
-(``look_prior``, ``weapon_id``, ``target_logits``, ``entity_scalars``,
+(``look_prior``, ``target_logits``, ``entity_scalars``,
 ``actor_mask``, ``self_scalars``). The canonical head reads only
 ``features``; variants pick what they need.
 """
@@ -32,7 +32,6 @@ class AttackHeadInput:
     # ignores them. Network.forward populates all of them so any variant
     # slotted in receives a uniform input dataclass.
     look_prior: torch.Tensor | None = None               # (B*, 3) unit vec to target
-    weapon_id: torch.Tensor | None = None               # (B*, 1) raw obs ID
     target_logits: torch.Tensor | None = None           # (B*, N)
     entity_scalars: torch.Tensor | None = None          # (B*, N, ACTOR_SCALAR_DIM)
     actor_mask: torch.Tensor | None = None              # (B*, N) bool
@@ -44,6 +43,22 @@ class AttackHeadOutput:
     attack_logit: torch.Tensor   # (B*, 1) fed to BCE
     prior_logit: torch.Tensor    # (B*, 1) prior alone — canonical returns zeros
     delta_attack: torch.Tensor   # (B*, 1) raw MLP output
+
+
+@dataclass(frozen=True, slots=True)
+class AttackSelectorInput:
+    """Input to the categorical 0..8 attack selector."""
+
+    selector: torch.Tensor
+    feasibility_mask: torch.Tensor | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttackSelectorOutput:
+    """Categorical attack logits plus their motor-conditioning context."""
+
+    logits: torch.Tensor
+    context: torch.Tensor
 
 
 class AttackHead(nn.Module):

@@ -13,8 +13,7 @@ Two halves:
   resolves these; nothing here holds tensors or parameters.
     - ``ScalarSpec`` — a fixed-width float contribution. Either a plain
       slice of a (dequanted) obs tensor, or a small computed quantity
-      (weapon static-table lookup, held-weapon readiness gather, the
-      engagement EMA aux scalar).
+      (the engagement EMA aux scalar).
     - ``VocabSpec`` — a discrete id field looked up in a shared embedding
       table, with a mask / reduce rule.
 
@@ -36,12 +35,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Single-source constants from their owners. WEAPON_SUBJECT_IDS / WT_* are
-# re-exported (token_builder + obs_accessor import them from here);
-# MODEL_TOKEN_SCALAR_DIM is used below for the weapon_static field width.
-from qnn.bc.weapon_physics import (  # noqa: F401  (WT_* re-exported)
-    MODEL_TOKEN_SCALAR_DIM, WT_DAMAGE, WT_RADIUS,
-)
 from qnn.model.dequant import WEAPON_SUBJECT_IDS  # noqa: F401  (re-exported)
 from qnn.schema import SELF_SCALAR_DIM
 
@@ -89,10 +82,6 @@ SCALAR_FIELDS: dict[str, ScalarSpec] = {
     "velocity":        _slice("velocity",         "self_motion_scalars",  0, 3),
     "view_pitch":      _slice("view_pitch",       "self_motion_scalars",  3, 4),
     "vel_pitch":       _slice("vel_pitch",        "self_motion_scalars",  0, 4),
-    # Computed (accessor owns the logic; see ObsAccessor).
-    "weapon_static":   _computed("weapon_static",   MODEL_TOKEN_SCALAR_DIM, "weapon_static"),
-    "weapon_dmg_rad":  _computed("weapon_dmg_rad",  2, "weapon_dmg_rad"),
-    "held_readiness":  _computed("held_readiness",  1, "held_readiness"),
     # look_delta = look[t-1] - look[t-2]: the frame-to-frame change in the
     # anchor-relative look vector (~0 under steady rotation; ≈ angular
     # acceleration, NOT angular velocity — a single look vector is that).
@@ -124,7 +113,6 @@ class VocabSpec:
 
 VOCAB_FIELDS: dict[str, VocabSpec] = {
     "armor_type":       VocabSpec("armor_type",       "self_armor_type_id",       "entity",   masked=True),
-    "weapon_id":        VocabSpec("weapon_id",        "self_weapon_id",           "entity",   masked=True),
     "movement_id":      VocabSpec("movement_id",      "self_movement_id",         "movement", masked=False),
     "powerup_state":    VocabSpec("powerup_state",    "self_state_powerup_ids",   "entity",   masked=True, reduce="sum"),
     "powerup_arsenal":  VocabSpec("powerup_arsenal",  "self_arsenal_powerup_ids", "entity",   masked=True, reduce="sum"),
@@ -200,12 +188,12 @@ class KindTag:
 FieldSource = "ScalarGroup | VocabEmbed | VocabSum | WeaponReadiness | AmmoPools | KindTag"
 
 
-def canonical_self_fields(include_weapon_id: bool) -> tuple:
+def canonical_self_fields() -> tuple:
     """Fields for the production monolithic self token.
 
     This mirrors the pre-TokenBuilder ObsEmbedding self block exactly:
     full-width self scalar projection, self kind tag, armor type, movement,
-    optional held-weapon identity, and all powerups.
+    and all powerups.
 
     The TokenSpec twin is ``qnn.model.graph.spec.monolithic_self_token``;
     a unit test asserts ``token_fields(monolithic_self_token(x))`` equals
@@ -217,8 +205,6 @@ def canonical_self_fields(include_weapon_id: bool) -> tuple:
         VocabEmbed("armor_type"),
         VocabEmbed("movement_id"),
     ]
-    if include_weapon_id:
-        fields.append(VocabEmbed("weapon_id"))
     fields.append(VocabSum("powerup_all"))
     return tuple(fields)
 
@@ -237,10 +223,7 @@ MOTION_FIELDS = (
 
 # Canonical lean "state token" — the self state subtoken: health/armor scalars,
 # armor_type, state powerups (PENT/RING/MEGAHEALTH). Deliberately EXCLUDES
-# weapon_id (an incumbent leak for the weapon head) and powerup_arsenal (lives in
-# the arsenal token). The move head uses a separate, richer state bundle that
-# intentionally includes weapon_id/attack_finished/arsenal — that is correct for
-# a motor head but must NOT be reused where an incumbent leak matters.
+# weapon identity and powerup_arsenal (lives in the arsenal token).
 SELF_STATE_FIELDS = (
     ScalarGroup(["health_armor"]),
     VocabEmbed("armor_type"),

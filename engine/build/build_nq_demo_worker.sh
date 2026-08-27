@@ -32,6 +32,8 @@ CUSTOM_SOURCES=(
   "${ENGINE_DIR}/common/qnn_self_common.c"
   "${ENGINE_DIR}/nq/qnn_progs_stub.c"
   "${ENGINE_DIR}/common/qnn_io.c"
+  "${ENGINE_DIR}/common/qnn_obs_registry.c"
+  "${ENGINE_DIR}/common/qnn_obs_shim.c"
   "${ENGINE_DIR}/common/qnn_metrics.c"
   "${ENGINE_DIR}/common/qnn_fault.c"
   "${ENGINE_DIR}/common/qnn_watchdog.c"

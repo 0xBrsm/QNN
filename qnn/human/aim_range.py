@@ -49,7 +49,7 @@ IMPULSE_NAME = {                         # impulse 1..8 = Axe,SG,SSG,NG,SNG,GL,R
     6: "GL", 7: "RL", 8: "LG",
 }
 MIN_ENGAGED_FRAMES_EP = 30               # episode admit (matches aim_skill)
-_WN, _ZD, _WI = A._build_physics_tables()  # weapon scalars, z-anchor, wid->impulse
+_WN, _ZD = A._build_physics_tables()
 
 # Direct-fire weapons emitted with the fitting weapons SSG/SNG (which transfer off
 # SG/NG on the grid) — the JSON carries all six so the pipeline can key by abbr.
@@ -72,7 +72,7 @@ FRIKBOT_TO_PIN = {"shotgun": "fsg", "nailgun": "fng",
 
 
 def _episode_perweapon_range(
-    ep_cnt, ep_rel, ep_vel, ep_typ, ep_rec, ep_wid, ep_engaged,
+    ep_cnt, ep_rel, ep_vel, ep_typ, ep_rec, ep_weapon, ep_engaged,
 ) -> dict[int, np.ndarray]:
     """Return {impulse: ranges[n_los_frames]} for one episode.
 
@@ -96,7 +96,7 @@ def _episode_perweapon_range(
     rel = all_rel[eng_idx]
     vel = all_vel[eng_idx]
     los = all_los[eng_idx]
-    imp = _WI[ep_wid[eng_idx]]                       # (M,) impulse 0..8 per frame
+    imp = A.action_attack_context(ep_weapon)[eng_idx]
 
     angles = A._lead_aim_angle_deg_live(rel, vel, imp, _WN)   # (M, 16)
     angles = np.where(los, angles, np.inf)
@@ -135,9 +135,8 @@ def _worker(args: tuple) -> dict[int, np.ndarray]:
     acc: dict[int, list[np.ndarray]] = defaultdict(list)
     for _ei, _dmi, fsl, esl, arr in A.iter_shard_episodes(
             sh, data_dir_str,
-            obs=("entity_rel", "entity_vel", "entity_types", "entity_recency",
-                 "self_weapon_id"),
-            acts=("target_probs",)):
+            obs=("entity_rel", "entity_vel", "entity_types", "entity_recency"),
+            acts=("target_probs", "attack")):
         ep_engaged = np.asarray(arr["target_probs"][fsl]).argmax(axis=1) > 0
         if int(ep_engaged.sum()) < MIN_ENGAGED_FRAMES_EP:
             continue
@@ -147,7 +146,7 @@ def _worker(args: tuple) -> dict[int, np.ndarray]:
             ep_vel=np.asarray(arr["entity_vel"][esl]),
             ep_typ=np.asarray(arr["entity_types"][esl]),
             ep_rec=np.asarray(arr["entity_recency"][esl]),
-            ep_wid=np.asarray(arr["self_weapon_id"][fsl]),
+            ep_weapon=np.asarray(arr["attack"][fsl]),
             ep_engaged=ep_engaged,
         )
         for w, r in per.items():
@@ -209,7 +208,7 @@ def run(collect_dir: Path, splits: list[str], out_path: Path, n_workers: int) ->
 
     out = {
         "metric": "engagement_range_units",
-        "measurement": "range_of_most_aligned_los_actor_per_held_weapon",
+        "measurement": "range_of_most_aligned_los_actor_per_action_attack_context",
         "splits": splits,
         "collect_dir": str(collect_dir),
         "engaged_def": "target_probs argmax>0 AND >=1 LOS actor (recency==0)",

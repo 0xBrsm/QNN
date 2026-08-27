@@ -64,6 +64,32 @@ static qboolean QNN_QualifyEntity(const qnn_entity_t *e, float now,
 	return true;
 }
 
+/* A27 combat-observation producer boundary (wire.13 / QNN_ENTITY_MODE_COMBAT).
+ *
+ * SIGHT is current-frame FOV + trace visibility. PROXIMITY is current-frame
+ * engine PVS ground truth and is the only piece intended to be replaced by a
+ * higher-layer prediction later. Sight wins when both channels contain the
+ * entity. Historical sound/memory stamps and all recency windows are ignored.
+ * Verbatim from the A27 combat substrate (feat/a27) — keep byte-identical so
+ * a wire.13 model sees exactly the obs it was trained on. */
+static qboolean QNN_QualifyCombatEntity(const qnn_entity_t *e, float now,
+	int *out_modality)
+{
+	if (e->type != QNN_ENT_ACTOR && e->type != QNN_ENT_PROJECTILE)
+		return false;
+	if (e->vis > 0.0f && e->vis == now)
+	{
+		*out_modality = QNN_MODALITY_SIGHT;
+		return true;
+	}
+	if (e->pvs > 0.0f && e->pvs == now)
+	{
+		*out_modality = QNN_MODALITY_PROXIMITY;
+		return true;
+	}
+	return false;
+}
+
 /* ── Candidate types ──────────────────────────────────────────── */
 
 #define QNN_CAND_PROJECTILE 0
@@ -291,39 +317,60 @@ int QNN_OracleEmitTokens(
 		{
 			qnn_entity_t *e = &qnn_store[i];
 			int cand_type, modality;
-			float age;
 
-			if (!QNN_QualifyEntity(e, now, &modality, &age))
-				continue;
-			switch (e->type)
+			if (QNN_IOGetEntityMode() == QNN_ENTITY_MODE_COMBAT)
 			{
-			case QNN_ENT_PROJECTILE:
-			case QNN_ENT_BACKPACK:   cand_type = (e->type == QNN_ENT_BACKPACK) ? QNN_CAND_ITEM : QNN_CAND_PROJECTILE; break;
-			case QNN_ENT_ACTOR:      cand_type = QNN_CAND_ACTOR; break;
-			case QNN_ENT_ITEM:       cand_type = QNN_CAND_ITEM; break;
-			case QNN_ENT_MOVER:      cand_type = QNN_CAND_MOVER; break;
-			default: continue;
+				/* wire.13 (A27 pure-combat): current-frame actor /
+				 * projectile only, SIGHT/PROXIMITY, no recency. */
+				switch (e->type)
+				{
+				case QNN_ENT_PROJECTILE: cand_type = QNN_CAND_PROJECTILE; break;
+				case QNN_ENT_ACTOR:      cand_type = QNN_CAND_ACTOR; break;
+				default: continue;
+				}
+				if (!QNN_QualifyCombatEntity(e, now, &modality))
+					continue;
+				candidates[candidate_count].recency = 0.0f;
+				candidates[candidate_count].pool =
+					(cand_type == QNN_CAND_ACTOR) ? QNN_POOL_ACTOR
+					                              : QNN_POOL_PROJECTILE;
+			}
+			else
+			{
+				/* wire.11/wire.12 (full stream): all token types with the
+				 * sight/proximity/sound/memory recency ladder. */
+				float age;
+				if (!QNN_QualifyEntity(e, now, &modality, &age))
+					continue;
+				switch (e->type)
+				{
+				case QNN_ENT_PROJECTILE:
+				case QNN_ENT_BACKPACK:   cand_type = (e->type == QNN_ENT_BACKPACK) ? QNN_CAND_ITEM : QNN_CAND_PROJECTILE; break;
+				case QNN_ENT_ACTOR:      cand_type = QNN_CAND_ACTOR; break;
+				case QNN_ENT_ITEM:       cand_type = QNN_CAND_ITEM; break;
+				case QNN_ENT_MOVER:      cand_type = QNN_CAND_MOVER; break;
+				default: continue;
+				}
+				/* Clamp recency to non-negative. age = cl.mtime[0] -
+				 * newest_obs can go negative across map-change-within-demo
+				 * boundaries (cl.mtime resets while qnn_store retains
+				 * prior-segment timestamps). Negative recency in the obs
+				 * blows up the target labeler's exp(-recency/tau). */
+				candidates[candidate_count].recency = (age < 0.0f) ? 0.0f : age;
+				switch (cand_type)
+				{
+				case QNN_CAND_ACTOR:      candidates[candidate_count].pool = QNN_POOL_ACTOR;      break;
+				case QNN_CAND_PROJECTILE: candidates[candidate_count].pool = QNN_POOL_PROJECTILE; break;
+				case QNN_CAND_ITEM:       candidates[candidate_count].pool = QNN_POOL_ITEM;       break;
+				case QNN_CAND_MOVER:      candidates[candidate_count].pool = QNN_POOL_MOVER;      break;
+				default:                  candidates[candidate_count].pool = QNN_POOL_MOVER;      break;
+				}
 			}
 			candidates[candidate_count].type = cand_type;
 			candidates[candidate_count].modality = modality;
 			candidates[candidate_count].store_index = i;
-			/* Clamp recency to non-negative. age = cl.mtime[0] - newest_obs
-			 * can go negative across map-change-within-demo boundaries
-			 * (cl.mtime resets while qnn_store retains prior-segment
-			 * timestamps). Negative recency in the obs blows up the
-			 * target labeler's exp(-recency/tau). */
-			candidates[candidate_count].recency = (age < 0.0f) ? 0.0f : age;
 			candidates[candidate_count].entry = e;
 			candidates[candidate_count].entity_num = e->entity_num;
-
-			switch (cand_type)
-			{
-			case QNN_CAND_ACTOR:      candidates[candidate_count].pool = QNN_POOL_ACTOR;      break;
-			case QNN_CAND_PROJECTILE: candidates[candidate_count].pool = QNN_POOL_PROJECTILE; break;
-			case QNN_CAND_ITEM:       candidates[candidate_count].pool = QNN_POOL_ITEM;       break;
-			case QNN_CAND_MOVER:      candidates[candidate_count].pool = QNN_POOL_MOVER;      break;
-			default:                  candidates[candidate_count].pool = QNN_POOL_MOVER;      break;
-			}
 
 			candidate_count++;
 		}

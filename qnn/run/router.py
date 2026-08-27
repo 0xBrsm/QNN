@@ -28,7 +28,7 @@ def get_runner(mode: str) -> Callable[[RunnerContext], dict[str, Any]]:
     if mode == "optuna":
         from qnn.ppo.optuna import run
         return run
-    if mode == "head_probe":
+    if mode == "bench":
         from qnn.model.bench.runner import run
         return run
     raise RuntimeError(f"Unsupported run mode in run.json: {mode}")

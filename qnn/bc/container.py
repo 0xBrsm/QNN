@@ -38,8 +38,30 @@ class BCSourceBundle:
         }
 
     def release_device_tensors(self) -> None:
+        """Drop the sources' device tensors AND hand their blocks back.
+
+        ``ResidentSource.release_device_tensors`` only clears the obs/actions
+        dicts.  That drops the references, so the tensors are freed to torch's
+        caching allocator as *reserved* — held by this process, not returned to
+        the device.  Reuse hides it whenever the next bundle wants
+        identically-shaped blocks, which is every reload of the same corpus, so
+        the daemon has always looked clean across `reset`.  A differently sized
+        corpus cannot reuse them: the allocator requests fresh segments while
+        the previous corpus still occupies its own, and the device OOMs at
+        roughly the sum of the two.  That reads as a mysterious OOM on a corpus
+        that fits comfortably on its own.
+
+        ``gc.collect()`` first — a tensor still reachable through a reference
+        cycle is not freed by ``clear()`` alone, and ``empty_cache`` can only
+        release blocks with no live tensors in them.
+        """
+        import gc as _gc
+
         self.train_source.release_device_tensors()
         self.val_source.release_device_tensors()
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def effective_head_loss_weights(raw: str) -> Dict[str, float]:
@@ -112,8 +134,8 @@ def _required_actions_for_config(
     head_loss_weights: Mapping[str, float],
 ) -> frozenset[str]:
     required_actions_set: set[str] = set()
-    if config.model.use_weapon_head and float(head_loss_weights.get("weapon", 1.0)) > 0.0:
-        required_actions_set.add("weapon")
+    if config.model.use_weapon_head and float(head_loss_weights.get("attack", 1.0)) > 0.0:
+        required_actions_set.add("attack")
     # input_mask is required when labels/derived loss targets depend on
     # op-frame semantics. Corpora without it still train cleanly when
     # those toggles are off.
@@ -155,6 +177,20 @@ def _source_compatibility_key(
         # a25: hazard runs carry extra derived obs/act columns, so they must not
         # share a cached source bundle with hazard-less runs (and vice versa).
         _needs_move_hazard(config),
+        # The pinned corpus identity. build_behavior_cloning_sources verifies
+        # this against the corpus's fingerprint.json — but ONLY when it builds.
+        # On the daemon's reuse path the build is skipped, so without this a run
+        # pinning a different fingerprint silently trained on the cached bundle
+        # of a different collect. (Disk changing under a bundle with the SAME
+        # pinned value is caught by the re-verify in
+        # validate_source_bundle_compatible.)
+        str(getattr(config, "collection_fingerprint", "") or ""),
+        # Load-time temporal resample is derived from fixed_tick_hz against the
+        # corpus's collected tick_hz (build_behavior_cloning_sources ->
+        # qnn.bc.resample), so it bakes into the resident tensors. Without this
+        # a 10 Hz run and a 20 Hz run on one corpus SHARE a bundle and one of
+        # them trains on the wrong frame grouping.
+        int(getattr(config, "fixed_tick_hz", 0) or 0),
     )
 
 
@@ -178,6 +214,28 @@ def validate_source_bundle_compatible(
             "BC source bundle is incompatible with this run config. "
             f"bundle={bundle.compatibility_key!r} expected={expected!r}"
         )
+    # Corpus-drift check on the REUSE path. The key above pins the CONFIG's
+    # fingerprint, which catches "different run, different pinned corpus". It
+    # cannot catch "same pinned value, corpus recollected on disk while a bundle
+    # is live" — and build_behavior_cloning_sources' verify only runs when it
+    # BUILDS, so on reuse nothing looked at the corpus at all.
+    #
+    # The bundle already records what it baked (`actual_fingerprint`, set at
+    # build); it was simply never compared. Compare it. One small JSON read.
+    from qnn import collection_fingerprint
+    baked = bundle.actual_fingerprint
+    if baked is not None:
+        bc_data_dir, _train_cache, _val_cache = _bc_cache_paths(config)
+        current = collection_fingerprint.load(bc_data_dir)
+        if current is not None and current.get("fingerprint") != baked.get("fingerprint"):
+            raise RuntimeError(
+                "BC source bundle was built from a different collect than the "
+                f"corpus now on disk at {bc_data_dir}: bundle baked "
+                f"{baked.get('fingerprint')!r}, disk now has "
+                f"{current.get('fingerprint')!r}. The corpus was recollected "
+                "while this bundle was cached — reset the daemon (or restart it) "
+                "so the next submit rebuilds from the current data."
+            )
 
 
 def build_behavior_cloning_sources(
@@ -218,6 +276,20 @@ def build_behavior_cloning_sources(
     if val_cache.exists():
         validate_cache_for_training(val_cache, required_actions=required_actions)
 
+    # Load-time temporal resample: if the run's fixed_tick_hz is below the
+    # corpus's collected rate, group every corpus_hz//target_hz frames into one
+    # at load (qnn.bc.resample) — no second collect. ratio 1 = no-op default.
+    resample_ratio = 1
+    _meta_path = bc_data_dir / "collect_metadata.json"
+    _corpus_hz = (json.loads(_meta_path.read_text()).get("tick_hz")
+                  if _meta_path.exists() else None)
+    _tgt_hz = int(getattr(config, "fixed_tick_hz", 0) or 0)
+    if _corpus_hz and _tgt_hz and _tgt_hz < _corpus_hz:
+        from qnn.bc.resample import resample_ratio as _resample_ratio
+        resample_ratio = _resample_ratio(_corpus_hz, _tgt_hz)
+        print(f"  [bc] load-time resample: corpus {_corpus_hz} Hz -> {_tgt_hz} Hz "
+              f"(group {resample_ratio} frames/tick)")
+
     print(f"  [bc] Loading training data: {train_cache}")
     if config.segment_mask:
         print(f"  [bc] segment_mask: {config.segment_mask}")
@@ -240,6 +312,7 @@ def build_behavior_cloning_sources(
             prefetch_depth=max(2, int(config.prefetch)),
             engagement_ema_alpha=eng_alpha,
             needs_move_hazard=needs_move_hazard,
+            resample_ratio=resample_ratio,
         )
         val_source = (
             make_streaming_source(
@@ -248,6 +321,7 @@ def build_behavior_cloning_sources(
                 prefetch_depth=max(2, int(config.prefetch)),
                 engagement_ema_alpha=eng_alpha,
                 needs_move_hazard=needs_move_hazard,
+                resample_ratio=resample_ratio,
             ) if val_cache.exists()
             else make_resident_source([], device, engagement_ema_alpha=eng_alpha)
         )
@@ -263,6 +337,7 @@ def build_behavior_cloning_sources(
             engagement_ema_alpha=eng_alpha,
             compact_dequantized=True,
             needs_move_hazard=needs_move_hazard,
+            resample_ratio=resample_ratio,
         )
         _gc.collect()
         if torch.cuda.is_available():
@@ -277,6 +352,7 @@ def build_behavior_cloning_sources(
                 engagement_ema_alpha=eng_alpha,
                 compact_dequantized=True,
                 needs_move_hazard=needs_move_hazard,
+                resample_ratio=resample_ratio,
             )
         else:
             val_source = make_resident_source([], device, engagement_ema_alpha=eng_alpha)

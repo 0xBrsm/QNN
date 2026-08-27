@@ -43,19 +43,8 @@ _RELEASE_FLOOR_COS = math.cos(math.radians(5.0))
 
 
 def _extract_attack(actions) -> np.ndarray:
-    """Return the per-frame attack stream from an actions dict.
-
-    The on-disk action layout packs attack into bit 0 of the ``move``
-    byte (mirroring the input_mask layout); there is no standalone
-    ``attack`` field after the engine collector. For BC-time call sites
-    that still pre-unpack ``attack`` as a (T,) uint8 (e.g. the streaming
-    source slice path), use that directly. Otherwise derive from
-    ``move`` bit 0.
-    """
-    if "attack" in actions:
-        return np.asarray(actions["attack"])
-    move = np.asarray(actions["move"], dtype=np.uint8)
-    return (move & 1).astype(np.uint8)
+    """Return the categorical 0..8 effective-attack labels."""
+    return np.asarray(actions["attack"], dtype=np.uint8)
 
 
 def _adaptive_cone_cos(dist_qu: np.ndarray, transverse_u: float,
@@ -112,7 +101,6 @@ _ACTOR_HALFEXT_OFFSET = 0
 # should freeze a calibrated config (see the calibration recipe in the
 # design doc) and record it in the manifest.
 
-_ACTOR_RECENCY_OFFSET = 18   # matches qnn.bc.weapon_physics.ACTOR_RECENCY_OFFSET
 _SELF_HEALTH_OFFSET = 0      # obs_self_scalars[:, 0] normalized health
 
 
@@ -128,9 +116,6 @@ class LabelerConfig:
     cone_admit:           float = 0.25   # min cone score for cone-only admission
     physics_hit_base:     float = 0.95   # base evidence weight for a physics hit
     theta_reject_deg:     float = 45.0   # hard reject if cone-only and angle > this
-
-    # Visibility / recency decay (recency is in seconds; SIGHT max = 2.0)
-    recency_tau:          float = 1.00
 
     # Anchor mass cap
     present_cap:          float = 0.98
@@ -159,6 +144,26 @@ class LabelerConfig:
     time_floor:            float = 0.65
     extension_tau:         float = 40.0  # frames
 
+    # Visibility decay — the A26 `vis = exp(-recency / 1.0s)` weight, restored
+    # on the A27 two-modality stream.  A26 keyed actor tokens to the `vis`
+    # stamp, so `recency` WAS "seconds since last seen" and was the labeler's
+    # only line-of-sight discriminator (a hard `recency == 0` gate on
+    # physics-hit evidence, plus this multiplicative weight on cone evidence
+    # and on the extension score).  A27 removed the field from the wire, which
+    # left the labeler with no visibility signal at all: it scored a
+    # wall-occluded PROXIMITY actor exactly like one in the open, and 49-61%
+    # of a27 target labels landed on enemies the demonstrator could not see.
+    #
+    # The model does not get recency back — that is A27's design and it stands.
+    # The labeler runs offline over a whole episode, so it reconstructs the
+    # same quantity from the modality stream: frames since this pid was last
+    # emitted as SIGHT.  Units are FRAMES, following `extension_tau` above
+    # (both assume the 20 Hz collect tick).  20 frames = A26's 1.0 s tau;
+    # 40 frames = A26's 2.0 s QNN_RECENCY_MAX_SIGHT, past which A26 stopped
+    # emitting the row at all, so beyond it vis is 0 rather than exp(-2).
+    staleness_tau_frames:  float = 20.0
+    staleness_max_frames:  float = 40.0
+
 
 DEFAULT_LABELER_CONFIG = LabelerConfig()
 
@@ -170,6 +175,45 @@ def _pid_indices_per_frame(enemy_mask: np.ndarray, player_ids: np.ndarray,
     any_pid = has.any(axis=1)
     first_idx = has.argmax(axis=1)
     return np.where(any_pid, first_idx, -1).astype(np.int64)
+
+
+def _visibility_from_modality(
+    enemy: np.ndarray,
+    player_ids: np.ndarray,
+    modality: np.ndarray,
+    config: LabelerConfig,
+) -> np.ndarray:
+    """``(T, N)`` visibility weight, the A26 ``exp(-recency / tau)`` rebuilt
+    from the modality stream.
+
+    For each enemy pid, walk the episode and track the most recent frame at
+    which it was emitted as SIGHT; the per-frame gap is A26's ``recency`` in
+    frames.  Weight is ``exp(-gap / staleness_tau_frames)``, and 0 once the gap
+    exceeds ``staleness_max_frames`` or the pid has not been seen yet in this
+    episode — both cases A26 represented by simply not emitting the row.
+
+    Slots that are not enemy actors get 0; they are never scored anyway.
+    """
+    T, N = enemy.shape
+    vis = np.zeros((T, N), dtype=np.float32)
+    if T == 0:
+        return vis
+    frames = np.arange(T, dtype=np.int64)
+    sight = enemy & (modality == _MODALITY_SIGHT)
+    pids = np.unique(player_ids[enemy])
+    for pid in pids:
+        pid = int(pid)
+        if pid <= 0:
+            continue
+        here = enemy & (player_ids == pid)
+        seen_now = (sight & here).any(axis=1)
+        # Last frame index at which this pid was SIGHT, or -1 before first sight.
+        last_seen = np.maximum.accumulate(np.where(seen_now, frames, -1))
+        gap = np.where(last_seen >= 0, frames - last_seen, np.inf)
+        w = np.exp(-gap / config.staleness_tau_frames)
+        w[gap > config.staleness_max_frames] = 0.0
+        vis[here] = np.broadcast_to(w[:, None], (T, N))[here]
+    return vis
 
 
 def _bad_end_window(dead: np.ndarray, death_edge: np.ndarray,
@@ -201,7 +245,7 @@ def label_enemy_target_probs(
     Algorithm (see ``src/docs/labeler_v3_simple.md``):
       1. For each fire, admit every enemy pid that has cone evidence
          (lead-corrected angle below opt3 adaptive width) OR physics-hit
-         evidence (recency-0 ray/projectile test). Distribute anchor mass
+         evidence (SIGHT-gated ray/projectile test). Distribute anchor mass
          proportionally; never argmax.
       2. Group anchors per-pid into streams while the pid stays in token
          stream. Multiple pid streams may overlap.
@@ -214,7 +258,7 @@ def label_enemy_target_probs(
     entity_scalars = np.asarray(obs["entity_scalars_raw"])
     self_scalars = np.asarray(obs["self_scalars"])
     look = np.asarray(actions["look"], dtype=np.float32)
-    fire = np.asarray(_extract_attack(actions)).reshape(-1)
+    attack = np.asarray(_extract_attack(actions)).reshape(-1)
 
     T = look.shape[0]
     N = MAX_TOKEN_OBJECTS
@@ -228,11 +272,12 @@ def label_enemy_target_probs(
     actor_mask = entity_types == TOKEN_ACTOR
     teammate_mask = entity_scalars[:, :, _ACTOR_TEAM_OFFSET] == _TEAM_TEAMMATE_VALUE
     enemy = actor_mask & ~teammate_mask
+    modality = entity_ids[:, :, 1]
     if sight_only:
-        modality = entity_ids[:, :, 1]
         enemy &= (modality == _MODALITY_SIGHT)
     player_ids = entity_ids[:, :, 2]
-    recency = entity_scalars[:, :, _ACTOR_RECENCY_OFFSET]
+    # A26's `vis`, rebuilt from modality (see _visibility_from_modality).
+    vis_tn = _visibility_from_modality(enemy, player_ids, modality, config)
 
     # Lead-corrected aim geometry.
     rel = entity_scalars[:, :, _ACTOR_REL_OFFSET:_ACTOR_REL_OFFSET + 3]
@@ -246,9 +291,7 @@ def label_enemy_target_probs(
     look_norm = np.linalg.norm(look, axis=-1, keepdims=True)
     unit_look = look / np.maximum(look_norm, 1e-6)
 
-    weapon = np.asarray(actions.get("weapon",
-                                    np.full(T, 7, dtype=np.uint8))).reshape(-1)
-    speed = np.asarray([_WEAPON_SPEED.get(int(w), math.inf) for w in weapon],
+    speed = np.asarray([_WEAPON_SPEED.get(int(a), math.inf) for a in attack],
                        dtype=np.float32)
     is_hitscan = np.isinf(speed)
     safe_speed = np.where(is_hitscan, 1.0, speed)
@@ -273,10 +316,10 @@ def label_enemy_target_probs(
 
     # ── Pass 1: per-fire anchor evidence ─────────────────────────────
     anchors_by_pid: dict[int, list[tuple[int, float]]] = defaultdict(list)
-    fire_ticks = np.flatnonzero(fire == 1)
+    fire_ticks = np.flatnonzero(attack > 0)
     for tt in fire_ticks:
         t = int(tt)
-        w = int(weapon[t])
+        w = int(attack[t])
         physics_pids = all_hits_at_fire(w, look[t], entity_scalars,
                                         entity_ids, t, enemy)
         cand: list[tuple[int, int]] = []
@@ -289,7 +332,11 @@ def label_enemy_target_probs(
                 continue
             cone_val = float(cone[t, s])
             cone_ok = cone_val >= config.cone_admit
-            hit = pid in physics_pids and recency[t, s] == 0.0
+            # A26 gated physics-hit evidence on `recency == 0`; the modality
+            # equivalent is "in the view cone and past the trace THIS frame".
+            # Without it, all_hits_at_fire — a pure ballistics test — registers
+            # hits on enemies through walls.
+            hit = pid in physics_pids and modality[t, s] == _MODALITY_SIGHT
             if not (cone_ok or hit):
                 continue
             if theta[t, s] > theta_reject_rad and not hit:
@@ -299,7 +346,7 @@ def label_enemy_target_probs(
             cone_e = cone_val if cone_ok else 0.0
             phys_e = config.physics_hit_base if hit else 0.0
             base = 1.0 - (1.0 - cone_e) * (1.0 - phys_e)
-            vis = math.exp(-max(0.0, float(recency[t, s])) / config.recency_tau)
+            vis = float(vis_tn[t, s])
             cand.append((pid, s))
             evidence.append(base * vis)
         if not evidence:
@@ -392,8 +439,7 @@ def label_enemy_target_probs(
             time_conf = (config.time_floor
                          + (1.0 - config.time_floor)
                          * math.exp(-dt / config.extension_tau))
-            vis = math.exp(-max(0.0, float(recency[t, s])) / config.recency_tau)
-            idx_scores[t, s] += eng_conf * time_conf * vis
+            idx_scores[t, s] += eng_conf * time_conf * float(vis_tn[t, s])
 
     # ── Normalize per frame ──────────────────────────────────────────
     S = idx_scores.sum(axis=1)

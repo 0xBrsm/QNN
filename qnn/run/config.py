@@ -143,7 +143,7 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
         "resume": resume,
     }
 
-    if mode == "head_probe":
+    if mode == "bench":
         # Head probes train memoryless MLPs from frozen shards — no
         # encoder/GRU/pointer model.json, but they do carry a probe.json
         # with the MLP shape + feature list.
@@ -578,8 +578,8 @@ def build_run_plan_values(run_cfg: dict[str, Any]) -> dict[str, int]:
             "eval_episodes": int(_key_with_prefix_fallback(machine, "num_episodes", "eval_", "machine.json")),
         }
 
-    if mode == "head_probe":
-        # head_probe goes through the canonical BC trainer, so its
+    if mode == "bench":
+        # bench goes through the canonical BC trainer, so its
         # planning surface mirrors BC's: batch_size is a machine knob.
         machine = _require_mapping(run_cfg, "machine", "run config")
         return {

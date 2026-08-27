@@ -24,8 +24,8 @@ import torch
 import torch.nn.functional as F
 
 from qnn.model.decode import bernoulli_sample, categorical_sample
-from qnn.model.network import ATTACK_HEAD, MOVE_HEAD, WEAPON_HEAD
-from qnn.schema import WEAPON_HEAD_SIZE
+from qnn.actions import ATTACK_ACTION_SIZE
+from qnn.model.network import ATTACK_HEAD, MOVE_HEAD
 
 
 def categorical_log_prob_entropy(
@@ -106,25 +106,36 @@ class HeadDistribution(ABC):
 
 
 class AttackDistribution(HeadDistribution):
-    """Split binary attack head; stored and emitted action is 0/1."""
+    """Nine-class no-attack/attack-with-impulse distribution."""
 
     name = "attack"
     action_shape = ()
     module_name = "attack_head"
     engine_fields = frozenset({"attack"})
 
+    @staticmethod
+    def _logits(logits: Mapping[str, torch.Tensor], shape: torch.Size) -> torch.Tensor:
+        attack_logits = logits[ATTACK_HEAD]
+        if attack_logits.shape[-1] != ATTACK_ACTION_SIZE:
+            raise RuntimeError(
+                f"attack adapter requires {ATTACK_ACTION_SIZE} logits, got "
+                f"{attack_logits.shape[-1]}"
+            )
+        return attack_logits.reshape(*shape, ATTACK_ACTION_SIZE)
+
     def sample(self, logits, *, temperature, row_generators):
-        logit = logits[ATTACK_HEAD].reshape(-1)
-        return bernoulli_sample(
-            torch.sigmoid(logit / max(float(temperature), 1e-6)), row_generators,
+        attack_logits = self._logits(
+            logits, torch.Size((logits[ATTACK_HEAD].shape[0],))
         )
+        probs = F.softmax(attack_logits / max(float(temperature), 1e-6), dim=-1)
+        return categorical_sample(probs, row_generators)
 
     def apply(self, engine_actions, sampled):
         engine_actions["attack"] = sampled.detach().cpu().numpy().astype(np.int64)
 
     def log_prob_entropy(self, logits, actions, temperature=1.0):
-        logit = logits[ATTACK_HEAD].reshape(actions.shape)
-        return bernoulli_log_prob_entropy(logit, actions, temperature)
+        attack_logits = self._logits(logits, actions.shape)
+        return categorical_log_prob_entropy(attack_logits, actions, temperature)
 
 
 class MoveAxesDistribution(HeadDistribution):
@@ -154,77 +165,9 @@ class MoveAxesDistribution(HeadDistribution):
         return lp.sum(dim=-1), ent.sum(dim=-1)
 
 
-class WeaponDistribution(HeadDistribution):
-    """Split eight-class weapon head; engine impulses are class + 1."""
-
-    name = "weapon"
-    action_shape = ()
-    module_name = "weapon_head"
-    engine_fields = frozenset({"weapon"})
-
-    @staticmethod
-    def _logits(logits: Mapping[str, torch.Tensor], shape: torch.Size) -> torch.Tensor:
-        weapon_logits = logits[WEAPON_HEAD]
-        if weapon_logits.shape[-1] != WEAPON_HEAD_SIZE:
-            raise RuntimeError(
-                f"weapon adapter requires {WEAPON_HEAD_SIZE} logits, got "
-                f"{weapon_logits.shape[-1]}"
-            )
-        return weapon_logits.reshape(*shape, WEAPON_HEAD_SIZE)
-
-    def sample(self, logits, *, temperature, row_generators):
-        weapon_logits = self._logits(logits, torch.Size((logits[WEAPON_HEAD].shape[0],)))
-        probs = F.softmax(weapon_logits / max(float(temperature), 1e-6), dim=-1)
-        return categorical_sample(probs, row_generators)
-
-    def apply(self, engine_actions, sampled):
-        engine_actions["weapon"] = (
-            sampled.detach().cpu().numpy().astype(np.int64) + 1
-        )
-
-    def log_prob_entropy(self, logits, actions, temperature=1.0):
-        weapon_logits = self._logits(logits, actions.shape)
-        return categorical_log_prob_entropy(weapon_logits, actions, temperature)
-
-
-class AttackWithDistribution(HeadDistribution):
-    """Structure-neutral joint no-fire/fire-with-weapon categorical adapter."""
-
-    name = "attack_with"
-    action_shape = ()
-    module_name = "weapon_head"
-    engine_fields = frozenset({"attack", "weapon"})
-    class_count = WEAPON_HEAD_SIZE + 1
-
-    def _logits(self, logits, shape):
-        joint = logits[WEAPON_HEAD]
-        if joint.shape[-1] != self.class_count:
-            raise RuntimeError(
-                f"attack_with adapter requires {self.class_count} logits, got "
-                f"{joint.shape[-1]}"
-            )
-        return joint.reshape(*shape, self.class_count)
-
-    def sample(self, logits, *, temperature, row_generators):
-        joint = self._logits(logits, torch.Size((logits[WEAPON_HEAD].shape[0],)))
-        probs = F.softmax(joint / max(float(temperature), 1e-6), dim=-1)
-        return categorical_sample(probs, row_generators)
-
-    def apply(self, engine_actions, sampled):
-        joint = sampled.detach().cpu().numpy().astype(np.int64)
-        engine_actions["attack"] = (joint > 0).astype(np.int64)
-        engine_actions["weapon"] = joint
-
-    def log_prob_entropy(self, logits, actions, temperature=1.0):
-        joint = self._logits(logits, actions.shape)
-        return categorical_log_prob_entropy(joint, actions, temperature)
-
-
 _ADAPTERS: dict[str, Callable[[], HeadDistribution]] = {
     "attack": AttackDistribution,
     "move": MoveAxesDistribution,
-    "weapon": WeaponDistribution,
-    "attack_with": AttackWithDistribution,
 }
 
 

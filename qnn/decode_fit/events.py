@@ -197,27 +197,49 @@ def load_waves(wave_dirs: Iterable[Path]) -> EventTable:
 # ── tracking windows (the trigger-free aim statistic) ─────────────────────────
 
 TRACKING_WINDOWS_NPZ = "intercept_windows.npz"        # under <run>/metrics/eval/
-# frozen window half-width (20Hz ticks): part of the instrument definition —
-# matches the human baseline's K_ANCHOR (qnn.human.tracking; ±200 ms ≈ one
-# tracking-oscillation period). Changing it re-anchors the ladder.
+# frozen window half-width (20Hz ticks) of the STATISTIC: part of the
+# instrument definition — matches the human baseline's K_ANCHOR
+# (qnn.human.tracking; ±200 ms ≈ one tracking-oscillation period). Changing it
+# re-anchors the ladder.
 TRACKING_K = 4
+# frozen CAPTURE geometry the eval is asked for (QNN_EVAL_INTERCEPT_WINDOW).
+# Asymmetric: the forward half only has to cover the crest-replay hold horizon
+# (TRACKING_K), while the pre-roll runs long enough for the alignment-LEAD
+# profile (16 ticks = 800 ms of convergence before the trigger,
+# agents/plans/cross-head-coordination.md metric #3). The ladder statistic
+# still reads only the ±TRACKING_K core, so widening the capture does NOT
+# re-anchor it.
+TRACKING_K_PRE = 16
+TRACKING_K_POST = TRACKING_K
+TRACKING_WINDOW_ENV = f"{TRACKING_K_PRE},{TRACKING_K_POST}"
+if TRACKING_K > min(TRACKING_K_PRE, TRACKING_K_POST):     # pragma: no cover
+    raise AssertionError("the ±TRACKING_K ladder core must fit the capture")
 
 
 def _load_window_npz(wave_dir: Path) -> dict[str, np.ndarray]:
     """The validated raw ``intercept_windows.npz`` arrays for one wave. FAILS
-    LOUD when the npz is absent or built at k != TRACKING_K — a pin wave
-    without windows predates the tracking instrument and must be rebuilt (the
-    env signature enforces this; absence is never an empty table)."""
+    LOUD when the npz is absent or built at a capture geometry other than
+    TRACKING_K_PRE/TRACKING_K_POST — a pin wave without windows predates the
+    tracking instrument and must be rebuilt (the env signature enforces this;
+    absence is never an empty table)."""
     p = Path(wave_dir) / "metrics" / "eval" / TRACKING_WINDOWS_NPZ
     if not p.exists():
         raise FileNotFoundError(
             f"{p} missing — the wave predates the tracking-window instrument "
-            f"(QNN_EVAL_INTERCEPT_WINDOW={TRACKING_K}); rebuild the wave")
+            f"(QNN_EVAL_INTERCEPT_WINDOW={TRACKING_WINDOW_ENV}); rebuild the "
+            "wave")
     with np.load(p, allow_pickle=False) as z:
-        if int(z["k"]) != TRACKING_K:
+        if "k_pre" not in z or "k_post" not in z:
             raise ValueError(
-                f"{p}: window k={int(z['k'])} != frozen TRACKING_K="
-                f"{TRACKING_K} — rebuild the wave on this checkout")
+                f"{p}: pre-asymmetric window schema (symmetric k only) — "
+                f"rebuild the wave at QNN_EVAL_INTERCEPT_WINDOW="
+                f"{TRACKING_WINDOW_ENV}")
+        if (int(z["k_pre"]), int(z["k_post"])) != (TRACKING_K_PRE,
+                                                  TRACKING_K_POST):
+            raise ValueError(
+                f"{p}: window ({int(z['k_pre'])},{int(z['k_post'])}) != frozen "
+                f"(TRACKING_K_PRE,TRACKING_K_POST)=({TRACKING_K_PRE},"
+                f"{TRACKING_K_POST}) — rebuild the wave on this checkout")
         if "tick" not in z:
             raise ValueError(
                 f"{p}: pre-identity window schema (no tick/lane rows) — "
@@ -229,18 +251,21 @@ def _load_window_npz(wave_dir: Path) -> dict[str, np.ndarray]:
 def wave_tracking_table(wave_dir: Path) -> EventTable:
     """One wave run-dir → the WINDOW-SAMPLED alignment EventTable (the
     trigger-free aim statistic; decode-fit-v2 addendum 2026-07-18). Each
-    ``intercept_windows.npz`` row is one discharge's ±k-tick hbw stream;
-    rows explode into per-tick samples, deduped across overlapping burst
-    windows by nearest-discharge (the human baseline's rule), annotated with
-    the lane operating point exactly like discharge events. ``hbw`` is the
-    window-tick alignment; clusters stay (run, lane, episode)."""
+    ``intercept_windows.npz`` row is one discharge's captured hbw stream, of
+    which this statistic reads only its frozen ±TRACKING_K core (the capture
+    pre-roll is longer — see TRACKING_K_PRE — and belongs to the lead profile,
+    not to this ladder); rows explode into per-tick samples, deduped across
+    overlapping burst windows by nearest-discharge (the human baseline's rule),
+    annotated with the lane operating point exactly like discharge events.
+    ``hbw`` is the window-tick alignment; clusters stay (run, lane, episode)."""
     wave_dir = Path(wave_dir)
     raw = _load_window_npz(wave_dir)
     n = len(raw["tick"])
     if n == 0:
         return EventTable()
     k = TRACKING_K
-    hbw_win = raw["hbw_win"].astype(np.float64)        # (n, 2k+1)
+    hbw_win = raw["hbw_win"].astype(np.float64)[
+        :, TRACKING_K_PRE - k:TRACKING_K_PRE + k + 1]   # (n, 2k+1)
     offs = np.arange(-k, k + 1, dtype=np.int64)
     abs_tick = raw["tick"].astype(np.int64)[:, None] + offs[None, :]
     fin = np.isfinite(hbw_win)
@@ -292,8 +317,8 @@ def load_waves_tracking(wave_dirs: Iterable[Path]) -> EventTable:
 
 # ── crest windows (the θ-replay sample unit) ─────────────────────────────────
 # The SAME npz, read the other way round: ``wave_tracking_table`` explodes each
-# window into per-tick samples (the trigger-free aim statistic, all 2k+1 slots,
-# deduped across overlapping bursts); the crest arm instead keeps each row
+# window into per-tick samples (the trigger-free aim statistic, the ±TRACKING_K
+# core, deduped across overlapping bursts); the crest arm instead keeps each row
 # WHOLE and only its FORWARD half, because the discharge-quality gate's
 # counterfactual is "given the head fired at t₀, which tick in [t₀, t₀+H] does
 # the latch actually release on?" — a per-discharge question, not a per-tick
@@ -304,14 +329,16 @@ CREST_WINDOW_COLS = ("weapon", "pin", "cluster", "tick", "weight") + OP_KEYS
 
 @dataclass
 class CrestWindowTable:
-    """Per-DISCHARGE forward alignment windows. ``fwd`` is ``(n, TRACKING_K+1)``
-    — hbw at t₀ (the fired tick, always finite: the eval only logs a window for
-    an operative in-LOS discharge) through t₀+TRACKING_K, NaN where the lane's
-    episode ended or LOS was lost. ``cols`` carries the same lane operating
-    point / cluster annotation as :class:`EventTable`, so both objects filter
-    to the same (gain, α, tremor, pin) cells and share bootstrap clusters."""
+    """Per-DISCHARGE forward alignment windows. ``fwd`` is
+    ``(n, TRACKING_K_POST+1)`` — hbw at t₀ (the fired tick, always finite: the
+    eval only logs a window for an operative in-LOS discharge) through
+    t₀+TRACKING_K_POST, NaN where the lane's episode ended or LOS was lost.
+    ``cols`` carries the same lane operating point / cluster annotation as
+    :class:`EventTable`, so both objects filter to the same (gain, α, tremor,
+    pin) cells and share bootstrap clusters."""
     cols: dict[str, np.ndarray] = field(default_factory=dict)
-    fwd: np.ndarray = field(default_factory=lambda: np.empty((0, TRACKING_K + 1)))
+    fwd: np.ndarray = field(
+        default_factory=lambda: np.empty((0, TRACKING_K_POST + 1)))
 
     def __len__(self) -> int:
         return len(self.fwd)
@@ -355,7 +382,7 @@ def wave_crest_windows(wave_dir: Path) -> CrestWindowTable:
     n = len(raw["tick"])
     if n == 0:
         return CrestWindowTable()
-    fwd = raw["hbw_win"].astype(np.float64)[:, TRACKING_K:]
+    fwd = raw["hbw_win"].astype(np.float64)[:, TRACKING_K_PRE:]
     if not np.isfinite(fwd[:, 0]).all():
         raise ValueError(
             f"{wave_dir}: {int((~np.isfinite(fwd[:, 0])).sum())} window rows "

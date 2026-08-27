@@ -2,6 +2,7 @@
 
 #include "qnn_collect_helpers.h"
 #include "qnn_io.h"
+#include "qnn_obs_registry.h"
 #include "qnn_predict.h"
 
 #include <string.h>
@@ -93,12 +94,28 @@ void QNN_ArenaObserverPrepare(void)
 	QNN_IOInit(&qnn_map_state);
 }
 
-void QNN_ArenaObserverWrite(FILE *out, const qnn_action_t *previous_action,
+void QNN_ArenaObserverWrite(FILE *out, const struct qnn_obs_plan_s *plan,
+	const qnn_action_t *previous_action,
 	int tick, int steps, qboolean reset_flag)
 {
 	qnn_snapshot_t snapshot;
 	qnn_tick_result_t result;
-	uint8_t obs[QNN_OBS_BUFFER_SIZE];
+	/* Frame buffer sized for the largest plan seen — per-seat plans
+	 * (OP_ATTACH_DECL) may exceed the default 864 (the legacy 4096
+	 * fixed-frame generations).  Single-threaded, like all emit state. */
+	static uint8_t *obs;
+	static int obs_cap;
+
+	if (plan == NULL)
+		plan = QNN_IODefaultObsPlan();
+	if (plan->frame_bytes > obs_cap)
+	{
+		obs = (uint8_t *)realloc(obs, (size_t)plan->frame_bytes);
+		if (obs == NULL)
+			Sys_Error("Arena observer: out of memory for a %d-byte frame",
+				plan->frame_bytes);
+		obs_cap = plan->frame_bytes;
+	}
 
 	QNN_CaptureBaseSnapshot(&snapshot);
 	if (getenv("QNN_ARENA_OBSERVER_DEBUG") != NULL)
@@ -115,11 +132,11 @@ void QNN_ArenaObserverWrite(FILE *out, const qnn_action_t *previous_action,
 	snapshot.done = QNN_TrainingNetworkRoundReset();
 	QNN_DrainSounds(&snapshot);
 	QNN_IOUpdate(&snapshot, 1.0f / 20.0f, reset_flag);
-	QNN_IOEmit(&snapshot, &result);
-	QNN_IOPackObsBuffer(obs, &result);
+	QNN_IOEmitPlan(plan, &snapshot, &result);
+	QNN_ObsPlanPack(plan, obs, plan->frame_bytes, &result);
 	if (QNN_IOPoseTailEnabled())
-		QNN_IOStashPoseTail(obs, &snapshot);
-	fwrite(obs, 1, sizeof(obs), out);
+		QNN_IOStashPoseTail(obs, plan->frame_bytes, &snapshot);
+	fwrite(obs, 1, (size_t)plan->frame_bytes, out);
 	QNN_WriteTrainingExtrasBinary(out, &snapshot, tick, steps, reset_flag);
 	fflush(out);
 }

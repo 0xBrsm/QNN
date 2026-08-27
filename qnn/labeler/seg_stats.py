@@ -2,7 +2,7 @@
 
 The a25 ``move_seg`` head trains on (onset, duration-bucket) targets derived
 on the fly from per-frame move classes
-(``qnn.model.bench.a25.move_seg_head.derive_segment_targets``), and the
+(``qnn.model.move_seg_head.derive_segment_targets``), and the
 commitment decode's ``dur_tilt`` is calibrated against the duration law those
 targets induce.  A relabeled corpus therefore has to be judged on SEGMENT
 statistics, not just frame accuracy: one isolated per-frame flip inside a long
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from qnn.model.bench.a25.seg_bins import N_BUCKETS, bucketize_duration_np
+from qnn.model.seg_bins import N_BUCKETS, bucketize_duration_np
 
 N_CLASSES = 3   # {0: neg, 1: none, 2: pos} — per-axis move classes
 

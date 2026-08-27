@@ -3,8 +3,10 @@
 #include "qnn_arena_observer.h"
 #include "qnn_collect_helpers.h"
 #include "qnn_context.h"
+#include "qnn_obs_registry.h"
 #include "qnn_predict.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,6 +50,57 @@ static int qnn_virtual_client_count;
 static qboolean qnn_virtual_selfplay;
 static qboolean qnn_virtual_shadow;
 static qboolean qnn_virtual_registered;
+static qboolean qnn_virtual_frames_emitted;
+
+/* Per-seat compiled obs plans (OP_ATTACH_DECL, WS2), keyed by ACTION
+ * index — the fixed position python's driver reads each seat's frames
+ * at, established before name-based seat assignment finishes.  No
+ * attach = NULL = the default plan (864-byte legacy frame). */
+static qnn_obs_plan_t qnn_virtual_seat_plans[QNN_VIRTUAL_MAX_CLIENTS];
+static qboolean qnn_virtual_seat_has_plan[QNN_VIRTUAL_MAX_CLIENTS];
+
+qboolean QNN_ArenaVirtualAttachSeatPlan(int seat_index,
+	const struct qnn_obs_plan_s *plan, char *error, size_t error_size)
+{
+	if (qnn_virtual_client_count == 0)
+	{
+		snprintf(error, error_size,
+			"arena runs external observers (no virtual/shadow seats) — "
+			"server-side obs declarations have no seat to bind");
+		return false;
+	}
+	if (seat_index < 0 || seat_index >= qnn_virtual_client_count)
+	{
+		snprintf(error, error_size,
+			"obs declaration seat %d out of range (0..%d)",
+			seat_index, qnn_virtual_client_count - 1);
+		return false;
+	}
+	if (qnn_virtual_frames_emitted)
+	{
+		snprintf(error, error_size,
+			"obs declaration for seat %d arrived after the first frame "
+			"was emitted — attach before the arena is ready", seat_index);
+		return false;
+	}
+	if (qnn_virtual_seat_has_plan[seat_index])
+	{
+		snprintf(error, error_size,
+			"obs declaration for seat %d was already attached", seat_index);
+		return false;
+	}
+	qnn_virtual_seat_plans[seat_index] = *plan;
+	qnn_virtual_seat_has_plan[seat_index] = true;
+	return true;
+}
+
+static const qnn_obs_plan_t *QNN_ArenaVirtualSeatPlan(int action_index)
+{
+	if (action_index >= 0 && action_index < QNN_VIRTUAL_MAX_CLIENTS
+		&& qnn_virtual_seat_has_plan[action_index])
+		return &qnn_virtual_seat_plans[action_index];
+	return NULL;
+}
 
 static void QNN_ArenaRegisterObserverState(void)
 {
@@ -149,6 +202,8 @@ void QNN_ArenaVirtualConfigure(int client_count, qboolean selfplay,
 	qnn_virtual_client_count = client_count;
 	qnn_virtual_selfplay = selfplay;
 	qnn_virtual_shadow = shadow;
+	qnn_virtual_frames_emitted = false;
+	memset(qnn_virtual_seat_has_plan, 0, sizeof(qnn_virtual_seat_has_plan));
 
 	for (index = 0; index < client_count; ++index)
 	{
@@ -390,11 +445,17 @@ void QNN_ArenaVirtualStageActions(const qnn_action_t *actions, int action_count)
 void QNN_ArenaVirtualWriteInitial(FILE *out)
 {
 	int action_index;
+
+	/* Frames are flowing at negotiated sizes from here on — a late
+	 * OP_ATTACH_DECL would desync the driver's reads, so refuse it
+	 * (see QNN_ArenaVirtualAttachSeatPlan). */
+	qnn_virtual_frames_emitted = true;
 	for (action_index = 0; action_index < qnn_virtual_client_count; ++action_index)
 	{
 		qnn_virtual_client_t *client = QNN_ArenaClientForAction(action_index);
 		QNN_ArenaActivate(client);
-		QNN_ArenaObserverWrite(out, &client->previous_action,
+		QNN_ArenaObserverWrite(out, QNN_ArenaVirtualSeatPlan(action_index),
+			&client->previous_action,
 			client->tick, client->steps, true);
 		QNN_ArenaDeactivate();
 	}
@@ -427,7 +488,8 @@ void QNN_ArenaVirtualReceive(FILE *out, float dt, qboolean reset_receive)
 			client->steps += 1;
 		}
 		reset_flag = QNN_TrainingNetworkRoundReset();
-		QNN_ArenaObserverWrite(out, &client->previous_action,
+		QNN_ArenaObserverWrite(out, QNN_ArenaVirtualSeatPlan(action_index),
+			&client->previous_action,
 			client->tick, client->steps, reset_flag);
 		if (reset_flag)
 			client->steps = 0;

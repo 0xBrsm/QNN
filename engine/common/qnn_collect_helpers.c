@@ -12,7 +12,7 @@
  *   - QNN_PackSnapshotObs / QNN_WriteObsTickPrepacked* (used by both
  *     the live emit path and the MVD back-shift ring drain)
  *   - QNN_SavePrev (per-tick state advance)
- *   - QNN_FillLookAndSwitch (look/weapon label, shared QWD + MVD)
+ *   - QNN_FillLook (look label, shared QWD + MVD)
  *   - Shared back-shift ring (deferred label emit; driven by the MVD
  *     sound writers in qnn_mvd_collect.c, reused by the QWD path)
  *
@@ -105,8 +105,8 @@ static void QNN_DumpAttackRoutes(int row, int tick, int steps,
 			r->weapon_id, r->native_time, r->emit_start_native,
 			r->ping_sec, r->phase, r->press_offset,
 			r->deterministic_offset,
-			r->route_offset, QNN_ActionAttack(action->move),
-			action->weapon);
+			r->route_offset, QNN_ActionAttackPressed(action->move),
+			action->attack);
 	}
 	fclose(out);
 }
@@ -286,20 +286,19 @@ void QNN_EmitTick(FILE *out, const uint8_t *obs, const qnn_action_t *action,
  * same stdout pipe; the Python orchestration demuxes by magic. */
 void QNN_EmitMlob(FILE *out, const qnn_mlob_record_t *rec)
 {
-	uint8_t buf[24];
+	uint8_t buf[23];
 
 	/* Pack explicitly (no struct-padding assumptions on the wire):
 	 *   0  native_index      u32
 	 *   4  flags             u16
 	 *   6  vel[3]            i16 ×3
 	 *  12  self_movement_id   u8
-	 *  13  self_weapon_id     u8
-	 *  14  move               u8  (qnn_action_t offset 0)
-	 *  15  weapon             u8
-	 *  16  input_mask         u8
-	 *  17  op_input           u8
-	 *  18  look[3]           f16 ×3  — packed below
-	 * Total 24 bytes. */
+	 *  13  move               u8  (qnn_action_t offset 0)
+	 *  14  weapon             u8
+	 *  15  input_mask         u8
+	 *  16  op_input           u8
+	 *  17  look[3]           f16 ×3  — packed below
+	 * Total 23 bytes. */
 	uint16_t lh[3];
 	int i;
 
@@ -307,14 +306,13 @@ void QNN_EmitMlob(FILE *out, const qnn_mlob_record_t *rec)
 	memcpy(buf + 4,  &rec->flags,        2);
 	memcpy(buf + 6,  rec->vel,           6);
 	buf[12] = rec->self_movement_id;
-	buf[13] = rec->self_weapon_id;
-	buf[14] = rec->action.move;
-	buf[15] = rec->action.weapon;
-	buf[16] = rec->action.input_mask;
-	buf[17] = rec->action.op_input;
+	buf[13] = rec->action.move;
+	buf[14] = rec->action.attack;
+	buf[15] = rec->action.input_mask;
+	buf[16] = rec->action.op_input;
 	for (i = 0; i < 3; ++i)
 		lh[i] = QNN_FloatToHalf(rec->action.look[i]);
-	memcpy(buf + 18, lh, 6);
+	memcpy(buf + 17, lh, 6);
 
 	fwrite(QNN_MLOB_MAGIC, 1, 4, out);
 	fwrite(buf, 1, sizeof(buf), out);
@@ -425,7 +423,7 @@ void QNN_PackSnapshotObs(const qnn_snapshot_t *snapshot, uint8_t *obs_out)
 	QNN_IOEmit(snapshot, &result);
 	QNN_IOPackObsBuffer(obs_out, &result);
 	if (QNN_PoseDiagEnabled())
-		QNN_IOStashPoseTail(obs_out, snapshot);
+		QNN_IOStashPoseTail(obs_out, QNN_OBS_BUFFER_SIZE, snapshot);
 }
 
 /* Internal: drive the obs/jitter pipeline from pre-packed obs bytes.
@@ -637,13 +635,8 @@ int QNN_EvalAttackFeasible(const qnn_snapshot_t *snapshot,
 	return op_attack;
 }
 
-/* Fill action->look (view-relative turn delta) and action->weapon
- * (per-frame held-weapon state) from the current snapshot.  Shared by
- * both the QWD usercmd-truth path and the MVD inference path.  weapon is
- * always set to the current weapon when not already set by the caller's
- * usercmd path (which provides press-time prediction); MVD has no
- * usercmd so this is the only source. */
-void QNN_FillLookAndSwitch(qnn_action_t *action,
+/* Fill action->look (view-relative turn delta) from the current snapshot. */
+void QNN_FillLook(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot)
 {
 	vec3_t forward, right, up, cur_forward;
@@ -657,13 +650,6 @@ void QNN_FillLookAndSwitch(qnn_action_t *action,
 	action->look[1] = DotProduct(cur_forward, right);
 	action->look[2] = DotProduct(cur_forward, up);
 
-	/* Held-weapon fallback: only adopt a vanilla weapon id (1..8).  Mod
-	 * servers report held ids >8 in the playerstate stat; treat those as
-	 * no-weapon (0), matching the obs token's qnn_weapon_subject_from_id
-	 * handling.  A bare `> 0` here leaked mod ids into the act_weapon
-	 * label and tripped the downstream 0..8 wire guard. */
-	if (action->weapon == 0 && QNN_WeaponIsValid(snapshot->weapon_id))
-		action->weapon = snapshot->weapon_id;
 }
 
 uint8_t QNN_PackOpInput(
@@ -892,39 +878,6 @@ void QNN_BackShiftPush(qnn_tick_emit_state_t *emit, FILE *out,
 	ring->head = (ring->head + 1) % QNN_BACKSHIFT_K;
 	ring->prev_weapon_id = weapon_id;
 	ring->has_prev_weapon_id = true;
-}
-
-/* On observed weapon_id transitions, rewrite the trailing `shift_frames`
- * slots back to the new weapon to anchor intent at the press frame
- * instead of the broadcast frame.  The pickup gate (handled at the call
- * site) suppresses the rewrite for server-forced touches. */
-void QNN_BackShiftRewriteWeapon(int new_weapon_id,
-	int prev_weapon_id, int shift_frames)
-{
-	qnn_backshift_ring_t *ring = &g_backshift_ring;
-	int n;
-	int i;
-
-	if (ring->count == 0 || shift_frames <= 0)
-		return;
-
-	/* Call site is BEFORE the current push of the post-transition
-	 * frame.  `latest` is therefore the previous push's slot.  Rewrite
-	 * the trailing `shift_frames` slots so they carry the new weapon.
-	 * Only rewrite slots whose label still equals `prev_weapon_id`
-	 * so a later transition can't clobber an earlier one when both
-	 * land inside the same window. */
-	n = shift_frames;
-	if (n > ring->count)
-		n = ring->count;
-	for (i = 0; i < n; i++)
-	{
-		qnn_backshift_slot_t *slot;
-		if (!QNN_BackShiftSlotAt(ring, i, &slot))
-			break;
-		if (slot->action.weapon == prev_weapon_id)
-			slot->action.weapon = new_weapon_id;
-	}
 }
 
 void QNN_BackShiftFlushAll(qnn_tick_emit_state_t *emit)

@@ -196,9 +196,6 @@ BC-only (PPO model templates carry only the common keys):
 |------|---------|
 | `use_weapon_head` | enable the 8-class weapon head |
 | `weapon_use_gru` | feed GRU output into weapon-head features |
-| `weapon_context_from_obs` | use observed (vs predicted) held weapon when building motor-head context |
-| `weapon_switch_confidence` | minimum weapon-head softmax to emit a switch at inference |
-| `weapon_switch_margin` | minimum margin over currently-held weapon to emit a switch |
 | `d_target` | TargetPointer MLP hidden width (per-entity scoring head) |
 | `head_bottleneck_dim` | per-head bottleneck width (0 = no bottleneck) |
 | `head_use_relu` | apply ReLU inside the head bottleneck |

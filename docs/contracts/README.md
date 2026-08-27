@@ -27,7 +27,7 @@ data means (scales, vocab) → violating it is a *misinterpretation*, silent. Th
 two failure modes line up exactly with the two axes.
 
 **Semantics also pins the tick, not just the value.** The timeliness clause
-([`semantics/semantics.1.md`](semantics/semantics.1.md), "Temporal alignment")
+([`semantics/semantics.2.md`](semantics/semantics.2.md), "Temporal alignment")
 requires every protocol frontend to deliver server-time-aligned self-state —
 `obs(t)` reflects own commands through t−1, the training alignment. It is
 behavioral (not in `semantics_sig`), so it is enforced per frontend by a
@@ -98,12 +98,14 @@ declared loop-back `in`, or if the `move` action output disagrees with the
 wire-version stamp (decided `move` vs raw `move_logits`). The wire version gates
 **only** that action interpretation — never state carrying.
 
-The current HEAD (`wire.12`, inherited unchanged from `wire.11`) declaration is:
+The current HEAD (`wire.13`, loop-backs inherited unchanged from `wire.11`) declaration is:
 
 ```
 in=hidden,out=next_hidden,init=zeros,reset=episode;
 in=move_state,out=move_state_out,init=1 1 1 1 1 -1 -1 0 0 0 0,reset=episode;
-in=move_state_rng,out=move_state_rng_out,init=entropy,reset=persist
+in=move_state_rng,out=move_state_rng_out,init=entropy,reset=persist;
+in=attack_state,out=attack_state_out,init=zeros,reset=episode;
+in=attack_rng,out=attack_rng_out,init=entropy,reset=persist
 ```
 
 See [`wire/wire.9.md`](wire/wire.9.md#stateloopback--generic-recurrent-state-carrying).
@@ -171,13 +173,16 @@ support feasibility (below).
 | (a24) | native split + in-graph MOVE decode | `wire.9` | `semantics.1` | `full_4head` | v24 | superseded by `wire.11` | A |
 | a24 | native split + in-graph MOVE **and ATTACK** decode | **`wire.11`** | **`semantics.1`** | `full_4head` | **v24** | **Yes** | **A** |
 | a26 | 72×11 **unpacked** spatial depth atlas + learned band IDs | **`wire.12.1`** | **`semantics.1`** | `full_4head` | `20260722-98wtxv` | **Yes** | A |
-| HEAD | 24×11 **packed** spatial depth atlas + learned band IDs | **`wire.12.2`** | **`semantics.1`** | `full_4head` | `20260722-98wtxv` | **Yes** | A |
+| a26 | 24×11 **packed** spatial depth atlas + learned band IDs | **`wire.12.2`** | **`semantics.1`** | `full_4head` | `20260722-98wtxv` | **Yes** | A |
+| a27 | 72×11 **unpacked** atlas + pure-combat entity stream + categorical attack action | **`wire.13.1`** | **`semantics.2`** | `full_movearch` | a27rc1a | **Yes** | A |
+| HEAD | 24×11 **packed** atlas + pure-combat entity stream + categorical attack action | **`wire.13.2`** | **`semantics.2`** | `full_movearch` | a27rc1a | **Yes** | A |
 
-Distinct contracts across the full history: **12 wire × 5 semantics**. With a
-surviving runnable artifact: **5 wire** (`wire.7`, `wire.9`, `wire.11`,
-`wire.12.1`, `wire.12.2`) **× 1 semantics** (`semantics.1`) — and all five have a
-registered codec in the bin (`QNN_CODECS` in `src/engine/common/qnn_onnx.c`), so
-one client serves the whole load set. `wire.8` is a reconstructed id — the native exporter postdates
+Distinct contracts across the full history: **12 wire × 6 semantics**. With a
+surviving runnable artifact: **7 wire** (`wire.7`, `wire.9`, `wire.11`,
+`wire.12.1`, `wire.12.2`, `wire.13.1`, `wire.13.2`) **× 2 semantics**
+(`semantics.1`, `semantics.2`) — and all seven have a registered codec in the
+bin (`QNN_CODECS` in `src/engine/common/qnn_onnx.c`), so one client serves the
+whole load set. `wire.8` is a reconstructed id — the native exporter postdates
 `look_delta`, so no 43-input graph was ever exported. `wire.11` = `wire.9` (native
 44-obs split + in-graph decided `move`/`weapon` + the move-decode state pair) **+
 the in-graph ATTACK decode** (decided `attack` bit instead of `fire_logit`, plus
@@ -192,16 +197,34 @@ so each is its own contract — see [`wire.12.md`](wire/wire.12.md):
 | id | atlas grid | on the wire | line |
 |---|---|---|---|
 | `wire.12.1` | 11 bands × 72 yaw cells | 792 B, one 4-bit code per byte | a26 rc1 |
-| `wire.12.2` | 11 bands × 24 yaw cells | 132 B, two codes per byte | HEAD |
+| `wire.12.2` | 11 bands × 24 yaw cells | 132 B, two codes per byte | a26 HEAD |
 
-`wire.12.2` is the finalized frontier: it passed a fresh production-engine
-reconstruction gate after the earlier supporting-plane layouts failed.
+`wire.12.2` is the finalized atlas frontier: it passed a fresh
+production-engine reconstruction gate after the earlier supporting-plane
+layouts failed.
 
-> **Bare `wire.12` is RETIRED — never re-use it.** Both families were stamped
-> `wire.12` before the frontier was settled, so the id cannot select a codec
-> without inspecting tensor shapes. The bin briefly did exactly that; it now
-> refuses the bare id and names the fix. Re-stamp with
-> `tools/stamp_onnx.py --wire wire.12.1|wire.12.2 --model-version <tier>`.
+A27 keeps that atlas and narrows the OBS around it — the entity stream becomes
+current-frame actors/projectiles with SIGHT or PROXIMITY semantics only (no
+recency, no item/mover rows, no `self_weapon_id`) — and collapses the action
+boundary to one categorical `attack` output (`0` = no attack, `1..8` = select
+and fire that impulse), with no separate binary fire or action-side `weapon`
+output. That is a different OBS *and* a different action set from `wire.12.x`,
+so it is its own wire line on its own semantics contract
+([`semantics.2`](semantics/semantics.2.md)) — see
+[`wire.13.md`](wire/wire.13.md). It inherits the same atlas-grid split, for the
+same reason:
+
+| id | atlas grid | on the wire | line |
+|---|---|---|---|
+| `wire.13.1` | 11 bands × 72 yaw cells | 792 B, one 4-bit code per byte | a27 rc1 (`a27rc1a`) |
+| `wire.13.2` | 11 bands × 24 yaw cells | 132 B, two codes per byte | HEAD |
+
+> **Bare `wire.12` and bare `wire.13` are RETIRED — never re-use them.** In
+> each line both families were stamped with the bare id before the frontier was
+> settled, so the id cannot select a codec without inspecting tensor shapes.
+> The bin briefly did exactly that; it now refuses the bare ids and names the
+> fix. Re-stamp with
+> `tools/stamp_onnx.py --wire wire.12.1|wire.12.2|wire.13.1|wire.13.2 --model-version <tier>`.
 > The retired set is `QNN_RETIRED_WIRES` in `qnn_onnx.c`; a parity test
 > (`tests/test_engine_norm_parity.py`) asserts no id is both registered and
 > retired, and that every id Python can stamp has a codec.

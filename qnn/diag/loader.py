@@ -39,8 +39,8 @@ def resolve_decode_module(run_dir: Path, policy: QNNPolicy | None = None):
     call this helper instead: it reads the run's OWN ``config/probe.json`` head
     set and resolves the arch from it —
 
-      * ``move_seg`` head and/or ``weapon.type == "attack_with"``
-        → ``qnn.model.bench.a25.decode``
+      * ``move_seg`` head and/or ``attack.type == "attack_with"``
+        → ``qnn.model.decode_actions``
 
     and RAISES when the arch cannot be determined (a24 is retired; there is no
     fallback). When ``policy`` is given the module is injected into
@@ -58,16 +58,16 @@ def resolve_decode_module(run_dir: Path, policy: QNNPolicy | None = None):
         except (ValueError, OSError):
             heads = {}
     is_a25 = bool(heads.get("move_seg")) or (
-        (heads.get("weapon") or {}).get("type") == "attack_with")
+        (heads.get("attack") or {}).get("type") == "attack_with")
     if not is_a25:
         raise RuntimeError(
             f"{run_dir}: cannot determine the run's decode arch from "
-            f"config/probe.json (no move_seg head and no attack_with weapon head). "
+            f"config/probe.json (no move_seg head and no attack_with attack head). "
             "a24 is retired — only a25-arch runs resolve here. Pass the run's "
             "resolved decode config instead (resolve_decode_config → "
             "resolved.decode_module → policy._decode_mod)."
         )
-    mod = importlib.import_module("qnn.model.bench.a25.decode")
+    mod = importlib.import_module("qnn.model.decode_actions")
     if policy is not None:
         policy._decode_mod = mod
     return mod

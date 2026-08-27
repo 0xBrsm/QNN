@@ -2,7 +2,9 @@
 #include "qnn_fault.h"
 #include "qnn_tick.h"
 #include "qnn_arena_virtual.h"
+#include "qnn_obs_shim.h"
 
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -11,6 +13,12 @@
 #define QNN_ARENA_SERVER_OP_RESET_MASK 3
 #define QNN_ARENA_SERVER_OP_STEP_BATCH 7
 #define QNN_ARENA_SERVER_OP_SHUTDOWN 255
+
+/* Quiet-window drain for OP_ATTACH_DECL before "ready": the driver
+ * sends its declarations right after reading "listening" and blocks on
+ * each reply, so once sign-on completes any straggler arrives within a
+ * python turnaround.  Each serviced request re-arms the window. */
+#define QNN_ARENA_ATTACH_DRAIN_MS 500
 
 static cvar_t qnn_train_cvar = {"qnn_train", "1", false, false};
 static cvar_t qnn_arena_selfplay_cvar = {"qnn_arena_selfplay", "0", false, false};
@@ -134,6 +142,132 @@ static void QNN_ServerFrame(float dt)
 	Host_Frame(dt);
 }
 
+/* ── OP_ATTACH_DECL servicing (WS2, agents/plans/obs-api.md) ─────────
+ *
+ * The declaration handshake runs between "listening" and "ready":
+ * request = u8 opcode (QNN_OBS_OP_ATTACH_DECL) | u8 seat_index |
+ * u32le JSON length | declaration JSON; reply = one JSON line —
+ * {"ok":true,"layout":{...}} or {"error":...,"ok":false} followed by
+ * a hard exit (fail loud — an unattachable seat must never fall back
+ * silently to the default plan).
+ *
+ * Reads here use raw fd-0 reads, NOT stdio: nothing has touched stdin
+ * via stdio yet (the fgetc opcode loop starts after "ready"), and raw
+ * exact-size reads keep poll() truthful about pending requests. */
+
+static void QNN_ArenaReadStdinExact(uint8_t *buf, size_t size,
+	const char *what)
+{
+	size_t have = 0;
+
+	while (have < size)
+	{
+		ssize_t got = read(0, buf + have, size - have);
+
+		if (got <= 0)
+			Sys_Error("Arena server stdin closed mid-%s", what);
+		have += (size_t)got;
+	}
+}
+
+/* Consume + answer one attach request; the opcode byte is already
+ * read.  Any validation failure replies the error frame, then exits —
+ * the driver read the reason from the reply.
+ *
+ * `virtual_seats` = the server drains obs itself (virtual/shadow
+ * observers): the compiled plan is stored per seat and sizes that
+ * seat's frames.  In EXTERNAL observer mode the server emits no obs —
+ * the arena clients carry their own plans — but the driver still
+ * attaches through the server pipe, so validate + reply the layout
+ * (the negotiation half) with nothing to bind. */
+static void QNN_ArenaHandleAttachRequest(qboolean virtual_seats,
+	int external_count)
+{
+	uint8_t header[5];
+	int seat_index;
+	uint32_t json_len;
+	char *json;
+	char error[256];
+	static char reply[4096];
+	qnn_obs_decl_t decl;
+	qnn_obs_plan_t plan;
+
+	QNN_ArenaReadStdinExact(header, sizeof(header), "attach-decl header");
+	seat_index = header[0];
+	json_len = (uint32_t)header[1] | ((uint32_t)header[2] << 8)
+		| ((uint32_t)header[3] << 16) | ((uint32_t)header[4] << 24);
+	if (json_len == 0 || json_len > QNN_OBS_DECL_JSON_MAX)
+		Sys_Error("Arena attach-decl length %u out of range (1..%d)",
+			json_len, QNN_OBS_DECL_JSON_MAX);
+	json = malloc(json_len + 1);
+	if (json == NULL)
+		Sys_Error("Arena attach-decl: out of memory (%u bytes)", json_len);
+	QNN_ArenaReadStdinExact((uint8_t *)json, json_len, "attach-decl JSON");
+	json[json_len] = 0;
+
+	if (!QNN_ObsDeclParseJson(json, (int)json_len, &decl,
+			error, sizeof(error))
+		|| !QNN_ObsPlanCompile(&decl, &plan, error, sizeof(error)))
+		goto reject;
+	if (virtual_seats)
+	{
+		if (!QNN_ArenaVirtualAttachSeatPlan(seat_index, &plan,
+				error, sizeof(error)))
+			goto reject;
+	}
+	else if (seat_index < 0 || seat_index >= external_count)
+	{
+		snprintf(error, sizeof(error),
+			"obs declaration seat %d out of range (0..%d)",
+			seat_index, external_count - 1);
+		goto reject;
+	}
+	free(json);
+
+	if (!QNN_ObsLayoutReplyJson(&plan, reply, sizeof(reply),
+			error, sizeof(error)))
+		Sys_Error("Arena attach-decl reply failed: %s", error);
+	fprintf(stdout, "%s\n", reply);
+	fflush(stdout);
+	return;
+
+reject:
+	QNN_WriteError(error);
+	Sys_Error("Arena seat %d obs declaration rejected: %s",
+		seat_index, error);
+}
+
+/* Service pending attach requests.  timeout_ms 0 = drain whatever is
+ * immediately available (called inside the sign-on pump loops);
+ * QNN_ARENA_ATTACH_DRAIN_MS = the final pre-"ready" quiet window. */
+static void QNN_ArenaServiceAttachRequests(int timeout_ms,
+	qboolean virtual_seats, int external_count)
+{
+	for (;;)
+	{
+		struct pollfd pfd;
+		int ready;
+		uint8_t opcode;
+
+		pfd.fd = 0;
+		pfd.events = POLLIN;
+		ready = poll(&pfd, 1, timeout_ms);
+		if (ready < 0)
+			Sys_Error("Arena server poll(stdin) failed");
+		if (ready == 0)
+			return;
+		if (pfd.revents & (POLLHUP | POLLERR)
+			&& !(pfd.revents & POLLIN))
+			Sys_Error("Arena server stdin closed before ready");
+		QNN_ArenaReadStdinExact(&opcode, 1, "opcode");
+		if (opcode != QNN_OBS_OP_ATTACH_DECL)
+			Sys_Error("Arena server opcode %d before ready (only "
+				"OP_ATTACH_DECL=%d is valid pre-ready)",
+				opcode, QNN_OBS_OP_ATTACH_DECL);
+		QNN_ArenaHandleAttachRequest(virtual_seats, external_count);
+	}
+}
+
 static void QNN_WriteState(const char *state, int port)
 {
 	fprintf(stdout, "{\"ok\":true,\"port\":%d,\"state\":\"%s\"}\n", port, state);
@@ -157,6 +291,11 @@ int main(int argc, char **argv)
 	double deadline;
 
 	QNN_FaultInit("ppo_arena_server");
+	/* fd 0 carries the binary opcode/attach protocol — the dedicated
+	   console reader must never race it for bytes (Sys_ConsoleInput
+	   runs inside every Host_Frame on a dedicated host, including the
+	   sign-on pump where OP_ATTACH_DECL arrives). */
+	qnn_stdin_is_protocol = true;
 	QNN_ResolveBasedir(qnn_basedir_storage, sizeof(qnn_basedir_storage));
 	memset(&parms, 0, sizeof(parms));
 	COM_InitArgv(argc, argv);
@@ -215,6 +354,13 @@ int main(int argc, char **argv)
 		QNN_ServerFrame(dt);
 		if (virtual_clients || shadow_clients)
 			QNN_ArenaVirtualPumpSignon(dt);
+		/* OP_ATTACH_DECL arrives between "listening" and "ready"; the
+		   driver blocks on each reply BEFORE spawning the external
+		   clients this loop waits for, so requests must be serviced
+		   inside the pump (a post-loop drain alone would deadlock). */
+		QNN_ArenaServiceAttachRequests(0,
+			(virtual_clients || shadow_clients) ? true : false,
+			external_count);
 		if (QNN_ArenaAssignNamedSeats() >= external_count
 			&& (!(virtual_clients || shadow_clients) || QNN_ArenaVirtualReady()))
 			break;
@@ -247,8 +393,16 @@ int main(int argc, char **argv)
 		QNN_ServerFrame(dt);
 		if (virtual_clients || shadow_clients)
 			QNN_ArenaVirtualPumpSignon(dt);
+		QNN_ArenaServiceAttachRequests(0,
+			(virtual_clients || shadow_clients) ? true : false,
+			external_count);
 		usleep(1000);
 	}
+	/* Final quiet-window drain: after this, per-seat frame sizes are
+	   frozen (QNN_ArenaVirtualWriteInitial emits the first frames). */
+	QNN_ArenaServiceAttachRequests(QNN_ARENA_ATTACH_DRAIN_MS,
+		(virtual_clients || shadow_clients) ? true : false,
+		external_count);
 	if (virtual_clients || shadow_clients)
 		QNN_ArenaVirtualPrepare();
 	QNN_WriteState("ready", port);

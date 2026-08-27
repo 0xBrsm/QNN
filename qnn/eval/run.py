@@ -9,6 +9,7 @@ from collections import deque
 from collections.abc import Mapping as MappingABC
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
@@ -30,13 +31,16 @@ from qnn.run.metrics import (
     build_eval_summary_aliases,
     mean_metric_values,
 )
-from qnn.model.bench.a25.decode import commit_reset_lanes as _commit_reset_lanes
+from qnn.model.decode_actions import commit_reset_lanes as _commit_reset_lanes
+from qnn.model.look_seg_decode import (
+    LOOK_COMMIT_STATE_DIM,
+    look_commit_reset_lanes as _look_commit_reset_lanes)
 from qnn.model.decode import BatchedRNG
 from qnn.model.policy import QNNPolicy
 from qnn.schema import GATE_STREAM_SCHEMA_VERSION, SELF_SCALAR_DIM
 from qnn.vocab import TOKEN_ACTOR, self_weapon_id_to_impulse
 from qnn.env.world import NativeWorldEnv
-from qnn.wire import OBS_BUFFER_SIZE, unpack_obs_buffer_native_batch
+from qnn.wire import OBS_BUFFER_SIZE, unpack_frame_batch, unpack_obs_buffer_native_batch
 from qnn.utils.io import trusted_torch_load, write_json
 from qnn.utils.repro import set_global_seed, write_experiment_manifest
 from mapgen.pool import PROCGEN_SENTINEL
@@ -86,7 +90,7 @@ class EvalConfig:
     # move dwell/switch diagnostics. eval_log_action_streams.
     log_action_streams: bool = False
     # Dump per-episode raw entity obs streams (entity_count/types/rel/vel/recency
-    # + self_weapon_id per tick) to output_dir/acq_streams_<mode>.npz — the
+    # + current attack-with weapon choice) to output_dir/acq_streams_<mode>.npz — the
     # closed-loop input of the ACQUISITION (Fitts-throughput) axis. These are the
     # SAME per-frame obs the human-corpus flick kernel consumes
     # (scripts/analysis/acq_submovement.py), scenario-tagged so a heterogeneous
@@ -196,6 +200,12 @@ class _EpisodeState:
     # covered fb/lr and broke the first movearch closed-loop eval.
     move_commit: np.ndarray = field(default_factory=lambda: np.asarray(
         _commit_reset_lanes(), dtype=np.float32))
+    # a25 LOOK commitment decode state — LOOK_COMMIT_STATE_DIM lanes
+    # [cls, rem, elapsed, dur_bucket, dir_bin] from the reset init (rem=0 forces an
+    # onset on the first tick). Mutated in place by policy.act's look_commit decode,
+    # scattered back per env — the move_commit precedent.
+    look_commit: np.ndarray = field(default_factory=lambda: np.asarray(
+        _look_commit_reset_lanes(), dtype=np.float32))
     # Per-tick decoded move classes, filled only when log_action_streams.
     move_trace: List[tuple] = field(default_factory=list)
     # Per-tick threat flags (bit0=damage, bit1=INCOMING-projectile appeared
@@ -204,10 +214,13 @@ class _EpisodeState:
     threat_trace: List[int] = field(default_factory=list)
     # Per-tick (attack, weapon, turn_deg, keep, discharge, weapon_imp, engaged)
     # for the decode-fit stage-6 rc_humanlikeness gate (band-v5 flat schema),
-    # filled only when log_action_streams.
+    # plus the 5 LOOK COMMIT lanes (cls, rem, elapsed, dur_bucket, dir_bin) this
+    # tick's look decode left behind — the cross-head coordination trace; -1
+    # when the model has no look_seg head — plus the 2 look-TANGENT components
+    # (schema 4). Filled only when log_action_streams.
     gate_trace: List[tuple] = field(default_factory=list)
     # Per-tick raw entity obs (n, entity_types, entity_rel, entity_vel,
-    # entity_recency, self_weapon_id) for the ACQUISITION axis, filled only when
+    # entity LOS state and attack-with weapon choice) for ACQUISITION, filled only when
     # log_acq_streams — the closed-loop analog of the human collect cache the
     # acq_submovement flick kernel reads.
     acq_trace: List[tuple] = field(default_factory=list)
@@ -328,6 +341,20 @@ def _episode_jobs(config: EvalConfig) -> tuple[list[_ScenarioSpec], dict[str, de
     return scenarios, jobs
 
 
+@lru_cache(maxsize=8)
+def _declaration_for_checkpoint(checkpoint_path: str) -> object:
+    """Obs declaration for the checkpoint's run dir (obs_api v1).
+
+    The eval must attach the declaration the model TRAINED on — the
+    engine's no-attach default plan tracks the branch head, not any
+    given checkpoint. Checkpoints live at <run_dir>/checkpoints/*.pth,
+    so the run dir (which declaration_for_run resolves stamps and
+    bare-stamp corpus fallbacks against) is two levels up.
+    """
+    from qnn.obs_api import declaration_for_run
+    return declaration_for_run(Path(checkpoint_path).resolve().parent.parent)
+
+
 def _build_eval_env(config: EvalConfig, scenario: _ScenarioSpec) -> NativeWorldEnv:
     if not config.native_executable:
         raise RuntimeError("Evaluation requires native_executable")
@@ -352,6 +379,7 @@ def _build_eval_env(config: EvalConfig, scenario: _ScenarioSpec) -> NativeWorldE
         native_args=list(scenario.native_args),
         options=env_options,
         procgen=scenario.procgen_cfg,
+        declaration=_declaration_for_checkpoint(config.checkpoint_path),
     )
 
 
@@ -412,6 +440,8 @@ def _select_actions_batch(
         if getattr(model, "move_commitment", False):
             # view, not copy: policy.act mutates the commitment state in place
             sticky_kw["move_commit_state"] = state.move_commit[None, :]
+        if getattr(model, "look_commitment", False):
+            sticky_kw["look_commit_state"] = state.look_commit[None, :]
         if mode == "greedy":
             action_batch = model.act(obs_b, mode=mode, hidden=hidden_b,
                                      diag_log_path=_MODEL_DIAG_LOG, **sticky_kw)
@@ -428,7 +458,7 @@ def _select_actions_batch(
             "look": action_batch.actions["look"][0].astype(np.float32, copy=False).tolist(),
             **{
                 head: int(action_batch.actions[head][0])
-                for head in ACTION_HEADS
+                for head in action_batch.actions
                 if head not in {"move", "look"}
             },
         })
@@ -553,6 +583,10 @@ def _select_actions_batched(
     if getattr(model, "move_commitment", False):
         commit_batch = np.stack([s.move_commit for s in states], axis=0)
         sticky_kw["move_commit_state"] = commit_batch
+    look_commit_batch: np.ndarray | None = None
+    if getattr(model, "look_commitment", False):
+        look_commit_batch = np.stack([s.look_commit for s in states], axis=0)
+        sticky_kw["look_commit_state"] = look_commit_batch
 
     # Per-lane decode overrides (aim-grid widener): one operating point per row,
     # applied inside the single act() (the forward stays shared). None ⇒ scalar.
@@ -577,6 +611,9 @@ def _select_actions_batched(
     if commit_batch is not None:
         for i, s2 in enumerate(states):
             s2.move_commit = commit_batch[i].copy()
+    if look_commit_batch is not None:
+        for i, s2 in enumerate(states):
+            s2.look_commit = look_commit_batch[i].copy()
     # Scatter the ATTACK wire slots back (pass-through on a25; kept for parity).
     for i, s in enumerate(states):
         s.attack_state[...] = attack_state_batch[i:i + 1].astype(
@@ -591,7 +628,7 @@ def _select_actions_batched(
             "look": action_batch.actions["look"][i].astype(np.float32, copy=False).tolist(),
             **{
                 head: int(action_batch.actions[head][i])
-                for head in ACTION_HEADS
+                for head in action_batch.actions
                 if head not in {"move", "look"}
             },
         })
@@ -648,13 +685,24 @@ def _receive_batched_raw(
     bucketing and result ordering are byte-for-byte unchanged.
     """
     n = len(idx_ids)
-    raws = np.empty((n, OBS_BUFFER_SIZE), dtype=np.uint8)
+    # Frame size + field layout follow the lanes' negotiated declaration
+    # (obs_api v1). All lanes in an eval serve one model, so the first
+    # lane's layout governs; a mismatched lane fails loudly on the row
+    # assignment below (frame length != layout.frame_bytes).
+    layout = getattr(envs[idx_ids[0]], "layout", None) if idx_ids else None
+    raws = np.empty(
+        (n, OBS_BUFFER_SIZE if layout is None else layout.frame_bytes),
+        dtype=np.uint8,
+    )
     meta: List[Tuple[float, bool, Dict[str, object]]] = []
     for row, idx in enumerate(idx_ids):
         raw, reward, done, info = envs[idx].step_recv_raw()
         raws[row] = np.frombuffer(raw, dtype=np.uint8)
         meta.append((float(reward), bool(done), dict(info)))
-    obs_b = unpack_obs_buffer_native_batch(raws)
+    if layout is None:
+        obs_b = unpack_obs_buffer_native_batch(raws)
+    else:
+        obs_b = unpack_frame_batch(raws, layout)
     return [({k: obs_b[k][row] for k in obs_b}, m[0], m[1], m[2])
             for row, m in enumerate(meta)]
 
@@ -873,24 +921,61 @@ def _write_intercept_events(
     return path
 
 
-def _write_intercept_windows(output_dir: str | Path, k: int,
+def _parse_intercept_window(spec: str | None) -> tuple[int, int]:
+    """``QNN_EVAL_INTERCEPT_WINDOW`` → (k_pre, k_post) tick counts.
+
+    ``"16,4"`` = 16 pre-roll ticks + 4 forward ticks around the discharge (the
+    frozen geometry decode-fit requests — qnn.decode_fit.events); a bare
+    ``"4"`` is the symmetric shorthand for ``"4,4"``; empty/unset disables the
+    instrument. Malformed values FAIL LOUD rather than silently disabling it.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return (0, 0)
+    parts = spec.split(",")
+    if len(parts) > 2:
+        raise ValueError(
+            f"QNN_EVAL_INTERCEPT_WINDOW must be '<pre>,<post>' or '<k>', "
+            f"got {spec!r}")
+    try:
+        vals = [int(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(
+            f"QNN_EVAL_INTERCEPT_WINDOW must be integer ticks, got {spec!r}"
+        ) from exc
+    k_pre, k_post = (vals * 2)[:2]
+    if k_pre < 0 or k_post < 0:
+        raise ValueError(
+            f"QNN_EVAL_INTERCEPT_WINDOW tick counts must be >= 0, got {spec!r}")
+    return (k_pre, k_post)
+
+
+def _write_intercept_windows(output_dir: str | Path, k_pre: int, k_post: int,
                              rows: Mapping[str, Sequence[Any]]) -> Path | None:
     """Write the tracking-window instrument, including an explicit empty file.
+
+    Each row is one discharge's hbw stream over ``[t0 - k_pre, t0 + k_post]``
+    (``k_pre + k_post + 1`` slots, the fired tick at index ``k_pre``). The
+    window is ASYMMETRIC: the alignment-lead profile needs a long pre-roll
+    (does the crosshair converge before the trigger?) while the forward half
+    only has to cover the crest-replay hold horizon. ``k_pre``/``k_post`` are
+    both stamped — there is no single half-width to infer them from.
 
     A zero-discharge wave is valid evidence about fire mass but contributes no
     tracking samples. It still needs a schema-bearing artifact so decode-fit can
     distinguish that result from a wave produced before the instrument existed.
     """
-    if not k:
+    if not (k_pre or k_post):
         return None
     hbw_win = np.asarray(rows["hbw_win"], dtype=np.float32)
     if not len(hbw_win):
-        hbw_win = np.empty((0, 2 * int(k) + 1), dtype=np.float32)
+        hbw_win = np.empty((0, int(k_pre) + int(k_post) + 1), dtype=np.float32)
     out = Path(output_dir) / "intercept_windows.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out,
-        k=np.int64(k),
+        k_pre=np.int64(k_pre),
+        k_post=np.int64(k_post),
         scenario_id=np.asarray(rows["scenario_id"], dtype="U64"),
         weapon=np.asarray(rows["weapon"], dtype="U8"),
         episode=np.asarray(rows["episode"], dtype=np.int32),
@@ -924,14 +1009,14 @@ def _fire_aim_best_cos(obs: object) -> float | None:
 # bot. The v3 QTRN extension exposes the nearest in-LOS actor's view-frame rel
 # pos + ABSOLUTE world velocity + the currently-held weapon; from those we
 # recompute the crosshair→LEAD-POINT angle via the LIVE aim-prior geometry
-# (qnn.model.bench.a25.lead_aim.compute_lead_aim/held_weapon_trajectory) — the
+# (qnn.model.lead_aim.compute_lead_aim/weapon_trajectory) — the
 # very physics the human coh_5deg curve and the deployed prior use — so
 # model↔human coherence is computed identically. RL gets
 # the same AIM_Z_DROP ground/feet anchor on BOTH sides (the comparability
 # requirement); body-center for non-floored weapons.
 
 def _build_lead_physics_tables():
-    """(weapon_static (9,7), aim_z_drop (9,2), wid→impulse (256,)) — cached."""
+    """Impulse-keyed weapon physics and aim-z tables — cached."""
     global _LEAD_PHYS_TABLES
     try:
         return _LEAD_PHYS_TABLES
@@ -968,28 +1053,23 @@ def _lead_aim_cos_from_info(
     """
     if not info.get("lead_valid", False):
         return None
-    ws, zdrop, wid_to_imp = _build_lead_physics_tables()
+    ws, zdrop = _build_lead_physics_tables()
     rel = np.asarray(info.get("lead_rel", (0.0, 0.0, 0.0)), dtype=np.float32) / _LEAD_DIST_SCALE
     vel = np.asarray(info.get("lead_vel", (0.0, 0.0, 0.0)), dtype=np.float32) / _LEAD_VEL_SCALE
-    # lead_weapon_id is the RAW engine weapon id (1..8, QNN_WeaponId). wid_to_imp
-    # is indexed by the ENTITY_IDS-encoded (subject) id, like the human curve's
-    # obs self_weapon_id — so convert raw→subject (+2) before the lookup. (The
-    # recurring raw-vs-subject ±2 trap; do NOT drop this conversion.)
     raw_wid = int(info.get("lead_weapon_id", 0))
-    subj_wid = (raw_wid + 2) & 0xFF if raw_wid > 0 else 0
-    imp = int(wid_to_imp[subj_wid])
+    imp = raw_wid if 1 <= raw_wid <= 8 else 0
 
     # Crosshair→lead-point angle via the LIVE aim-prior geometry: the hitscan
-    # ×100 boost (held_weapon_trajectory) collapses lead to the bearing for
+    # ×100 boost (weapon_trajectory) collapses lead to the bearing for
     # instant-fire weapons, and the intercept quadratic + per-weapon z-anchor
     # (compute_lead_aim) are the deployed prior's exact physics — so the model
     # coherence and the human coh_5deg curve cannot drift apart.
     import torch
-    from qnn.model.bench.a25.lead_aim import compute_lead_aim, held_weapon_trajectory
+    from qnn.model.lead_aim import compute_lead_aim, weapon_trajectory
 
     ws_t = torch.from_numpy(np.ascontiguousarray(ws, dtype=np.float32))
     imp_t = torch.tensor([imp], dtype=torch.long)
-    v_horiz, drop_const, drop_rate = held_weapon_trajectory(ws_t, imp_t)   # (1,) each
+    v_horiz, drop_const, drop_rate = weapon_trajectory(ws_t, imp_t)   # (1,) each
     rel_t = torch.from_numpy(rel).reshape(1, 1, 3)
     vel_t = torch.from_numpy(vel).reshape(1, 1, 3)
     aim = compute_lead_aim(rel_t, vel_t, v_horiz, drop_const, drop_rate)[0, 0]  # (3,)
@@ -1023,7 +1103,7 @@ def _lead_aim_cos_batched(
     the dominant per-macro-step serial cost of the batched closed-loop eval.
 
     BIT-IDENTICAL to the per-lane path (up to float32 vs float64 rounding in the
-    trailing scalar trig, < 1e-5): ``compute_lead_aim`` / ``held_weapon_trajectory``
+    trailing scalar trig, < 1e-5): ``compute_lead_aim`` / ``weapon_trajectory``
     are elementwise/broadcast over the batch dim — the only reductions are over the
     xyz axis, PER ROW — so batching cannot change any row's float result. Returns a
     list aligned with ``infos``; None for lanes with lead_valid=0 (no actor), exactly
@@ -1033,8 +1113,8 @@ def _lead_aim_cos_batched(
     valid_idx = [i for i, info in enumerate(infos) if info.get("lead_valid", False)]
     if not valid_idx:
         return out
-    from qnn.model.bench.a25.lead_aim import compute_lead_aim, held_weapon_trajectory
-    ws, _zdrop, wid_to_imp = _build_lead_physics_tables()
+    from qnn.model.lead_aim import compute_lead_aim, weapon_trajectory
+    ws, _zdrop = _build_lead_physics_tables()
     v = len(valid_idx)
     rel = np.empty((v, 3), dtype=np.float32)
     vel = np.empty((v, 3), dtype=np.float32)
@@ -1043,14 +1123,11 @@ def _lead_aim_cos_batched(
         info = infos[i]
         rel[k] = np.asarray(info.get("lead_rel", (0.0, 0.0, 0.0)), dtype=np.float32) / _LEAD_DIST_SCALE
         vel[k] = np.asarray(info.get("lead_vel", (0.0, 0.0, 0.0)), dtype=np.float32) / _LEAD_VEL_SCALE
-        # raw engine weapon id 1..8 → ENTITY_IDS subject id (+2) → impulse index
-        # (the recurring raw-vs-subject ±2 trap; do NOT drop this conversion).
         raw_wid = int(info.get("lead_weapon_id", 0))
-        subj_wid = (raw_wid + 2) & 0xFF if raw_wid > 0 else 0
-        imps[k] = int(wid_to_imp[subj_wid])
+        imps[k] = raw_wid if 1 <= raw_wid <= 8 else 0
     ws_t = torch.from_numpy(np.ascontiguousarray(ws, dtype=np.float32))
     imp_t = torch.from_numpy(imps)
-    v_horiz, drop_const, drop_rate = held_weapon_trajectory(ws_t, imp_t)   # (v,) each
+    v_horiz, drop_const, drop_rate = weapon_trajectory(ws_t, imp_t)   # (v,) each
     rel_t = torch.from_numpy(rel).reshape(v, 1, 3)
     vel_t = torch.from_numpy(vel).reshape(v, 1, 3)
     # feet-anchored (per-weapon z-drop) and origin/center-mass (drop zeroed) — the
@@ -1214,6 +1291,9 @@ def _evaluate_mode(
             scenario_id=scenarios[0].scenario_id,
             scenario_ids=scenario_ids,
             weapon_config=weapon_config or None,
+            declarations=(
+                [_declaration_for_checkpoint(config.checkpoint_path)] * num_envs
+            ),
         )
     elif config.env_backend != "process":
         raise ValueError(f"unknown eval env_backend {config.env_backend!r}")
@@ -1309,11 +1389,16 @@ def _evaluate_mode(
     # past the cap; the npz is then stamped truncated=True).
     intercept_events: Dict[str, list] = {k: [] for k in _EVENT_RAW_FIELDS}
     intercept_events_truncated = False
-    # DIAGNOSTIC (env-gated, additive): per-discharge ±k-tick hbw window —
-    # the crest-vs-fired timing analysis (does the model fire at its local
-    # alignment crest the way the elite-anchor humans do?). Env-gated so wave
-    # config hashes are untouched; emitted as intercept_windows.npz.
-    _win_k = int(os.environ.get("QNN_EVAL_INTERCEPT_WINDOW", "0") or 0)
+    # DIAGNOSTIC (env-gated, additive): per-discharge hbw window over
+    # [t0-pre, t0+post] — the crest-vs-fired timing analysis (does the model
+    # fire at its local alignment crest the way the elite-anchor humans do?)
+    # and the alignment-LEAD profile (how far ahead of the trigger does the
+    # crosshair converge?), which is why the pre-roll is the long side.
+    # Env-gated so wave config hashes are untouched; emitted as
+    # intercept_windows.npz. QNN_EVAL_INTERCEPT_WINDOW is "<pre>,<post>";
+    # a single int is the symmetric shorthand "<k>,<k>".
+    _win_pre, _win_post = _parse_intercept_window(
+        os.environ.get("QNN_EVAL_INTERCEPT_WINDOW", ""))
     _win_rows: Dict[str, list] = {"scenario_id": [], "weapon": [],
                                   "episode": [], "env_idx": [], "tick": [],
                                   "hbw_win": []}
@@ -1485,6 +1570,15 @@ def _evaluate_mode(
         # obs lacks them the flat keys are OMITTED so the band scorer fails loud
         # (pre-v5 npz) instead of scoring an all-zeros discharge stream.
         _v5_gate_fields = {"ok": None}
+        # LOOK COMMIT trace (gate schema 3): the LOOK_COMMIT_STATE_DIM lanes
+        # policy.act's look-commitment decode just left in state.look_commit —
+        # logged tick-aligned with the gate row so stroke class/direction sit on
+        # the same index as fb/lr/turn_deg (the cross-head coordination channel;
+        # lc_elapsed == 0 marks a stroke onset). A model without a look_seg head
+        # never runs that decode, so its lanes are the -1 sentinel, never the
+        # reset zeros (which are a REAL state: hold, onset due next tick).
+        _has_look_commit = bool(getattr(model, "look_commitment", False))
+        _lc_absent = (-1,) * LOOK_COMMIT_STATE_DIM
 
         def _log_streams(states, actions):
             if config.log_action_streams:
@@ -1536,25 +1630,65 @@ def _evaluate_mode(
                     _lk = _act.get("look")
                     if _lk is not None:
                         _lx, _ly, _lz = float(_lk[0]), float(_lk[1]), float(_lk[2])
-                        _turn = float(np.degrees(np.arctan2(np.hypot(_ly, _lz), _lx)))
+                        # θ = atan2(|yz|, x) and the TANGENT z = θ·ŷz — the
+                        # corpus act_look_tan law, verbatim (see
+                        # qnn.bc.cache_look_tan.look_to_tangent /
+                        # qnn.model.look_bins.tangent_logmap; NEVER arccos(x),
+                        # which manufactures holds below ~1.27°). turn_deg is
+                        # |z| in degrees; the tangent carries the direction the
+                        # segmenter needs. Pinned against the corpus law by
+                        # tests/test_h2h.py.
+                        _hyz = float(np.hypot(_ly, _lz))
+                        _th = float(np.arctan2(_hyz, _lx))
+                        _turn = float(np.degrees(_th))
+                        _tsc = (_th / _hyz) if _hyz > 0.0 else 0.0
+                        _tan_y, _tan_z = _ly * _tsc, _lz * _tsc
                     else:
                         _turn = 0.0
+                        _tan_y, _tan_z = 0.0, 0.0
                     _keep = 0
                     _engaged = 0
                     if isinstance(_st.obs, dict) and "entity_types" in _st.obs:
                         _et_g = np.asarray(_st.obs["entity_types"]).reshape(-1)
                         _keep = int((_et_g == TOKEN_ACTOR).any())
-                        # engaged (band v5 context mask) = LOS actor among the
-                        # LIVE entity slots (recency==0); keep (any-recency
-                        # actor, incl. the ~2s memory tail) stays the validity
-                        # mask — same split as the human side's engaged-LOS.
-                        if "entity_recency" in _st.obs and "entity_count" in _st.obs:
+                        # engaged (band v5 context mask) = SIGHT actor among
+                        # the live entity slots. A27 derives this directly
+                        # from modality; legacy observations fall back to
+                        # recency==0.
+                        if "entity_count" in _st.obs:
                             _n_g = int(np.asarray(_st.obs["entity_count"]).reshape(-1)[0])
-                            _rec_g = np.asarray(
-                                _st.obs["entity_recency"], dtype=np.float64).reshape(-1)[:_n_g]
-                            _engaged = int(((_et_g[:_n_g] == TOKEN_ACTOR)
-                                            & (_rec_g <= 0.0)).any())
-                    _attack_g = int(_act.get("attack", 0) or 0)
+                            if "entity_modality_id" in _st.obs:
+                                _mod_g = np.asarray(
+                                    _st.obs["entity_modality_id"]
+                                ).reshape(-1)[:_n_g]
+                                _engaged = int(((_et_g[:_n_g] == TOKEN_ACTOR)
+                                                & (_mod_g == 0)).any())
+                            elif "entity_recency" in _st.obs:
+                                _rec_g = np.asarray(
+                                    _st.obs["entity_recency"],
+                                    dtype=np.float64,
+                                ).reshape(-1)[:_n_g]
+                                _engaged = int(((_et_g[:_n_g] == TOKEN_ACTOR)
+                                                & (_rec_g <= 0.0)).any())
+                    if "weapon" in _act:
+                        # a26 action convention: attack is the fire BIT and
+                        # the per-tick weapon INTENT rides its own channel;
+                        # the discharging weapon is the HELD one
+                        # (self_weapon_id), mirroring the a26-line gate row.
+                        _attack_g = int(int(np.asarray(
+                            _act["attack"]).reshape(-1)[0]) > 0)
+                        _wsel_g = int(np.asarray(
+                            _act["weapon"]).reshape(-1)[0])
+                        _wimp_g = 0
+                        if isinstance(_st.obs, dict) and "self_weapon_id" in _st.obs:
+                            _wimp_g = int(self_weapon_id_to_impulse(int(np.asarray(
+                                _st.obs["self_weapon_id"]).reshape(-1)[0])))
+                    else:
+                        # a27 convention: attack IS the attack_with class
+                        # (0 hold, 1..8 weapon impulse being fired).
+                        _wimp_g = int(_act.get("attack", 0) or 0)
+                        _attack_g = int(_wimp_g > 0)
+                        _wsel_g = _wimp_g
                     # engine-visible DISCHARGE (band v5 attack channel): the
                     # engine honors an attack only when QC attack_finished has
                     # expired — the mirror of the human op-attack decision
@@ -1564,28 +1698,32 @@ def _evaluate_mode(
                              if isinstance(_st.obs, dict) else None)
                     _disch_g = int(bool(_attack_g) and _af_g is not None
                                    and float(np.asarray(_af_g).reshape(-1)[0]) <= 1e-6)
-                    _wimp_g = 0
-                    if isinstance(_st.obs, dict) and "self_weapon_id" in _st.obs:
-                        _wimp_g = int(self_weapon_id_to_impulse(int(np.asarray(
-                            _st.obs["self_weapon_id"]).reshape(-1)[0])))
                     if _v5_gate_fields["ok"] is None:
                         _v5_gate_fields["ok"] = bool(
                             isinstance(_st.obs, dict)
                             and all(k in _st.obs for k in (
-                                "attack_finished", "self_weapon_id",
-                                "entity_types", "entity_recency", "entity_count")))
+                                "attack_finished",
+                                "entity_types", "entity_count"))
+                            and ("entity_modality_id" in _st.obs
+                                 or "entity_recency" in _st.obs))
+                    if _has_look_commit:
+                        _lc_g = tuple(int(v) for v in np.asarray(
+                            _st.look_commit).reshape(-1)[:LOOK_COMMIT_STATE_DIM])
+                    else:
+                        _lc_g = _lc_absent
                     _st.gate_trace.append(
-                        (_attack_g, int(_act.get("weapon", 0) or 0), _turn,
-                         _keep, _disch_g, _wimp_g, _engaged))
+                        (_attack_g, _wsel_g, _turn,
+                         _keep, _disch_g, _wimp_g, _engaged) + _lc_g
+                        + (_tan_y, _tan_z))
 
             # ACQUISITION obs capture: per-tick RAW entity obs (the SAME fields
             # the human collect cache feeds the acq_submovement flick kernel —
             # entity_rel/vel int16 game units, entity_types int8, recency float16,
-            # self_weapon_id — sliced to the live entity_count so padding never
+            # entity arrays are sliced to the live count so padding never
             # leaks in). The kernel derives view-motion + nearest-actor origin
             # bearing from these, so no geometry is duplicated here.
             if config.log_acq_streams:
-                for _st in states:
+                for _i, _st in enumerate(states):
                     _o = _st.obs
                     if not (isinstance(_o, Mapping) and "entity_count" in _o):
                         _st.acq_trace.append((0, np.zeros(0, np.int8),
@@ -1594,13 +1732,27 @@ def _evaluate_mode(
                                               np.zeros(0, np.float16), 0))
                         continue
                     _n = int(np.asarray(_o["entity_count"]).reshape(-1)[0])
+                    if "entity_recency" in _o:
+                        _acq_rec = np.asarray(
+                            _o["entity_recency"]
+                        ).reshape(-1)[:_n].astype(np.float16)
+                    else:
+                        # The acquisition stream's legacy `rec` lane is an
+                        # analysis-only LOS mask. A27 supplies it from modality:
+                        # zero for SIGHT, a large finite sentinel for PROXIMITY.
+                        _mod = np.asarray(
+                            _o["entity_modality_id"]
+                        ).reshape(-1)[:_n]
+                        _acq_rec = np.where(
+                            _mod == 0, 0.0, np.finfo(np.float16).max
+                        ).astype(np.float16)
                     _st.acq_trace.append((
                         _n,
                         np.asarray(_o["entity_types"]).reshape(-1)[:_n].astype(np.int8),
                         np.asarray(_o["entity_rel"]).reshape(-1, 3)[:_n].astype(np.int16),
                         np.asarray(_o["entity_vel"]).reshape(-1, 3)[:_n].astype(np.int16),
-                        np.asarray(_o["entity_recency"]).reshape(-1)[:_n].astype(np.float16),
-                        int(np.asarray(_o["self_weapon_id"]).reshape(-1)[0]),
+                        _acq_rec,
+                        int(actions[_i].get("attack", 0) or 0),
                     ))
 
         def _obs_fire_disc(states, actions):
@@ -1609,7 +1761,7 @@ def _evaluate_mode(
             # obs-side fire discrimination: at each fire tick, score the model's
             # crosshair alignment to the nearest-aligned actor in its OWN obs.
             for _i, _st in enumerate(states):
-                _w = int(actions[_i].get("weapon", 0) or 0)
+                _w = int(actions[_i].get("attack", 0) or 0)
                 if 1 <= _w <= 8:
                     weapon_held_ticks[_w] = weapon_held_ticks.get(_w, 0) + 1
                 if _dbg_obs_keys is None and isinstance(_st.obs, dict):
@@ -1619,7 +1771,7 @@ def _evaluate_mode(
                         _dbg_af.append(float(np.asarray(_st.obs["attack_finished"]).reshape(-1)[0]))
                     except Exception:
                         pass
-                if not int(actions[_i].get("attack", 0)):
+                if _w <= 0:
                     continue
                 fire_ticks += 1
                 if 1 <= _w <= 8:
@@ -1719,7 +1871,7 @@ def _evaluate_mode(
                         blind_attack_no_los += 1
                     elif float(np.degrees(np.arccos(np.clip(_lead[0], -1.0, 1.0)))) > _FIRE_CONE_DEG:
                         blind_attack_offcone_lead += 1
-                if _win_k:
+                if _win_pre or _win_post:
                     # per-tick hbw stream for the crest window (NaN when no
                     # in-LOS actor); trailing buffer + forward fills per lane
                     _wkey = (int(env_idxs[batch_idx]),
@@ -1733,15 +1885,15 @@ def _evaluate_mode(
                         _hbw_t = float("nan")
                     _tr = _win_trail.get(_wkey)
                     if _tr is None:
-                        _tr = _win_trail[_wkey] = deque(maxlen=_win_k + 1)
+                        _tr = _win_trail[_wkey] = deque(maxlen=_win_pre + 1)
                     _tr.append(_hbw_t)
                     _pend = _win_pending.get(_wkey)
                     if _pend:
                         _done_bufs = []
                         for _buf in _pend:
                             _buf.append(_hbw_t)
-                            # 1 weapon tag + (k+1) trailing + k forward
-                            if len(_buf) == 2 * _win_k + 2:
+                            # 1 meta tag + (pre+1) trailing + post forward
+                            if len(_buf) == _win_pre + _win_post + 2:
                                 _done_bufs.append(_buf)
                         for _buf in _done_bufs:
                             _pend.remove(_buf)
@@ -1797,10 +1949,11 @@ def _evaluate_mode(
                                 intercept_events["tick"].append(int(tick))
                             else:
                                 intercept_events_truncated = True
-                            if _win_k and len(_win_rows["hbw_win"]) < _WIN_CAP:
+                            if ((_win_pre or _win_post)
+                                    and len(_win_rows["hbw_win"]) < _WIN_CAP):
                                 # crest-window row: identity meta + trailing
-                                # (k+1, NaN-padded left) — forward k ticks
-                                # fill on this lane's next ticks. The meta
+                                # (pre+1, NaN-padded left) — the forward `post`
+                                # ticks fill on this lane's next ticks. The meta
                                 # (scenario/episode/lane/tick) makes the npz
                                 # self-contained for the decode-fit tracking
                                 # loader (cluster keys + op annotation),
@@ -1809,7 +1962,7 @@ def _evaluate_mode(
                                     (int(env_idxs[batch_idx]),
                                      int(episode_ords[batch_idx])), ()))
                                 _twin = ([float("nan")] *
-                                         (_win_k + 1 - len(_twin))) + _twin
+                                         (_win_pre + 1 - len(_twin))) + _twin
                                 _win_pending.setdefault(
                                     (int(env_idxs[batch_idx]),
                                      int(episode_ords[batch_idx])), []
@@ -1949,7 +2102,7 @@ def _evaluate_mode(
                             [r[3] for r in _tr]).astype(np.int16)
                         acq_streams[f"acq_rec_{_key}"] = np.concatenate(
                             [r[4] for r in _tr]).astype(np.float16)
-                        acq_streams[f"acq_wid_{_key}"] = np.asarray(
+                        acq_streams[f"acq_weapon_{_key}"] = np.asarray(
                             [r[5] for r in _tr], dtype=np.uint8)
                         acq_scenarios[_key] = str(state.scenario_id)
                     returns.append(float(state.return_value))
@@ -2024,7 +2177,7 @@ def _evaluate_mode(
         streams_path.parent.mkdir(parents=True, exist_ok=True)
         # Flat rc_humanlikeness schema (decode-fit stage-6 gate) alongside the
         # legacy per-episode keys: episode-concatenated fb/lr/ud/weapon/attack/
-        # turn_deg/keep (+ band-v5 discharge/weapon_imp/engaged) +
+        # turn_deg/keep/lc_* (+ band-v5 discharge/weapon_imp/engaged) +
         # episode_offsets + tick_hz.
         flat: dict = {}
         ep_keys = sorted(k for k in move_streams if k.startswith("ep_"))
@@ -2044,6 +2197,17 @@ def _evaluate_mode(
                 "weapon": gt_cat[:, 1].astype(np.int8),
                 "turn_deg": gt_cat[:, 2].astype(np.float32),
                 "keep": gt_cat[:, 3].astype(bool),
+                # look-commitment lanes (schema 3) — always present, -1 when
+                # the model has no look_seg head (see qnn.schema).
+                "lc_cls": gt_cat[:, 7].astype(np.int8),
+                "lc_rem": gt_cat[:, 8].astype(np.int16),
+                "lc_elapsed": gt_cat[:, 9].astype(np.int16),
+                "lc_dur": gt_cat[:, 10].astype(np.int8),
+                "lc_dir": gt_cat[:, 11].astype(np.int8),
+                # look tangent (schema 4), (n, 2) float16 radians — the corpus
+                # act_look_tan quantity, so model streams segment by the human
+                # rule (see qnn.schema).
+                "look_tan": gt_cat[:, 12:14].astype(np.float16),
             }
             # band-v5 fields — only when the obs carried their engine sources
             # (see _v5_gate_fields above); the scorer fails loud when absent.
@@ -2215,12 +2379,13 @@ def _evaluate_mode(
     # (the loader treats absence as "no discharges / predates event logging").
     _write_intercept_events(config.output_dir, intercept_events,
                             truncated=intercept_events_truncated)
-    if _win_k:
+    if _win_pre or _win_post:
         # flush pendings cut short by episode end (NaN-pad the forward side)
         for _bufs in _win_pending.values():
             for _buf in _bufs:
-                _win_emit(_buf, pad_to=2 * _win_k + 1)
-        _write_intercept_windows(config.output_dir, _win_k, _win_rows)
+                _win_emit(_buf, pad_to=_win_pre + _win_post + 1)
+        _write_intercept_windows(config.output_dir, _win_pre, _win_post,
+                                 _win_rows)
     # Decoded turn-magnitude distribution per LOS-angle zone (the lock-on curve):
     # {los_angle_bin: {turn_mag_bin: p}} normalized within each LOS zone. Matched
     # against the human reference to calibrate the turn_mag_scale dampener.
@@ -2365,6 +2530,16 @@ def _apply_decode_config_params(config: "EvalConfig", model: QNNPolicy, resolved
     # form). There is no config.look_aim_ffwd field.
     _g = model.look_aim_prior_gain
     config.look_aim_prior_gain = _g if isinstance(_g, float) else None
+    # a25 LOOK commitment decode: auto-enabled from model SHAPE, not from a
+    # config key — a look_seg head with NO classic look head is the sole look
+    # mechanism, so the commit decode is mandatory (there is no per-frame look
+    # readout to fall back to). It is therefore NOT a DECODE_PARAMS row: deriving
+    # it from shape is what makes eval and the exported graph agree by
+    # construction (tools/export_onnx derives the same flag the same way).
+    # NOTE: head-shape flags live on the NETWORK (model.model), not the QNNPolicy.
+    _net = getattr(model, "model", model)
+    model.look_commitment = (getattr(_net, "_has_look_seg_head", False)
+                             and not getattr(_net, "_has_look_head", False))
     # NOTE: the a24 move keys (move.sticky_tau_*, move.switchback_eps,
     # move.stop_onset, move.tau_engagement_gated, move.jump_*), the inline
     # move_hazard table, and attack.threshold are RETIRED with the a24 arch —

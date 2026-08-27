@@ -11,8 +11,8 @@ collects results into the canonical schema::
         "meta":    { "n_episodes": N, "n_frames": M }
     }
 
-Weapon is included if ``qnn.diag.weapon`` exists and exposes ``analyze``;
-absent or ImportError → silently skipped.
+The attack-with output is analyzed as part of the attack slice; there is no
+separate equipped-weapon diagnostic.
 """
 from __future__ import annotations
 
@@ -33,7 +33,6 @@ _HEAD_MODULES = [
     ("attack", "qnn.diag.attack"),
     ("look",   "qnn.diag.look"),
     ("move",   "qnn.diag.move"),
-    ("weapon", "qnn.diag.weapon"),   # optional — skipped if missing
 ]
 
 

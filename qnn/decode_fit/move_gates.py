@@ -61,7 +61,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from qnn.model.bench.a25.move_seg_head import JOINT, N_BUCKETS, N_CLASSES
+from qnn.model.move_seg_head import JOINT, N_BUCKETS, N_CLASSES
 from qnn.model.network import JUMP_HEAD, MOVE_SEG_HEAD
 
 # Seg-head joint layout per axis: [class0 buckets | class1 (none) buckets |
@@ -96,7 +96,7 @@ def collect_gate_rows(policy, source, *, device=None) -> dict[str, np.ndarray]:
     shape is what identifies which statistic a recorded fit used.
     """
     from qnn.diag.move_metrics import plan_batches
-    from qnn.model.bench.a25.decode import (move_engagement_signals,
+    from qnn.model.decode_actions import (move_engagement_signals,
                                             move_threat_signal)
 
     if device is None:
@@ -369,7 +369,7 @@ def rollout_standstill(rows: dict[str, np.ndarray], no_enemy: np.ndarray,
     So: fine for a smoke test, not worth it for a fit. Leave it None (the
     default: every episode) for anything that gets reported.
     """
-    from qnn.model.bench.a25.decode import COMMIT_STATE_DIM, commit_reset_lanes, move_commit_step
+    from qnn.model.decode_actions import COMMIT_STATE_DIM, commit_reset_lanes, move_commit_step
 
     offsets = np.asarray(rows["episode_offsets"], dtype=np.int64)
     lengths = (offsets[1:] - offsets[:-1]).astype(np.int64)

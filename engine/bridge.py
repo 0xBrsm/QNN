@@ -163,7 +163,7 @@ class NativeProcessBase:
     # -- Action helpers ------------------------------------------------------
 
     # Binary step protocol: 1-byte opcode + packed action struct (16 bytes).
-    # Matches qnn_action_t layout: move (press byte) + weapon + input_mask +
+    # Matches qnn_action_t layout: move (press byte) + categorical attack + input_mask +
     # pad + look[3]. The press byte bit layout mirrors input_mask:
     #   bit 0   = attack press
     #   bits 1-2 = forward neg / pos
@@ -171,15 +171,21 @@ class NativeProcessBase:
     #   bits 5-6 = up neg / pos
     #   bit 7   = jump press
     _BINARY_OP_STEP = b"\x01"
-    _ACTION_PACK_FORMAT = "<4B3f"  # 4 uint8 + 3 float32 = 16 bytes
-    _ACTION_PACKET_SIZE = 17
+    # Mirrors qnn_action_t (src/engine/common/qnn.h) EXACTLY — the engine
+    # freads sizeof(qnn_action_t) == 20 on both the worker binary-step and the
+    # arena OP_STEP_BATCH paths: move, weapon, attack, input_mask, op_input,
+    # 3 alignment pad bytes, look[3] float32. The pre-merge bridges packed a
+    # 16-byte payload (no weapon/op_input, no pad), which the 20-byte reader
+    # blocks on forever — the desync behind the post-merge closed-loop hangs.
+    _ACTION_PACK_FORMAT = "<5B3x3f"  # 5 uint8 + 3 pad + 3 float32 = 20 bytes
+    _ACTION_PACKET_SIZE = 21
 
     @staticmethod
     def _pack_press_byte(labels: ActionLabels) -> int:
         t = 0.1
         m0, m1, m2 = float(labels.move[0]), float(labels.move[1]), float(labels.move[2])
         byte = 0
-        if int(labels.attack):
+        if int(labels.attack) > 0:
             byte |= 0x01
         if m0 < -t:
             byte |= 0x02
@@ -206,12 +212,18 @@ class NativeProcessBase:
         latency-sensitive pipe fan-out.
         """
         labels = ActionLabels.from_dict(action)
+        # weapon is not an ActionLabels field on the pure-combat arch; full-
+        # entity (wire.11/12) models still drive switches through the raw
+        # engine weapon byte, so it rides the dict directly. The engine's
+        # codec picks fire semantics per model (move bit 0 + weapon vs the
+        # 9-way attack categorical) — both fields are always transmitted.
         return cls._BINARY_OP_STEP + struct.pack(
             cls._ACTION_PACK_FORMAT,
             cls._pack_press_byte(labels),
-            int(labels.weapon),
+            int(action.get("weapon", 0) or 0) & 0xFF,
+            int(labels.attack),
             0,  # input_mask not transmitted from runtime
-            0,  # _pad
+            0,  # op_input not transmitted from runtime
             float(labels.look[0]), float(labels.look[1]), float(labels.look[2]),
         )
 
@@ -271,12 +283,13 @@ class NativeProcessBase:
             )
         look = np.clip(look, -1.0, 1.0)
         attack = _scalar_int("attack")
-        if np.any((attack < 0) | (attack >= 2)):
-            raise ValueError("attack out of range [0, 2)")
-        # Match ActionLabels.from_dict: engine weapon impulses clamp to 0..8.
+        if np.any((attack < 0) | (attack > 8)):
+            raise ValueError("attack out of range [0, 9)")
+        # Raw engine weapon impulse (0 = no switch, 1..8) — driven by
+        # full-entity models; pure-combat batches simply omit the key.
         weapon = np.clip(_scalar_int("weapon"), 0, 8)
 
-        press = attack.astype(np.uint8)
+        press = (attack > 0).astype(np.uint8)
         threshold = np.float32(0.1)
         press |= ((move[:, 0] < -threshold).astype(np.uint8) << 1)
         press |= ((move[:, 0] > threshold).astype(np.uint8) << 2)
@@ -289,9 +302,14 @@ class NativeProcessBase:
 
         packets = np.zeros((rows, cls._ACTION_PACKET_SIZE), dtype=np.uint8)
         packets[:, 0] = cls._BINARY_OP_STEP[0]
+        # Byte layout after the opcode = qnn_action_t verbatim (see
+        # _ACTION_PACK_FORMAT): move press byte, weapon impulse, attack
+        # categorical, input_mask(0), op_input(0), 3 pad, look f32x3.
         packets[:, 1] = press
         packets[:, 2] = weapon.astype(np.uint8)
-        packets[:, 5:].view("<f4").reshape(rows, 3)[:] = look
+        packets[:, 3] = attack.astype(np.uint8)
+        packets[:, 9:21] = (
+            look.astype("<f4", copy=False).view(np.uint8).reshape(rows, 12))
         return packets
 
     def _binary_step_request(self, action: Mapping[str, object]) -> bytes:
@@ -396,15 +414,55 @@ class NativeProcessBase:
 # parser is dead; we use the native dict format end-to-end on this
 # bridge. Downstream consumers (qnn.model.policy via ObsEmbedding's
 # dequantizers, qnn.eval.live's logging) read the native key set.
-from qnn.wire import OBS_BUFFER_SIZE, unpack_obs_buffer_native as _unpack_obs_buffer
+from qnn.obs_api import (
+    Declaration,
+    coerce_declaration,
+    compile_layout,
+    encode_attach_decl,
+    parse_layout_reply,
+)
+from qnn.wire import (
+    OBS_BUFFER_SIZE,
+    unpack_frame,
+    unpack_obs_buffer_native as _unpack_obs_buffer,
+)
 
 
 class NativeObsBufferProcess(NativeProcessBase):
-    """Subprocess bridge that reads direct-pack obs_buffer_v1 binary."""
+    """Subprocess bridge that reads direct-pack obs_buffer_v1 binary.
+
+    Passing ``declaration`` (obs_api v1 — a qnn.obs_api.Declaration,
+    dict, or JSON) attaches it via OP_ATTACH_DECL after hello: the
+    worker compiles the seat's emit plan and every obs read is sized
+    by the negotiated layout. Without one (the default), NOTHING is
+    sent and the worker serves the default plan — today's 864-byte
+    frame, bit-identical.
+    """
 
     _step_format = "obs_buffer_v1"
     _required_capability = "obs_buffer_v1"
     _last_obs: Dict[str, np.ndarray] | None = None
+
+    def __init__(self, *args: Any, declaration: object = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.declaration: Declaration | None = coerce_declaration(declaration)
+        # Compile locally at construction so a bad declaration fails
+        # before any subprocess is spawned; the engine's handshake
+        # reply must match this layout exactly.
+        self.layout = None if self.declaration is None else compile_layout(self.declaration)
+        self._frame_bytes = OBS_BUFFER_SIZE if self.layout is None else self.layout.frame_bytes
+
+    def _on_hello(self) -> None:
+        super()._on_hello()
+        if self.declaration is None:
+            return  # legacy driver: send nothing, default plan
+        response = self._request_json(encode_attach_decl(self.declaration, seat_index=0))
+        layout = parse_layout_reply(response.get("layout"))
+        if layout != self.layout:
+            raise NativeEngineError(
+                "Worker attach-decl layout disagrees with the local compile: "
+                f"engine={layout.to_dict()} local={self.layout.to_dict()}"
+            )
 
     def _read_raw_obs_packet(self) -> bytes:
         """Read one obs buffer, surfacing control-plane errors immediately."""
@@ -416,11 +474,14 @@ class NativeObsBufferProcess(NativeProcessBase):
             # forever on a short error line.
             self._decode_json_response(first + proc.stdout.readline())
             raise NativeEngineError("Worker returned JSON where an observation was expected")
-        return first + self._read_exact(OBS_BUFFER_SIZE - 1)
+        return first + self._read_exact(self._frame_bytes - 1)
 
     def _read_obs_packet(self) -> Dict[str, np.ndarray]:
         raw = self._read_raw_obs_packet()
-        obs = _unpack_obs_buffer(raw)
+        if self.layout is not None:
+            obs = unpack_frame(raw, self.layout)
+        else:
+            obs = _unpack_obs_buffer(raw)
         self._last_obs = obs
         return obs
 
@@ -572,6 +633,7 @@ class NativeObsBufferAdapter:
         extra_args: Sequence[str] | None = None,
         reset_options: Mapping[str, object] | None = None,
         training_format: str = "",
+        declaration: object = None,
     ) -> None:
         self.reset_options = dict(reset_options or {})
         self.process = NativeObsBufferProcess(
@@ -582,6 +644,7 @@ class NativeObsBufferAdapter:
             env=env,
             extra_args=extra_args,
             training_format=training_format,
+            declaration=declaration,
         )
         self.process.start()
 
@@ -611,6 +674,7 @@ class NativeObsBufferAdapter:
             env=self.process.env,
             extra_args=self.process.extra_args,
             training_format=self.process.training_format,
+            declaration=self.process.declaration,
         )
         self.process.start()
         return self.process.map_id
@@ -636,14 +700,14 @@ class NativeClientProcess:
     """
 
     _BINARY_OP_STEP = b"\x01"
-    _ACTION_PACK_FORMAT = "<4B3f"  # 4 uint8 + 3 float32 = 16 bytes
+    _ACTION_PACK_FORMAT = "<5B3x3f"  # qnn_action_t: 5 uint8 + 3 pad + 3 float32 = 20 bytes
 
     @staticmethod
     def _pack_press_byte(labels: ActionLabels) -> int:
         t = 0.1
         m0, m1, m2 = float(labels.move[0]), float(labels.move[1]), float(labels.move[2])
         byte = 0
-        if int(labels.attack):
+        if int(labels.attack) > 0:
             byte |= 0x01
         if m0 < -t:
             byte |= 0x02
@@ -728,9 +792,10 @@ class NativeClientProcess:
         payload = self._BINARY_OP_STEP + struct.pack(
             self._ACTION_PACK_FORMAT,
             self._pack_press_byte(labels),
-            int(labels.weapon),
+            int(getattr(labels, "weapon", 0) or 0),
+            int(labels.attack),
             0,  # input_mask not transmitted from runtime
-            0,  # _pad
+            0,  # op_input not transmitted from runtime
             float(labels.look[0]), float(labels.look[1]), float(labels.look[2]),
         )
         proc.stdin.write(payload)

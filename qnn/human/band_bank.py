@@ -53,10 +53,10 @@ from pathlib import Path
 
 import numpy as np
 
-from qnn.eval.aim_kernel import iter_shard_episodes
+from qnn.eval.aim_kernel import action_attack_context, iter_shard_episodes
 from qnn.eval.humanlikeness.core import dwell_times, switch_rate
 from qnn.eval.humanlikeness.human_reference import _turn_deg, _unpack_move
-from qnn.vocab import TOKEN_ACTOR, self_weapon_id_to_impulse
+from qnn.vocab import TOKEN_ACTOR
 from qnn.weapons import COOLDOWN_SEC
 
 BANK_VERSION = 5
@@ -117,20 +117,20 @@ def load_human_episodes(root: Path, split: str) -> list[tuple[int, dict]]:
     for sh in manifest["shards"]:
         for _ei, dmi, fsl, esl, arr in iter_shard_episodes(
                 sh, str(dd),
-                obs=("entity_types", "entity_recency", "self_weapon_id"),
-                acts=("move", "input_mask", "weapon", "target_probs", "look")):
+                obs=("entity_types", "entity_recency"),
+                acts=("move", "attack", "target_probs", "look")):
             packed = np.asarray(arr["move"][fsl], dtype=np.uint8).reshape(-1)
-            imask = np.asarray(arr["input_mask"][fsl], dtype=np.uint8).reshape(-1)
             move = _unpack_move(packed)
             tp = np.asarray(arr["target_probs"][fsl], dtype=np.float32)
-            wid = np.asarray(arr["self_weapon_id"][fsl], dtype=np.int64).reshape(-1)
+            attack = np.asarray(arr["attack"][fsl], dtype=np.int64).reshape(-1)
+            weapon_context = action_attack_context(attack)
             out.append((int(dmi), {
                 "fb": move[:, 0].astype(np.int8),
                 "lr": move[:, 1].astype(np.int8),
-                "attack": (packed & 1).astype(np.int8),
-                "weapon": np.asarray(arr["weapon"][fsl], dtype=np.int8).reshape(-1),
-                "wimp": self_weapon_id_to_impulse(wid).astype(np.int8),
-                "discharge": ((packed & 1) & (imask & 1)).astype(bool),
+                "attack": attack.astype(np.int8),
+                "weapon": weapon_context,
+                "wimp": weapon_context,
+                "discharge": (attack > 0),
                 "turn": _turn_deg(np.asarray(arr["look"][fsl])).astype(np.float64),
                 "keep": (1.0 - tp[:, 0]) != 0.0,
                 "engaged": _los_actor_per_frame(

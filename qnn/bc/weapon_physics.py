@@ -13,9 +13,8 @@ and velocity by 1/QNN_VEL_SCALE (=1/2000) before being packed into
 ``entity_scalars_raw``. Callers pass the raw scalar array; we unscale
 internally.
 
-Recency is in *seconds* (float32, max 2.0 for SIGHT modality per
-``qnn_vocab.h``). The physics path requires recency == 0 — anything else
-is treated as occluded.
+A27 entity tokens are current-frame observations by construction, so the
+physics path needs no recency gate.
 """
 from __future__ import annotations
 
@@ -32,7 +31,6 @@ ACTOR_HALFEXT_OFFSET = 0   # length 3
 ACTOR_REL_OFFSET     = 3   # length 3
 ACTOR_VEL_OFFSET     = 7   # length 3
 ACTOR_TEAM_OFFSET    = 16
-ACTOR_RECENCY_OFFSET = 18
 
 TEAM_TEAMMATE_VALUE = 1.0
 
@@ -107,7 +105,7 @@ _DIST_SCALE = QNN_DIST_SCALE   # 1000.0
 _VEL_SCALE  = QNN_VEL_SCALE    # 2000.0
 
 # Model weapon-token scalar layout. Row 0 = "no weapon" sentinel; rows
-# 1..8 = weapons in impulse order, matching `self_weapon_id` indexing.
+# 1..8 = weapons in action-impulse order.
 MODEL_TOKEN_SCALAR_DIM = 7
 WT_DAMAGE   = 0
 WT_COOLDOWN = 1
@@ -244,12 +242,10 @@ def _look_unit(look_t: np.ndarray) -> np.ndarray | None:
 
 def idx_would_be_hit(weapon: int, look_t: np.ndarray, esc: np.ndarray,
                       t: int, idx: int) -> bool:
-    """Recency-gated boolean: would a shot with ``weapon`` at frame ``t``
+    """Would a shot with ``weapon`` at frame ``t``
     hit the actor at ``idx``? Used by the cone labeler's sticky-keep
     physics check (see ``hit_labeler.label_hit_anchored``)."""
     if weapon not in WEAPON_PHYSICS or weapon == 0:
-        return False
-    if esc[t, idx, ACTOR_RECENCY_OFFSET] > 0.0:
         return False
     look_u = _look_unit(look_t)
     if look_u is None:
@@ -261,7 +257,7 @@ def idx_would_be_hit(weapon: int, look_t: np.ndarray, esc: np.ndarray,
 def find_hit_idx(weapon: int, look: np.ndarray, esc: np.ndarray, t: int,
                   enemy_mask: np.ndarray) -> int:
     """Argmin-metric hit idx at frame ``t``, or -1 if no enemy gets hit.
-    Hitscan uses ray-distance, projectile uses time-of-hit. Recency-gated."""
+    Hitscan uses ray-distance, projectile uses time-of-hit."""
     if weapon not in WEAPON_PHYSICS or weapon == 0:
         return -1
     look_u = _look_unit(look[t])
@@ -271,8 +267,6 @@ def find_hit_idx(weapon: int, look: np.ndarray, esc: np.ndarray, t: int,
     best_metric = math.inf
     for s in range(esc.shape[1]):
         if not enemy_mask[t, s]:
-            continue
-        if esc[t, s, ACTOR_RECENCY_OFFSET] > 0.0:
             continue
         hit, metric = _physics_hit_for_idx(weapon, look_u, esc, t, s)
         if hit and metric < best_metric:
@@ -285,8 +279,8 @@ def all_hits_at_fire(weapon: int, look_t: np.ndarray, esc: np.ndarray,
                      eids: np.ndarray, t: int, enemy_mask: np.ndarray) -> set[int]:
     """Set of enemy pids the projectile/ray would hit at frame ``t``.
     Used by the v3 distribution labeler to admit physics-hit candidates
-    alongside cone candidates (cone-OR-physics co-primary). Recency-gated;
-    pids <= 0 are skipped (no-pid sentinel)."""
+    alongside cone candidates (cone-OR-physics co-primary). Pids <= 0 are
+    skipped (no-pid sentinel)."""
     if weapon not in WEAPON_PHYSICS or weapon == 0:
         return set()
     look_u = _look_unit(look_t)
@@ -295,8 +289,6 @@ def all_hits_at_fire(weapon: int, look_t: np.ndarray, esc: np.ndarray,
     hits: set[int] = set()
     for s in range(esc.shape[1]):
         if not enemy_mask[t, s]:
-            continue
-        if esc[t, s, ACTOR_RECENCY_OFFSET] > 0.0:
             continue
         hit, _ = _physics_hit_for_idx(weapon, look_u, esc, t, s)
         if hit:

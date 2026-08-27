@@ -490,8 +490,8 @@ int QNN_ProgsEvalAttack(
  * the statics across calls; server-forced switches (pickup / ammo-out
  * W_BestWeapon / respawn) resync self.weapon from the snapshot.
  *
- * This is the single actual-advance path for BOTH the weapon label and
- * the attack op-bit, replacing the separate ungated QNN_ProgsEvalWeaponImpulse*
+ * This is the single actual-advance path for the categorical attack label
+ * and attack op-bit, replacing the separate ungated QNN_ProgsEvalWeaponImpulse*
  * advance and the per-cmd QNN_ProgsEvalAttack advance.  Feasibility probes
  * (counterfactual button0=1 with save/restore) stay on QNN_ProgsEvalAttack.
  *
@@ -692,9 +692,8 @@ float QNN_ProgsGetAttackFinished(void)
 
 /* Current QC-tracked self.weapon (impulse 1..8 form), maintained across
  * calls by QNN_ProgsEvalWeaponImpulseOperative.  0 until the first call
- * seeds it from snapshot.weapon_id.  This IS the canonical action.weapon
- * label: the weapon the engine's own W_ChangeWeapon would have equipped
- * (ownership + ammo gated) plus server-forced resyncs. */
+ * seeds it from snapshot.weapon_id. The QWD collector uses it to name the
+ * weapon on an effective categorical action.attack event. */
 int QNN_ProgsGetSelfWeapon(void)
 {
 	return qnn_progs_self_weapon;

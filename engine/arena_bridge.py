@@ -20,14 +20,58 @@ import tempfile
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from engine.bridge import NativeEngineError
+from engine.bridge import NativeEngineError, NativeObsBufferProcess
 from engine.training_protocol import (
     TRAINING_BINARY_HEADER_SIZE,
     TRAINING_BINARY_MAGIC,
     TrustedTrainingExtrasV1,
     decode_binary_training_extras,
 )
+from qnn.obs_api import (
+    Declaration,
+    coerce_declaration,
+    compile_layout,
+    encode_attach_decl,
+    parse_layout_reply,
+)
 from qnn.wire import OBS_BUFFER_SIZE
+
+
+def _compile_seat_declaration(
+    declaration: object,
+) -> tuple[Declaration | None, int]:
+    """Normalize one seat's optional declaration → (declaration, read size).
+
+    No declaration (the default everywhere today) means the seat runs
+    the legacy default plan: nothing is sent on the wire and its obs
+    reads stay OBS_BUFFER_SIZE.
+    """
+    parsed = coerce_declaration(declaration)
+    if parsed is None:
+        return None, OBS_BUFFER_SIZE
+    return parsed, compile_layout(parsed).frame_bytes
+
+
+def _attach_seat_declaration(
+    process: "_ArenaPipeProcess",
+    declaration: Declaration,
+    seat_index: int,
+) -> None:
+    """Send one OP_ATTACH_DECL and verify the engine's layout reply.
+
+    The reply must equal the local ``compile_layout`` result exactly —
+    any divergence means the two registry mirrors disagree, which is a
+    hard error, never something to paper over.
+    """
+    process.write(encode_attach_decl(declaration, seat_index=seat_index))
+    response = process.read_json()
+    layout = parse_layout_reply(response.get("layout"))
+    expected = compile_layout(declaration)
+    if layout != expected:
+        raise NativeEngineError(
+            f"Arena attach-decl layout for seat {seat_index} disagrees with the "
+            f"local compile: engine={layout.to_dict()} local={expected.to_dict()}"
+        )
 
 
 class _ArenaPipeProcess:
@@ -197,6 +241,7 @@ class ArenaServerProcess(_ArenaPipeProcess):
         observer_mode: str = "external",
         reward_json: str = "",
         weapon_config: Mapping[str, object] | None = None,
+        observer_declarations: Sequence[object] | None = None,
     ) -> None:
         self.port = int(port)
         if observer_mode not in {"external", "virtual", "shadow"}:
@@ -205,6 +250,22 @@ class ArenaServerProcess(_ArenaPipeProcess):
         self.observer_seats = tuple(
             (int(match_id), int(seat_id)) for match_id, seat_id in observer_seats
         )
+        # Per-observer-seat obs declarations (obs_api v1), aligned with
+        # observer_seats. None entries (and a None list — the default
+        # everywhere today) keep the legacy default plan for that seat.
+        if observer_declarations is None:
+            observer_declarations = (None,) * len(self.observer_seats)
+        if len(observer_declarations) != len(self.observer_seats):
+            raise ValueError(
+                f"observer_declarations has {len(observer_declarations)} entries "
+                f"for {len(self.observer_seats)} observer seats"
+            )
+        compiled = tuple(
+            _compile_seat_declaration(declaration)
+            for declaration in observer_declarations
+        )
+        self.observer_declarations = tuple(decl for decl, _bytes in compiled)
+        self._observer_frame_bytes = tuple(bytes_ for _decl, bytes_ in compiled)
         self._episode_generations = [0] * len(self.observer_seats)
         self.last_training_frames: tuple[bytes, ...] = ()
         server_env = dict(env or {})
@@ -275,6 +336,19 @@ class ArenaServerProcess(_ArenaPipeProcess):
         state = self.read_json()
         if state.get("state") != "listening":
             raise NativeEngineError(f"Unexpected arena server state {state!r}")
+        self.attach_declarations()
+
+    def attach_declarations(self) -> None:
+        """Attach every declared observer seat's obs plan (OP_ATTACH_DECL).
+
+        Sent between the "listening" and "ready" states so the engine
+        compiles per-seat emit plans before the first observer drain.
+        Seats without a declaration send nothing and keep the default
+        plan — the legacy protocol byte-for-byte.
+        """
+        for index, declaration in enumerate(self.observer_declarations):
+            if declaration is not None:
+                _attach_seat_declaration(self, declaration, seat_index=index)
 
     def wait_ready(self) -> list[tuple[bytes, TrustedTrainingExtrasV1]]:
         state = self.read_json()
@@ -291,7 +365,7 @@ class ArenaServerProcess(_ArenaPipeProcess):
         transitions: list[tuple[bytes, TrustedTrainingExtrasV1]] = []
         frames: list[bytes] = []
         for index, (match_id, seat_id) in enumerate(self.observer_seats):
-            obs = self.read_exact(OBS_BUFFER_SIZE)
+            obs = self.read_exact(self._observer_frame_bytes[index])
             extras, raw_frame = self.read_training_frame(
                 episode_id=(
                     f"arena:{match_id}:{seat_id}:"
@@ -320,8 +394,11 @@ class ArenaServerProcess(_ArenaPipeProcess):
         payload = bytearray((self.OP_STEP_BATCH, count))
         for action_packet in action_packets:
             packet = memoryview(action_packet)
-            if len(packet) != 17 or packet[0] != ArenaClientProcess.OP_STAGE:
-                raise ValueError("arena action packet must be the packed 17-byte step format")
+            if (len(packet) != NativeObsBufferProcess._ACTION_PACKET_SIZE
+                    or packet[0] != ArenaClientProcess.OP_STAGE):
+                raise ValueError(
+                    "arena action packet must be the packed qnn_action_t step "
+                    f"format ({NativeObsBufferProcess._ACTION_PACKET_SIZE} bytes)")
             payload.extend(packet[1:])
         self.write(payload)
         if self.read_exact(1) != bytes((self.OP_STEP_BATCH,)):
@@ -364,11 +441,13 @@ class ArenaClientProcess(_ArenaPipeProcess):
         env: Mapping[str, str] | None = None,
         workdir: str | Path | None = None,
         extra_args: Sequence[str] = (),
+        declaration: object = None,
     ) -> None:
         client_env = dict(env or {})
         client_env["QNN_REWARD_JSON"] = str(reward_json)
         self.match_id = int(match_id)
         self.seat_id = int(seat_id)
+        self.declaration, self._frame_bytes = _compile_seat_declaration(declaration)
         self._episode_generation = 0
         self.last_training_frame = b""
         super().__init__(
@@ -390,6 +469,17 @@ class ArenaClientProcess(_ArenaPipeProcess):
         state = self.read_json()
         if state.get("state") != "signed_on":
             raise NativeEngineError(f"Unexpected arena client state {state!r}")
+        self.attach_declaration()
+
+    def attach_declaration(self) -> None:
+        """Attach this seat's obs plan (OP_ATTACH_DECL), if declared.
+
+        Sent between "signed_on" and OP_RESUME_SIGNON so the engine
+        compiles the emit plan before the first transition drain. No
+        declaration = nothing sent, default plan, legacy protocol.
+        """
+        if self.declaration is not None:
+            _attach_seat_declaration(self, self.declaration, seat_index=0)
 
     def resume_signon(self) -> None:
         self.write(bytes((self.OP_RESUME_SIGNON,)))
@@ -407,13 +497,16 @@ class ArenaClientProcess(_ArenaPipeProcess):
         return extras
 
     def _read_transition(self) -> tuple[bytes, TrustedTrainingExtrasV1]:
-        obs = self.read_exact(OBS_BUFFER_SIZE)
+        obs = self.read_exact(self._frame_bytes)
         return obs, self._read_training()
 
     def stage(self, action_packet: bytes | bytearray | memoryview) -> None:
         packet = memoryview(action_packet)
-        if len(packet) != 17 or packet[0] != self.OP_STAGE:
-            raise ValueError("arena action packet must be the packed 17-byte step format")
+        if (len(packet) != NativeObsBufferProcess._ACTION_PACKET_SIZE
+                or packet[0] != self.OP_STAGE):
+            raise ValueError(
+                "arena action packet must be the packed qnn_action_t step "
+                f"format ({NativeObsBufferProcess._ACTION_PACKET_SIZE} bytes)")
         self.write(packet)
 
     def wait_staged(self) -> None:
@@ -422,8 +515,11 @@ class ArenaClientProcess(_ArenaPipeProcess):
 
     def stage_local(self, action_packet: bytes | bytearray | memoryview) -> None:
         packet = memoryview(action_packet)
-        if len(packet) != 17 or packet[0] != self.OP_STAGE:
-            raise ValueError("arena action packet must be the packed 17-byte step format")
+        if (len(packet) != NativeObsBufferProcess._ACTION_PACKET_SIZE
+                or packet[0] != self.OP_STAGE):
+            raise ValueError(
+                "arena action packet must be the packed qnn_action_t step "
+                f"format ({NativeObsBufferProcess._ACTION_PACKET_SIZE} bytes)")
         payload = bytearray(packet)
         payload[0] = self.OP_STAGE_LOCAL
         self.write(payload)
@@ -464,12 +560,24 @@ class ArenaGroupProcess:
         env: Mapping[str, str] | None = None,
         workdir: str | Path | None = None,
         weapon_config: Mapping[str, object] | None = None,
+        declarations: Sequence[object] | None = None,
     ) -> None:
         seats = tuple((int(match_id), int(seat_id)) for match_id, seat_id in external_seats)
         if observer_mode not in {"external", "virtual", "shadow"}:
             raise ValueError(f"unknown arena observer mode {observer_mode!r}")
         if observer_mode != "external" and not direct_actions:
             raise ValueError("virtual and shadow observers require direct actions")
+        # Per-seat obs declarations (obs_api v1), aligned with
+        # external_seats. Seats may differ — that heterogeneity is the
+        # point of the negotiated layout (cross-arch H2H). None (the
+        # default everywhere today) keeps every seat on the legacy
+        # default plan with nothing sent on the wire.
+        if declarations is None:
+            declarations = (None,) * len(seats)
+        if len(declarations) != len(seats):
+            raise ValueError(
+                f"declarations has {len(declarations)} entries for {len(seats)} seats"
+            )
         self.direct_actions = bool(direct_actions)
         self.observer_mode = observer_mode
         self.shadow_checks = 0
@@ -487,6 +595,7 @@ class ArenaGroupProcess:
             observer_mode=observer_mode,
             reward_json=reward_json,
             weapon_config=weapon_config,
+            observer_declarations=declarations,
         )
         self.clients = tuple(
             ArenaClientProcess(
@@ -501,8 +610,9 @@ class ArenaGroupProcess:
                 env=env,
                 workdir=workdir,
                 extra_args=("-port", str(int(port)), "-qnn_direct_connect"),
+                declaration=declaration,
             )
-            for match_id, seat_id in seats
+            for (match_id, seat_id), declaration in zip(seats, declarations, strict=True)
             if observer_mode != "virtual"
         )
 

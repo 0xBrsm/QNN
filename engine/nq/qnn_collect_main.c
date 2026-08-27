@@ -70,7 +70,8 @@ static void QNN_InferEmitAction(qnn_action_t *action, const qnn_snapshot_t *snap
 	}
 
 	if (snapshot->weapon_id > 0)
-		action->weapon = snapshot->weapon_id;
+		action->attack = QNN_ActionAttackPressed(action->move)
+			? snapshot->weapon_id : 0;
 	if (qnn_runtime.native_attack_this_window)
 		action->move |= 0x01; /* bit 0 = attack press */
 }

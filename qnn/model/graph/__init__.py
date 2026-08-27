@@ -4,10 +4,12 @@ See ``src/docs/model-graph.md``. The spec is pure data
 (:class:`GraphSpec`), the builder (:func:`build_network`) is the single
 model factory shared by BC, bench probes, eval, PPO, and export.
 
-Base graphs name the validated model lines and live *with their
-generation* (``qnn.model.bench.a24.graphs`` / ``a25.graphs`` register
-them into :mod:`qnn.model.node_registry`); bench probes are overrides
-merged onto a base via :func:`merge_overrides`.
+Base graphs name the validated model lines. Retired-generation bases still
+live with their generation (``qnn.model.bench.a24.graphs`` registers
+full_4head/full_5head, kept for legacy-checkpoint reload); bases that
+outlived their generation are promoted to :mod:`qnn.model.graph.base_graphs`
+(full_6head/full_movearch). Both register into :mod:`qnn.model.node_registry`;
+bench probes are overrides merged onto a base via :func:`merge_overrides`.
 """
 
 from __future__ import annotations

@@ -41,9 +41,13 @@ from qnn.model.tokens.obs_fields import canonical_self_fields
 from qnn.model.tokens.token_builder import TokenBuilder
 from qnn.vocab import (
     TOKEN_PROJECTILE, TOKEN_ACTOR, TOKEN_ITEM, TOKEN_MOVER,
-    ENTITY_VOCAB_SIZE, ACTION_VOCAB_SIZE, MODALITY_VOCAB_SIZE,
+    ENTITY_VOCAB_SIZE, ACTION_VOCAB_SIZE, COMBAT_MODALITY_VOCAB_SIZE,
+    MODALITY_VOCAB_SIZE,
     MAX_PLAYER_INDICES, MAX_TOKEN_OBJECTS,
-    PROJECTILE_SCALAR_DIM, ACTOR_SCALAR_DIM, ITEM_SCALAR_DIM, MOVER_SCALAR_DIM,
+    PROJECTILE_SCALAR_DIM, ACTOR_SCALAR_DIM,
+    FULL_PROJECTILE_SCALAR_DIM, FULL_ACTOR_SCALAR_DIM,
+    ITEM_SCALAR_DIM, MOVER_SCALAR_DIM,
+    ENTITY_STREAMS, ENTITY_STREAM_COMBAT, ENTITY_STREAM_FULL,
 )
 from qnn.schema import (
     SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM, PROBE_OFFSET_DIM,
@@ -110,17 +114,26 @@ class ObsEmbedding(nn.Module):
         self,
         d_model: int,
         *,
-        self_weapon_embed_in_self: bool,
         include_spatial: bool = True,
         spatial_source: str = SPATIAL_SOURCE_EGO,
         spatial_k: int = 0,
         probe_bands: tuple[int, ...] = (),
+        entity_stream: str = ENTITY_STREAM_COMBAT,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
+        # Entity stream: "combat" (default) is the A27 actor/projectile
+        # stream; "full" rebuilds the a26-line entity wiring (recency dims,
+        # live item/mover projections, 4-way modality vocab, actor-only
+        # attention mask) so a26 checkpoints load and forward bit-faithfully.
+        self.entity_stream = str(entity_stream)
+        if self.entity_stream not in ENTITY_STREAMS:
+            raise ValueError(
+                f"unknown entity_stream {self.entity_stream!r}; "
+                f"expected one of {ENTITY_STREAMS}"
+            )
         # out_dim — width of every token vector this embedding emits.
         self.out_dim = self.d_model
-        self.self_weapon_embed_in_self = bool(self_weapon_embed_in_self)
         self.include_spatial = bool(include_spatial)
         self.spatial_source = str(spatial_source)
         if self.spatial_source not in SPATIAL_SOURCES:
@@ -145,13 +158,19 @@ class ObsEmbedding(nn.Module):
         )
         self.self_dequant    = SelfDequantizer()
         self.spatial_dequant = SpatialDequantizer()
-        self.entity_dequant  = EntityDequantizer()
+        self.entity_dequant  = EntityDequantizer(entity_stream=self.entity_stream)
 
-        # Per-type entity projections.
-        self.proj_projectile = nn.Linear(PROJECTILE_SCALAR_DIM, self.d_model)
-        self.proj_actor      = nn.Linear(ACTOR_SCALAR_DIM,      self.d_model)
-        self.proj_item       = nn.Linear(ITEM_SCALAR_DIM,       self.d_model)
-        self.proj_mover      = nn.Linear(MOVER_SCALAR_DIM,      self.d_model)
+        # Per-type entity projections. The full (a26) stream widens
+        # projectile/actor by the trailing recency scalar and adds the
+        # item/mover projections the combat stream deleted.
+        if self.entity_stream == ENTITY_STREAM_FULL:
+            self.proj_projectile = nn.Linear(FULL_PROJECTILE_SCALAR_DIM, self.d_model)
+            self.proj_actor      = nn.Linear(FULL_ACTOR_SCALAR_DIM,      self.d_model)
+            self.proj_item       = nn.Linear(ITEM_SCALAR_DIM,            self.d_model)
+            self.proj_mover      = nn.Linear(MOVER_SCALAR_DIM,           self.d_model)
+        else:
+            self.proj_projectile = nn.Linear(PROJECTILE_SCALAR_DIM, self.d_model)
+            self.proj_actor      = nn.Linear(ACTOR_SCALAR_DIM,      self.d_model)
 
         # Ego source projects the row's own band panorama; probe_grid
         # projects the k nearest map probes' same-band panoramas plus
@@ -205,7 +224,14 @@ class ObsEmbedding(nn.Module):
         # Shared embeddings.
         self.entity_embed   = nn.Embedding(ENTITY_VOCAB_SIZE,    self.d_model)
         self.action_embed   = nn.Embedding(ACTION_VOCAB_SIZE,    self.d_model)
-        self.modality_embed = nn.Embedding(MODALITY_VOCAB_SIZE,  self.d_model)
+        # Combat exposes SIGHT/PROXIMITY only; the full stream keeps the
+        # 4-way engine vocab (SOUND/MEMORY rows are trained a26 weights).
+        self.modality_embed = nn.Embedding(
+            MODALITY_VOCAB_SIZE
+            if self.entity_stream == ENTITY_STREAM_FULL
+            else COMBAT_MODALITY_VOCAB_SIZE,
+            self.d_model,
+        )
         self.player_embed   = nn.Embedding(MAX_PLAYER_INDICES + 1, self.d_model)
         # Fixed row order is a wire convention, not something a transformer
         # without positional encoding can observe. Give each atlas band
@@ -234,7 +260,7 @@ class ObsEmbedding(nn.Module):
         """Declare self-block submodules. Override to change the self design."""
         self.self_token_builder = TokenBuilder(
             self.d_model,
-            canonical_self_fields(self.self_weapon_embed_in_self),
+            canonical_self_fields(),
             entity_embed=self.entity_embed,
             movement_embed=self.movement_embed,
             kind_embed=self.kind_embed,
@@ -254,40 +280,53 @@ class ObsEmbedding(nn.Module):
         Returns:
             (batch, 16, d_model) — projected entity representations
         """
-        proj_map = {
-            TOKEN_PROJECTILE: (self.proj_projectile, PROJECTILE_SCALAR_DIM),
-            TOKEN_ACTOR: (self.proj_actor, ACTOR_SCALAR_DIM),
-            TOKEN_ITEM: (self.proj_item, ITEM_SCALAR_DIM),
-            TOKEN_MOVER: (self.proj_mover, MOVER_SCALAR_DIM),
-        }
+        if self.entity_stream == ENTITY_STREAM_FULL:
+            proj_map = {
+                TOKEN_PROJECTILE: (self.proj_projectile, FULL_PROJECTILE_SCALAR_DIM),
+                TOKEN_ACTOR: (self.proj_actor, FULL_ACTOR_SCALAR_DIM),
+                TOKEN_ITEM: (self.proj_item, ITEM_SCALAR_DIM),
+                TOKEN_MOVER: (self.proj_mover, MOVER_SCALAR_DIM),
+            }
+        else:
+            proj_map = {
+                TOKEN_PROJECTILE: (self.proj_projectile, PROJECTILE_SCALAR_DIM),
+                TOKEN_ACTOR: (self.proj_actor, ACTOR_SCALAR_DIM),
+            }
         out_dtype = entity_scalars_raw.dtype
 
         if self.training:
-            # One fused GEMM over the four type projections, then a per-slot
-            # gather on the type tag. The weights stay the four checkpoint
+            # One fused GEMM over the per-type projections, then a per-slot
+            # gather on the type tag. The weights stay the checkpoint
             # Linears — they are zero-padded to the max scalar width and
             # concatenated per forward (tiny tensors; autograd splits the
-            # grads back). TOKEN_* values are contiguous 0..3, so the tag
-            # doubles as the gather index; empty slots (-1) clamp to 0 and
-            # are zeroed by the mask. Eval/export keep the per-type form so
+            # grads back). Active TOKEN_* values are contiguous from 0, so
+            # the tag doubles as the gather index; invalid/empty slots are
+            # zeroed. Eval/export keep the per-type form so
             # the traced inference graph is unchanged.
             max_dim = int(entity_scalars_raw.shape[-1])
             weights = torch.cat([
                 nn.functional.pad(proj.weight, (0, max_dim - proj.weight.shape[1]))
                 for proj, _ in proj_map.values()
-            ])                                                    # (4·d, max_dim)
+            ])                                                    # (n·d, max_dim)
             bias = torch.cat([proj.bias for proj, _ in proj_map.values()])
             fused = nn.functional.linear(entity_scalars_raw, weights, bias)
             fused = fused.view(*entity_types.shape, len(proj_map), self.d_model)
-            idx = entity_types.clamp(min=0).view(*entity_types.shape, 1, 1)
+            if self.entity_stream == ENTITY_STREAM_FULL:
+                # a26: all four TOKEN_* tags are live; empty slots (-1)
+                # clamp to 0 and are zeroed by the mask.
+                valid = entity_types >= 0
+                idx = entity_types.clamp(min=0).view(*entity_types.shape, 1, 1)
+            else:
+                valid = ((entity_types == TOKEN_PROJECTILE) | (entity_types == TOKEN_ACTOR))
+                idx = entity_types.clamp(min=0, max=TOKEN_ACTOR).view(*entity_types.shape, 1, 1)
             picked = fused.gather(2, idx.expand(*entity_types.shape, 1, self.d_model))
-            picked = picked.squeeze(2) * (entity_types >= 0).unsqueeze(-1).to(fused.dtype)
+            picked = picked.squeeze(2) * valid.unsqueeze(-1).to(fused.dtype)
             return picked.to(out_dtype)
 
         # Eval/export: project every slot through every type's Linear and
         # select by type mask. Branch-free and sync-free (boolean-mask
         # gather/scatter would call nonzero(), a blocking device→host copy);
-        # the four dense GEMMs over 16 slots are microseconds.
+        # the dense GEMMs over 16 slots are microseconds.
         result: torch.Tensor | None = None
         for tok_type, (proj, sdim) in proj_map.items():
             mask = (entity_types == tok_type).unsqueeze(-1)  # (batch, 16, 1)
@@ -320,7 +359,7 @@ class ObsEmbedding(nn.Module):
 
         obs_dict must contain:
             self_scalars: (batch, SELF_SCALAR_DIM) — monolithic self bundle
-            self_weapon_id, self_armor_type_id, self_movement_id: (batch, 1)
+            self_armor_type_id, self_movement_id: (batch, 1)
             self_powerup_ids: (batch, 5) — QUAD/PENT/RING/SUIT/MEGAHEALTH
                               (composed from the split fields if absent)
             entity_types: (batch, N) — token type tags, -1 for empty
@@ -350,11 +389,21 @@ class ObsEmbedding(nn.Module):
                 entity_types, obs_dict["entity_scalars_raw"],
             )
         entity_mask = (entity_types == TOKEN_ACTOR)
+        # Attention validity: combat attends actor + projectile tokens; the
+        # full (a26) stream attended ONLY actor tokens (parity-pinned — the
+        # projectile/item/mover rows were computed but key-padded out).
+        if self.entity_stream == ENTITY_STREAM_FULL:
+            entity_valid = entity_mask
+        else:
+            entity_valid = entity_mask | (entity_types == TOKEN_PROJECTILE)
 
         entity_subject = obs_dict["entity_ids"][:, :, 0].long().clamp(0, vocab_max)
         entity_repr = entity_repr + self.entity_embed(entity_subject)
 
-        entity_modality = obs_dict["entity_ids"][:, :, 1].long().clamp(0, self.modality_embed.num_embeddings - 1)
+        entity_modality = obs_dict["entity_ids"][:, :, 1].long()
+        if self.entity_stream == ENTITY_STREAM_FULL:
+            # a26 clamped the modality id into its 4-row table.
+            entity_modality = entity_modality.clamp(0, self.modality_embed.num_embeddings - 1)
         entity_repr = entity_repr + self.modality_embed(entity_modality)
 
         if obs_dict["entity_ids"].shape[2] >= 3:
@@ -435,7 +484,7 @@ class ObsEmbedding(nn.Module):
             non_entity_valid = torch.zeros(
                 (batch, self._N_SELF_TOKENS), dtype=torch.bool, device=device,
             )
-        key_padding_mask = torch.cat([non_entity_valid, ~entity_mask], dim=1)
+        key_padding_mask = torch.cat([non_entity_valid, ~entity_valid], dim=1)
 
         return EncoderInput(
             tokens=tokens,

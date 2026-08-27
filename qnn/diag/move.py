@@ -69,7 +69,7 @@ MIN_SEG_FFT = 16                         # min kept-segment length for a periodo
 SCALAR_COLS = [
     "obs_vel", "obs_view_pitch", "obs_health", "obs_effective_armor",
     "obs_ammo_shells", "obs_ammo_nails", "obs_ammo_rockets", "obs_ammo_cells",
-    "obs_attack_finished", "obs_self_movement_id", "obs_self_weapon_id",
+    "obs_attack_finished", "obs_self_movement_id",
     "obs_self_items",
 ]
 # rev-8 depth-atlas spatial field (spatial-tokens-v2).
@@ -353,9 +353,15 @@ def _sd_load_actionlog(path: Path) -> list[list[np.ndarray]]:
 
 
 def _sd_load_bot(npz_path: Path) -> list[list[np.ndarray]]:
+    # move_streams_*.npz carries the per-episode move arrays under `ep_*`
+    # alongside the flat gate-stream block (fb/lr/turn_deg/lc_*/…) and the
+    # `gate_ep_*` / `threat_ep_*` families; only the move episodes are (T,3).
     z = np.load(npz_path)
+    keys = sorted(k for k in z.files if k.startswith("ep_"))
+    if not keys:
+        raise ValueError(f"{npz_path}: no ep_* move episodes in the npz")
     by_axis: list[list[np.ndarray]] = [[], [], []]
-    for key in sorted(z.files):
+    for key in keys:
         ep = z[key]                         # (T,3) classes 0/1/2
         for a in range(3):
             by_axis[a].append(ep[:, a].astype(np.int8))
@@ -886,8 +892,7 @@ def _jp_feature_groups(
     state_keys = [
         "obs_health", "obs_effective_armor", "obs_ammo_shells",
         "obs_ammo_nails", "obs_ammo_rockets", "obs_ammo_cells",
-        "obs_attack_finished", "obs_self_movement_id",
-        "obs_self_weapon_id", "obs_self_items",
+        "obs_attack_finished", "obs_self_movement_id", "obs_self_items",
     ]
     state = np.column_stack([f32(k).reshape(len(vel), -1) for k in state_keys])
     state_names = [k.removeprefix("obs_") for k in state_keys]

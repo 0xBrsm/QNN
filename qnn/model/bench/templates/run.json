@@ -1,6 +1,6 @@
 {
-  "name": "example_head_probe",
-  "mode": "head_probe",
+  "name": "example_bench",
+  "mode": "bench",
   "runtime_scale": "live",
   "resume": true,
   "description": "",

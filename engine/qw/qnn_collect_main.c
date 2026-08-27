@@ -566,24 +566,6 @@ static int QNN_HandleHello(const char *line)
  * attack_finished = now + the weapon's QC cooldown so the obs scalar and
  * the input-mask attack-feasibility bit reflect the engine lockout.
  * Cooldown is owned by qnn_weapon.c (raw weapon id 1..8). */
-/* QC-feasibility callback for the MVD intent label (weapon-head.md §12
- * parity): same predicate the QWD machine uses (QNN_QwdEvalSelect →
- * QNN_ProgsEvalWeaponImpulse), answering "would W_ChangeWeapon accept a
- * direct select of `weapon` given the snapshot's items/ammo".  Returns 0
- * when the progs VM is unavailable (bare real-.mvd playback) — every
- * held change then re-baselines, degrading toward held-tracking rather
- * than inventing intent. */
-static int QNN_MvdSelectFeasible(const qnn_snapshot_t *snapshot,
-	int current, int weapon)
-{
-	int cand = QNN_ImpulseFromItemFlag(QNN_ProgsEvalWeaponImpulse(
-		snapshot->health, snapshot->items_owned,
-		snapshot->ammo_shells, snapshot->ammo_nails,
-		snapshot->ammo_rockets, snapshot->ammo_cells,
-		current, weapon));
-	return cand == weapon;
-}
-
 static void QNN_MvdStampAttackFinished(int weapon_id, float now_seconds)
 {
 	float done_sec;
@@ -650,7 +632,7 @@ static int QNN_HandleEnumeratePlayers(const char *line)
  * One native-dt replay that emits TWO interleaved framed streams:
  *
  *   MLOB (every native frame): the slim move-labeler record — view-frame
- *     per-native-frame velocity, self_movement_id / self_weapon_id, and
+ *     per-native-frame velocity, self_movement_id, and
  *     usercmd-TRUTH move/look/op_input (always the QWD decoder, even when
  *     the run sets force_mvd_emit — the labeler trains on MVD-domain obs
  *     with truth labels).  native_index = qnn_runtime.tick.
@@ -784,7 +766,7 @@ static void QNN_RunMatchedEmit(qnn_snapshot_t *snapshot,
 
 			memset(&rec, 0, sizeof(rec));
 			QNN_QwdBuildActionLabel(&label_snapshot->action_label, label_snapshot);
-			QNN_FillLookAndSwitch(&label_snapshot->action_label, label_snapshot);
+			QNN_FillLook(&label_snapshot->action_label, label_snapshot);
 
 			rec.native_index = (uint32_t)qnn_runtime.tick;
 			rec.flags = 0;
@@ -806,8 +788,6 @@ static void QNN_RunMatchedEmit(qnn_snapshot_t *snapshot,
 			default: rec.self_movement_id =
 				snapshot->grounded ? 0 : 1; break;
 			}
-			rec.self_weapon_id =
-				(uint8_t)qnn_weapon_subject_from_id(snapshot->weapon_id);
 			rec.action = label_snapshot->action_label;
 			QNN_EmitMlob(stdout, &rec);
 		}
@@ -857,7 +837,7 @@ static void QNN_RunMatchedEmit(qnn_snapshot_t *snapshot,
 			 * what later supplies MVD-domain move; co-emitting truth keeps
 			 * the QOBS self-consistent and avoids the back-shift machinery). */
 			QNN_QwdBuildActionLabel(&obs_snap.action_label, &obs_snap);
-			QNN_FillLookAndSwitch(&obs_snap.action_label, &obs_snap);
+			QNN_FillLook(&obs_snap.action_label, &obs_snap);
 
 			/* steps field carries the native index this QOBS was sampled
 			 * at (reused — downstream QOBS parser ignores steps). */
@@ -927,10 +907,6 @@ static int QNN_HandleCollect(const char *line)
 	 * qnn_runtime_t.matched_emit).  Requires native-rate playback
 	 * (requested_tick_hz==0); the controller pairs it with tick_hz:0 hello. */
 	qnn_runtime.matched_emit   = QNN_JsonExtractInt(line, "\"matched_emit\"", 0) != 0;
-	/* Attack-script fingerprint for the de-scripted weapon intent label
-	 * (weapon-head.md §10-11); 0/0 default = unscripted demo. */
-	qnn_runtime.weapon_script  = QNN_JsonExtractInt(line, "\"weapon_script\"", 0) != 0;
-	qnn_runtime.weapon_release = QNN_JsonExtractInt(line, "\"weapon_release\"", 0);
 	if (!QNN_JsonExtractString(line, "\"demo_path\"", demo_path, sizeof(demo_path)))
 	{
 		QNN_WriteError("reset options must include demo_path");
@@ -1286,8 +1262,8 @@ static int QNN_HandleCollect(const char *line)
 						&label_snapshot);
 			}
 
-			/* Emit-time action label.  QWD path is a pure usercmd-byte
-			 * decoder (action.weapon written canonically inside
+			/* Emit-time action label. QWD replays usercmds through QC and
+			 * writes the categorical action.attack outcome inside
 			 * QNN_QwdBuildActionLabel); MVD path runs inference. */
 			if (!snapshot.done)
 			{
@@ -1356,7 +1332,7 @@ static int QNN_HandleCollect(const char *line)
 					QNN_QwdBuildActionLabel(
 						&snapshot.action_label,
 						&snapshot);
-					QNN_FillLookAndSwitch(&snapshot.action_label,
+					QNN_FillLook(&snapshot.action_label,
 						&label_snapshot);
 				}
 			}
@@ -1387,10 +1363,8 @@ static int QNN_HandleCollect(const char *line)
 					emit_out = QNN_EmitFilter(&snapshot);
 				}
 
-				/* QWD path is a pure cmd-byte decoder — action.weapon
-				 * is already the canonical label, no rewriting needed.
-				 * Only the MVD path runs back-shift inference (weapon
-				 * via ping-shift + pickup gate, attack/jump per-event).
+				/* QWD action.attack is already canonical. Only the MVD path
+				 * runs back-shift inference for attack/jump events.
 				 *
 				 * AF restore: pack obs with the start-of-tick
 				 * attack_finished (captured before any action label
@@ -1417,38 +1391,6 @@ static int QNN_HandleCollect(const char *line)
 					int prev_weapon = 0;
 					qboolean has_prev_weapon =
 						QNN_BackShiftPrevWeapon(&prev_weapon);
-					qnn_mvd_wtrans_t wtrans = QNN_MVD_WTRANS_NONE;
-					int prev_intent = 0;
-
-					/* De-scripted intent label (weapon-head.md §12
-					 * parity): the intent machine owns act.weapon
-					 * OUTRIGHT — including 0 = unrevealed/masked —
-					 * overwriting the held fallback that
-					 * QNN_FillLookAndSwitch wrote.  Transition
-					 * classification (deliberate / script dump /
-					 * forced pickup+ammo-out / death) lives in
-					 * qnn_mvd_collect.c; the pickup gate that used
-					 * to sit here is the FORCED branch there. */
-					snapshot.action_label.weapon =
-						(uint8_t)QNN_MvdIntentWeaponStep(
-							&label_snapshot,
-							QNN_MvdSelectFeasible,
-							&wtrans, &prev_intent);
-
-					/* Deliberate adoptions anticipate the press:
-					 * rewrite the trailing ring slots from the old
-					 * intent, same shift source as the old held
-					 * rewrite.  prev_intent==0 slots stay masked —
-					 * they may reach into dead frames, which QWD
-					 * keeps at 0. */
-					if (wtrans == QNN_MVD_WTRANS_DELIBERATE
-						&& prev_intent > 0)
-						QNN_BackShiftRewriteWeapon(
-							snapshot.action_label.weapon,
-							prev_intent,
-							QNN_PressBackShiftFrames(
-								cl.playernum, emit_hz));
-
 					/* Break attack carryover across HELD transitions
 					 * (dedup state is held-stream domain, independent
 					 * of the intent label): clear the old weapon's
@@ -1459,18 +1401,6 @@ static int QNN_HandleCollect(const char *line)
 						&& prev_weapon != cur_weapon
 						&& cur_weapon > 0)
 						QNN_MvdResetAttackChain(prev_weapon);
-				}
-				else
-				{
-					/* Genuine QWD usercmd path: clear a pending weapon lead
-					 * the engine never confirms within ~ping×2 frames (a
-					 * stale-impulse phantom) by walking the shared ring back
-					 * over the lead window — keeps QWD logic out of the MVD
-					 * module, reusing QNN_BackShiftRewriteWeapon. */
-					QNN_QwdWeaponLeadStep(&snapshot.action_label, &snapshot,
-						qnn_runtime.tick,
-						QNN_PressBackShiftFrames(cl.playernum, emit_hz),
-						emit_hz);
 				}
 
 				QNN_BackShiftPush(

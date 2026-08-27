@@ -1,8 +1,10 @@
-# Semantics contract `semantics.1` — current (v11 → spatial-v2)
+# Semantics contract `semantics.1` — v11 through A26
 
 The meaning behind the wire tensors: normalization scales + vocabulary id
-mappings + value-interpretation constants. Shared by the v11+ contract
-family, including the finalized [`wire.12`](../wire/wire.12.md). The
+mappings + value-interpretation constants. Shared by the v11+ contract family
+up to and including both a26 atlas families
+([`wire.12.1`/`wire.12.2`](../wire/wire.12.md)), i.e. everything before the A27
+combat-substrate boundary. The
 axes divide by failure mode: WIRE covers what fails at bind time (tensor
 set, names, shapes, dtypes); SEMANTICS covers what would NOT fail at bind
 time — identical shapes, silently reinterpreted values. Spatial shape and

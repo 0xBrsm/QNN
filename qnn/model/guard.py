@@ -252,6 +252,7 @@ def _atlas_conservative_depth(depth: torch.Tensor) -> torch.Tensor:
 def rocket_self_splash_guard_mask(
     obs_tensors: Mapping[str, torch.Tensor],
     move_classes: torch.Tensor,
+    weapon_impulse: torch.Tensor,
 ) -> torch.Tensor:
     """Rows where an RL shot's self-splash would be lethal given EHR.
 
@@ -269,10 +270,9 @@ def rocket_self_splash_guard_mask(
     state = obs_tensors.get("self_state_scalars")    # (B, 2) health, eff_armor (normalized)
     motion = obs_tensors.get("self_motion_scalars")  # (B, 4) vel(3), view_pitch (deg/90)
     spatial = obs_tensors.get("spatial_scalars")
-    weapon_id = obs_tensors.get("self_weapon_id")
     entity_types = obs_tensors.get("entity_types")
     entity_scalars = obs_tensors.get("entity_scalars_raw")
-    if (state is None or motion is None or spatial is None or weapon_id is None
+    if (state is None or motion is None or spatial is None
             or entity_types is None or entity_scalars is None):
         return false
     if (state.numel() == 0 or motion.numel() == 0 or spatial.numel() == 0
@@ -282,7 +282,7 @@ def rocket_self_splash_guard_mask(
     state = state.to(device=device).reshape(-1, state.shape[-1])
     motion = motion.to(device=device).reshape(-1, motion.shape[-1])
     spatial = spatial.to(device=device).reshape(-1, spatial.shape[-2], spatial.shape[-1])
-    weapon_id = weapon_id.to(device=device).reshape(-1)
+    weapon_impulse = weapon_impulse.to(device=device).reshape(-1)
     entity_types = entity_types.to(device=device).reshape(-1, entity_types.shape[-1])
     entity_scalars = entity_scalars.to(device=device).reshape(
         -1, entity_scalars.shape[-2], entity_scalars.shape[-1]
@@ -320,17 +320,18 @@ def rocket_self_splash_guard_mask(
     nearest_actor = torch.where(actor_mask, actor_dist, inf_a).amin(dim=1)    # (B,)
 
     surface = torch.minimum(torch.minimum(wall, floor_slant), nearest_actor)  # (B,)
-    held_rl = weapon_id == _RL_LAUNCHER_ID
-    return held_rl & (surface < d_safe)
+    firing_rl = weapon_impulse == _RL_IMPULSE
+    return firing_rl & (surface < d_safe)
 
 
 def apply_self_splash_guard(
     obs_tensors: Mapping[str, torch.Tensor],
     move_classes: torch.Tensor,
+    weapon_impulse: torch.Tensor,
     fire: torch.Tensor,
 ) -> torch.Tensor:
     """Apply ONLY the RL self-splash veto to a decoded fire tensor (a25 guard set)."""
-    mask = rocket_self_splash_guard_mask(obs_tensors, move_classes)
+    mask = rocket_self_splash_guard_mask(obs_tensors, move_classes, weapon_impulse)
     return torch.where(mask, torch.zeros_like(fire), fire)
 
 
@@ -345,13 +346,16 @@ def policy_decode_action_postprocess(
     contract requires it to be present)."""
     if not isinstance(obs, Mapping):
         return fire
-    obs_tensors = policy._obs_tensors_dequant(obs)
-    return apply_self_splash_guard(obs_tensors, move_classes, fire)
+    # The split attack/weapon path has no joint firing intent. It is retained
+    # only as a compatibility hook and cannot safely apply a weapon-specific
+    # guard without recreating held-weapon state.
+    return fire
 
 
 def guard_attack_logit_for_export(
     obs_tensors: Mapping[str, torch.Tensor],
     move_logits: torch.Tensor,
+    weapon_impulse: torch.Tensor,
     attack_logit: torch.Tensor,
 ) -> torch.Tensor:
     """ONNX export / attack-with helper: force RL self-splash rows' logit to -1e9.
@@ -361,7 +365,7 @@ def guard_attack_logit_for_export(
     input logit unchanged (align_bias resolves to zero)."""
     move_flat = move_logits.reshape(-1, MOVE_AXES, move_logits.shape[-1])
     move_classes = move_flat.argmax(dim=-1)
-    mask = rocket_self_splash_guard_mask(obs_tensors, move_classes)
+    mask = rocket_self_splash_guard_mask(obs_tensors, move_classes, weapon_impulse)
     return torch.where(
         mask.unsqueeze(-1), torch.full_like(attack_logit, -1.0e9), attack_logit)
 

@@ -773,20 +773,26 @@ def _apzo_collect_shard(cache: Path, shard: dict) -> dict[str, np.ndarray]:
     half = np.load(cache / obs["entity_half_extents"]).astype(np.float64)
     types = np.load(cache / obs["entity_types"])
     team = np.load(cache / obs["entity_team"])
-    rec = np.load(cache / obs["entity_recency"]).astype(np.float64)
+    rec_path = obs.get("entity_recency")
+    if rec_path is not None:
+        rec = np.load(cache / rec_path).astype(np.float64)
+    else:
+        modality = np.load(cache / obs["entity_modality_id"])
+        rec = np.where(
+            modality == 0, 0.0, np.finfo(np.float16).max
+        )
     count = np.load(cache / obs["entity_count"]).astype(np.int64)
     self_vel = np.load(cache / obs["vel"]).astype(np.float64)
     pitch = np.load(cache / obs["view_pitch"]).astype(np.float64) * 90.0 / 127.0
-    weap = np.load(cache / obs["self_weapon_id"]).astype(np.int64)
-    move = np.load(cache / act["move"])
+    attack_labels = np.load(cache / act["attack"]).astype(np.int64)
     tp = np.load(cache / act["target_probs"]).astype(np.float64)
 
     F = count.shape[0]
     starts = np.zeros(F, dtype=np.int64)
     np.cumsum(count[:-1], out=starts[1:])
 
-    attack = (move & 1).astype(bool)
-    impulse = np.maximum(weap - 2, 0)
+    attack = attack_labels > 0
+    impulse = np.clip(attack_labels, 0, 8)
     tgt_col = tp.argmax(axis=1)
     tgt_w = tp[np.arange(F), tgt_col]
     has_tgt = (
@@ -1423,11 +1429,11 @@ def look_aim_prior_decode(
         ACTOR_REL_OFFSET, ACTOR_VEL_OFFSET, ACTOR_TEAM_OFFSET,
         TEAM_TEAMMATE_VALUE, build_model_weapon_scalars,
     )
-    from qnn.model.bench.a25.lead_aim import (
-        compute_lead_aim, held_weapon_trajectory, pooled_aim_vec,
+    from qnn.model.lead_aim import (
+        compute_lead_aim, pooled_aim_vec, weapon_trajectory,
     )
     from qnn.model.look_bins import install_polar_grid
-    from qnn.vocab import self_weapon_id_to_impulse
+    from qnn.eval.aim_kernel import action_attack_context
     from qnn.bc.train import TOKEN_ACTOR
 
     run_dir = Path(run_dir)
@@ -1473,7 +1479,7 @@ def look_aim_prior_decode(
         lambda m, i, o: caps.update(tl=o.target_logits.detach())
     )
 
-    weapon_static = torch.from_numpy(build_model_weapon_scalars()).float().to(device)
+    weapon_physics = torch.from_numpy(build_model_weapon_scalars()).float().to(device)
 
     sel = np.unique(
         np.linspace(0, n_eps - 1, min(n_episodes, n_eps)).astype(int)
@@ -1513,9 +1519,11 @@ def look_aim_prior_decode(
             enemy = (etypes == TOKEN_ACTOR) & (
                 esc[..., ACTOR_TEAM_OFFSET] != TEAM_TEAMMATE_VALUE
             )
-            wid = obs["self_weapon_id"].index_select(0, idx).reshape(T)
-            imp = self_weapon_id_to_impulse(wid.long())
-            v_h, drop_a, drop_b = held_weapon_trajectory(weapon_static, imp)
+            action = acts["attack"].index_select(0, idx).reshape(T)
+            imp = torch.from_numpy(action_attack_context(
+                action.detach().cpu().numpy()
+            )).to(device=device, dtype=torch.long)
+            v_h, drop_a, drop_b = weapon_trajectory(weapon_physics, imp)
             aim_pts = compute_lead_aim(rel, vel, v_h, drop_a, drop_b)
             aim_u = pooled_aim_vec(aim_pts, target_logits, enemy)
             bear_u = pooled_aim_vec(rel, target_logits, enemy)

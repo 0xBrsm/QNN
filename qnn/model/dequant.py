@@ -8,9 +8,8 @@ int tensors the existing ObsEmbedding + heads consume:
                             bitfield, attack cooldown.
 - ``SpatialDequantizer`` — 11 nibble-packed depth-atlas rows, expanded to
                             24 depth and 24 hit scalars per row.
-- ``EntityDequantizer``  — variable-length entity tokens (per-type
-                            scalars: actor / projectile / item / mover).
-                            Added in a follow-up commit.
+- ``EntityDequantizer``  — variable-length A27 combat tokens (actor and
+                            projectile scalars).
 
 Each owns the per-field normalization (``/QNN_MAX_HEALTH``,
 ``/QNN_VELOCITY_SCALE``, ``/QNN_TIME_SCALE``, ``/QNN_DIST_SCALE``,
@@ -42,7 +41,8 @@ from qnn import engine_norm as en
 from qnn.vocab import (
     ENTITY_IDS,
     TOKEN_PROJECTILE, TOKEN_ACTOR, TOKEN_ITEM, TOKEN_MOVER,
-    ACTOR_SCALAR_DIM,
+    ACTOR_SCALAR_DIM, FULL_ACTOR_SCALAR_DIM,
+    ENTITY_STREAMS, ENTITY_STREAM_COMBAT, ENTITY_STREAM_FULL,
 )
 
 
@@ -319,7 +319,6 @@ class SelfDequantizer(nn.Module):
         )                                                              # (B, 4)
         out["self_scalars"]         = scalars
         out["self_weapon_readiness"] = readiness
-        out["self_weapon_id"]       = obs["self_weapon_id"].to(torch.int64).unsqueeze(-1)
         out["self_armor_type_id"]   = armor_type.unsqueeze(-1)
         out["self_movement_id"]     = obs["self_movement_id"].to(torch.int64).unsqueeze(-1)
         return out
@@ -447,25 +446,31 @@ class SpatialDequantizer(nn.Module):
 
 # ── EntityDequantizer ────────────────────────────────────────────
 
-# Per-type scalar idx layouts in the legacy (B, N, ACTOR_SCALAR_DIM=19)
+# Per-type scalar idx layouts in the A27 (B, N, ACTOR_SCALAR_DIM=18)
 # entity_scalars_raw tensor that the ObsEmbedding's per-type Linear
-# projections consume. These mirror the C side qnn_onnx.c:194-318
-# emit_{actor,projectile,item,mover} functions exactly so trained
-# checkpoints stay valid.
+# projections consume. These mirror the actor/projectile emitters in
+# qnn_onnx.c.
 #
 # Idx indices the model expects (post-dist-recompute):
+#   ACTOR:      [hx,hy,hz, rx,ry,rz, dist, vx,vy,vz, px,py,pz, pd, eta, fac,team,score]
+#   PROJECTILE: [rx,ry,rz, dist, vx,vy,vz, 0..0]                      (7 used / 18)
+#
+# Full-stream (a26) idx layouts, (B, N, FULL_ACTOR_SCALAR_DIM=19) — recency
+# trails every type and item/mover are live (verbatim a26 assembly, selected
+# by ``entity_stream="full"``):
 #   ACTOR:      [hx,hy,hz, rx,ry,rz, dist, vx,vy,vz, px,py,pz, pd, eta, fac,team,score, rec]
 #   PROJECTILE: [rx,ry,rz, dist, vx,vy,vz, rec, 0..0]                        (8 used / 19)
 #   ITEM:       [hx,hy,hz, rx,ry,rz, dist, px,py,pz, pd, eta, amt, regen, rec, 0..0]  (15)
 #   MOVER:      [hx,hy,hz, rx,ry,rz, dist, px,py,pz, pd, eta, state, rec, 0..0]       (14)
 
 
-_ITEM_AMOUNT_MULT  = torch.tensor(en.ITEM_AMOUNT_MULT,  dtype=torch.float32)
-_ITEM_AMOUNT_CONST = torch.tensor(en.ITEM_AMOUNT_CONST, dtype=torch.float32)
-
-
 class EntityDequantizer(nn.Module):
-    """Engine-native entity block → ``(B, N, 19)`` ``entity_scalars_raw``.
+    """Engine-native entity block → ``(B, N, 18|19)`` ``entity_scalars_raw``.
+
+    ``entity_stream`` selects the assembly: ``"combat"`` (default) is the
+    A27 actor/projectile stream at width 18; ``"full"`` is the a26-line
+    stream at width 19 (recency on every type, live item/mover tokens
+    with the per-subject amount normalization).
 
     Native obs is the only input contract; the dataloader is
     responsible for materializing the per-field tensors below.
@@ -482,21 +487,17 @@ class EntityDequantizer(nn.Module):
       entity_event_sources  (B, N, 4) u8
       entity_half_extents   (B, N, 3) u8  — zero for projectile
       entity_rel            (B, N, 3) i16
-      entity_vel            (B, N, 3) i16 — zero for item / mover
+      entity_vel            (B, N, 3) i16
       entity_path           (B, N, 3) i16 — zero for projectile
       entity_path_dist      (B, N)    u16 — zero for projectile
       entity_eta            (B, N)    f16 — zero for projectile
-      entity_recency        (B, N)    f16
       entity_facing         (B, N)    u8  — actor only
       entity_team           (B, N)    u8  — actor only
       entity_score          (B, N)    u8  — actor only
-      entity_amount         (B, N)    u8  — item only
-      entity_regen          (B, N)    f16 — item only
-      entity_state          (B, N)    u8  — mover only
 
     Outputs (ObsEmbedding-ready):
 
-      entity_scalars_raw   (B, N, 19) f32 — legacy idx layout per type
+      entity_scalars_raw   (B, N, 18) f32 — A27 idx layout per type
       entity_types         (B, N)    i64
       entity_ids           (B, N, 3) i64
       entity_event_actions (B, N, 4) i64
@@ -504,13 +505,28 @@ class EntityDequantizer(nn.Module):
       entity_event_counts  (B, N)    i64
     """
 
-    def __init__(self) -> None:
+    def __init__(self, entity_stream: str = ENTITY_STREAM_COMBAT) -> None:
         super().__init__()
-        # Per-subject item amount lookup tables. Register as buffers so
-        # they follow the module's device under .to() / .cuda() and stay
-        # serializable in state_dicts (without being trained parameters).
-        self.register_buffer("_amount_mult",  _ITEM_AMOUNT_MULT,  persistent=False)
-        self.register_buffer("_amount_const", _ITEM_AMOUNT_CONST, persistent=False)
+        if entity_stream not in ENTITY_STREAMS:
+            raise ValueError(
+                f"unknown entity_stream {entity_stream!r}; "
+                f"expected one of {ENTITY_STREAMS}"
+            )
+        self.entity_stream = str(entity_stream)
+        if self.entity_stream == ENTITY_STREAM_FULL:
+            # Per-subject item amount lookup tables (full stream only).
+            # Buffers so they follow the module's device under .to() /
+            # .cuda(); persistent=False keeps them out of state_dicts.
+            self.register_buffer(
+                "_amount_mult",
+                torch.tensor(en.ITEM_AMOUNT_MULT, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_amount_const",
+                torch.tensor(en.ITEM_AMOUNT_CONST, dtype=torch.float32),
+                persistent=False,
+            )
 
     def forward(
         self, obs: Mapping[str, torch.Tensor]
@@ -519,6 +535,73 @@ class EntityDequantizer(nn.Module):
         # ``entity_scalars_raw`` (preload ran the dequant), pass through.
         if "entity_scalars_raw" in obs:
             return dict(obs)
+        if self.entity_stream == ENTITY_STREAM_FULL:
+            return self._forward_full(obs)
+        out: dict[str, torch.Tensor] = dict(obs)
+
+        et          = obs["entity_types"].to(torch.int64)         # (B, N)
+        half        = obs["entity_half_extents"].to(torch.float32) / en.DIST_SCALE
+        rel         = obs["entity_rel"].to(torch.float32)         / en.DIST_SCALE
+        vel         = obs["entity_vel"].to(torch.float32)         / en.MAX_VELOCITY
+        path        = obs["entity_path"].to(torch.float32)        / en.DIST_SCALE
+        path_dist   = obs["entity_path_dist"].to(torch.float32)   / en.DIST_SCALE
+        eta         = obs["entity_eta"].to(torch.float32)         / en.TIME_SCALE
+        facing      = obs["entity_facing"].to(torch.float32)      / 255.0
+        team        = obs["entity_team"].to(torch.float32)
+        score       = obs["entity_score"].to(torch.float32)       / 255.0
+        # dist = |rel| / DIST_SCALE — but rel is already pre-scaled, so:
+        dist = torch.linalg.norm(rel, dim=-1)                     # (B, N)
+
+        batch, n_max = et.shape
+        scalars = torch.zeros(
+            batch, n_max, ACTOR_SCALAR_DIM,
+            device=et.device, dtype=torch.float32,
+        )
+
+        # Per-type writes via boolean masks. Each branch is the idx
+        # layout the C-side emit_{type} produced; the
+        # entity_scalars_raw passes through the ObsEmbedding's per-type
+        # Linear, which projects only the [:type_scalar_dim] prefix.
+
+        mask_actor = (et == TOKEN_ACTOR)
+        if mask_actor.any():
+            scalars[..., 0:3]   = torch.where(mask_actor.unsqueeze(-1), half,       scalars[..., 0:3])
+            scalars[..., 3:6]   = torch.where(mask_actor.unsqueeze(-1), rel,        scalars[..., 3:6])
+            scalars[..., 6]     = torch.where(mask_actor,               dist,       scalars[..., 6])
+            scalars[..., 7:10]  = torch.where(mask_actor.unsqueeze(-1), vel,        scalars[..., 7:10])
+            scalars[..., 10:13] = torch.where(mask_actor.unsqueeze(-1), path,       scalars[..., 10:13])
+            scalars[..., 13]    = torch.where(mask_actor,               path_dist,  scalars[..., 13])
+            scalars[..., 14]    = torch.where(mask_actor,               eta,        scalars[..., 14])
+            scalars[..., 15]    = torch.where(mask_actor,               facing,     scalars[..., 15])
+            scalars[..., 16]    = torch.where(mask_actor,               team,       scalars[..., 16])
+            scalars[..., 17]    = torch.where(mask_actor,               score,      scalars[..., 17])
+
+        mask_proj = (et == TOKEN_PROJECTILE)
+        if mask_proj.any():
+            scalars[..., 0:3]  = torch.where(mask_proj.unsqueeze(-1), rel,     scalars[..., 0:3])
+            scalars[..., 3]    = torch.where(mask_proj,               dist,    scalars[..., 3])
+            scalars[..., 4:7]  = torch.where(mask_proj.unsqueeze(-1), vel,     scalars[..., 4:7])
+
+        # Pack entity_ids into the (B, N, 3) layout the ObsEmbedding reads.
+        ids = torch.stack([
+            obs["entity_subject_id"].to(torch.int64),
+            obs["entity_modality_id"].to(torch.int64),
+            obs["entity_player_id"].to(torch.int64),
+        ], dim=-1)
+
+        out["entity_scalars_raw"]   = scalars
+        out["entity_types"]         = et
+        out["entity_ids"]           = ids
+        out["entity_event_actions"] = obs["entity_event_actions"].to(torch.int64)
+        out["entity_event_sources"] = obs["entity_event_sources"].to(torch.int64)
+        out["entity_event_counts"]  = obs["entity_event_count"].to(torch.int64)
+        return out
+
+    def _forward_full(
+        self, obs: Mapping[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Full-stream (a26) assembly — verbatim from the pre-split codec
+        layer (215eb608) so a26-line checkpoints dequant bit-faithfully."""
         out: dict[str, torch.Tensor] = dict(obs)
 
         et          = obs["entity_types"].to(torch.int64)         # (B, N)
@@ -551,12 +634,12 @@ class EntityDequantizer(nn.Module):
 
         batch, n_max = et.shape
         scalars = torch.zeros(
-            batch, n_max, ACTOR_SCALAR_DIM,
+            batch, n_max, FULL_ACTOR_SCALAR_DIM,
             device=et.device, dtype=torch.float32,
         )
 
         # Per-type writes via boolean masks. Each branch is the idx
-        # layout the C-side emit_{type} produced; the legacy
+        # layout the a26 C-side emit_{type} produced; the
         # entity_scalars_raw passes through the ObsEmbedding's per-type
         # Linear, which projects only the [:type_scalar_dim] prefix.
 

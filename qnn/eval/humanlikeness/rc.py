@@ -28,7 +28,7 @@ from qnn.eval.humanlikeness.core import (  # noqa: E402
     dwell_times, switch_rate, onset_intervals, compare_samples,
     mmd2_rbf_permutation_test, describe,
 )
-from qnn.eval.humanlikeness.human_reference import _episodes, AXES, FLICK_DEG, WEAPON_NAMES  # noqa: E402
+from qnn.eval.humanlikeness.human_reference import _episodes, AXES, FLICK_DEG  # noqa: E402
 
 HUMAN_HZ = 20.0  # qwd corpus is labeled/downsampled to 20 Hz (labeler GBT + relabel table)
 
@@ -47,9 +47,9 @@ def collect_human(data_dir: Path, split: str) -> dict:
             d = dwell_times(lab, keep)
             if d.size: move_dwell[ax].append(d)
             _, ns, nt = switch_rate(lab, keep); move_sw[ax][0] += ns; move_sw[ax][1] += nt
-        d = dwell_times(ep["weapon"], keep)
+        d = dwell_times(ep["attack_context"], keep)
         if d.size: wpn_dwell.append(d)
-        _, ns, nt = switch_rate(ep["weapon"], keep); wpn_sw[0] += ns; wpn_sw[1] += nt
+        _, ns, nt = switch_rate(ep["attack_context"], keep); wpn_sw[0] += ns; wpn_sw[1] += nt
         r = dwell_times(ep["attack"], keep, only_value=1)
         if r.size: atk_run.append(r)
         oi = onset_intervals(ep["attack"], keep, onset_value=1)

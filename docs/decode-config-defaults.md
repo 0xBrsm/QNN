@@ -66,7 +66,7 @@ design — the retired/research DOWN-band degraders and the `_mode` back-compat
 alias. They are marked in the table rather than merely missing from the export
 block, and the test asserts `ExportWrapper` does **not** accept them.
 
-### a25 module extras (`MODULE_REQUIRED_PARAM_KEYS["qnn.model.bench.a25.decode"]`)
+### a25 module extras (`MODULE_REQUIRED_PARAM_KEYS["qnn.model.decode_actions"]`)
 
 Promoted 2026-07-13 (this pass): `move.commitment`, `look.hold_passthrough`.
 Both live a25 templates now carry them (`a25rc1` had omitted
@@ -77,7 +77,7 @@ Both live a25 templates now carry them (`a25rc1` had omitted
 a24 decode/guard modules are **deleted** (`test_a24_modules_are_gone`); a24
 templates (`decode.a24rc1*`) can no longer resolve — module import fails before
 the param check. The manifest therefore only needs to be satisfied by the **live
-a25 configs** (`decode.a25base.json`, `decode.a25rc1.json`) and every
+a25 configs** (`decode.base.json`, `decode.a25rc1.json`) and every
 freshly-emitted a25 decode-fit config (built from `a25base` as `ORACLE_TEMPLATE`).
 Both live templates were backfilled so they carry all required keys.
 

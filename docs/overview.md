@@ -3,7 +3,7 @@
 Competitive Quake PvP agent trained end-to-end: native C worker emits semantic
 tokens, a transformer encoder attends over them, a GRU maintains temporal
 state, supervised pointer attention picks an engagement target, and factored
-action heads (move, look, attack, weapon) drive the engine. The pipeline is
+action heads (move, look, attack) drive the engine. The pipeline is
 seeded by behavioral cloning on Quake demos and fine-tuned by native bounded
 PPO against FrikBotNex opponents. PPO overlaps one immutable recurrent rollout
 with the preceding learner update and caps policy lag at exactly one update.
@@ -33,28 +33,23 @@ TransformerEncoder
         │
         └──► GRU input:      x_t -> h_t                  (sequence of cls_readouts)
 
-Action features (per tick):
-  motor heads (move, look, attack):
-    features = cat(gru_out, target_feat, weapon_context)
-  weapon head:
-    features = cat(gru_out, cls_readout, target_feat)   (gru_out optional)
+Action heads (per tick):
+  ├──► move_seg  semi-Markov movement commitments
+  ├──► jump      vertical action classifier
+  ├──► look      target-anchored polar direction + learned residual
+  └──► attack    9-way attack choice
+                  class 0 = no attack
+                  classes 1..8 = attack with Quake impulse 1..8
 
-  weapon_context comes from the held weapon in obs (default) or from a
-  softmax over the weapon head's own logits.
-
-  ├──► move    (3 categorical axes × 3 classes {neg, none, pos})
-  ├──► look    target-anchored base direction + learned residual
-  ├──► attack  binary BCE
-  └──► weapon  8-way categorical → Quake impulse byte 1..8
-
-  Target is supervised internally; it conditions action heads but is
-  never sampled. The 8-class weapon head emits a direct Quake impulse;
-  the engine-facing "switch" slot is gone end-to-end.
+  The current attack-with choice also selects per-weapon aim physics and
+  decode gains. Target is supervised internally; it conditions action heads
+  but is never sampled.
 ```
 
-Primary supervised heads: `target` (pointer over actor slots), `move`,
-`look`, `attack`, `weapon`. The weapon class index is converted to a Quake
-impulse byte (1..8 = axe..lightning) by the engine bridge; no separate
+Primary A27 supervised heads are `target` (pointer over actor slots),
+`move_seg`, `jump`, `look`, and `attack` (implemented by the `attack_with`
+head type). There is no
+separate binary attack head, equipped-weapon input, intent-history buffer, or
 switch controller.
 
 | Encoder parameter | Value |
@@ -69,9 +64,17 @@ switch controller.
 
 The model is assembled from a declarative `GraphSpec` (see `src/docs/model-graph.md`). Every pipeline — BC, bench probes, eval, PPO, and ONNX export — calls `qnn.model.graph.build_network(obs_dim, spec)` as the single factory. Node builders self-register into `qnn.model.node_registry` via `@register_head` / `@register_encoder` / `@register_pointer` / `@register_temporal` decorators declared beside each node class; `build_network` dispatches by the spec's type discriminators. Named base-graph compositions are registered by each model generation's `graphs` module via `register_base_graph`; probes are expressed as override dicts merged onto a base via `qnn.model.graph.merge_overrides`.
 
-Token sequence: `self(1) + spatial(11) + entities(up to 16) = up to 28 tokens`.
+The A27 base graph uses four self rows (`cls`, `state`, `arsenal`, `motion`),
+eleven spatial rows, and up to sixteen combat-entity rows: at most 31 tokens.
 Invalid entity rows masked via `key_padding_mask`. Action-history tokens are
 parked (templates set `action_history_tokens: 0`; no wire region in v11).
+
+On A27, entity attention is a pure combat stream: actors and projectiles only.
+Both may arrive as current-frame `SIGHT` or `PROXIMITY` observations;
+projectiles participate in encoder attention, while the target pointer remains
+actor-only. Item/mover tokens, recency, SOUND, and MEMORY are outside the fast
+action substrate. The POC PROXIMITY producer is engine PVS ground truth and is
+an explicit substitution point for a future higher-layer belief model.
 
 On spatial-v2 (`wire.12`), the eleven spatial attention rows are a
 center-ray depth atlas: elevation bands from −75° to +75° in 15° steps,
@@ -89,11 +92,12 @@ geometry to camera aim.
 Move is trained as three independent categorical axes; the up/down axis
 carries jump and can be reweighted via `jump_pos_weight` with linear decay.
 
-Attack is trained as binary BCE with corpus-derived positive weighting.
-
-Weapon is trained as 8-class CE on the demonstrator's held-weapon impulse.
-No-weapon frames (pre-spawn, dead, transitional) carry 0 on disk and are
-masked from the CE loss via `ignore_index=-100`.
+Attack is trained as 9-class CE. Class 0 means no effective attack;
+classes 1 through 8 mean attack with that Quake impulse. The QWD/MVD collector
+stamps a nonzero `attack` label only on an effective attack frame, so the
+label is action truth rather than equipped state. Per-class feasibility uses
+ownership/ammo readiness and cooldown state without exposing the equipped
+weapon ID.
 
 Target is trained as 16-way CE on the adaptive-cone target-labeler output;
 unlabeled frames carry `-100` and are skipped.

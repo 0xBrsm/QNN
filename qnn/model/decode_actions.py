@@ -74,9 +74,9 @@ from qnn.schema import WEAPON_HEAD_SIZE
 # (QNNPolicy.act) resolves one decode_module from the run's decode config and reads
 # everything it decodes with through it — move commitment, attack-with, AND the
 # aim-prior (gains + ffwd primitive). The aim primitives' home is the a25-owned
-# qnn.model.bench.a25.lead_aim (cloned from a24 so a25 executes no a24 code); this is
+# qnn.model.lead_aim (cloned from a24 so a25 executes no a24 code); this is
 # the facade seam, not a move.
-from qnn.model.bench.a25.lead_aim import (  # noqa: F401
+from qnn.model.lead_aim import (  # noqa: F401
     AIM_FFWD_GAIN, AIM_PRIOR_GAIN, _TICK_DT_MODULE, aim_prior_tangent_ffwd,
 )
 
@@ -138,7 +138,7 @@ def attack_with_decode_step(
     Parameters
     ----------
     logits9 : (B, 9) raw head logits (class 0 = no-attack, 1..8 = attack weapon k)
-    held_impulse : (B,) int64 engine impulse 1..8 of the currently held weapon
+    held_impulse : (B,) int64 engine impulse 1..8 of the currently held weapon.
     attack_bias : global propensity knob (positive = more attack)
     bias_vec : optional legacy (8,) JOINT operating point, added to both the
         selection and fire scores. Existing configs retain their exact law.
@@ -184,6 +184,32 @@ def attack_with_decode_step(
     choice = sel_idx.to(held.dtype) + 1                      # impulse 1..8
     weapon_impulse = torch.where(fire, choice, held)
     return fire.to(torch.int64), weapon_impulse.to(torch.int64)
+
+
+def attack_lane_gate(fire: torch.Tensor, weapon_impulse: torch.Tensor) -> torch.Tensor:
+    """The A27 single-lane ACTION convention: ``attack WITH weapon X this tick``.
+
+    ``(B,)`` int64, 0 = no attack, 1..8 = press attack while selecting that
+    impulse. The A27 pure-combat wire has NO separate weapon slot, so the engine
+    derives BOTH the attack button and the weapon impulse from this one value
+    (``qnn_onnx.c`` ``qnn_onnx_decode_core``: ``attack_bit = attack_decided !=
+    0``; ``qnn_input.c``: ``impulse = action.attack`` in combat mode). The decode
+    itself emits the HELD impulse on no-fire ticks — the A26 SWITCH convention,
+    where ``attack`` is a separate fire bit and a held impulse is a server no-op
+    — so the lane MUST be gated on the fire bit before it leaves the model, or
+    the bot holds the trigger down every tick.
+
+    Same-tick select-and-fire is intact: the server's QC runs ``ImpulseCommands``
+    (the weapon change) BEFORE the ``button0`` attack check inside one
+    ``W_WeaponFrame``, so an impulse emitted on the fire tick fires the weapon it
+    selects. Weapon switching therefore never needs a no-fire-tick impulse.
+
+    Shared by ``QNNPolicy.act`` and the ONNX ExportWrapper — one law, so offline
+    and deploy cannot fork. TRACE-SAFE (``torch.where`` only).
+    """
+    f = fire.reshape(-1).to(torch.bool)
+    w = weapon_impulse.reshape(-1).to(torch.int64)
+    return torch.where(f, w, torch.zeros_like(w))
 
 
 def attack_with_marginal_logit(logits9: torch.Tensor) -> torch.Tensor:
@@ -311,10 +337,10 @@ def attack_crest_gate_step(
 
 def attack_with_decode(
     logits9: torch.Tensor,
-    self_weapon_id: torch.Tensor,
     obs_tensors,
     move_logits: torch.Tensor,
     *,
+    self_weapon_id: torch.Tensor | None = None,
     guard=None,
     attack_bias: float = 0.0,
     bias_vec: torch.Tensor | None = None,
@@ -331,19 +357,24 @@ def attack_with_decode(
     """Full a25 attack-with decode — the SINGLE implementation shared by
     ``QNNPolicy.act`` and the ONNX ExportWrapper (decode-regime-in-model: the
     offline decode and the baked-into-ONNX deploy decode are the same code, so
-    they cannot skew). Resolves the held impulse and the guard's alignment bias +
-    hard-veto mask, runs :func:`attack_with_decode_step`, then composes the
-    crest gate (:func:`attack_crest_gate_step`) when armed.
+    they cannot skew). Resolves the held impulse and the guard's alignment
+    bias + hard-veto mask, runs :func:`attack_with_decode_step`, then composes
+    the crest gate (:func:`attack_crest_gate_step`) when armed.
 
     Parameters
     ----------
     logits9 : (B, 9) raw attack-with logits.
-    self_weapon_id : (B,) / (B,1) held-weapon id (obs ``self_weapon_id``).
     obs_tensors : the guard's obs input (each caller passes the form its guard
         expects — dequantised in act, native in export; the guard reads it).
         The crest gate also reads ``attack_finished`` from it (cooldown gate).
     move_logits : (B, MOVE_AXES, classes) or flat — the guard argmaxes it for the
         movement-direction splash checks.
+    self_weapon_id : (B,) / (B,1) held-weapon id (obs ``self_weapon_id``), or
+        None for a held-weapon-blind graph (the A27 pure-combat contract, which
+        has no held-weapon input — see agents/plans/decode-fit-reconciliation.md
+        "A27 Port Boundary"). None falls back to always selecting the ideal
+        weapon (``switch_margin`` has no effect: there is no held weapon to
+        hysterese against) until A27 restores a held-weapon signal.
     guard : the resolved guard module (``guard_attack_logit_for_export``); None →
         no alignment bias / veto. The guard applies the SAME hard vetoes
         (attack-splash / RL self-splash / LG range) that the deployed graph bakes.
@@ -374,10 +405,15 @@ def attack_with_decode(
     TRACE-SAFETY: torch-only, no ``.item()`` / data-dependent control flow (the
     guard presence + knobs are static python config, decided at trace build).
     """
-    from qnn.model.weapon_head import weapon_index_from_id
+    from qnn.vocab import self_weapon_id_to_impulse
 
     l9 = logits9.reshape(-1, ATTACK_WITH_SIZE)
-    held_impulse = weapon_index_from_id(self_weapon_id.reshape(-1)) + 1
+    # Naive ideal weapon (no bias_vec, no hysteresis) — a guard-probe heuristic
+    # only; the real selection (with switch_margin) happens below.
+    choice = l9[..., 1:].argmax(dim=-1) + 1
+    held_impulse = (
+        self_weapon_id_to_impulse(self_weapon_id.reshape(-1))
+        if self_weapon_id is not None else choice)
     align_bias = None
     veto_mask = None
     if guard is not None and hasattr(guard, "guard_attack_logit_for_export"):
@@ -388,7 +424,8 @@ def attack_with_decode(
         # alignment strength — call it with (obs, move, logit) exactly as the
         # original export did; do NOT pass a 4th strength arg.
         probe = guard.guard_attack_logit_for_export(
-            obs_tensors, move_logits, torch.zeros_like(l9[..., :1])).reshape(-1)
+            obs_tensors, move_logits, choice,
+            torch.zeros_like(l9[..., :1])).reshape(-1)
         veto_mask = probe < -1.0e8
         align_bias = torch.where(veto_mask, torch.zeros_like(probe), probe)
     fire, weapon_impulse = attack_with_decode_step(
@@ -461,7 +498,7 @@ def attack_with_decode(
 # on state, instead of a context-free corpus table (research/move-head.md §8;
 # acceptance gate = the closed-loop threat PSTH).
 
-from qnn.model.bench.a25.move_seg_head import (  # noqa: E402
+from qnn.model.move_seg_head import (  # noqa: E402
     FIB_EDGES, N_BUCKETS, N_CLASSES, N_AXES, JOINT)
 from qnn.model.decode import gumbel_argmax  # noqa: E402
 
@@ -1272,7 +1309,7 @@ def assemble_aim_prior(
 def assemble_pitch_correction(
     z_err: torch.Tensor,
     weapon_pitch_gain: torch.Tensor,
-    self_weapon_id: torch.Tensor,
+    weapon_impulse: torch.Tensor,
     weapon_pitch_bias: "torch.Tensor | None" = None,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
     """Per-row VERTICAL feet-aim BLEND terms — the RL-splash feet-aiming.
@@ -1280,15 +1317,14 @@ def assemble_pitch_correction(
     ``z_err`` is the UNSCALED aim-prior error tangent (vertical component
     ``z_err[..., 1]`` is the absolute turn-to-anchor pitch, + = up / − = down).
     ``weapon_pitch_gain`` is a (9,) per-IMPULSE blend weight β ∈ [0, 1] (0 = OFF).
-    ``self_weapon_id`` is ENTITY_IDS-encoded, mapped to impulse via the canonical helper.
+    ``weapon_impulse`` is the attack-with intent in engine order (0..8).
 
     Returns ``(beta, target_vert, feet_vert)``, consumed by :func:`decode_look_from_polar`
     as the LERP ``z_vert ← (1−β)·z_head_vert + β·target_vert``. β is enemy-gated
     (``z_err`` is exactly zero rows otherwise). ``weapon_pitch_bias`` (per-IMPULSE deg,
     default None) deepens the target to cancel the static RL fire-high offset.
     """
-    from qnn.vocab import self_weapon_id_to_impulse
-    imp = self_weapon_id_to_impulse(self_weapon_id.reshape(-1).long()).clamp(0, 8)
+    imp = weapon_impulse.reshape(-1).long().clamp(0, 8)
     beta = weapon_pitch_gain.reshape(-1).index_select(0, imp)            # (R,)
     z = z_err.reshape(-1, z_err.shape[-1])                               # (R, 2)
     feet_vert = z[:, 1]                                                  # (R,) UN-biased feet-anchor pitch (floor)
@@ -1305,10 +1341,10 @@ def assemble_pitch_correction(
 
 
 def decode_look_from_polar(
-    mag_bin: torch.Tensor,
-    dir_logits: torch.Tensor,
-    mag_centers: torch.Tensor,
-    dir_centers: torch.Tensor,
+    mag_bin: "torch.Tensor | None" = None,
+    dir_logits: "torch.Tensor | None" = None,
+    mag_centers: "torch.Tensor | None" = None,
+    dir_centers: "torch.Tensor | None" = None,
     z_prior: torch.Tensor | None = None,
     mag_gain: float = 0.0,
     turn_mag_scale: "float | torch.Tensor" = 1.0,
@@ -1319,6 +1355,9 @@ def decode_look_from_polar(
     origin_elev: "torch.Tensor | None" = None,
     pitch_mode: str = "lock",
     shift_strength: float = 1.0,
+    *,
+    theta_override: "torch.Tensor | None" = None,
+    phi_override: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """(sampled ``mag_bin``, ``dir_logits``) → look unit vector (hybrid decode).
 
@@ -1329,10 +1368,28 @@ def decode_look_from_polar(
     continuous DIRECTION readout (circular mean of the direction softmax), the
     z-assembly, the aim-prior blend, the feet-aim pitch, and the expmap.
 
+    ``theta_override`` / ``phi_override`` (the look_seg COMMIT decode path): when
+    given, skip the polar mag_bin/dir readout and take the per-tick signed
+    magnitude θ and direction φ DIRECTLY from the commit playout
+    (``look_commit_step`` / ``look_commit_step_graph``). ``turn_mag_scale`` still
+    applies to the supplied θ; the shared z-assembly + aim-prior blend + feet-aim
+    pitch + expmap remainder is IDENTICAL to the polar path — the single source of
+    truth co-decoded with tools/export_onnx.ExportWrapper.
+
     Returns the look unit vector with shape ``mag_bin.shape + (3,)``.
     """
-    # polar_to_tangent via index_select (export-friendly vs advanced index).
-    theta = mag_centers.index_select(0, mag_bin.reshape(-1)).reshape(mag_bin.shape)
+    if theta_override is not None:
+        # COMMIT path: θ, φ supplied by the segment-commitment playout.
+        theta = theta_override
+        phi = phi_override
+    else:
+        # polar_to_tangent via index_select (export-friendly vs advanced index).
+        theta = mag_centers.index_select(0, mag_bin.reshape(-1)).reshape(mag_bin.shape)
+        # Continuous direction: circular mean of the direction distribution.
+        p_dir = torch.softmax(dir_logits, dim=-1)                   # (..., N_DIR)
+        cos_phi = (p_dir * torch.cos(dir_centers)).sum(dim=-1)
+        sin_phi = (p_dir * torch.sin(dir_centers)).sum(dim=-1)
+        phi = torch.atan2(sin_phi, cos_phi)                         # (...,)
     # Head turn-magnitude dampener (turn_mag_scale, default 1.0 = no-op).
     # A per-ROW tensor (the aim-grid per-lane override) dampens each lane's θ
     # independently; the scalar/export path is unchanged (bit-identical).
@@ -1340,11 +1397,6 @@ def decode_look_from_polar(
         theta = theta * turn_mag_scale.reshape(theta.shape).to(theta.dtype)
     elif turn_mag_scale != 1.0:
         theta = theta * float(turn_mag_scale)
-    # Continuous direction: circular mean of the direction distribution.
-    p_dir = torch.softmax(dir_logits, dim=-1)                       # (..., N_DIR)
-    cos_phi = (p_dir * torch.cos(dir_centers)).sum(dim=-1)
-    sin_phi = (p_dir * torch.sin(dir_centers)).sum(dim=-1)
-    phi = torch.atan2(sin_phi, cos_phi)                             # (...,)
     z = torch.stack([theta * torch.cos(phi), theta * torch.sin(phi)], dim=-1)
     if hold_drift_eps > 0.0:
         # HOLD-DRIFT (default 0.0 = OFF = bit-identical): replace exact holds with an

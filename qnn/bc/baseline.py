@@ -72,12 +72,9 @@ def copy_previous_baseline(episodes: Sequence[dict[str, np.ndarray]]) -> Dict[st
     move_fwd_l1: list[np.ndarray] = []
     move_str_l1: list[np.ndarray] = []
     move_up_l1: list[np.ndarray] = []
-    # Discrete copy-previous floors. The cache stores NO standalone `attack`
-    # array — the demonstrator fire press is bit 0 of the packed move byte
-    # (mirrors qnn.bc.train._unpack_attack_bit / the resident-source preload).
-    # The move axes are the unpacked (T,3) classes scored via the L1 path, NOT a
-    # discrete fire-style head, so move is excluded from this confusion-matrix.
-    discrete_counts: Dict[str, list[int]] = {"attack": [0, 0, 0], "weapon": [0, 0, 0]}
+    # Categorical attack copy-previous floor. Move remains the unpacked (T,3)
+    # class tensor scored through the L1 path below.
+    discrete_counts: Dict[str, list[int]] = {"attack": [0, 0, 0]}
 
     for ep in episodes:
         n = len(next(iter(ep.values())))
@@ -98,22 +95,10 @@ def copy_previous_baseline(episodes: Sequence[dict[str, np.ndarray]]) -> Dict[st
         move_l1.append(diff.sum(axis=1))
         move_fwd_l1.append(diff[:, 0]); move_str_l1.append(diff[:, 1]); move_up_l1.append(diff[:, 2])
 
-        # Discrete heads: attack = move byte bit 0 (raw demo press), weapon = class.
-        streams = {"attack": (move_raw & 0x1), "weapon": np.asarray(ep["weapon"]).reshape(-1)}
+        # Attack is one categorical effective-action label: 0 or impulse 1..8.
+        streams = {"attack": np.asarray(ep["attack"]).reshape(-1)}
         for head, vals in streams.items():
             pred, tgt = vals[:-1], vals[1:]
-            # OPERATIVE-FRAME FILTER (see src/docs/attack-head.md): the copy-previous
-            # floor MUST be scored on the SAME frame population the trained head's
-            # metric uses. attack: operative = input_mask bit 0 (engine honours fire;
-            # raw attack over-counts held-trigger cooldown frames). weapon: weapon-
-            # present frames (training ignores no-weapon target=-100). The mask aligns
-            # to the TARGET frame T (tgt = vals[1:]).
-            if head == "attack" and "input_mask" in ep:
-                op = (np.asarray(ep["input_mask"]).reshape(-1).astype(np.uint8) & 0x1) != 0
-                keep = op[1:]
-            else:  # weapon
-                keep = tgt != 0
-            pred, tgt = pred[keep], tgt[keep]
             pos_pred = pred != 0
             pos_tgt = tgt != 0
             match = pred == tgt

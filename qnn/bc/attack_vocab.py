@@ -23,7 +23,7 @@ _HDR = os.path.join(
     "engine", "common", "qnn_demo_sounds.h",
 )
 
-# subject token (qnn.h: case N -> QNN_SUBJECT_*) -> collect act_weapon class
+# subject token (qnn.h: case N -> QNN_SUBJECT_*) -> collect act_attack class
 _SUBJECT_CLASS = {
     "QNN_SUBJECT_AXE": 1,
     "QNN_SUBJECT_SHOTGUN": 2,

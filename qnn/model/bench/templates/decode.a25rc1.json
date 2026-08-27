@@ -2,8 +2,8 @@
   "decode_version": 1,
   "version": "a25rc1",
   "description": "a25-owned decode template (seg-commitment move + 9-way attack-with): names a25 decode/guard modules so decode-fit + export of an a25 model emit a25 refs. Per-model params (aim gain/alpha vectors, attack.bias_vec, turn_mag_scale, commit_dur_tilt) are filled by the decode-fit pipeline; the values below are neutral placeholders establishing the a25 param shape.",
-  "decode_module": "qnn.model.bench.a25.decode",
-  "guard_module": "qnn.model.bench.a25.guard",
+  "decode_module": "qnn.model.decode_actions",
+  "guard_module": "qnn.model.guard",
   "look_grid": "config/look_grid.json",
   "params": {
     "look.aim_prior_gain": 0.0,
@@ -18,7 +18,6 @@
     "move.commit_interrupt": false,
     "move.commit_dur_tilt": [0.0, 0.0],
     "attack.bias": 0.0,
-    "attack.stick_bias": 0.0,
     "guard.projectile_release": true,
     "guard.projectile_release_mode": "any",
     "guard.attack_align_strength": 0.0

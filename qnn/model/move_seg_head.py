@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from qnn.model._mlp import make_head_mlp
-from qnn.model.bench.a25.seg_bins import FIB_EDGES, N_BUCKETS  # torch-free home
+from qnn.model.seg_bins import FIB_EDGES, N_BUCKETS  # torch-free home
 N_CLASSES = 3                        # {neg, none, pos}
 N_AXES = 2                           # fb, lr
 JOINT = N_CLASSES * N_BUCKETS        # 30-way per axis
@@ -210,7 +210,9 @@ from qnn.model.node_registry import register_head  # noqa: E402
 def _build_move_seg(head, dims, d_model):
     # readout-first feature layout lets a prefix slice drop target_feat when
     # the probe declares inputs=["readout"] (pointer present in these graphs).
-    in_dim = dims["base_features_dim"]
+    # coord_features_dim == base_features_dim unless a shared attack-intent
+    # block is spliced in (network.slot_dims); this head is a CONSUMER of it.
+    in_dim = dims["coord_features_dim"]
     if "target.feat" not in head.inputs:
         in_dim -= d_model
     return MoveSegHead(in_dim=in_dim, d_hidden=head.d_hidden,

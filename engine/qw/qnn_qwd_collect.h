@@ -6,11 +6,9 @@
  * cl.frames[] each Host_Frame and aggregates them into a single
  * emit-rate action label.
  *
- * Pure cmd-window decode — no inference, no back-shift, no ring
- * rewriting.  action.weapon is written directly at the press tick from
- * the decoded impulse target, with carry-forward on non-press ticks and
- * a stat-transition check to pick up engine-forced switches (pickup
- * auto-switch via weapon_touch, respawn defaults, etc.).  All inference
+ * Pure cmd-window decode — no inference, no back-shift, no ring rewriting.
+ * action.attack is 0 on non-attacks and the effective W_Attack weapon impulse
+ * on attack ticks. All inference
  * machinery (back-shift ring, chain-fill, log-normal hold) lives behind
  * mvd_path; force_mvd_emit is the only legal way to run a QWD file
  * through inference.
@@ -26,7 +24,7 @@
 void QNN_QwdCollectReset(void);
 
 /* Walk the current dem_cmd window into a single emit-rate action label.
- * Pure cmd-byte decode — does not touch action->weapon or any module
+ * Pure cmd-byte decode — does not touch action->attack or any module
  * state.  Returns the resolved impulse_target weapon (1..8) or 0 if no
  * weapon-select impulse appeared in the window.
  *
@@ -39,27 +37,15 @@ void QNN_QwdCollectReset(void);
  *   upmove (swim down):
  *     Most-negative value across the window.
  *
- * action->weapon is left untouched by this function, but the per-cmd loop
+ * action->attack is left untouched by this function, but the per-cmd loop
  * advances the QC weapon-select predicate (once per emit tick); the label
  * is then read from QNN_ProgsGetSelfWeapon in QNN_QwdBuildActionLabel.
  */
 void QNN_QwdExtractAction(qnn_action_t *action, const qnn_snapshot_t *snapshot);
 
-/* Emit-time QWD action: usercmd extraction + canonical action.weapon label
- * (held weapon + ping-gated pending-impulse lead) + look/switch fill. */
+/* Emit-time QWD action: usercmd extraction + effective attack-with label. */
 void QNN_QwdBuildActionLabel(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
-
-/* Ping-gated weapon-lead clear.  Call once per emit tick on the genuine QWD
- * usercmd path, AFTER QwdBuildActionLabel and BEFORE the back-shift ring push:
- * clears a lead the engine never confirms within its realization window
- * (ping×2 + the remaining attack cooldown the switch must wait out) — a
- * stale-impulse phantom — by walking the shared ring back over the lead window
- * and resetting those slots + this frame to held.  ping_frames =
- * QNN_PressBackShiftFrames(player, emit_hz); emit_hz converts cooldown to
- * frames. */
-void QNN_QwdWeaponLeadStep(qnn_action_t *action,
-	const qnn_snapshot_t *snapshot, int tick, int ping_frames, int emit_hz);
 
 /* Per-cmd attack-predicate eval + cmd-block aggregation across the
  * current QWD cmd window.  Calls QNN_ProgsEvalAttack once per cmd

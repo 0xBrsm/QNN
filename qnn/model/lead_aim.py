@@ -4,14 +4,14 @@ Cloned from the a24 lineage (``qnn.model.bench.a24.lead_aim``) so the a25 arch
 executes its OWN aim-prior geometry and never imports/executes a24 code
 (cross-arch decode-coupling ban). This is a BIT-IDENTICAL clone of the reachable
 a24 aim-prior path: :func:`aim_prior_tangent_ffwd` + its dependencies
-(:func:`compute_lead_aim`, :func:`held_weapon_trajectory`, :func:`pooled_aim_vec`)
+(:func:`compute_lead_aim`, :func:`weapon_trajectory`, :func:`pooled_aim_vec`)
 and the decode-contract constants (``AIM_PRIOR_GAIN``, ``AIM_FFWD_GAIN``,
 ``AIM_Z_DROP``, ``_TICK_DT_MODULE``). The a24 ``aim_prior_tangent`` (non-ffwd)
 variant is NOT cloned — the a25 policy/export only call the ``_ffwd`` form.
 
 For each entity (target candidate), compute "where would I have to aim to hit
-this entity given my held weapon's trajectory?" The single formula handles all
-three weapon classes by parameterization:
+this entity with the attack-with choice's trajectory?" The single formula
+handles all three weapon classes by parameterization:
 
 * Hitscan: ``v_horiz ≈ QNN_VEL_SCALE`` (sentinel max). Lead time collapses to ≈ 0
   and the aim point collapses to the entity's current position.
@@ -172,23 +172,19 @@ def _compute_lead_aim_impl(
          (aim_point[..., 2] + net_z - _AIM_MUZZLE_OFS).unsqueeze(-1)], dim=-1)
 
 
-def held_weapon_trajectory(
-    weapon_static: torch.Tensor,     # (9, 7) from build_model_weapon_scalars
+def weapon_trajectory(
+    weapon_physics: torch.Tensor,    # (9, 7) from build_model_weapon_scalars
     weapon_impulse: torch.Tensor,    # (B,) impulse-indexed long, 0..8
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Look up per-batch (v_horiz, drop_const, drop_rate) for the held weapon.
-
-    ``weapon_impulse`` must already be impulse-indexed — obs ``self_weapon_id`` is
-    ENTITY_IDS-encoded and goes through ``qnn.vocab.self_weapon_id_to_impulse`` first.
-    """
-    idx = weapon_impulse.long().clamp(0, weapon_static.shape[0] - 1)
-    table = weapon_static[idx]                                   # (B, 7)
+    """Look up per-batch trajectory terms for an attack-with impulse."""
+    idx = weapon_impulse.long().clamp(0, weapon_physics.shape[0] - 1)
+    table = weapon_physics[idx]                                  # (B, 7)
     v_horiz = table[:, 2]                                        # WT_V_HORIZ
     # Hitscan rows carry the sentinel v_horiz == 1.0 (2000 u/s); boost it 100× so the
     # intercept collapses to the bearing (arithmetic mask, ROCm-safe).
     hitscan_f = (v_horiz >= 0.999).to(v_horiz.dtype)
     v_horiz = v_horiz * (1.0 + 99.0 * hitscan_f)
-    drop = weapon_static.new_tensor(AIM_Z_DROP)[idx]             # (B, 2)
+    drop = weapon_physics.new_tensor(AIM_Z_DROP)[idx]            # (B, 2)
     return v_horiz, drop[:, 0], drop[:, 1]
 
 
@@ -236,9 +232,9 @@ def pooled_aim_vec(
 def aim_prior_tangent_ffwd(
     entity_scalars_raw: torch.Tensor,
     entity_types: torch.Tensor,
-    self_weapon_id: torch.Tensor,
+    weapon_impulse: torch.Tensor,
     target_logits: torch.Tensor,
-    weapon_static: torch.Tensor,
+    weapon_physics: torch.Tensor,
     tick_dt: float = _TICK_DT_MODULE,
     lead_hold_cap: float | None = None,
     lead_hold_cap_radial: float | None = None,
@@ -257,14 +253,14 @@ def aim_prior_tangent_ffwd(
     ``tick_dt`` is the per-decision-tick step in this module's time unit; it MUST
     scale with the model's decision cadence. Defaults to the 20 Hz value."""
     from qnn.model.look_bins import tangent_logmap
-    from qnn.vocab import TOKEN_ACTOR, self_weapon_id_to_impulse
+    from qnn.vocab import TOKEN_ACTOR
 
     rel = entity_scalars_raw[..., _ACTOR_REL_OFFSET:_ACTOR_REL_OFFSET + 3]
     vel = entity_scalars_raw[..., _ACTOR_VEL_OFFSET:_ACTOR_VEL_OFFSET + 3]
     team = entity_scalars_raw[..., _ACTOR_TEAM_OFFSET]
     enemy = (entity_types.long() == TOKEN_ACTOR) & (team != _TEAM_TEAMMATE_VALUE)
-    imp = self_weapon_id_to_impulse(self_weapon_id.reshape(-1).long())
-    v_horiz, drop_const, drop_rate = held_weapon_trajectory(weapon_static, imp)
+    imp = weapon_impulse.reshape(-1).long().clamp(0, 8)
+    v_horiz, drop_const, drop_rate = weapon_trajectory(weapon_physics, imp)
     # The per-weapon aim-z anchor (AIM_Z_DROP) is applied inside compute_lead_aim,
     # i.e. before pooling — so it rides the error term AND the ffwd rate term.
     aim_pts = compute_lead_aim(

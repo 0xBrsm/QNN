@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 
 from qnn.diag.report import run_report, render_markdown
+from qnn.diag.target_location_probe import add_cli_parser as _add_target_location_probe_parser
+from qnn.diag.target_location_probe import run_cli as _run_target_location_probe
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +157,7 @@ def main() -> None:
     argv = sys.argv[1:]
 
     # If the first non-flag argument is a known subcommand, use subparser routing.
-    known_subcmds = {"analyze", "diagnostic"}
+    known_subcmds = {"analyze", "diagnostic", "target-location-probe"}
     first_positional = next((a for a in argv if not a.startswith("-")), None)
 
     if first_positional in known_subcmds:
@@ -167,11 +169,14 @@ def main() -> None:
         sub = top.add_subparsers(dest="subcommand", required=True)
         _add_analyze_parser(sub)
         _add_diagnostic_parser(sub)
+        _add_target_location_probe_parser(sub)
         args = top.parse_args(argv)
         if args.subcommand == "analyze":
             _run_analyze(args)
         elif args.subcommand == "diagnostic":
             _run_diagnostic(args)
+        elif args.subcommand == "target-location-probe":
+            _run_target_location_probe(args)
         return
 
     # ── Legacy flat-arg mode (backward compatibility) ────────────────────────

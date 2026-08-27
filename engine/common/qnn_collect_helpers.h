@@ -107,11 +107,6 @@ void QNN_BackShiftPush(qnn_tick_emit_state_t *emit, FILE *out,
 	qboolean reset_flag, qboolean grounded,
 	int weapon_id);
 
-/* Rewrite the trailing `shift_frames` slots so they carry the new
- * weapon — anchoring intent at the press frame. */
-void QNN_BackShiftRewriteWeapon(int new_weapon_id,
-	int prev_weapon_id, int shift_frames);
-
 /* Drain every remaining slot through `emit`.  Called at demo end. */
 void QNN_BackShiftFlushAll(qnn_tick_emit_state_t *emit);
 
@@ -262,17 +257,6 @@ typedef struct
 	 * The Python orchestration demuxes the two streams by magic.  Default
 	 * false = the pre-existing single-stream collect, unchanged. */
 	qboolean	matched_emit;
-	/* Per-demo fire-script fingerprint (set per-collect from the op JSON;
-	 * weapon-head.md §10-11).  weapon_script=1 marks a demo whose player
-	 * uses press/release `+weapon` aliases (select on attack press, dump
-	 * to a fallback on release, every shot); weapon_release is that
-	 * alias's release target (raw 1..8).  Drives the de-scripted
-	 * act.weapon intent label in qnn_qwd_collect.c: a select to
-	 * weapon_release on a cmd with the attack button UP is config churn,
-	 * not intent, and must not update the label.  Defaults 0/0 = no
-	 * dump suppression (unscripted demo).  QWD-only. */
-	int		weapon_script;
-	int		weapon_release;
 	char		demo_path[MAX_OSPATH];
 	/* The shared back-shift ring instance lives file-static in
 	 * qnn_collect_helpers.c (see QNN_BackShiftRing).  MVD-path fire/jump
@@ -314,10 +298,10 @@ FILE *QNN_EmitFilter(qnn_snapshot_t *snapshot);
  * without space after the colon), else 0. */
 int QNN_OpIs(const char *line, const char *value);
 
-/* Fill action->look (view-relative turn delta) and action->weapon
- * (per-frame held-weapon state) from the current snapshot.  Shared by
- * the QWD usercmd-truth path and the MVD inference path. */
-void QNN_FillLookAndSwitch(qnn_action_t *action,
+/* Fill action->look (view-relative turn delta). Attack attribution is owned
+ * by the format-specific collector. Shared by the QWD usercmd-truth path and
+ * the MVD inference path. */
+void QNN_FillLook(qnn_action_t *action,
 	const qnn_snapshot_t *snapshot);
 
 /* Pack the per-axis op_input mask given press bits + per-axis op
@@ -382,10 +366,5 @@ uint8_t QNN_PackInputMask(
  * shot-stamped AF). */
 int QNN_EvalAttackFeasible(const qnn_snapshot_t *snapshot,
 	float start_of_tick_attack_finished);
-
-/* NOTE: the QWD act_weapon action-label helper (held + pending-impulse
- * lead) lives in qnn_qwd_collect.c, not here — it depends on the QW-only QC
- * predicate (QNN_ProgsEvalWeaponImpulse) and must not be linked into the NQ
- * worker via this shared module. */
 
 #endif /* QNN_COLLECT_HELPERS_H */

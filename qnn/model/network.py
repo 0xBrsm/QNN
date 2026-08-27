@@ -29,14 +29,14 @@ import torch
 from torch import nn
 
 from qnn.actions import MOVE_AXES, MOVE_AXIS_CLASSES
-from qnn.model.attack_head import AttackHead, AttackHeadInput
+from qnn.model.attack_head import AttackHead, AttackHeadInput, AttackSelectorInput
 from qnn.model.look_head import LookHead, LookHeadInput
 from qnn.model.move_head import MoveHead, MoveHeadInput
 from qnn.model.target import TargetPointer, TargetPointerInput
 from qnn.model.temporal import Temporal, TemporalInput
 from qnn.model.tokens.obs_fields import SCALAR_FIELDS
 from qnn.model.transformer import ObsEmbedding, TransformerEncoder
-from qnn.model.weapon_head import WeaponHead, WeaponHeadInput
+from qnn.model.weapon_head import WeaponHead
 from qnn.vocab import TOKEN_ACTOR
 
 
@@ -66,8 +66,6 @@ class ModelConfig:
     use_gru: bool
     d_gru: int
     use_weapon_head: bool
-    weapon_switch_confidence: float
-    weapon_switch_margin: float
     # Weapon-selector input composition as an ordered edge list, not bools.
     # Each member names a source the selector cat is built from, in order:
     #   "gru"          — temporal hidden (contributes only when a temporal
@@ -78,10 +76,8 @@ class ModelConfig:
     # Canonical is ("gru", "self_readout", "target_feat"). At least one of
     # {"gru", "self_readout"} must be present — target_feat alone is too thin.
     weapon_sources: tuple[str, ...]
-    weapon_context_from_obs: bool
     look_bypass_gru: bool
     d_target: int
-    self_weapon_embed_in_self: bool
     d_move: int
     d_look: int
     d_attack: int
@@ -161,14 +157,16 @@ ATTACK_HEAD = "attack"
 WEAPON_HEAD = "weapon"
 MOVE_HAZARD_HEAD = "move_hazard"  # a25 WHEN/termination head (opt-in)
 MOVE_SEG_HEAD = "move_seg"        # a25 segment (class x duration) head (opt-in)
+LOOK_SEG_HEAD = "look_seg"        # a25 look segment (onset-class x duration) head (opt-in)
 JUMP_HEAD = "jump"                # a25 2-class land-jump head (opt-in)
+ATTACK_FUTURE_HEAD = "attack_future"  # a27 MTP aux head (training-only, opt-in)
 
 # Output sizes, exported for callers that build padded buffers or
 # downstream layers against these sizes. Heads define their own
 # OUT_DIM internally; these are the public face.
 MOVE_HEAD_SIZE = MOVE_AXES * MOVE_AXIS_CLASSES  # 9 logits
 LOOK_HEAD_SIZE = 3  # 3D direction vector
-ATTACK_HEAD_SIZE = 1  # binary logit
+ATTACK_HEAD_SIZE = 9  # categorical no-attack + Quake impulses 1..8
 
 # Offset of the relative-XYZ block inside an actor's per-token scalar vector.
 # Mirrors qnn.bc.target_labeler._ACTOR_REL_OFFSET; duplicated here so the model
@@ -278,6 +276,7 @@ def slot_dims(
     has_target_pointer: bool,
     has_weapon_head: bool,
     weapon_sources: "tuple[str, ...]",
+    intent_dim: int = 0,
 ) -> dict[str, int]:
     """Single authority for the dim contract Network's slots are built with.
 
@@ -295,18 +294,31 @@ def slot_dims(
     a weapon head present, sits *between* the readout and weapon_context where no
     prefix slice can drop it). "If target is off, it's off."
 
+    ``intent_dim`` > 0 splices a shared ATTACK-INTENT block into the motor
+    feature vector, between the base features and ``weapon_context``. It sits
+    there deliberately, not at the end: heads prefix-slice to their declared
+    ``in_dim``, so a block appended last would be silently sliced OFF by exactly
+    the canonical heads (look_seg / move_seg / jump) this block exists to reach.
+    The same reasoning the ``target_dim`` note above records.
+
     Keys:
-      base_features_dim — input to motor heads excluding weapon_context.
-      motor_in          — input to MoveHead / LookHead / AttackHead.
-      weapon_in         — input to WeaponHead's classifier.
+      base_features_dim  — pre-intent features. The intent PRODUCER reads this
+                           (it cannot consume its own output), as does any head
+                           that predates the coordination block.
+      coord_features_dim — base + intent. What the coordinated heads read.
+      motor_in           — input to MoveHead / LookHead / AttackHead.
+      weapon_in          — input to WeaponHead's classifier.
+      intent_dim         — width of the shared intent block (0 = off).
     """
     d_gru = int(d_gru) if has_temporal else 0
     d_model = int(d_model)
+    intent_dim = max(0, int(intent_dim))
     weapon_ctx_dim = d_model if has_weapon_head else 0
     readout_dim = d_gru if has_temporal else d_model
     target_dim = d_model if has_target_pointer else 0
     base_features_dim = readout_dim + target_dim
-    motor_in = base_features_dim + weapon_ctx_dim
+    coord_features_dim = base_features_dim + intent_dim
+    motor_in = coord_features_dim + weapon_ctx_dim
     weapon_in = sum(
         _weapon_source_dim(src, d_model=d_model, d_gru=d_gru, has_temporal=has_temporal)
         for src in weapon_sources
@@ -315,6 +327,8 @@ def slot_dims(
         "d_model": d_model,
         "d_gru": d_gru,
         "base_features_dim": base_features_dim,
+        "coord_features_dim": coord_features_dim,
+        "intent_dim": intent_dim,
         "motor_in": motor_in,
         "weapon_in": weapon_in,
     }
@@ -367,7 +381,9 @@ class Network(nn.Module):
         weapon_head: "nn.Module | Off | None" = None,
         move_hazard_head: "nn.Module | Off | None" = Off,
         move_seg_head: "nn.Module | Off | None" = Off,
+        look_seg_head: "nn.Module | Off | None" = Off,
         jump_head: "nn.Module | Off | None" = Off,
+        attack_future_head: "nn.Module | Off | None" = Off,
     ) -> None:
         super().__init__()
         if obs_embedding is Off:
@@ -378,7 +394,6 @@ class Network(nn.Module):
         self.config = model
         self.obs_embedding = obs_embedding if obs_embedding is not None else ObsEmbedding(
             d_model=int(model.d_model),
-            self_weapon_embed_in_self=bool(model.self_weapon_embed_in_self),
         )
         self.encoder = encoder if encoder is not None else TransformerEncoder(
             d_model=int(model.d_model),
@@ -442,7 +457,6 @@ class Network(nn.Module):
                 f"'token:<name>' source; got {self.weapon_sources!r} "
                 "(target_feat alone is too thin)"
             )
-        self.weapon_context_from_obs = bool(model.weapon_context_from_obs)
         self.d_target = int(model.d_target)
         self.d_move = int(model.d_move)
         self.d_look = int(model.d_look)
@@ -460,12 +474,27 @@ class Network(nn.Module):
         self._has_move_head = move_head is not Off
         self._has_look_head = look_head is not Off
         self._has_attack_head = attack_head is not Off
+        self._has_attack_selector = (
+            isinstance(attack_head, nn.Module)
+            and hasattr(attack_head, "attack_loss")
+        )
+        if self._has_attack_selector and self._has_weapon_head:
+            raise ValueError("categorical attack_head cannot coexist with a weapon_head")
         # a25 hazard head: opt-in only (no canonical fallback). Present iff
         # build_network passed a real module — default Off keeps every existing
         # Network construction (which never passes it) hazard-free.
         self._has_move_hazard_head = isinstance(move_hazard_head, nn.Module)
         self._has_move_seg_head = isinstance(move_seg_head, nn.Module)
+        self._has_look_seg_head = isinstance(look_seg_head, nn.Module)
         self._has_jump_head = isinstance(jump_head, nn.Module)
+        self._has_attack_future_head = isinstance(attack_future_head, nn.Module)
+        # a27 MTP aux head switch (agents/plans/mtp-attack-future-probe.md).
+        # A PLAIN attribute, not a buffer: it must never enter the state dict
+        # (a checkpoint would then carry an export-time value into training)
+        # and it must be flippable on a loaded model. Export sets it False so
+        # the aux MLP is never traced into the ONNX graph — the move_hazard
+        # precedent, minus the derived-input coincidence.
+        self.aux_training_heads: bool = True
 
         # Build the upstream slots (temporal, target pointer) FIRST so the
         # downstream dim contract reads their declared out_dim rather than a
@@ -497,7 +526,7 @@ class Network(nn.Module):
             d_gru=self.d_gru,
             has_temporal=self._has_temporal,
             has_target_pointer=self._has_target_pointer,
-            has_weapon_head=self._has_weapon_head,
+            has_weapon_head=self._has_weapon_head or self._has_attack_selector,
             weapon_sources=self.weapon_sources,
         )
         motor_in = dims["motor_in"]
@@ -510,7 +539,6 @@ class Network(nn.Module):
                     d_model=self.d_model,
                     d_hidden=self.d_weapon,
                     activation=self.head_activation,
-                    context_from_obs=self.weapon_context_from_obs,
                 )
             else:
                 self.weapon_head = weapon_head
@@ -537,6 +565,10 @@ class Network(nn.Module):
 
         if self._has_move_seg_head:
             self.move_seg_head = move_seg_head
+        if self._has_look_seg_head:
+            # a25 look segment head: opt-in passenger, same contract as
+            # move_seg (reads the shared motor feature vector).
+            self.look_seg_head = look_seg_head
         if self._has_jump_head:
             # a25 land-jump head: opt-in only, same passenger contract as
             # move_seg (reads the shared motor feature vector).
@@ -544,6 +576,18 @@ class Network(nn.Module):
         if self._has_move_hazard_head:
             # No canonical fallback — always an override built by build_network.
             self.move_hazard_head = move_hazard_head
+        if self._has_attack_future_head:
+            # ASSIGNED LAST, and this ordering is load-bearing: _init_weights
+            # walks self.modules() in registration order, so appending the aux
+            # head at the end leaves every other module's xavier_uniform_ draw
+            # bit-identical to the control arm at the same seed. Moving this
+            # block up would reshuffle the RNG stream and make the two probe
+            # arms incomparable. Ordering is HALF the invariant — the head's
+            # builder also restores the RNG across its nn.Linear constructor
+            # draw, which lands before _init_weights runs
+            # (attack_future_head._build_attack_future). Both are pinned by
+            # tests/model/test_attack_future_head.py.
+            self.attack_future_head = attack_future_head
 
         self._init_weights()
 
@@ -648,8 +692,8 @@ class Network(nn.Module):
         entity_scalars_flat = flat_obs["entity_scalars_raw"]
         entity_rel_flat = entity_scalars_flat[..., _ACTOR_REL_OFFSET:_ACTOR_REL_OFFSET + 3]
 
-        weapon_out = None
-        if self._has_weapon_head:
+        selector_out = None
+        if self._has_weapon_head or self._has_attack_selector:
             # Selector cat — assembled by iterating weapon_sources in declared
             # order. The "gru" source only exists when temporal is on; it's
             # dropped from the cat otherwise (matching its 0-width dim).
@@ -682,17 +726,19 @@ class Network(nn.Module):
                 [_ws_available[src] for src in self.weapon_sources if src in _ws_available],
                 dim=-1,
             )
+            selector_head = (
+                self.attack_head if self._has_attack_selector else self.weapon_head
+            )
             _feas_mask = (
                 self._weapon_feasibility_mask(flat_obs)
-                if getattr(self.weapon_head, "wants_feasibility_mask", False)
+                if getattr(selector_head, "wants_feasibility_mask", False)
                 else None
             )
-            weapon_out = self.weapon_head(WeaponHeadInput(
+            selector_out = selector_head(AttackSelectorInput(
                 selector=weapon_selector_flat,
-                obs_weapon_id=flat_obs["self_weapon_id"] if self.weapon_context_from_obs else None,
                 feasibility_mask=_feas_mask,
             ))
-        weapon_context = weapon_out.context if weapon_out is not None else None
+        weapon_context = selector_out.context if selector_out is not None else None
 
         move_features_flat = self._with_weapon_context(features_base_flat, weapon_context)
         move_out = self.move_head(MoveHeadInput(features=move_features_flat)) if self._has_move_head else None
@@ -708,11 +754,27 @@ class Network(nn.Module):
             # as the move head; the module prefix-slices to its declared inputs.
             move_seg_out = self.move_seg_head(move_features_flat)
 
+        look_seg_out = None
+        if self._has_look_seg_head:
+            # a25 look segment head (passenger): reads the SAME motor feature
+            # vector as the move/look heads; the module prefix-slices to its
+            # declared inputs.
+            look_seg_out = self.look_seg_head(move_features_flat)
+
         jump_out = None
         if self._has_jump_head:
             # a25 land-jump head (passenger): same motor feature vector; the
             # module prefix-slices to its declared inputs.
             jump_out = self.jump_head(move_features_flat)
+
+        attack_future_out = None
+        if self._has_attack_future_head and self.aux_training_heads:
+            # a27 MTP aux head: reads features_base_flat, NOT move_features_flat.
+            # The motor vector carries weapon_context = softmax(attack_logits) @
+            # embed, so feeding it would route this head's gradient into the
+            # attack head — exactly the attack marginal the probe holds fixed.
+            # Skipped entirely when aux_training_heads is off (export).
+            attack_future_out = self.attack_future_head(features_base_flat)
 
         move_hazard_out = None
         # The move-hazard (a25 WHEN-law) head is a TRAINING auxiliary: it consumes
@@ -758,11 +820,10 @@ class Network(nn.Module):
         )
 
         attack_features_flat = self._with_weapon_context(features_base_flat, weapon_context)
-        if self._has_attack_head:
+        if self._has_attack_head and not self._has_attack_selector:
             attack_out = self.attack_head(AttackHeadInput(
                 features=attack_features_flat,
                 look_prior=look_prior_for_attack,
-                weapon_id=flat_obs["self_weapon_id"],
                 target_logits=target_logits,
                 entity_scalars=entity_scalars_flat,
                 actor_mask=actor_mask_flat,
@@ -776,8 +837,12 @@ class Network(nn.Module):
             logits_flat[MOVE_HEAD] = move_out.logits
         if move_seg_out is not None:
             logits_flat[MOVE_SEG_HEAD] = move_seg_out
+        if look_seg_out is not None:
+            logits_flat[LOOK_SEG_HEAD] = look_seg_out
         if jump_out is not None:
             logits_flat[JUMP_HEAD] = jump_out
+        if attack_future_out is not None:
+            logits_flat[ATTACK_FUTURE_HEAD] = attack_future_out
         if move_hazard_out is not None:
             # Per-axis release-hazard logits — consumed by the loss (phase 3) and
             # the move WHEN-decode; not an argmax-sampled action vector.
@@ -798,12 +863,9 @@ class Network(nn.Module):
             logits_flat["_attack_prior"] = attack_out.prior_logit
             logits_flat["_attack_delta"] = attack_out.delta_attack
             logits_flat[ATTACK_HEAD] = attack_out.attack_logit
-        if weapon_out is not None:
-            logits_flat[WEAPON_HEAD] = weapon_out.logits
-            # Loss-only underscored key (not used for inference/sampling) so a
-            # bench weapon head's LOSS can live entirely in bench — mirrors look.
-            if getattr(weapon_out, "when_logit", None) is not None:
-                logits_flat["_weapon_switch_when"] = weapon_out.when_logit
+        if selector_out is not None:
+            selector_key = ATTACK_HEAD if self._has_attack_selector else WEAPON_HEAD
+            logits_flat[selector_key] = selector_out.logits
 
         features_flat = move_features_flat  # downstream consumers ignore the weapon-ctx dim
         values_flat = torch.zeros((batch_flat,), dtype=sample.dtype, device=sample.device)

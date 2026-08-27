@@ -48,7 +48,6 @@ from qnn.model.bench.side_channels import (
     _target_supervision_scope,
 )
 from qnn.model.policy import QNNPolicy
-from qnn.vocab import self_weapon_id_to_impulse
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -72,9 +71,9 @@ MAX_LANES = 128
 #: Weapon names indexed by impulse (1..8).
 WEAPON_NAMES = ("NONE", "AXE", "SG", "SSG", "NG", "SNG", "GL", "RL", "LG")
 
-#: obs["self_weapon_id"] entity-ID to name mapping (used by empirical_fire_range).
-ENTITY_WEAPON_NAMES = {3: "axe", 4: "sg", 5: "ssg", 6: "ng",
-                       7: "sng", 8: "gl", 9: "rl", 10: "lg"}
+#: Action impulse to short name (used by empirical_fire_range).
+IMPULSE_WEAPON_NAMES = {1: "axe", 2: "sg", 3: "ssg", 4: "ng",
+                        5: "sng", 6: "gl", 7: "rl", 8: "lg"}
 
 #: Slice indices for entity_scalars_raw rel vector.
 _ESC_REL_BEGIN, _ESC_REL_END = 3, 6
@@ -92,16 +91,9 @@ ATTACK_INPUT_SLICES: dict[str, tuple[int, int]] = {
     "tang_norm":      (139, 140),
 }
 
-# 8-dim held-weapon token layout feeding obs_embedding.weapon_builder.projs.0.
-# The old obs_embedding.self_proj (Linear(17, d_model)) no longer exists in the
-# current HeldWeaponSplitObsEmbedding arch; self scalars are split across three
-# TokenBuilder sub-projections.  The held-weapon builder (projs.0) is the most
-# attack-relevant self sub-token: it contains attack_finished (the cooldown gate)
-# plus the 7-dim weapon-static impulse-gathered scalars.
-# Layout: ScalarGroup(["weapon_static"(7), "attack_finished"(1)]) -> Linear(8, d_model).
+# Cooldown scalar in the arsenal token.
 SELF_SCALAR_SLICES: dict[str, tuple[int, int]] = {
-    "weapon_static":   (0, 7),
-    "attack_finished": (7, 8),
+    "attack_finished": (0, 1),
 }
 
 # 19-dim actor-scalar layout feeding obs_embedding.proj_actor.
@@ -361,20 +353,17 @@ def _collect_predictions_flat(
                 _target_supervision_scope(act_b, None),
             ):
                 _, logits, *_ = policy._forward_tensors(obs_b)
-            attack_logit = logits["attack"].reshape(-1)
-            probs[start:end] = torch.sigmoid(attack_logit).detach().float().cpu().numpy()
+            attack_logits = logits["attack"].reshape(-1, 9)
+            probs[start:end] = (
+                1.0 - torch.softmax(attack_logits, dim=-1)[:, 0]
+            ).detach().float().cpu().numpy()
     attack_target = (
-        source.actions["attack"].reshape(-1).detach().cpu().numpy().astype(bool)
+        source.actions["attack"].reshape(-1).detach().cpu().numpy() > 0
     )
     input_mask = (
         source.actions["input_mask"].reshape(-1).detach().cpu().numpy().astype(np.uint8)
     )
-    weapon_raw = source.obs["self_weapon_id"].reshape(-1).detach().cpu().numpy()
-    weapon_imp = (
-        self_weapon_id_to_impulse(torch.from_numpy(weapon_raw.astype(np.int64)))
-        .numpy()
-        .astype(np.int8)
-    )
+    weapon_imp = source.actions["attack"].reshape(-1).detach().cpu().numpy().astype(np.int8)
     op = (input_mask & 1).astype(bool)                              # OPERATIVE filter
     return probs, attack_target, op, weapon_imp, np.asarray(source.episode_offsets, dtype=np.int64)
 
@@ -540,7 +529,7 @@ def empirical_fire_range(source) -> dict[str, dict]:
 
     For every val frame with ``attack=1`` AND ``input_mask_bit0=1`` (an
     engine-accepted demo press), computes the soft-target distance
-    ``|Σ p · rel|`` in world units and bins by ``self_weapon_id``.
+    ``|Σ p · rel|`` in world units and bins by actual action weapon.
 
     The operative filter ``engine_ready = input_mask & 1`` is applied by
     construction.
@@ -570,24 +559,21 @@ def empirical_fire_range(source) -> dict[str, dict]:
         soft_dist_qu = torch.linalg.vector_norm(soft_rel, dim=-1) * QNN_DIST_SCALE
 
     soft_dist = soft_dist_qu.float().cpu().numpy()
-    attack = source.actions["attack"].reshape(-1).detach().cpu().numpy().astype(bool)
+    attack_np = source.actions["attack"].reshape(-1).detach().cpu().numpy().astype(int)
     input_mask = (
         source.actions["input_mask"].reshape(-1).detach().cpu().numpy().astype(np.uint8)
     )
-    weapon_np = source.obs["self_weapon_id"].reshape(-1).detach().cpu().numpy().astype(int)
-
     engine_ready = (input_mask & 1).astype(bool)                    # OPERATIVE filter
-    fired = attack & engine_ready
+    fired = (attack_np > 0) & engine_ready
 
     qs = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
     out: dict[str, dict] = {}
-    for wid, name in ENTITY_WEAPON_NAMES.items():
-        m = fired & (weapon_np == wid)
+    for impulse, name in IMPULSE_WEAPON_NAMES.items():
+        m = fired & (attack_np == impulse)
         n = int(m.sum())
         if n < 50:
             continue
         dists = soft_dist[m]
-        impulse = int(self_weapon_id_to_impulse(wid))
         engine_range = float(WEAPON_PHYSICS[impulse].get("range", float("nan")))
         beyond = (
             float(np.mean(dists > engine_range) * 100.0)
@@ -596,7 +582,6 @@ def empirical_fire_range(source) -> dict[str, dict]:
         )
         out[name] = {
             "weapon": name,
-            "entity_id": wid,
             "impulse": impulse,
             "engine_range_qu": engine_range,
             "n_fires": n,
@@ -794,7 +779,7 @@ def input_ablation(
     source,
     *,
     target: str = "attack_head.mlp.0",
-    self_target: str = "obs_embedding.weapon_builder.projs.0",
+    self_target: str = "obs_embedding.self_builders.arsenal.projs.0",
     actor_target: str = "obs_embedding.proj_actor",
     attack_input_slices: dict[str, tuple[int, int]] | None = None,
     self_scalar_slices: dict[str, tuple[int, int]] | None = None,
@@ -891,7 +876,6 @@ def input_ablation(
         k for k, r in self_ablation_rows.items() if abs(float(r["delta"])) < 0.0005
     ]
     af = float(self_ablation_rows["attack_finished"]["delta"])
-    ws = float(self_ablation_rows["weapon_static"]["delta"])
     flags = []
     if abs(af) < 0.005:
         flags.append(
@@ -903,21 +887,11 @@ def input_ablation(
             f"`attack_finished` ablation Δ = {af:+.4f} (acts as the cooldown "
             "gate as expected)"
         )
-    if abs(ws) < 0.005:
-        flags.append(
-            f"`weapon_static` ablation Δ = {ws:+.4f} — small; the held-weapon "
-            "token's physics stats are not driving the attack decision directly"
-        )
-    else:
-        flags.append(
-            f"`weapon_static` ablation Δ = {ws:+.4f} — the held-weapon "
-            "physics scalars are contributing to the attack decision"
-        )
     self_interp = (
         f"Essential scalars (Δloss ≥ 0.005): {self_essential or 'none'}. "
         f"Near-dead scalars (|Δloss| < 0.0005): {self_dead or 'none'}. "
         f"{self_agreement} "
-        f"Spot checks: {flags[0]}; {flags[1]}."
+        f"Spot check: {flags[0]}."
     )
 
     # --- Section 3: encoder actor_scalars ---

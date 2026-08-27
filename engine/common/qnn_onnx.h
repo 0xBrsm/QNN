@@ -50,6 +50,15 @@ void QNN_OnnxFree(qnn_onnx_ctx_t *ctx);
  * this rate. Returns 0 if ctx is NULL. */
 int QNN_OnnxTickHz(const qnn_onnx_ctx_t *ctx);
 
+/* The model's compiled OBS PLAN (obs_api v1 — agents/plans/obs-api.md):
+ * from its `obs_declaration` metadata prop when stamped, else the
+ * wire-identity shim for the stamped wire.12.x/.13.x fleet, else the
+ * built-in raycast-era compute declaration (wire.7/.9/.11). The live
+ * client emits through it (QNN_IOEmitPlan) so the engine computes
+ * EXACTLY this model's observation. Never NULL for a loaded ctx. */
+struct qnn_obs_plan_s;
+const struct qnn_obs_plan_s *QNN_OnnxObsPlan(const qnn_onnx_ctx_t *ctx);
+
 /* Thread-local last error message. "" if no error has been raised
  * on this thread. */
 const char *QNN_OnnxLastError(void);

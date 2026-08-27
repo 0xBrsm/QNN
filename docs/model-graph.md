@@ -24,9 +24,8 @@ A model graph is a JSON object with five sections: `tokens`, `encoder`, `tempora
   "tokens": {
     "cls":     {"kind": "cls"},
     "state":   {"scalars": ["health_armor"], "vocab": ["armor_type"], "vocab_sum": ["powerup_state"]},
-    "arsenal": {"readiness": true, "vocab_sum": ["powerup_arsenal"]},
+    "arsenal": {"scalars": ["attack_finished"], "readiness": true, "vocab_sum": ["powerup_arsenal"]},
     "motion":  {"scalars": ["velocity", "view_pitch", "look_delta"], "vocab": ["movement_id"], "vocab_sum": ["powerup_motion"]},
-    "held_weapon": {"scalars": ["weapon_static", "attack_finished"], "vocab": ["weapon_id"]},
     "spatial":  {"kind": "spatial"},
     "entities": {"kind": "entities"}
   },
@@ -36,11 +35,10 @@ A model graph is a JSON object with five sections: `tokens`, `encoder`, `tempora
     "target": {"type": "mlp", "d_target": 16}
   },
   "heads": {
-    "move":   {"type": "cls",   "inputs": ["readout", "target.feat"], "d_hidden": 64, "activation": "gelu"},
+    "move_seg": {"type": "canonical", "inputs": ["readout", "target.feat"], "d_hidden": 64, "activation": "gelu"},
+    "jump":   {"type": "canonical", "inputs": ["readout", "target.feat"], "d_hidden": 64, "activation": "gelu"},
     "look":   {"type": "polar", "inputs": ["readout", "target.feat"], "d_hidden": 64, "activation": "gelu"},
-    "attack": {"type": "cls",   "inputs": ["readout", "target.feat"], "d_hidden": 64, "activation": "gelu"},
-    "weapon": {"type": "cls",   "inputs": ["gru"], "d_hidden": 64, "activation": "gelu",
-               "context_from_obs": false}
+    "attack": {"type": "attack_with", "inputs": ["gru", "target.feat"], "d_hidden": 64, "activation": "gelu", "feasibility_mask": true}
   }
 }
 ```
@@ -54,7 +52,7 @@ Each entry under `tokens` declares one token built by `TokenBuilder` from the fi
 - `vocab_sum` — names with `reduce="sum"` (`VocabSum`).
 - `readiness: true` — appends the `WeaponReadiness` einsum source.
 - `kind_tag: true` — adds the encoder's self `KindTag` row (the monolithic-self layout uses it; split-self tokens do not).
-- `kind` — reserved token kinds the builder constructs outside `TokenBuilder`: `cls`, `spatial`, `entities`. Entity tokens keep the per-type projections (`actor`, `projectile`, `item`, `mover`) inside `GraphObsEmbedding`; they are not field-declarative.
+- `kind` — reserved token kinds the builder constructs outside `TokenBuilder`: `cls`, `spatial`, `entities`. A27 entity tokens keep the actor/projectile projections inside `GraphObsEmbedding`; they are not field-declarative.
 
 Field order inside a token is fixed (scalars → kind_tag → vocab → readiness → vocab_sum) so the parameter layout is deterministic. `GraphObsEmbedding` replaces the `ObsEmbedding` subclass zoo: layouts are token dicts, not classes.
 
@@ -70,7 +68,8 @@ Token ordering constraint: `[cls?, fields.., spatial?, entities]` — the reserv
 
 Each head names its `type` (resolved via the self-registered node builders in `node_registry`) and its `inputs` — an ordered list of edge names whose widths are summed to size the head's input Linear.
 
-Valid head names (v1): `move`, `look`, `attack`, `weapon`, `move_hazard`.
+Current public head names are `move`, `look`, and `attack`, plus the
+generation-specific `move_seg`, `jump`, and retired compatibility slots.
 
 Motor heads (`move`, `look`, `attack`, `move_hazard`) must share identical `inputs` — `Network` builds one shared motor feature vector and feeds it to all of them. When a target pointer is declared, motor heads must include `target.feat` (there is no per-head opt-out).
 
@@ -84,7 +83,10 @@ Motor heads (`move`, `look`, `attack`, `move_hazard`) must share identical `inpu
 
 `inputs` replaces both `weapon_sources` and the implicit `motor_in` composition. Dangling edges are a build-time error — there is no "silently dropped" source and no zero-padding for absent nodes.
 
-The `weapon` head may additionally carry a `decode` block with `sticky_confidence` and `sticky_margin` (the sticky-gate thresholds baked into ONNX export). The decode regime is part of the model, never decided by the engine.
+The A27 `attack` slot contains the 9-class attack-with head. Class 0 is no
+attack and classes 1 through 8 are attack with that Quake impulse. Its optional
+`feasibility_mask` gates impossible attack classes from ownership/ammo readiness
+and cooldown state before softmax, loss, and decode.
 
 The PPO critic is not a graph node. The native trainer owns a small MLP value
 head over the graph's motor features; it is saved in RL resume checkpoints but
@@ -139,7 +141,7 @@ Checkpoints save `meta["model_graph"] = spec.to_dict()`. The loader branches: `m
 {
   "base": "full_5head",
   "overrides": {
-    "heads": {"weapon": {"inputs": ["gru", "target.feat"]}}
+    "heads": {"attack": {"inputs": ["gru", "target.feat"]}}
   }
 }
 ```
@@ -161,7 +163,10 @@ Loss weights stay in `train.json` (`head_loss_weights`) like every other trainin
 - `decode_attack_bit` — sigmoid + threshold (greedy) or temperature-Bernoulli (sampled).
 - `decode_move_axes` — per-axis categorical readout (argmax greedy / categorical-sample sampled).
 
-What does NOT live here: generation-specific geometry (polar-look hybrid, sticky-weapon gate, aim-prior blend) and stateful move layers (hysteresis, semi-Markov hazard, watermarking) — those belong to the generation's decode module and are referenced by the decode config.
+What does NOT live here: generation-specific geometry (polar-look hybrid and
+aim-prior blend) and stateful move layers (hysteresis, semi-Markov hazard,
+watermarking) — those belong to the generation's decode module and are
+referenced by the decode config.
 
 **`qnn.model.decode_config`** resolves a run-pinned decode-config JSON (`decode_version` 1) into modules and parameters for export and eval. Schema fields: `decode_module` (dotted import — gen decode geometry), `guard_module` (dotted import or `"none"`), `version` (provenance string), `look_grid`, `move_hazard`, `params` (flat str→scalar/list map). The exporter stamps the resolved config's sha256 and the repo git sha into ONNX `metadata_props`. Regime names (`a24rc1`, `a24rc2`, etc.) are convenience aliases resolved to bundled template JSONs; A/B comparison is done by pointing at a different config file, not by changing code.
 

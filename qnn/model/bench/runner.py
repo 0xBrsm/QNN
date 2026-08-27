@@ -79,11 +79,11 @@ def _resolve_probe_model(probe: dict[str, Any]):
     return model_config_from_graph(graph), None, graph
 
 
-def _build_head_probe_bc_config(
+def _build_bench_bc_config(
     run_cfg: dict[str, Any],
     device: str,
 ) -> tuple[BCConfig, "Callable[[int, Any], Any] | None", "Any | None"]:  # noqa: F821
-    """Translate a head_probe run-dir config into BCConfig + model source.
+    """Translate a bench run-dir config into BCConfig + model source.
 
     Mirrors ``qnn.run.config.build_run_bc_config``: copy train.json
     verbatim, augment with the output_dir + bc_data_dir + machine
@@ -113,7 +113,7 @@ def _build_head_probe_bc_config(
         del _payload
         if _ckpt_graph is None:
             raise RuntimeError(
-                f"{seed_checkpoint} has no embedded model_graph — head_probe "
+                f"{seed_checkpoint} has no embedded model_graph — bench "
                 "warm-start requires a graph checkpoint")
         if graph is not None and _ckpt_graph != graph.to_dict():
             raise RuntimeError(
@@ -126,7 +126,7 @@ def _build_head_probe_bc_config(
     # Pin the look turn-delta grid this run trains/decodes with. The grid lives
     # in the run dir (config/look_grid.json) — written by run.init from the
     # corpus's data-fit grid (or the materialized code-default for retained
-    # models). No implicit default: a head_probe run-dir must carry its grid.
+    # models). No implicit default: a bench run-dir must carry its grid.
     # Installing here (once, before the model factory runs) keeps the loss
     # target and the offline decode on the SAME centers. See
     # qnn.model.look_bins.install_polar_grid + qnn.human.look_grid.
@@ -141,7 +141,7 @@ def _build_head_probe_bc_config(
     _grid = _json.loads(grid_path.read_text())
     _look_bins.install_polar_grid(_grid["mag_centers_rad"], _grid.get("dir_centers_rad"),
                                   deadzone_rad=_grid.get("deadzone_rad"))
-    print(f"  [head_probe] look grid pinned: source={_grid.get('source','?')} "
+    print(f"  [bench] look grid pinned: source={_grid.get('source','?')} "
           f"hold_max={_grid['hold_max_rad']:.5f} rad "
           f"(fit rms {_grid.get('fit_rms_deg', '?')} vs default {_grid.get('default_rms_deg', '?')})")
 
@@ -180,7 +180,7 @@ def run(ctx: RunnerContext) -> dict[str, object]:
     results = base_results(ctx)
     stage_timings: dict[str, float] = {}
 
-    bc_config, model_factory, graph = _build_head_probe_bc_config(ctx.run_cfg, ctx.device)
+    bc_config, model_factory, graph = _build_bench_bc_config(ctx.run_cfg, ctx.device)
     prepare_bc_run_outputs(ctx.run_cfg, resume=ctx.resume)
 
     bc_data_dir = Path(bc_config.bc_data_dir)

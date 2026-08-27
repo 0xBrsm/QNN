@@ -8,7 +8,7 @@ factory/registry reload path. (The legacy `HEADS` registry + `full_*.py`
 assemblies were retired once the rc lineage migrated to graph checkpoints;
 concluded ablations are archived under `runs/_archive/bc/a24/`.)
 
-The runner translates a head_probe run-dir into a `BCConfig` + the resolved
+The runner translates a bench run-dir into a `BCConfig` + the resolved
 `GraphSpec` + `head_loss_weights` and hands it to `run_behavior_cloning`. Shard
 loading, segment_mask filtering, fingerprint verification, episode shuffling,
 BPTT batching, eval cadence, checkpointing, and `bc_history.json` are all the

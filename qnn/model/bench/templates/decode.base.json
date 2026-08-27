@@ -2,8 +2,8 @@
   "decode_version": 1,
   "version": "a25base",
   "description": "a25-native BASE decode template for decode-fit. Legacy attack.bias_vec stays zero for artifact reproducibility; split_v1 uses fire-only attack.fire_bias_vec, selection-only weapon.preference_bias_vec, and weapon.switch_margin, all calibrated on final-aim free play before promotion.",
-  "decode_module": "qnn.model.bench.a25.decode",
-  "guard_module": "qnn.model.bench.a25.guard",
+  "decode_module": "qnn.model.decode_actions",
+  "guard_module": "qnn.model.guard",
   "look_grid": "config/look_grid.json",
   "params": {
     "look.aim_prior_gain": 0.0,

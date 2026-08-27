@@ -110,16 +110,23 @@ void IN_Move(usercmd_t *cmd)
 	else if (cl.stats[STAT_HEALTH] > 0)
 		in_jump.state = 0;
 
-	/* weapon byte 1..8 is a Quake impulse directly (axe..lightning);
-	 * the server's QC rejects impulses for unowned weapons.  Only send
-	 * it when it differs from the held weapon: stock W_ChangeWeapon has
-	 * no same-weapon guard, so a per-tick impulse re-runs
-	 * W_SetCurrentAmmo -> player_run() every server frame, playing the
-	 * run animation at 4x and stomping pain frames.  The action log
-	 * still records the raw decided weapon (qnn_client_main.c). */
-	if (qnn_pending_action.weapon > 0
-		&& qnn_pending_action.weapon != QNN_WeaponId())
-		in_impulse = qnn_pending_action.weapon;
+	/* Impulse byte 1..8 is a Quake weapon impulse directly (axe..lightning);
+	 * the server's QC rejects impulses for unowned weapons.  Its SOURCE
+	 * differs by contract: FULL wires (wire.11/wire.12) carry the held weapon
+	 * in `weapon`; the A27 combat wire (wire.13) folds select-and-fire into the
+	 * 9-way `attack` (1..8 = that impulse), leaving `weapon` at 0.  Only send
+	 * it when it differs from the held weapon: stock W_ChangeWeapon has no
+	 * same-weapon guard, so a per-tick impulse re-runs W_SetCurrentAmmo ->
+	 * player_run() every server frame, playing the run animation at 4x and
+	 * stomping pain frames.  The action log records the raw decided value
+	 * (qnn_client_main.c). */
+	{
+		int impulse = (QNN_IOGetEntityMode() == QNN_ENTITY_MODE_COMBAT)
+			? (int)qnn_pending_action.attack
+			: (int)qnn_pending_action.weapon;
+		if (impulse > 0 && impulse != QNN_WeaponId())
+			in_impulse = impulse;
+	}
 }
 
 void QNN_ArenaApplyLocalAction(const qnn_action_t *action)

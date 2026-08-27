@@ -35,14 +35,30 @@
 
 /* Which spatial obs block the emit path produces per tick. Exactly ONE
  * is emitted — the engine obeys the loaded model's codec, never computes
- * both. The ONNX load path pushes the active codec's declared mode via
- * QNN_IOSetSpatialMode; the default (no model loaded — e.g. corpus
- * collect, which packs the flat atlas obs buffer) is the v2 atlas. */
+ * both. Post-obs-api (WS2) the ATLAS parameterization (24-packed vs the
+ * a26 rc1 72-unpacked) rides the compiled emit plan — the old
+ * ATLAS_LEGACY override is retired. What remains of this mode is the
+ * wire.7/.9/.11 raycast residue: the v1 raycast scalars are NOT a
+ * registry field (they live outside the flat obs buffer, consumed only
+ * by the ONNX scratch packer), so QNN_IOEmitPlan still keys their
+ * emission on this global, pushed by QNN_OnnxInit at model load. The
+ * default (no model loaded) is the atlas. */
 typedef enum {
-	QNN_SPATIAL_MODE_ATLAS = 0,   /* wire.12 depth atlas (default) */
-	QNN_SPATIAL_MODE_ATLAS_LEGACY,/* pre-final a26 rc1: 72 unpacked cells */
+	QNN_SPATIAL_MODE_ATLAS = 0,   /* depth atlas — params from the plan */
 	QNN_SPATIAL_MODE_RAYCAST_V1,  /* wire.11 raycast scalars */
 } qnn_spatial_mode_t;
+
+/* Which entity stream the oracle produces + the packer lays out per tick.
+ * FULL = all token types (projectile/actor/item/mover) with recency and the
+ * sight/proximity/sound/memory modality ladder (wire.11/wire.12). COMBAT =
+ * current-frame actor/projectile only, SIGHT/PROXIMITY, no recency, no item/
+ * mover (wire.13 / the A27 pure-combat substrate). Set at model load from the
+ * selected codec (qnn_onnx.c); the default is COMBAT — the A27 tree's native
+ * contract, so corpus collect (no model loaded) produces the combat stream. */
+typedef enum {
+	QNN_ENTITY_MODE_FULL = 0,     /* wire.11/wire.12 full entity stream */
+	QNN_ENTITY_MODE_COMBAT,       /* wire.13 A27 pure-combat stream (default) */
+} qnn_entity_mode_t;
 
 /* ── Normalization constants ───────────────────────────────────── */
 
@@ -92,13 +108,19 @@ typedef enum {
  *      [1 player_id (u8)        ACTOR only — omitted for other types]
  *       1 event_count (u8)
  *       event_count × 2  interleaved (action, source) u8 pairs
- *       … per-type scalars (see below)
+ *       … per-type scalars (see below) — the scalar block is
+ *         POLICY-DEPENDENT (qnn_obs_registry.c
+ *         QNN_ObsEmitEntityRowV1/V3); the default plan (policy v3,
+ *         this 864 B frame) uses the V3 shapes below. v1 (the
+ *         wire-shim FULL stream, wire.9/.11/.12.x) additionally
+ *         carries recency in every row plus the ITEM/MOVER types.
  *
- *     PROJECTILE per-type (14 B):
+ *     PROJECTILE per-type, v3 combat (12 B, no recency):
  *         rel[3]  i16 × 3      raw Quake units
  *         vel[3]  i16 × 3      clamped ±VELOCITY_SCALE
- *         recency f16          raw seconds
- *     ACTOR per-type (30 B):
+ *     PROJECTILE per-type, v1 full (14 B): as above + recency f16 (raw seconds)
+ *
+ *     ACTOR per-type, v3 combat (28 B, no recency):
  *         half_extents[3] u8 × 3  (saturating)
  *         rel[3]   i16 × 3
  *         vel[3]   i16 × 3
@@ -108,8 +130,9 @@ typedef enum {
  *         facing   u8           raw round(value × 255)
  *         team     u8
  *         score    u8           raw round(value × 255)
- *         recency  f16
- *     ITEM per-type (24 B):
+ *     ACTOR per-type, v1 full (30 B): as above + recency f16
+ *
+ *     ITEM per-type (v1 full ONLY — 24 B; never emitted under v3):
  *         half_extents[3] u8 × 3
  *         rel[3]   i16 × 3
  *         path[3]  i16 × 3
@@ -118,7 +141,7 @@ typedef enum {
  *         amount   u8           raw round(value × 255)
  *         regen    f16
  *         recency  f16
- *     MOVER per-type (22 B):
+ *     MOVER per-type (v1 full ONLY — 22 B; never emitted under v3):
  *         half_extents[3] u8 × 3
  *         rel[3]   i16 × 3
  *         path[3]  i16 × 3
@@ -430,21 +453,51 @@ void QNN_IOUpdate(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag)
 void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out);
 void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *result);
 
-/* Select which spatial block QNN_IOEmit produces. Set once at model load
- * from the selected codec (qnn_onnx.c) so the emit path computes EXACTLY
- * the loaded contract's spatial obs and skips the other. */
+/* The compiled default emit plan — today's packed 864-byte frame,
+ * served to consumers that carry no declaration.  QNN_IOEmit and
+ * QNN_IOPackObsBuffer walk it; per-seat plans (WS2) compile their own
+ * via qnn_obs_registry.h. */
+struct qnn_obs_plan_s;
+const struct qnn_obs_plan_s *QNN_IODefaultObsPlan(void);
+
+/* Plan-driven emit (WS2): compute EXACTLY the fields `plan` demands —
+ * atlas parameterization from the plan's atlas params, oracle
+ * disclosure from the plan's entity policy (v1 = FULL, v3 = COMBAT) —
+ * plus the wire.7/.9/.11 raycast residue when the loaded codec
+ * selected QNN_SPATIAL_MODE_RAYCAST_V1.  QNN_IOEmit is this over the
+ * default plan.  Serialize per-seat frames with QNN_ObsPlanPack. */
+void QNN_IOEmitPlan(const struct qnn_obs_plan_s *plan,
+	const qnn_snapshot_t *snapshot, qnn_tick_result_t *out);
+
+/* WS2 residue of the codec spatial-mode shim (see the enum above):
+ * selects ONLY whether QNN_IOEmitPlan additionally emits the v1
+ * raycast scalars. Atlas parameterization is plan-driven now. Set once
+ * at model load (qnn_onnx.c). */
 void QNN_IOSetSpatialMode(qnn_spatial_mode_t mode);
 
+/* Which entity stream the ACTION path assumes. Set once at model load
+ * from the selected codec. Post-WS2 the oracle's per-tick token
+ * qualification is derived from the emit plan's entity policy (the
+ * qnn_io.c provider sets this around the oracle call), so the steady
+ * global matters only to qnn_input.c's action interpretation (FULL
+ * wires carry the held weapon in `weapon`; the A27 combat wire folds
+ * select-and-fire into `attack`). */
+void QNN_IOSetEntityMode(qnn_entity_mode_t mode);
+qnn_entity_mode_t QNN_IOGetEntityMode(void);
+
 /* Pose tail: capture-time (origin_xyz, view_yaw) as 4 f32 in the obs
- * buffer's guaranteed-zero tail (the entity stream tops out well below
- * it). Not part of the wire contract — consumers opt in per channel:
- * collect stashes when QNN_POSE_DIAG is set (pose sidecars), the
- * trainer/arena workers when QNN_POSE_TAIL=1 (closed-loop pose for
- * probe-grid obs assembly + geometry metrics). Off = tail stays zero. */
+ * buffer's guaranteed-zero tail (every compiled plan reserves the last
+ * QNN_OBS_POSE_TAIL_BYTES of its frame; `frame_bytes` is the caller's
+ * plan frame size — QNN_OBS_BUFFER_SIZE for the default plan). Not
+ * part of the wire contract — consumers opt in per channel: collect
+ * stashes when QNN_POSE_DIAG is set (pose sidecars), the trainer/arena
+ * workers when QNN_POSE_TAIL=1 (closed-loop pose for probe-grid obs
+ * assembly + geometry metrics). Off = tail stays zero. */
 #define QNN_POSE_TAIL_OFF (QNN_OBS_BUFFER_SIZE - 16)
 typedef char qnn_obs_payload_must_not_overlap_pose_tail[
 	QNN_OBS_MAX_PAYLOAD_BYTES <= QNN_POSE_TAIL_OFF ? 1 : -1];
-void QNN_IOStashPoseTail(uint8_t *obs, const qnn_snapshot_t *snapshot);
+void QNN_IOStashPoseTail(uint8_t *obs, int frame_bytes,
+	const qnn_snapshot_t *snapshot);
 int QNN_IOPoseTailEnabled(void);
 
 /* ── Internal module functions (called by qnn_io.c) ──────────── */

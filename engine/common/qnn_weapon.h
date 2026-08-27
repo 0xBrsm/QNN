@@ -6,7 +6,7 @@
  *   RAW weapon id     1..8   Axe=1 SG=2 SSG=3 NG=4 SNG=5 GL=6 RL=7 LG=8
  *                            (QC impulse order). This is what every engine
  *                            and label path uses: snapshot->weapon_id, the
- *                            act_weapon byte, the .npy caches, the QC
+ *                            categorical action.attack label, the QC
  *                            predicates (QNN_ProgsEvalAttack guards 1..8),
  *                            cooldown/dedup tables. Use qnn_weapon_id_t /
  *                            QNN_WEAPON_* for these.

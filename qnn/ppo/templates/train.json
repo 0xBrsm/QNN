@@ -21,13 +21,11 @@
   "collector_dtype": "bf16",
   "rl_head_weights": {
     "attack": 1.0,
-    "move": 1.0,
-    "weapon": 1.0
+    "move": 1.0
   },
   "entropy_coef": {
     "attack": 0.005,
-    "move": 0.005,
-    "weapon": 0.005
+    "move": 0.005
   },
   "rl_temperatures": {},
   "sample_temperatures": {},

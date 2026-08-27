@@ -34,8 +34,7 @@ ENGINE-FACING (ActionLabels):
                   view-relative coordinates.  Approximately unit length.
                   [1, 0, 0] = no turn.
 
-  fire    int     0 = not firing, 1 = firing.
-  switch  int     0 = no switch, 1-6 = weapon idx.
+  attack  int     0 = no attack; 1..8 = select and fire that impulse.
 
 TRAINING-FACING (on-disk corpus):
 
@@ -50,23 +49,18 @@ TRAINING-FACING (on-disk corpus):
             bit 7 = jump button press
             Loader (qnn.bc.train._unpack_move_axes) collapses each axis
             pair into ``uint8[T, 3]`` class indices in {0=neg,1=none,
-            2=pos} via ``class = 1 + pos_bit - neg_bit``.  Attack and
-            jump bits are extracted separately.
+            2=pos} via ``class = 1 + pos_bit - neg_bit``. The packed
+            attack-press bit is collection evidence only; jump is extracted
+            separately.
 
   look    float16[3]  Same semantics as engine-facing.  fp16 is finer
                       than the source mouse quantization (~0.066°) so
                       the precision drop is below the signal floor.
 
-  fire    uint8       0/1.
-  weapon  uint8       raw engine weapon byte:
-                        0 = no weapon held (pre-spawn / dead / transitional),
-                        1..8 = Quake weapon id in impulse order (axe..LG).
-                      No-weapon frames stay in the corpus so move/fire/look
-                      labels still train; the 8-class weapon head masks
-                      them out of its CE loss via ignore_index=-100.
-                      The engine-facing `switch` idx 0-6 is derived from
-                      the weapon head's argmax at inference time; it is
-                      not stored on disk.
+  attack uint8       categorical effective-discharge label:
+                       0 = no effective attack,
+                       1..8 = attack with that Quake impulse (axe..LG).
+                     There is no parallel binary fire or weapon label.
 """
 
 from __future__ import annotations
@@ -81,14 +75,10 @@ LOOK_NONLINEAR_BASE_COUNT = 256.0
 LOOK_HIGH_GAIN_MULTIPLIER = 2.0  # sensitivity 3 near center, 6 at the edge
 LOOK_DEADZONE = 0.03
 MOVE_DEADZONE = 0.25
-# Weapon action: 8 model classes (0..7 = axe..lightning).  The PPO /
-# select_actions action emits a class index in this range; the engine
-# bridge maps class+1 → Quake impulse byte 1..8 before packing into
-# the wire so the engine receives a direct impulse.  No "no switch"
-# class — the model picks a weapon every frame; emitting the
-# currently-held weapon is a server-side no-op.
-WEAPON_ACTION_SIZE = 8
-ACTION_SCHEMA_VERSION = 3
+# Attack action: class 0 is no attack; classes 1..8 select and fire the
+# corresponding Quake impulse in the same usercmd.
+ATTACK_ACTION_SIZE = 9
+ACTION_SCHEMA_VERSION = 4
 
 # Move = 3 categorical axes, each a 3-class softmax {neg, none, pos}.
 # Class index encoding per axis:
@@ -113,26 +103,19 @@ MOVE_AXIS_THRESHOLD = 0.1
 ACTION_HEADS = {
     "move": MOVE_AXES * MOVE_AXIS_CLASSES,  # 9 logits → reshape (3 axes, 3 classes)
     "look": 3,
-    "attack": 2,
-    "weapon": WEAPON_ACTION_SIZE,
+    "attack": ATTACK_ACTION_SIZE,
 }
 CONTINUOUS_ACTION_HEADS = frozenset({"look"})
 
 # Deterministic head ordering (Python 3.7+ dict preserves insertion order).
 # Shared by checkpoint_converter and other modules that need a canonical order.
 HEAD_ORDER: list[str] = list(ACTION_HEADS.keys())
-DISCRETE_ACTION_HEADS = frozenset({"move", "attack", "weapon"})
+DISCRETE_ACTION_HEADS = frozenset({"move", "attack"})
 
 
-def clamp_weapon(value: int) -> int:
-    """Clamp a weapon impulse byte to the engine wire range.
-
-    ActionLabels.weapon carries the engine impulse byte 0..8 directly
-    (0 = no impulse this frame, 1..8 = axe..lightning).  PPO and BC
-    inference always emit 1..8; 0 only appears when the weapon head
-    is disabled via head_loss_weights.
-    """
-    return max(0, min(int(value), WEAPON_ACTION_SIZE))
+def clamp_attack(value: int) -> int:
+    """Clamp the categorical attack to 0..8."""
+    return max(0, min(int(value), ATTACK_ACTION_SIZE - 1))
 
 
 def clamp_unit(value: float) -> float:
@@ -272,8 +255,7 @@ def normalized_action_features(action: Mapping[str, object]) -> List[float]:
         float(labels.look[0]),
         float(labels.look[1]),
         float(labels.look[2]),
-        float(labels.attack),
-        float(labels.weapon) / float(WEAPON_ACTION_SIZE - 1),  # class 0..7 → [0, 1]
+        float(labels.attack) / float(ATTACK_ACTION_SIZE - 1),
     ]
 
 
@@ -282,7 +264,6 @@ class ActionLabels:
     move: tuple[float, float, float] = (0.0, 0.0, 0.0)
     look: tuple[float, float, float] = (0.0, 0.0, 0.0)
     attack: int = 0
-    weapon: int = 0
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "ActionLabels":
@@ -292,8 +273,7 @@ class ActionLabels:
         action = cls(
             move=move,
             look=look,
-            attack=int(payload.get("attack", 0)),
-            weapon=clamp_weapon(int(payload.get("weapon", 0))),
+            attack=clamp_attack(int(payload.get("attack", 0))),
         )
         action.validate()
         return action
@@ -302,21 +282,14 @@ class ActionLabels:
         for value in (*self.move, *self.look):
             if float(value) < -1.0 or float(value) > 1.0:
                 raise ValueError("continuous action values must be in [-1, 1]")
-        if self.attack < 0 or self.attack >= ACTION_HEADS["attack"]:
+        if self.attack < 0 or self.attack >= ATTACK_ACTION_SIZE:
             raise ValueError(f"attack out of range [0, {ACTION_HEADS['attack']})")
-        # weapon is the engine impulse byte 0..8 (0 = no impulse,
-        # 1..8 = axe..lightning).  ACTION_HEADS["weapon"]=8 is the
-        # PPO model class count; the impulse range is 1..8 plus the
-        # 0 no-op sentinel, hence the wider check here.
-        if self.weapon < 0 or self.weapon > WEAPON_ACTION_SIZE:
-            raise ValueError(f"weapon impulse out of range [0, {WEAPON_ACTION_SIZE}]")
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "move": [float(self.move[0]), float(self.move[1]), float(self.move[2])],
             "look": [float(self.look[0]), float(self.look[1]), float(self.look[2])],
             "attack": int(self.attack),
-            "weapon": int(self.weapon),
         }
 
 
@@ -330,18 +303,16 @@ def flatten_action(action: Mapping[str, object]) -> List[float]:
         float(labels.look[1]),
         float(labels.look[2]),
         float(labels.attack),
-        float(labels.weapon),
     ]
 
 
 def action_from_list(values: Sequence[float]) -> Dict[str, object]:
-    if len(values) != 8:
-        raise ValueError(f"Expected 8 values, got {len(values)}")
+    if len(values) != 7:
+        raise ValueError(f"Expected 7 values, got {len(values)}")
     payload: Dict[str, object] = {
         "move": [float(values[0]), float(values[1]), float(values[2])],
         "look": [float(values[3]), float(values[4]), float(values[5])],
         "attack": int(round(float(values[6]))),
-        "weapon": int(round(float(values[7]))),
     }
     return ActionLabels.from_dict(payload).to_dict()
 

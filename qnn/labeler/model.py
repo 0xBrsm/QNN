@@ -37,7 +37,7 @@ import torch.nn.functional as F
 #   act_move (target) uint8 (T,)    packed press byte (fb|lr<<2|ud<<4 + bits)
 #
 # Why look as 3-vec rather than yaw_rate scalar: at native-rate emit,
-# QNN_FillLookAndSwitch produces look[i] = cur_forward dot anchor_basis[i],
+# QNN_FillLook produces look[i] = cur_forward dot anchor_basis[i],
 # where anchor advances after every emit (qnn_collect_main.c:972). So at
 # resample_hz=0, look is the per-native-frame view delta as a unit vector
 # with no atan2 / wrap-seam math required.
@@ -49,7 +49,6 @@ from .data import (  # noqa: F401  (re-exported)
     N_CLASSES,
     VEL_CLIP,
     VELOCITY_SCALE,
-    WEAPON_OH_DIM,
     FeatureSpec,
     _baseline_classes_from_vel,
     build_features,
@@ -236,15 +235,9 @@ if __name__ == "__main__":
     mid = rng.integers(0, 3, size=T, dtype=np.int32)
     look = rng.normal(0, 0.3, (T, 3)).astype(np.float32)
     look[:, 0] = 1.0 - 0.05 * rng.random(T)  # near-identity
-    weapon = rng.integers(0, 9, size=T, dtype=np.uint8)
-
-    for spec in [
-        FeatureSpec(),
-        FeatureSpec(use_weapon_id=True),
-    ]:
+    for spec in [FeatureSpec()]:
         feats = build_features(
             vel, mid, look,
-            weapon_id=weapon if spec.use_weapon_id else None,
             spec=spec,
         )
         model = MoveLabeler(feat_dim=spec.dim)

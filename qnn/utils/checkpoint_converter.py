@@ -36,7 +36,11 @@ from qnn.schema import (
 from qnn.model.network import ModelConfig
 from qnn.model.policy import QNNPolicy
 from qnn.utils.io import trusted_torch_load
-from qnn.vocab import ENTITY_IDS
+from qnn.vocab import (
+    ENTITY_IDS,
+    ENTITY_STREAM_COMBAT, ENTITY_STREAM_FULL,
+    PROJECTILE_SCALAR_DIM, FULL_PROJECTILE_SCALAR_DIM,
+)
 
 _HEAD_ORDER = HEAD_ORDER
 _HEAD_SIZES: list[int] = list(ACTION_HEADS.values())
@@ -185,9 +189,6 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
             # v17 had no weapon head — state_dict migration allow-lists
             # weapon_head.* / weapon_embed.* as missing keys at load time.
             "use_weapon_head":          False,
-            "weapon_switch_confidence": 0.5,
-            "weapon_switch_margin":     0.0,
-            "weapon_context_from_obs":  False,
             "look_bypass_gru":          bool(meta["look_bypass_gru"]),
             # MLP target pointer hidden width — d_model is the historical
             # default. v17 had no MLP pointer; weights are random-init at
@@ -196,7 +197,6 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
             # Inert when use_weapon_head=False (weapon_head module isn't
             # built); set to canonical so the spec is well-formed.
             "weapon_sources":           ["self_readout", "target_feat"],
-            "self_weapon_embed_in_self": False,
             "d_move":      0,
             "d_look":      0,
             "d_attack":    0,
@@ -263,10 +263,7 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
         "use_gru":                   bool(meta["use_gru"]),
         "d_gru":                int(meta["d_gru"]),
         "use_weapon_head":           bool(meta.get("use_weapon_head", True)),
-        "weapon_switch_confidence":  float(meta.get("weapon_switch_confidence", 0.65)),
-        "weapon_switch_margin":      float(meta.get("weapon_switch_margin", 0.15)),
         "weapon_sources":            weapon_sources,
-        "weapon_context_from_obs":   bool(meta.get("weapon_context_from_obs", False)),
         "look_bypass_gru":           bool(meta["look_bypass_gru"]),
         # MLP target pointer hidden width — falls back to d_model when
         # the source meta predates the MLP pointer (pre-promotion
@@ -276,7 +273,6 @@ def migrate_legacy_flat_meta(meta: Dict[str, Any]) -> Dict[str, Any] | None:
         "d_target":                  int(
             meta.get("d_target", meta.get("d_model"))
         ),
-        "self_weapon_embed_in_self": bool(meta.get("self_weapon_embed_in_self", False)),
         "d_move":             d_move,
         "d_look":             d_look,
         "d_attack":           d_attack,
@@ -1118,6 +1114,33 @@ def load_sf_checkpoint_as_qnn(
         model=model,
         device=device,
         graph=graph,
+    )
+
+
+def sniff_entity_stream(state: "Dict[str, torch.Tensor]") -> str | None:
+    """Which entity stream a state dict was trained on, from module shape.
+
+    The one shape that separates the generations: the projectile
+    projection's in-dim (combat 7 vs full 8 — the a26 stream keeps the
+    trailing recency scalar). Returns None when the state dict carries no
+    obs embedding at this key (SF layouts, pre-rename legacy checkpoints —
+    those lines never trained the full stream, so there is nothing to
+    sniff). Any other in-dim fails loud: it is not a stream this line can
+    rebuild.
+    """
+    weight = state.get("obs_embedding.proj_projectile.weight")
+    if weight is None:
+        return None
+    in_dim = int(weight.shape[1])
+    if in_dim == FULL_PROJECTILE_SCALAR_DIM:
+        return ENTITY_STREAM_FULL
+    if in_dim == PROJECTILE_SCALAR_DIM:
+        return ENTITY_STREAM_COMBAT
+    raise ValueError(
+        f"obs_embedding.proj_projectile.weight has in-dim {in_dim}; expected "
+        f"{PROJECTILE_SCALAR_DIM} (combat stream) or "
+        f"{FULL_PROJECTILE_SCALAR_DIM} (full a26 stream) — unknown entity "
+        "stream, refusing to guess a model layout"
     )
 
 

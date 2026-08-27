@@ -131,7 +131,16 @@ typedef struct
 				 *   bit 7    = jump press (explicit) */
 	uint8_t	weapon;		/* raw engine weapon byte: 0 = no switch this
 				 * frame, 1..8 = Quake weapon id (axe..lightning)
-				 * consumed as an impulse by the runtime engine. */
+				 * consumed as an impulse by the runtime engine.
+				 * FULL-entity wires (wire.11/wire.12); combat
+				 * wire.13 leaves this 0 and uses `attack` below. */
+	uint8_t	attack;		/* A27 combat 9-way categorical (wire.13): 0 = no
+				 * effective attack, 1..8 = select-and-fire that
+				 * Quake impulse in one tick. Both the supervised
+				 * label and the runtime command. wire.11/wire.12
+				 * leave this 0 and drive fire via `move` bit 0 +
+				 * `weapon`. The application layer (IN_Move) picks
+				 * the field by the loaded codec's entity_mode. */
 	uint8_t	input_mask;	/* 8-bit per-axis PURE-FEASIBILITY mask: each
 				 * bit answers "would the engine accept this
 				 * axis press if I pressed it right now?".
@@ -164,6 +173,9 @@ static inline int QNN_ActionAxisSign(uint8_t move, int axis)
 }
 
 static inline int QNN_ActionAttack(uint8_t move) { return move & 1; }
+/* Alias kept for the A27 combat call sites (renamed there to disambiguate the
+ * move-byte press bit from the 9-way `attack` categorical). Same bit. */
+static inline int QNN_ActionAttackPressed(uint8_t move) { return move & 1; }
 static inline int QNN_ActionJump(uint8_t move)   { return (move >> 7) & 1; }
 
 /* Expand the press byte into a (forward, right, up) vector of ±1.0/0.0
@@ -245,6 +257,11 @@ extern qnn_map_state_t qnn_map_state;
 extern char qnn_basedir_storage[MAX_OSPATH];
 extern char *basedir;
 extern char *cachedir;
+/* stdin-is-protocol latch (defined in nq/qnn_sys.c): a binary-protocol
+ * main (the arena server) sets this before Host_Init so the dedicated
+ * console reader never steals opcode bytes from fd 0 — OP_ATTACH_DECL
+ * arrives while the host is still pumping sign-on frames. */
+extern qboolean qnn_stdin_is_protocol;
 
 /* Utilities (qnn_sys.c) */
 int QNN_JsonExtractInt(const char *line, const char *key, int fallback);

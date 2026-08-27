@@ -3,7 +3,7 @@
 
 Computes the human (demo-label) temporal-statistic fingerprints — dwell-time,
 switch-rate, inter-event-interval, turn magnitude — for every channel
-(move fb/lr/ud, target, weapon, attack, look), in-distribution and
+(move fb/lr/ud, target, attack context, attack event, look), in-distribution and
 episode-boundary-respecting. Pure numpy, no model, no torch — runs locally.
 
 In-distribution loading mirrors scripts/analysis/move_momentum_baseline.py:
@@ -13,9 +13,10 @@ decode (bit 0 = attack; fb bits 1-2; lr bits 3-4; ud_neg bit 5, ud_pos bit 6|7).
 
 Action label formats:
   move    packed byte -> per-axis class {0=neg,1=none,2=pos} (decode above)
-  attack  packed byte bit 0 -> {0,1}
+  attack  act_attack categorical byte: 0=no effective attack, 1..8=impulse
   target  argmax over act_target_probs (17-dim; index 0 = no-target)
-  weapon  act_weapon impulse byte (1..8: AXE,SHOTGUN,SSG,NG,SNG,GL,RL,LG)
+  attack context  nearest nonzero act_attack category within the episode;
+                  analysis-only, never a corpus label or model input
   look    act_look view-relative unit vector (3,); turn magnitude =
           degrees(arccos(clip(unit[0],-1,1))); turn bout = run of frames >=15deg.
 
@@ -42,6 +43,7 @@ from qnn.eval.humanlikeness.core import (  # noqa: E402
     onset_intervals,
     describe,
 )
+from qnn.eval.aim_kernel import action_attack_context  # noqa: E402
 
 # Canonical output path for the human reference fingerprint JSON.  Defined once
 # here so shell harnesses and sibling scripts can reference this constant instead
@@ -65,6 +67,7 @@ def _unpack_move(packed: np.ndarray) -> np.ndarray:
 
 
 def _unpack_attack(packed: np.ndarray) -> np.ndarray:
+    """Packed move byte bit 0 -> fire bit (a26 cache schema)."""
     return (np.asarray(packed, dtype=np.uint8).reshape(-1) & 0x1).astype(np.int64)
 
 
@@ -101,25 +104,36 @@ def _episodes(root: Path, split: str, *, with_demo: bool = False):
         packed = np.asarray(np.load(root / split / a["move"], mmap_mode="r"))
         imask = np.asarray(np.load(root / split / a["input_mask"], mmap_mode="r")).reshape(-1)
         move = _ud_rewrite(_unpack_move(packed), imask)
-        attack = _unpack_attack(packed)
-        weapon = np.asarray(np.load(root / split / a["weapon"], mmap_mode="r"), dtype=np.int64).reshape(-1)
+        if "attack" in a:
+            attack_class = np.asarray(
+                np.load(root / split / a["attack"], mmap_mode="r"),
+                dtype=np.int64,
+            ).reshape(-1)
+        else:
+            # a26 cache schema: the fire bit rides the packed move byte and
+            # the held weapon (impulse-coded 0..8) is its own channel — the
+            # attack-with class is their product (0 = hold).
+            wpn = np.asarray(
+                np.load(root / split / a["weapon"], mmap_mode="r"),
+                dtype=np.int64,
+            ).reshape(-1)
+            attack_class = _unpack_attack(packed) * wpn
+        attack = (attack_class > 0).astype(np.int64)
+        attack_context = action_attack_context(attack_class)
         tp = np.asarray(np.load(root / split / a["target_probs"], mmap_mode="r"), dtype=np.float32)
         target = np.argmax(tp, axis=1).astype(np.int64)
         keep = (1.0 - tp[:, 0]) != 0.0
         turn = _turn_deg(np.asarray(np.load(root / split / a["look"], mmap_mode="r")))
-        # attack operativeness (input_mask bit0): raw attack is held-button
-        # STATE; only op frames are decisions. Model<->human attack rate
-        # comparisons must condition on this (op-filter doctrine).
-        atk_op = (imask & 1) != 0
         demo_idxs = shard.get("demo_idxs") or [None] * len(shard["episode_lengths"])
         start = 0
         for ei, length in enumerate(shard["episode_lengths"]):
             stop = start + int(length)
             sl = slice(start, stop)
             ep = {
-                "move": move[sl], "attack": attack[sl], "weapon": weapon[sl],
+                "move": move[sl], "attack": attack[sl],
+                "attack_class": attack_class[sl],
+                "attack_context": attack_context[sl],
                 "target": target[sl], "turn": turn[sl], "keep": keep[sl],
-                "attack_op": atk_op[sl],
             }
             if with_demo:
                 ep["demo"] = demo_idxs[ei]
@@ -145,10 +159,10 @@ def main() -> None:
     tgt_id_iei = []           # re-target interval (between target-id switches)
     tgt_sw = [0, 0]           # re-target switch-rate over target-id stream
 
-    wpn_dwell = {}            # dwell per equipped weapon id
-    wpn_dwell_all = []
-    wpn_switch_iei = []       # weapon-switch interval
-    wpn_sw = [0, 0]
+    ctx_dwell = {}            # dwell per analysis-only attack context
+    ctx_dwell_all = []
+    ctx_switch_iei = []
+    ctx_sw = [0, 0]
 
     atk_runs = []             # sustained-fire run lengths (attack==1)
     atk_onset_iei = []        # fire-onset interval
@@ -202,21 +216,21 @@ def main() -> None:
         tgt_sw[0] += ns
         tgt_sw[1] += nt
 
-        # weapon -----------------------------------------------------------
-        wpn = ep["weapon"]
-        for w in np.unique(wpn[keep]):
-            d = dwell_times(wpn, keep, only_value=int(w))
+        # attack context --------------------------------------------------
+        ctx = ep["attack_context"]
+        for w in np.unique(ctx[keep]):
+            d = dwell_times(ctx, keep, only_value=int(w))
             if d.size:
-                wpn_dwell.setdefault(int(w), []).append(d)
-        da = dwell_times(wpn, keep)
+                ctx_dwell.setdefault(int(w), []).append(d)
+        da = dwell_times(ctx, keep)
         if da.size:
-            wpn_dwell_all.append(da)
-        iei = inter_event_intervals(wpn, keep)
+            ctx_dwell_all.append(da)
+        iei = inter_event_intervals(ctx, keep)
         if iei.size:
-            wpn_switch_iei.append(iei)
-        _, ns, nt = switch_rate(wpn, keep)
-        wpn_sw[0] += ns
-        wpn_sw[1] += nt
+            ctx_switch_iei.append(iei)
+        _, ns, nt = switch_rate(ctx, keep)
+        ctx_sw[0] += ns
+        ctx_sw[1] += nt
 
         # attack -----------------------------------------------------------
         atk = ep["attack"]
@@ -256,7 +270,7 @@ def main() -> None:
         },
         "move": {},
         "target": {},
-        "weapon": {},
+        "attack_context": {},
         "attack": {},
         "look": {},
     }
@@ -282,15 +296,16 @@ def main() -> None:
         "retarget_interval": describe(cat(tgt_id_iei)),
     }
 
-    fp["weapon"] = {
-        "switch_rate": rate(wpn_sw),
-        "n_switches": wpn_sw[0],
-        "n_transitions": wpn_sw[1],
-        "dwell_all": describe(cat(wpn_dwell_all)),
-        "dwell_by_weapon": {
-            WEAPON_NAMES.get(w, str(w)): describe(cat(d)) for w, d in sorted(wpn_dwell.items())
+    fp["attack_context"] = {
+        "switch_rate": rate(ctx_sw),
+        "n_switches": ctx_sw[0],
+        "n_transitions": ctx_sw[1],
+        "dwell_all": describe(cat(ctx_dwell_all)),
+        "dwell_by_attack": {
+            WEAPON_NAMES.get(w, str(w)): describe(cat(d)) for w, d in sorted(ctx_dwell.items())
         },
-        "weapon_switch_interval": describe(cat(wpn_switch_iei)),
+        "switch_interval": describe(cat(ctx_switch_iei)),
+        "note": "nearest effective attack category; analysis-only, not held state or a label",
     }
 
     fp["attack"] = {
@@ -326,7 +341,8 @@ def main() -> None:
     for ax in AXES:
         row(f"move.{ax}", fp["move"][ax]["switch_rate"], fp["move"][ax]["dwell_all"])
     row("target (id)", fp["target"]["retarget_switch_rate"], fp["target"]["locked_target_dwell"])
-    row("weapon", fp["weapon"]["switch_rate"], fp["weapon"]["dwell_all"])
+    row("attack context", fp["attack_context"]["switch_rate"],
+        fp["attack_context"]["dwell_all"])
     row("attack (fire run)", fp["attack"]["switch_rate"], fp["attack"]["sustained_fire_run"])
     row("look (turn-bout)", None, fp["look"]["turn_bout_duration"])
     print(f"\nlook turn-magnitude (deg): mean={fp['look']['turn_magnitude_deg']['mean']}  "

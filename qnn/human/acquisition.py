@@ -240,7 +240,7 @@ def shannon_throughput(onset_D, mt_frames, we: float) -> float:
     return ide / (mt_frames / FPS)
 
 
-def _episode_metrics(ep_cnt, ep_rel, ep_vel, ep_typ, ep_rec, ep_wid, ep_engaged):
+def _episode_metrics(ep_cnt, ep_rel, ep_vel, ep_typ, ep_rec, ep_weapon, ep_engaged):
     """Per-episode flick events (two-component) + per-weapon pursuit coh + lead."""
     T = len(ep_cnt)
     # Shared densify (raw padded arrays; caller applies the unit scale) — aim_kernel.
@@ -271,7 +271,7 @@ def _episode_metrics(ep_cnt, ep_rel, ep_vel, ep_typ, ep_rec, ep_wid, ep_engaged)
     rel = all_rel[eng_idx]
     vel = all_vel[eng_idx]
     los = all_los[eng_idx]
-    imp = _WI[ep_wid[eng_idx]]
+    imp = A.action_attack_context(ep_weapon)[eng_idx]
 
     lead_ang = A._lead_aim_angle_deg_live(rel, vel, imp, _WN)   # (M,16)
     orig_ang = _origin_angle_deg(rel)                          # (M,16)
@@ -358,7 +358,7 @@ def _episode_metrics(ep_cnt, ep_rel, ep_vel, ep_typ, ep_rec, ep_wid, ep_engaged)
     return res
 
 
-_WN, _ZD, _WI = A._build_physics_tables()
+_WN, _ZD = A._build_physics_tables()
 
 
 # ── accumulators ─────────────────────────────────────────────────────────────
@@ -391,9 +391,8 @@ def _worker(args: tuple) -> dict[int, dict[str, Any]]:
     out: dict[int, dict[str, Any]] = {}
     for _ei, demo_idx, fsl, esl, arr in A.iter_shard_episodes(
             sh, data_dir_str,
-            obs=("entity_rel", "entity_vel", "entity_types", "entity_recency",
-                 "self_weapon_id"),
-            acts=("target_probs",)):
+            obs=("entity_rel", "entity_vel", "entity_types", "entity_recency"),
+            acts=("target_probs", "attack")):
         ep_engaged = np.asarray(arr["target_probs"][fsl]).argmax(axis=1) > 0
         if int(ep_engaged.sum()) < MIN_ENGAGED_FRAMES_EP:
             continue
@@ -403,7 +402,7 @@ def _worker(args: tuple) -> dict[int, dict[str, Any]]:
             ep_vel=np.asarray(arr["entity_vel"][esl]),
             ep_typ=np.asarray(arr["entity_types"][esl]),
             ep_rec=np.asarray(arr["entity_recency"][esl]),
-            ep_wid=np.asarray(arr["self_weapon_id"][fsl]),
+            ep_weapon=np.asarray(arr["attack"][fsl]),
             ep_engaged=ep_engaged,
         )
         b = out.setdefault(int(demo_idx), _new_acc())
@@ -893,7 +892,7 @@ def run(collect_dir: Path, splits: list[str], out_path: Path,
 
 def episode_metrics_from_streams(
     cnt: np.ndarray, rel: np.ndarray, vel: np.ndarray,
-    typ: np.ndarray, rec: np.ndarray, wid: np.ndarray,
+    typ: np.ndarray, rec: np.ndarray, weapon: np.ndarray,
 ) -> dict[str, Any]:
     """Run the shared _episode_metrics kernel on ONE emitted closed-loop episode's
     entity streams (collect-cache layout: (T,) count + concatenated entities)."""
@@ -904,7 +903,7 @@ def episode_metrics_from_streams(
         ep_vel=np.asarray(vel),
         ep_typ=np.asarray(typ),
         ep_rec=np.asarray(rec),
-        ep_wid=np.asarray(wid),
+        ep_weapon=np.asarray(weapon),
         ep_engaged=ep_engaged,
     )
 
@@ -929,7 +928,7 @@ def cell_acquisition_throughput(npz_path: Path, scenario_id: str,
         n_eps += 1
         _merge(acc, episode_metrics_from_streams(
             z[f"acq_cnt_{k}"], z[f"acq_rel_{k}"], z[f"acq_vel_{k}"],
-            z[f"acq_typ_{k}"], z[f"acq_rec_{k}"], z[f"acq_wid_{k}"]))
+            z[f"acq_typ_{k}"], z[f"acq_rec_{k}"], z[f"acq_weapon_{k}"]))
     if not n_eps:
         return None
     tps = [shannon_throughput(D, mt, effective_width_deg)

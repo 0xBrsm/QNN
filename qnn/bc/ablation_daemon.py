@@ -112,16 +112,16 @@ def _build_job(job_id: str, run_dir: Path) -> _AblationJob:
         model_factory = None
         graph = None
         side_channel_provider = None
-    elif ctx.mode == "head_probe":
-        from qnn.model.bench.runner import _build_head_probe_bc_config
+    elif ctx.mode == "bench":
+        from qnn.model.bench.runner import _build_bench_bc_config
         from qnn.model.bench.side_channels import bench_side_channel_scope
 
-        bc_config, model_factory, graph = _build_head_probe_bc_config(ctx.run_cfg, ctx.device)
+        bc_config, model_factory, graph = _build_bench_bc_config(ctx.run_cfg, ctx.device)
         side_channel_provider = bench_side_channel_scope
     else:
         raise RuntimeError(
             f"{ctx.run_dir}: mode {ctx.mode!r} cannot use the BC ablation "
-            "daemon; expected 'bc' or 'head_probe'."
+            "daemon; expected 'bc' or 'bench'."
         )
 
     return _AblationJob(

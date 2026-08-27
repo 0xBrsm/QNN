@@ -154,7 +154,7 @@ void QNN_ArenaApplyStagedClient(client_t *client)
 	qnn_action_t *action;
 	edict_t *player;
 	int match_id, seat_id, slot, axis;
-	int held_weapon;
+	int current_weapon;
 
 	if (!QNN_ArenaClientSeat(client, &match_id, &seat_id))
 		return;
@@ -191,13 +191,13 @@ void QNN_ArenaApplyStagedClient(client_t *client)
 	}
 	else
 	{
-		player->v.button0 = QNN_ActionAttack(action->move) ? 1.0f : 0.0f;
+		player->v.button0 = action->attack > 0 ? 1.0f : 0.0f;
 		player->v.button2 = QNN_ActionAxisSign(action->move, 2) > 0 ? 1.0f : 0.0f;
 	}
 
-	held_weapon = QNN_ImpulseFromItemFlag((int)player->v.weapon);
-	if (action->weapon > 0 && action->weapon != held_weapon)
-		player->v.impulse = (float)action->weapon;
+	current_weapon = QNN_ImpulseFromItemFlag((int)player->v.weapon);
+	if (action->attack > 0 && action->attack != current_weapon)
+		player->v.impulse = (float)action->attack;
 	state->staged = false;
 }
 

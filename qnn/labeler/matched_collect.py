@@ -5,7 +5,7 @@ Drives ``qw_demo_worker`` in matched-emit mode (``matched_emit:1``,
 one pipe (see qnn.wire / qnn_collect_main.c):
 
   - a slim **MLOB** record every native frame — the move-labeler input
-    subset (view-frame vel, self_movement_id / self_weapon_id) plus the
+    subset (view-frame vel and self_movement_id) plus the
     usercmd-TRUTH action (move press byte, look, op_input) and the native
     frame index;  and
   - the full **QOBS** at each 20 Hz demo-time boundary (the model corpus),
@@ -45,7 +45,7 @@ from qnn.wire import parse_mlob_frame  # noqa: F401  (documents the MLOB schema)
 
 
 # Slim labeler field subset (on-disk names match qnn.labeler.collect).
-_SLIM_OBS_FIELDS = ("vel", "self_movement_id", "self_weapon_id")
+_SLIM_OBS_FIELDS = ("vel", "self_movement_id")
 _SLIM_ACT_FIELDS = ("move", "look", "op_input")
 
 
@@ -54,7 +54,7 @@ _SLIM_ACT_FIELDS = ("move", "look", "op_input")
 def _unpack_mlob_episode(mlob_ticks: list[dict]) -> tuple[dict, dict]:
     """Stack the per-native-frame MLOB records into (obs, act) arrays.
 
-    obs:  vel (i16, T×3), self_movement_id (u8, T), self_weapon_id (u8, T),
+    obs:  vel (i16, T×3), self_movement_id (u8, T),
           native_index (u32, T) — the slim corpus key.
     act:  move (u8, T), look (f16, T×3), op_input (u8, T).
     """
@@ -62,7 +62,6 @@ def _unpack_mlob_episode(mlob_ticks: list[dict]) -> tuple[dict, dict]:
     obs = {
         "vel": np.stack([t["vel"] for t in mlob_ticks], axis=0).astype(np.int16),
         "self_movement_id": np.array([t["self_movement_id"] for t in mlob_ticks], dtype=np.uint8),
-        "self_weapon_id":   np.array([t["self_weapon_id"]   for t in mlob_ticks], dtype=np.uint8),
         "native_index":     np.array([t["native_index"]     for t in mlob_ticks], dtype=np.uint32),
     }
     act = {

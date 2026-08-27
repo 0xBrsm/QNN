@@ -45,12 +45,11 @@ def extract_head_input_features(
     """Run frozen forward passes; capture each head's input via a hook.
 
     Returns (features dict, labels dict) keyed by head name.
-    Labels are unified per-head: discretised move axes, fire {0,1}, weapon class.
+    Labels are unified per-head: discretised move axes and attack class 0..8.
     """
-    captures: dict[str, list[np.ndarray]] = {"move": [], "look": [], "attack": [], "weapon": []}
+    captures: dict[str, list[np.ndarray]] = {"move": [], "look": [], "attack": []}
     move_lab: list[np.ndarray] = []
-    fire_lab: list[np.ndarray] = []
-    weapon_lab: list[np.ndarray] = []
+    attack_lab: list[np.ndarray] = []
 
     def hook_factory(name: str):
         def hook(_m, inp, _out):
@@ -58,7 +57,7 @@ def extract_head_input_features(
         return hook
 
     handles = []
-    for name in ("move", "look", "attack", "weapon"):
+    for name in ("move", "look", "attack"):
         head = getattr(policy.model, f"{name}_head", None)
         if head is None:
             continue
@@ -76,11 +75,7 @@ def extract_head_input_features(
             }
             policy._forward_tensors(obs_t)
             move_lab.append(np.asarray(ep["actions"]["move"]))
-            fire_lab.append(np.asarray(ep["actions"]["attack"]))
-            if "weapon_idx" in ep["actions"]:
-                weapon_lab.append(np.asarray(ep["actions"]["weapon_idx"]))
-            elif "weapon" in ep["actions"]:
-                weapon_lab.append(np.asarray(ep["actions"]["weapon"]))
+            attack_lab.append(np.asarray(ep["actions"]["attack"]))
             frames_seen += n
 
     for h in handles:
@@ -94,10 +89,8 @@ def extract_head_input_features(
 
     labels: dict[str, np.ndarray] = {
         "move": np.concatenate(move_lab, axis=0) if move_lab else np.empty((0, 3), dtype=np.int64),
-        "attack": np.concatenate(fire_lab, axis=0) if fire_lab else np.empty((0,), dtype=np.int64),
+        "attack": np.concatenate(attack_lab, axis=0) if attack_lab else np.empty((0,), dtype=np.int64),
     }
-    if weapon_lab:
-        labels["weapon"] = np.concatenate(weapon_lab, axis=0)
     return feats, labels
 
 
@@ -235,19 +228,9 @@ def linear_probe_report(
             out["attack"] = fit_linear_probe(
                 train_feats["attack"], train_labels["attack"].astype(int),
                 val_feats["attack"], val_labels["attack"].astype(int),
-                multi_class=False,
-            )
-        except Exception as e:  # noqa: BLE001
-            out["fire_error"] = str(e)
-
-    if "weapon" in train_labels and "weapon" in val_labels:
-        try:
-            out["weapon"] = fit_linear_probe(
-                train_feats["weapon"], train_labels["weapon"].astype(int),
-                val_feats["weapon"], val_labels["weapon"].astype(int),
                 multi_class=True,
             )
         except Exception as e:  # noqa: BLE001
-            out["weapon_error"] = str(e)
+            out["attack_error"] = str(e)
 
     return out

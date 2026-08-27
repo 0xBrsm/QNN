@@ -26,8 +26,9 @@ python -m qnn.diag analyze \
 `checkpoints/`.  `--cache-dir` is the root cache directory; the resident
 source is built from `<cache-dir>/precomputed_val`.
 
-`--heads` defaults to `attack,look,move`; `weapon` is included automatically
-when `qnn.diag.weapon.analyze` is importable. `--segment` is `engaged`
+`--heads` defaults to `attack,look,move`. The categorical attack-with output is
+analyzed by `qnn.diag.attack`; there is no separate action-weapon diagnostic.
+`--segment` is `engaged`
 (frames where `act.target != 0`) or `all` (no filter).
 
 The output JSON follows the Phase-2 schema:
@@ -275,7 +276,6 @@ scripts:
 | `qnn.diag.attack` | `fire_target_conditional`, `attack_offset_distribution`, `attack_empirical_range`, `attack_input_ablation` |
 | `qnn.diag.look` | `look_prior_fit`, `look_prior_explore4`, `look_history_attention`, `look_horizon_ceiling`, `look_metric_references`, `look_target_intersection`, `aim_point_z_offset`, `look_ground_spin`, `look_aim_prior_decode` |
 | `qnn.diag.move` | `momentum_baseline`, `stream_dynamics`, `jump_discrim`, `jump_onset_probe`, `rate_fidelity` |
-| `qnn.diag.weapon` | `corpus_stats`, `intent_decompose`, `intent_psth`, `gate_sweep`, `switch_gated`, `anticip_roc`, `decode_sweep`, `switch_window_roc`, `switch_decompose`, `switch_timing_detail`, `switch_leadtime`, `switch_leak_test`, `switch_vs_token`, `switchframe_decomp`, `when_switch_detect` |
 
 `analyze()` in each module runs the subset that is compatible with a loaded
 policy + resident source. Functions requiring additional inputs (NPZ caches,
@@ -303,7 +303,6 @@ these at call sites.**
 | attack | `op = input_mask & 1` (bit 0 of `act.input_mask`) |
 | move (jump) | `jump_feas = ((im >> 7) \| (im >> 6)) & 1` (ground-jump or swim-up feasible) |
 | look | no filter (look is not `input_mask`-gated) |
-| weapon | `label != 0` (weapon-present frames); NOT `input_mask & 1` — bit 0 is the attack bit |
 
 ## `diagnostic` subcommand sections
 
@@ -389,7 +388,7 @@ but the absolute gap may overstate the asymptotic delta.
 - `qnn/diag/analyze.py` — `run_analyze` dispatcher (Phase-2 `analyze` subcommand)
 - `qnn/diag/report.py` — `run_report` aggregator (`diagnostic` subcommand)
 - `qnn/diag/loader.py` — `load_policy`, shared by all analysis scripts
-- `qnn/diag/attack.py`, `look.py`, `move.py`, `weapon.py` — per-head analysis modules
+- `qnn/diag/attack.py`, `look.py`, `move.py` — per-head analysis modules
 - `qnn/diag/look_data.py`, `move_metrics.py` — shared computation kernels
 - `qnn/diag/spatial_reconstruction.py` — map/token geometry reconstruction
 - `qnn/diag/static_map_memory.py` — immutable hull-face memory reconstruction

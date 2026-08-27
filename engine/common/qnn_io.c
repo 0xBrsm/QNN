@@ -6,6 +6,7 @@
  */
 
 #include "qnn_io.h"
+#include "qnn_obs_registry.h"
 #include "qnn_object.h"
 #include "qnn_store.h"
 #include "qnn_map.h"
@@ -56,9 +57,9 @@ void QNN_IOUpdate(const qnn_snapshot_t *snapshot, float dt, qboolean reset_flag)
  * StoreUpdate is now in IOUpdate so it runs before EventTick.  Emit
  * just reads the already-stamped store. */
 
-/* Active spatial obs contract. Default = v2 atlas (the flat obs-buffer /
- * corpus contract); QNN_OnnxInit overrides it from the loaded model's
- * codec so inference emits EXACTLY that contract's spatial block. */
+/* WS2 residue of the codec spatial-mode shim: whether QNN_IOEmitPlan
+ * additionally emits the v1 raycast scalars (wire.7/.9/.11 — not a
+ * registry field). The atlas parameterization rides the plan now. */
 static qnn_spatial_mode_t qnn_io_spatial_mode = QNN_SPATIAL_MODE_ATLAS;
 
 void QNN_IOSetSpatialMode(qnn_spatial_mode_t mode)
@@ -66,64 +67,136 @@ void QNN_IOSetSpatialMode(qnn_spatial_mode_t mode)
 	qnn_io_spatial_mode = mode;
 }
 
+/* Entity-stream contract the ACTION path assumes (qnn_input.c's
+ * weapon-vs-attack impulse branch). Default = COMBAT (the A27 tree's
+ * native contract); QNN_OnnxInit overrides it from the loaded model's
+ * codec (FULL for wire.9/.11/.12.x). The oracle's per-tick token
+ * qualification is derived from the emit plan's entity policy in
+ * QNN_IOProvideEntities below — set around the oracle call so
+ * heterogeneous per-seat plans qualify independently. */
+static qnn_entity_mode_t qnn_io_entity_mode = QNN_ENTITY_MODE_COMBAT;
+
+void QNN_IOSetEntityMode(qnn_entity_mode_t mode)
+{
+	qnn_io_entity_mode = mode;
+}
+
+qnn_entity_mode_t QNN_IOGetEntityMode(void)
+{
+	return qnn_io_entity_mode;
+}
+
+/* ── Emit plan (obs API) ─────────────────────────────────────────
+ * QNN_IOEmit / QNN_IOPackObsBuffer walk a compiled emit plan
+ * (qnn_obs_registry.{c,h}).  Until WS2 lands per-seat declarations,
+ * every consumer runs the DEFAULT plan — today's packed 864-byte
+ * frame; the plan machinery is gate-tested to reproduce it
+ * bit-identically (src/engine/tests/qnn_obs_registry_test.c). */
+
+const qnn_obs_plan_t *QNN_IODefaultObsPlan(void)
+{
+	static qnn_obs_plan_t plan;
+	static int compiled;
+
+	if (!compiled)
+	{
+		qnn_obs_decl_t decl;
+		char error[256];
+
+		QNN_ObsDeclDefault(&decl);
+		if (!QNN_ObsPlanCompile(&decl, &plan, error, sizeof(error)))
+		{
+			fprintf(stderr, "qnn_io: default obs plan failed to "
+				"compile: %s\n", error);
+			abort();
+		}
+		/* The default plan IS today's frame — payload 848 + 16-byte
+		 * pose tail.  Any drift here is a wire break; die loudly. */
+		if (plan.frame_bytes != QNN_OBS_BUFFER_SIZE)
+		{
+			fprintf(stderr, "qnn_io: default obs plan frame is %d B, "
+				"expected %d B\n", plan.frame_bytes, QNN_OBS_BUFFER_SIZE);
+			abort();
+		}
+		compiled = 1;
+	}
+	return &plan;
+}
+
+/* Engine-side compute providers.  QNN_ObsPlanCompute calls a provider
+ * ONLY when the plan demands its kind; the qnn_runtime skip flags (a
+ * per-collect compute gate, both default true — set in
+ * QNN_HandleCollect) layer on top. */
+
+static void QNN_IOProvideSelf(const qnn_snapshot_t *snapshot,
+	qnn_self_token_t *out)
+{
+	QNN_SelfEmitToken(out, snapshot);
+}
+
+static int QNN_IOProvideEntities(const qnn_snapshot_t *snapshot,
+	const qnn_obs_entity_params_t *params, qnn_tagged_token_t *out,
+	int max_tokens)
+{
+	int player_cluster_id;
+	int count;
+	qnn_entity_mode_t saved;
+
+	if (qnn_runtime.skip_entities)
+		return 0;
+	/* Oracle disclosure follows the PLAN's policy, not the process
+	 * global: v1 = the FULL ladder (all token types, memory tail),
+	 * v3 = COMBAT (current-frame actor/projectile).  Save/restore so
+	 * heterogeneous per-seat plans in one world qualify independently
+	 * and the steady global keeps serving the action path. */
+	saved = qnn_io_entity_mode;
+	qnn_io_entity_mode = (strcmp(params->policy, "v1") == 0)
+		? QNN_ENTITY_MODE_FULL : QNN_ENTITY_MODE_COMBAT;
+	count = QNN_OracleEmitTokens(out, max_tokens,
+		snapshot, &qnn_map_state, &player_cluster_id);
+	qnn_io_entity_mode = saved;
+	return count;
+}
+
+static void QNN_IOProvideAtlas(const qnn_snapshot_t *snapshot,
+	const qnn_obs_atlas_params_t *params,
+	uint8_t atlas[QNN_OBS_ATLAS_ELEVS][QNN_OBS_ATLAS_YAWS_MAX])
+{
+	if (qnn_runtime.skip_spatial)
+		return;
+	/* Parameterization is plan-carried: 24 for the packed frontier,
+	 * 72 for the a26/a27 rc1 lines.  (The old ATLAS_LEGACY global
+	 * override is retired; raycast contracts simply do not request
+	 * the atlas.) */
+	QNN_SpatialEmitAtlas(snapshot, atlas, params->yaw);
+}
+
+static const qnn_obs_compute_fns_t qnn_io_compute_fns = {
+	QNN_IOProvideSelf,
+	QNN_IOProvideEntities,
+	QNN_IOProvideAtlas,
+};
+
+void QNN_IOEmitPlan(const qnn_obs_plan_t *plan,
+	const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
+{
+	QNN_ObsPlanCompute(plan, &qnn_io_compute_fns, snapshot, out);
+
+	/* wire.7/.9/.11 raycast residue: the v1 raycast scalars are not a
+	 * registry field (they live outside the flat obs buffer, consumed
+	 * by the ONNX scratch packer); keep emitting them when the loaded
+	 * codec selected that contract. */
+	if (qnn_io_spatial_mode == QNN_SPATIAL_MODE_RAYCAST_V1
+		&& !qnn_runtime.skip_spatial)
+		QNN_SpatialEmitTokens(snapshot, out->spatial);
+}
+
 void QNN_IOEmit(const qnn_snapshot_t *snapshot, qnn_tick_result_t *out)
 {
-	memset(out, 0, sizeof(*out));
-
-	/* Compute-gate: skip the expensive entity oracle / spatial atlas
-	 * when their blocks are not selected for this collect.  The memset
-	 * above already zeroed out->entities / out->entity_count (entity
-	 * stream n_tokens=0); a skipped atlas must read all-miss, not
-	 * hit-at-zero, so fill it with the miss code first.  Both flags
-	 * default true (set in QNN_HandleCollect), so the full BC collect
-	 * is unchanged. */
-	memset(out->spatial_atlas, QNN_OBS_ATLAS_MISS_CODE,
-		sizeof(out->spatial_atlas));
-	if (!qnn_runtime.skip_entities)
-	{
-		int player_cluster_id;
-		out->entity_count = QNN_OracleEmitTokens(out->entities,
-			QNN_MAX_TOKEN_OBJECTS,
-			snapshot, &qnn_map_state, &player_cluster_id);
-	}
-	QNN_SelfEmitToken(&out->self, snapshot);
-	if (!qnn_runtime.skip_spatial)
-	{
-		/* Codec-driven: emit EXACTLY the loaded model's spatial obs
-		 * block, never both.  The single bin serves both wire.11 (v1
-		 * raycast scalars) and wire.12 (v2 depth atlas); the load path
-		 * set qnn_io_spatial_mode from the selected codec, so only the
-		 * matching emitter runs and the other's compute is skipped. */
-		if (qnn_io_spatial_mode == QNN_SPATIAL_MODE_RAYCAST_V1)
-			QNN_SpatialEmitTokens(snapshot, out->spatial);
-		else
-			QNN_SpatialEmitAtlas(snapshot, out->spatial_atlas,
-				qnn_io_spatial_mode == QNN_SPATIAL_MODE_ATLAS_LEGACY
-					? QNN_OBS_ATLAS_YAWS_LEGACY : QNN_OBS_ATLAS_YAWS);
-	}
+	QNN_IOEmitPlan(QNN_IODefaultObsPlan(), snapshot, out);
 }
 
 /* ── Obs buffer serialization ─────────────────────────────────── */
-
-/* Pack the event block: u8 count followed by `count` interleaved
- * (action, source) u8 pairs.  Matches the Python wire parser in
- * src/qnn/wire.py:_unpack_native_entity_stream. */
-static int QNN_PackEventSlots(uint8_t *obs, int pos,
-	const qnn_token_event_t *events, int event_count)
-{
-	int j;
-	int cap = event_count;
-	if (cap > QNN_MAX_ENTITY_EVENTS) cap = QNN_MAX_ENTITY_EVENTS;
-	if (cap < 0) cap = 0;
-
-	obs[pos++] = (uint8_t)cap;
-	for (j = 0; j < cap; ++j)
-	{
-		obs[pos++] = (uint8_t)events[j].action_id;
-		obs[pos++] = (uint8_t)events[j].source_id;
-	}
-	return pos;
-}
 
 int QNN_IOPoseTailEnabled(void)
 {
@@ -138,191 +211,32 @@ int QNN_IOPoseTailEnabled(void)
 	return enabled;
 }
 
-void QNN_IOStashPoseTail(uint8_t *obs, const qnn_snapshot_t *snapshot)
+void QNN_IOStashPoseTail(uint8_t *obs, int frame_bytes,
+	const qnn_snapshot_t *snapshot)
 {
 	float pose[4];
 
+	/* Every compiled plan reserves QNN_OBS_POSE_TAIL_BYTES at the end
+	 * of its frame; a shorter buffer here is a programming error. */
+	if (frame_bytes < (int)sizeof(pose))
+	{
+		fprintf(stderr, "qnn_io: pose tail into a %d-byte frame\n",
+			frame_bytes);
+		abort();
+	}
 	pose[0] = snapshot->player_origin[0];
 	pose[1] = snapshot->player_origin[1];
 	pose[2] = snapshot->player_origin[2];
 	pose[3] = snapshot->player_view_angles[1];
-	memcpy(obs + QNN_POSE_TAIL_OFF, pose, sizeof(pose));
+	memcpy(obs + frame_bytes - (int)sizeof(pose), pose, sizeof(pose));
 }
 
 void QNN_IOPackObsBuffer(uint8_t *obs, const qnn_tick_result_t *r)
 {
-	int i, j;
-	int pos;
-
-	memset(obs, 0, QNN_OBS_BUFFER_SIZE);
-
-	/* ── Self block (27 B) ───────────────────────────────────── */
-	{
-		const qnn_self_token_t *tok = &r->self;
-		float eff_armor = (float)tok->raw_armor * tok->armor_type;
-
-		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_HEALTH,
-			QNN_QuantizeU8Saturating((float)tok->health));
-		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_EFF_ARMOR,
-			QNN_QuantizeU8Saturating(eff_armor));
-		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_AMMO_SHELLS,
-			QNN_QuantizeU8Saturating((float)tok->ammo_shells));
-		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_AMMO_NAILS,
-			QNN_QuantizeU8Saturating((float)tok->ammo_nails));
-		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_AMMO_ROCKETS,
-			QNN_QuantizeU8Saturating((float)tok->ammo_rockets));
-		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_AMMO_CELLS,
-			QNN_QuantizeU8Saturating((float)tok->ammo_cells));
-
-		QNN_BufWriteI16(obs, QNN_OBS_OFF_SELF_VEL + 0,
-			QNN_QuantizeI16Clamped(tok->vel[0], QNN_VELOCITY_SCALE));
-		QNN_BufWriteI16(obs, QNN_OBS_OFF_SELF_VEL + 2,
-			QNN_QuantizeI16Clamped(tok->vel[1], QNN_VELOCITY_SCALE));
-		QNN_BufWriteI16(obs, QNN_OBS_OFF_SELF_VEL + 4,
-			QNN_QuantizeI16Clamped(tok->vel[2], QNN_VELOCITY_SCALE));
-
-		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_ATTACK_FIN, tok->attack_finished);
-
-		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_WEAPON_ID,
-			(uint8_t)tok->weapon_id);
-		QNN_BufWriteU8 (obs, QNN_OBS_OFF_SELF_MOVEMENT_ID,
-			(uint8_t)tok->movement_id);
-
-		QNN_BufWriteI32(obs, QNN_OBS_OFF_SELF_ITEMS, tok->items);
-
-		QNN_BufWriteI8 (obs, QNN_OBS_OFF_SELF_VIEW_PITCH,
-			QNN_QuantizeI8(tok->view_pitch));
-
-		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_LOOK_DELTA + 0, tok->look_delta[0]);
-		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_LOOK_DELTA + 2, tok->look_delta[1]);
-		QNN_BufWriteF16(obs, QNN_OBS_OFF_SELF_LOOK_DELTA + 4, tok->look_delta[2]);
-	}
-
-	/* ── Spatial block (132 B — 24x11 depth-atlas codes, nibble-packed).
-	 * Low nibble = even yaw cell; high nibble = odd yaw cell. Matches
-	 * qnn/wire.py's _unpack_native_spatial and the ONNX scratch packer. */
-	for (i = 0; i < QNN_OBS_ATLAS_ELEVS; ++i)
-		QNN_AtlasPackRow(
-			&obs[QNN_OBS_OFF_SPATIAL + i * QNN_OBS_ATLAS_PACKED_BYTES],
-			r->spatial_atlas[i]);
-
-	/* ── Entity stream (variable-length, native widths) ──────── */
-	{
-		int pack_count = r->entity_count < QNN_MAX_TOKEN_OBJECTS
-			? r->entity_count : QNN_MAX_TOKEN_OBJECTS;
-		pos = QNN_OBS_OFF_ENTITY_STREAM;
-		obs[pos++] = (uint8_t)pack_count;
-
-		for (i = 0; i < pack_count; ++i)
-		{
-			const qnn_tagged_token_t *tt = &r->entities[i];
-			obs[pos++] = (uint8_t)tt->type;
-
-			switch (tt->type)
-			{
-			case QNN_TOKEN_PROJECTILE:
-				{
-					const qnn_projectile_token_t *tok = &tt->projectile;
-					/* Common IDs — projectile has no player_id. */
-					obs[pos++] = (uint8_t)tok->subject_id;
-					obs[pos++] = (uint8_t)tok->modality_id;
-					/* Events */
-					pos = QNN_PackEventSlots(obs, pos, tok->events, tok->event_count);
-					/* Per-type scalars (14 B): rel i16×3, vel i16×3, recency f16 */
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[0], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[1], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[2], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[0], QNN_VELOCITY_SCALE)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[1], QNN_VELOCITY_SCALE)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[2], QNN_VELOCITY_SCALE)); pos += 2;
-					QNN_BufWriteF16(obs, pos, tok->recency); pos += 2;
-				}
-				break;
-
-			case QNN_TOKEN_ACTOR:
-				{
-					const qnn_actor_token_t *tok = &tt->actor;
-					obs[pos++] = (uint8_t)tok->subject_id;
-					obs[pos++] = (uint8_t)tok->modality_id;
-					obs[pos++] = (uint8_t)tok->player_id;
-					pos = QNN_PackEventSlots(obs, pos, tok->events, tok->event_count);
-					/* Per-type (30 B): half u8×3, rel i16×3, vel i16×3, path i16×3,
-					 * path_dist u16, eta f16, facing u8, team u8, score u8, recency f16 */
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[0])); pos += 1;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[1])); pos += 1;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[2])); pos += 1;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[0], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[1], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[2], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[0], QNN_VELOCITY_SCALE)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[1], QNN_VELOCITY_SCALE)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->vel[2], QNN_VELOCITY_SCALE)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[0], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[1], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[2], 32767.0f)); pos += 2;
-					QNN_BufWriteU16(obs, pos, QNN_QuantizeU16Saturating(tok->path_dist)); pos += 2;
-					QNN_BufWriteF16(obs, pos, tok->eta); pos += 2;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Unit(tok->facing)); pos += 1;
-					QNN_BufWriteU8 (obs, pos, (uint8_t)(tok->team > 0.5f ? 1 : 0)); pos += 1;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Unit(tok->score)); pos += 1;
-					QNN_BufWriteF16(obs, pos, tok->recency); pos += 2;
-				}
-				break;
-
-			case QNN_TOKEN_ITEM:
-				{
-					const qnn_item_token_t *tok = &tt->item;
-					obs[pos++] = (uint8_t)tok->subject_id;
-					obs[pos++] = (uint8_t)tok->modality_id;
-					pos = QNN_PackEventSlots(obs, pos, tok->events, tok->event_count);
-					/* Per-type (24 B): half u8×3, rel i16×3, path i16×3,
-					 * path_dist u16, eta f16, amount u8, regen f16, recency f16 */
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[0])); pos += 1;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[1])); pos += 1;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[2])); pos += 1;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[0], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[1], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[2], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[0], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[1], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[2], 32767.0f)); pos += 2;
-					QNN_BufWriteU16(obs, pos, QNN_QuantizeU16Saturating(tok->path_dist)); pos += 2;
-					QNN_BufWriteF16(obs, pos, tok->eta); pos += 2;
-					/* Raw engine pickup amount as u8 saturating; model
-					 * applies per-subject normalization via
-					 * qnn.engine_norm.ITEM_AMOUNT_MULT/CONST. */
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->amount)); pos += 1;
-					QNN_BufWriteF16(obs, pos, tok->regen); pos += 2;
-					QNN_BufWriteF16(obs, pos, tok->recency); pos += 2;
-				}
-				break;
-
-			case QNN_TOKEN_MOVER:
-				{
-					const qnn_mover_token_t *tok = &tt->mover;
-					obs[pos++] = (uint8_t)tok->subject_id;
-					obs[pos++] = (uint8_t)tok->modality_id;
-					pos = QNN_PackEventSlots(obs, pos, tok->events, tok->event_count);
-					/* Per-type (22 B): half u8×3, rel i16×3, path i16×3,
-					 * path_dist u16, eta f16, state u8, recency f16 */
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[0])); pos += 1;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[1])); pos += 1;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Saturating(tok->half_extents[2])); pos += 1;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[0], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[1], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->rel[2], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[0], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[1], 32767.0f)); pos += 2;
-					QNN_BufWriteI16(obs, pos, QNN_QuantizeI16Clamped(tok->path[2], 32767.0f)); pos += 2;
-					QNN_BufWriteU16(obs, pos, QNN_QuantizeU16Saturating(tok->path_dist)); pos += 2;
-					QNN_BufWriteF16(obs, pos, tok->eta); pos += 2;
-					QNN_BufWriteU8 (obs, pos, QNN_QuantizeU8Unit(tok->state)); pos += 1;
-					QNN_BufWriteF16(obs, pos, tok->recency); pos += 2;
-				}
-				break;
-			}
-		}
-	}
+	/* Legacy fixed-frame entry point: serialize the DEFAULT plan into
+	 * the classic 864-byte buffer.  Per-seat plans go through
+	 * QNN_ObsPlanPack directly (WS2). */
+	QNN_ObsPlanPack(QNN_IODefaultObsPlan(), obs, QNN_OBS_BUFFER_SIZE, r);
 }
 
 /* ══════════════════════════════════════════════════════════════════

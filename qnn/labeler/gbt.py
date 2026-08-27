@@ -374,7 +374,6 @@ def run(
         "data_dir": str(data_dir),
         "feat_spec": {
             "base_dim": spec.dim,
-            "use_weapon_id": spec.use_weapon_id,
             "use_baseline": spec.use_baseline,
             "clip_velocity": spec.clip_velocity,
         },

@@ -20,19 +20,18 @@ Native-width policy
 Per-field native dtype is chosen to match how the engine actually
 carries the value:
 
-- Health, armor, ammo, score, state — **u8** (engine byte ranges).
+- Health, armor, ammo, score — **u8** (engine byte ranges).
 - Distances and coordinates (``rel``, ``path``, ``path_dist``) — **i16/u16**
   raw Quake units. See "Deviations from
   Quake" below for the precision note.
 - Velocities — **i16** clamped to ±MAX_VELOCITY (sv_maxvelocity).
-- Time scalars (``attack_finished``, ``recency``, ``eta``, ``regen``) —
+- Time scalars (``attack_finished``, ``eta``) —
   **f16 seconds**. u8 fails because the meaningful range spans 0.1s up
   to 60s and we need ~10ms precision at the low end.
-- Already-normalized [0,1] floats (``facing``, ``team``, ``score``,
-  ``state``) — **u8** with 1/255 precision.
-- Spatial clearance — **u8** in four-Quake-unit increments.
-- Spatial plane normals — **u8 azimuth + i8 z**, reconstructing xyz with
-  about 0.7-degree azimuth and 1/127 vertical precision; z=-128 is a miss.
+- Already-normalized [0,1] floats (``facing``, ``team``, ``score``) —
+  **u8** with 1/255 precision.
+- Spatial depth-atlas codes — **u8**, with codes 0–14 indexing the distance
+  ladder and 15 denoting no hit inside the band's range.
 - Categorical IDs — **u8** (vocab fits in <256).
 - ``cl.items`` — **i32**, matches Quake's ``int items``.
 - ``act_target_probs`` — NOT on disk. Recomputed at training start
@@ -70,15 +69,7 @@ deviate, and why:
    alongside rel). Recomputed by the dequantizer via
    ``|rel| / DIST_SCALE``. Zero precision loss; saves 2 B/idx.
 
-5. **item amount (u8 saturating, model-side normalized)** vs engine's
-   raw ``e->amount`` (int, max value 200). Wire carries raw u8;
-   per-subject normalization (``raw × MULT[subj] + CONST[subj]``)
-   happens model-side via ``ITEM_AMOUNT_MULT``/``CONST`` (mirrors the
-   old C-side QNN_NormalizeItemAmount). Why: keeps the engine free
-   of MAX_HEALTH/MAX_ARMOR/per-weapon-ammo-bonus tables, single source
-   of truth for normalization stays in this file.
-
-6. **act_target_probs NOT on disk at all** — the target labeler is
+5. **act_target_probs NOT on disk at all** — the target labeler is
    ~3 µs/frame and runs deterministically on (obs, actions, config).
    We recompute it once at training start instead of caching, which
    decouples LabelerConfig from the cache fingerprint and avoids any
@@ -86,7 +77,7 @@ deviate, and why:
    overhead for an 8M-frame corpus, negligible against multi-hour
    training. See ``qnn.bc.train._compute_target_probs``.
 
-7. **act_move (u8 packed: move + fire)** vs engine's
+6. **act_move (u8 packed: move + fire)** vs engine's
    ``(forwardmove/sidemove/upmove i16 × 3, buttons.bit0 fire)``. We
    collapse the three i16 axes to discrete classes {neg, none, pos}
    per axis (2 bits each, 6 bits total) and pack BUTTON_ATTACK as
@@ -99,7 +90,7 @@ deviate, and why:
    into (T, 3) move + (T,) fire arrays so the heads see the same
    tensor shapes they always did.
 
-8. **act_look (f16 × 3)** vs engine's ``cl.viewangles[3] (float
+7. **act_look (f16 × 3)** vs engine's ``cl.viewangles[3] (float
    degrees)``. Native ``cmd_angles`` are i16 (QW 65536/360 quant);
    our act_look is the per-emit cur_forward · anchor_basis dot
    products in [-1, 1]. Why: matches the look head's anchor-relative
@@ -107,12 +98,12 @@ deviate, and why:
    instead of i8 (~0.5° step at unit length would be visible in
    smoothness).
 
-9. **Synthesized fields not in any Quake protocol idx**:
+8. **Synthesized fields not in any Quake protocol idx**:
    ``attack_finished`` (QC self.attack_finished cooldown, our f16
    seconds), ``self_movement_id`` (composite ground/air/water-level
-   we synthesize), entity ``eta``/``recency``/``regen``/``facing``/
-   ``team``/``score``/``state``/``path``/``path_dist``,  every
-   spatial-sector field, and every event scalar are all derived in
+   we synthesize), entity ``eta``/``facing``/``team``/``score``/
+   ``path``/``path_dist``, every spatial-atlas field, and every event scalar
+   are all derived in
    the C-side oracle/spatial/event modules — no Quake-native source
    to deviate from.
 
@@ -124,35 +115,27 @@ QW ``usercmd_t`` has 7 fields. What we carry, drop, or transform:
                             once tick-rate is fixed at collect time.
   angles[3]          i16 × 3 (65536/360 quant) — TRANSFORMED to
                             act_look (f16 × 3 anchor-basis dots).
-                            See deviation #8.
+                            See deviation #7.
   forwardmove        i16 — TRANSFORMED to act_move fb-axis class
                             {neg, none, pos} (2 bits).
   sidemove           i16 — TRANSFORMED to act_move lr-axis class.
   upmove             i16 — TRANSFORMED to act_move ud-axis class.
-  buttons.bit0       (BUTTON_ATTACK) — captured as act_move bit 6
-                            (packed with the 3-axis move classifier).
-  buttons.bit1       (BUTTON_JUMP)   — NOT directly captured. The
-                            model has to infer "did the demonstrator
-                            press +jump" from act_move ud=pos, which
-                            conflates ground-jump with
-                            water-swim-up (upmove>0). See
-                            project_labeler_fire_jump_drift memory.
-                            Idx reserved at act_move bit 7 for a
-                            future fix.
-  impulse 1..8       — captured as act_weapon (u8).
+  buttons.bit0       (BUTTON_ATTACK) — captured as raw evidence in
+                            act_move bit 0. The supervised attack
+                            outcome is stored separately as act_attack.
+  buttons.bit1       (BUTTON_JUMP)   — captured as act_move bit 7;
+                            swim-up remains act_move bit 6.
+  impulse 1..8       — not stored as an independent switch command.
+                            ``act_attack`` records the resolved impulse only
+                            when an effective engine attack occurs.
   impulse 9, 10..    — DROPPED. Quake's `impulse 9` is a cheat;
                             `impulse 10`/`11` cycle weapons (not
                             used in BC corpus); 100+ are mod-specific.
-                            Anything not in the 1..8 weapon-switch
-                            range gets silently ignored at the
-                            action labeler boundary.
+                            Anything outside the 1..8 weapon range is
+                            ignored at the action labeler boundary.
 
-The BUTTON_JUMP omission is the structurally meaningful gap. It's a
-known item — the labeler can emit jump separately (see the
-project_labeler_fire_jump_drift memory) but the BC action format
-hasn't been extended to carry it as its own field. The model's
-ability to learn jump timing precisely is limited by this; a future
-revision would add ``act_jump u8`` as a dedicated field.
+The raw attack bit and categorical attack field intentionally answer different
+questions: usercmd press evidence versus accepted engine action.
 """
 
 from __future__ import annotations
@@ -204,7 +187,7 @@ import numpy as np
 #             engine ORs the bit into the Quake press byte and runs NO attack
 #             sigmoid/threshold/hold-tail of its own. (move_state also dropped its
 #             two dead trailing slots → (B,9).) With
-#             this, ALL FOUR actions (move/look/weapon/attack) are decided in-graph
+#             this, all three actions (move/look/attack) are decided in-graph
 #             → the engine is decode-agnostic and decode-regime changes no longer
 #             touch the wire. wire.11 REPLACES wire.9 for the a24 gen (re-export);
 #             wire.10 stays burned (never reuse). (jumps 9→11 deliberately.)
@@ -222,24 +205,36 @@ import numpy as np
 #
 # (The third axis, ARCH — model internals / weight layout — is checkpoint-side
 #  only; the live bin ignores it. Tracked by qnn/utils/checkpoint_converter.py.)
-# wire.12.x = wire.11 + the spatial-tokens-v2 depth-atlas obs block (the 11
-# v1 raycast-scalar spatial inputs replaced by a single spatial_atlas grid).
-# The atlas GRID itself moved once while the line was in flight, and both
-# resolutions have deployed artifacts, so each gets its own id:
+# wire.13.x = the A27 pure-combat obs contract: the spatial-tokens-v2 depth
+# atlas PLUS the actor/projectile-only combat entity stream (SIGHT/PROXIMITY
+# current-frame, no item/mover rows) and the 9-way categorical attack head.
+# It is a DISTINCT wire from a26's wire.12 (atlas + FULL entity stream,
+# semantics.1) — the number moved off wire.12 because a26 already reclaimed
+# that shape.
 #
-#   wire.12.1  a26 rc1: 72 yaw cells per band, unpacked one code per byte.
-#   wire.12.2  finalized frontier: 24 yaw cells per band, nibble-packed to
+# The atlas GRID moved under a27 exactly as it did under a26, and both
+# resolutions have deployed artifacts, so — same rule as wire.12.x — each
+# gets its own id:
+#
+#   wire.13.1  a27 rc1: 72 yaw cells per band, unpacked one code per byte.
+#              This is the deployed a27rc1a line.
+#   wire.13.2  finalized frontier: 24 yaw cells per band, nibble-packed to
 #              12 bytes per row. HEAD — what this exporter produces.
 #
-# BARE `wire.12` IS RETIRED AND MUST NOT BE RE-USED. It was stamped on both
-# families before the frontier was settled, so it cannot select a codec
-# without inspecting tensor shapes; the bin refuses it with a re-stamp hint
-# (QNN_RETIRED_WIRES in src/engine/common/qnn_onnx.c). Same rule as wire.10.
-WIRE_CONTRACT_ID = "wire.12.2"
-# The a26 rc1 atlas line (ATLAS_YAWS_LEGACY-wide, unpacked). Still loadable:
+# BARE `wire.13` IS RETIRED AND MUST NOT BE RE-USED, for the same reason bare
+# `wire.12` is: it was stamped on both families while the frontier was in
+# flight, so it cannot select a codec without inspecting tensor shapes. The
+# bin refuses it with a re-stamp hint (QNN_RETIRED_WIRES in
+# src/engine/common/qnn_onnx.c). Same rule as wire.10.
+#
+# a24/a25's wire.11 (v1 raycast) and both a26 atlas families (wire.12.1 /
+# wire.12.2) remain live codecs in the bin — one bin serves every artifact
+# family; wire.13.2 is HEAD.
+WIRE_CONTRACT_ID = "wire.13.2"
+# The a27 rc1 atlas line (ATLAS_YAWS_LEGACY-wide, unpacked). Still loadable:
 # its codec is registered and its artifacts are deployed.
-WIRE_CONTRACT_ID_ATLAS_LEGACY = "wire.12.1"
-SEMANTICS_CONTRACT_ID = "semantics.1"
+WIRE_CONTRACT_ID_ATLAS_LEGACY = "wire.13.1"
+SEMANTICS_CONTRACT_ID = "semantics.2"
 
 
 # ── Engine resource caps ─────────────────────────────────────────
@@ -406,15 +401,6 @@ SELF_FIELDS: Tuple[Field, ...] = (
                "~2s with sub-frame precision needs.",
     ),
     Field(
-        name="self_weapon_id",
-        dtype=np.uint8, shape=(),
-        scale=None, transform="embedding",
-        source="STAT_ACTIVEWEAPON → mapped to ENTITY_IDS subject "
-               "(AXE..LIGHTNING block). Categorical, fed to "
-               "ObsEmbedding.entity_embed sharing rows with world-"
-               "entity weapons.",
-    ),
-    Field(
         name="self_movement_id",
         dtype=np.uint8, shape=(),
         scale=None, transform="embedding",
@@ -468,7 +454,7 @@ SELF_FIELDS: Tuple[Field, ...] = (
 SELF_BLOCK_BYTES: int = sum(f.bytes_per_frame for f in SELF_FIELDS)
 # Computed at import time; expect 27 bytes:
 #   health 1 + effective_armor 1 + ammo×4 4 + vel 6 + attack_finished 2
-#   + weapon_id 1 + movement_id 1 + items 4 + view_pitch 1 = 21
+#   + movement_id 1 + items 4 + view_pitch 1 = 20
 #   + look_delta 6 = 27
 
 
@@ -569,9 +555,8 @@ ENTITY_COMMON_FIELDS: Tuple[Field, ...] = (
         name="type",
         dtype=np.int8, shape=(),
         scale=None, transform=None,
-        source="Token type tag (TOKEN_PROJECTILE=0, TOKEN_ACTOR=1, "
-               "TOKEN_ITEM=2, TOKEN_MOVER=3). -1 for empty idx in "
-               "dense cache.",
+        source="A27 combat token type tag (TOKEN_PROJECTILE=0, "
+               "TOKEN_ACTOR=1). -1 for empty idx in dense cache.",
     ),
     Field(
         name="subject_id",
@@ -584,7 +569,7 @@ ENTITY_COMMON_FIELDS: Tuple[Field, ...] = (
         name="modality_id",
         dtype=np.uint8, shape=(),
         scale=None, transform="embedding",
-        source="MODALITY_IDS — SIGHT/PROXIMITY/SOUND/MEMORY. "
+        source="A27 combat modality — SIGHT or PROXIMITY only. "
                "Categorical, fed to modality_embed.",
     ),
     Field(
@@ -632,13 +617,8 @@ _F_HALF_EXTENTS = Field(
     dtype=np.uint8, shape=(3,),
     scale=DIST_SCALE, transform=None,
     source="Entity bbox half-sizes in Quake units. Native raw, model "
-           "divides by DIST_SCALE. Players/items are <64; standard "
-           "DM doors and lifts are typically <128. **Saturates at 255** "
-           "— affects only unusually large movers (custom-map trains "
-           "or skybox-spanning movers), which are rare in DM. Saved "
-           "3 B/idx × 16 indices = 48 B/frame vs i16; acceptable "
-           "given the model's response to 'huge mover' is "
-           "indistinguishable above ~255 units anyway.",
+           "divides by DIST_SCALE. Actor bounds are well below the u8 "
+           "ceiling; values saturate at 255 Quake units.",
 )
 _F_REL = Field(
     name="rel",
@@ -684,12 +664,11 @@ _F_RECENCY = Field(
     name="recency",
     dtype=np.float16, shape=(),
     scale=TIME_SCALE, transform=None,
-    source="Time since last observed, seconds. f16.",
+    source="Time since last observed, seconds. f16. Full-stream (a26) "
+           "only — the A27 combat stream dropped it.",
 )
-
-
 PROJECTILE_FIELDS: Tuple[Field, ...] = (
-    _F_REL, _F_VEL, _F_RECENCY,
+    _F_REL, _F_VEL,
 )
 
 ACTOR_FIELDS: Tuple[Field, ...] = (
@@ -716,8 +695,38 @@ ACTOR_FIELDS: Tuple[Field, ...] = (
         scale=255.0, transform=None,
         source="frags / max_frags in [0, 1]. u8 with 1/255 precision.",
     ),
-    _F_RECENCY,
 )
+
+ENTITY_FIELDS: dict[str, Tuple[Field, ...]] = {
+    "projectile": PROJECTILE_FIELDS,
+    "actor":      ACTOR_FIELDS,
+}
+
+# Per-type scalar block byte totals (excluding common IDs / events).
+ENTITY_SCALAR_BYTES: dict[str, int] = {
+    name: sum(f.bytes_per_frame for f in fields)
+    for name, fields in ENTITY_FIELDS.items()
+}
+# Expected (the per-type difference is exactly what makes the wire
+# variable-length on the C side):
+#   projectile: 6 + 6 = 12
+#   actor:      3 + 6 + 6 + 6 + 2 + 2 + 1 + 1 + 1 = 28
+
+
+# ── Full-stream (a26) per-type scalar tables ─────────────────────
+# The a26-line stream, verbatim from the pre-split codec layer
+# (215eb608): recency trails every type, and item/mover are live token
+# types (the A27 combat stream deleted them). Kept ALONGSIDE the combat
+# tables so a26-line checkpoints load and forward on this line —
+# selected per checkpoint via the model's ``entity_stream``. The combat
+# tables above stay the canonical ENTITY_FIELDS objects; nothing here
+# feeds the A27 wire/cache math.
+
+FULL_PROJECTILE_FIELDS: Tuple[Field, ...] = (
+    _F_REL, _F_VEL, _F_RECENCY,
+)
+
+FULL_ACTOR_FIELDS: Tuple[Field, ...] = ACTOR_FIELDS + (_F_RECENCY,)
 
 ITEM_FIELDS: Tuple[Field, ...] = (
     _F_HALF_EXTENTS,
@@ -757,30 +766,40 @@ MOVER_FIELDS: Tuple[Field, ...] = (
     _F_RECENCY,
 )
 
-ENTITY_FIELDS: dict[str, Tuple[Field, ...]] = {
-    "projectile": PROJECTILE_FIELDS,
-    "actor":      ACTOR_FIELDS,
+FULL_ENTITY_FIELDS: dict[str, Tuple[Field, ...]] = {
+    "projectile": FULL_PROJECTILE_FIELDS,
+    "actor":      FULL_ACTOR_FIELDS,
     "item":       ITEM_FIELDS,
     "mover":      MOVER_FIELDS,
 }
 
+# Stream-keyed views. "combat" IS the canonical dict above (same object;
+# existing consumers — contracts fingerprinting, wire math — unchanged).
+ENTITY_FIELDS_BY_STREAM: dict[str, dict[str, Tuple[Field, ...]]] = {
+    "combat": ENTITY_FIELDS,
+    "full":   FULL_ENTITY_FIELDS,
+}
+ENTITY_SCALAR_BYTES_BY_STREAM: dict[str, dict[str, int]] = {
+    "combat": ENTITY_SCALAR_BYTES,
+    "full": {
+        name: sum(f.bytes_per_frame for f in fields)
+        for name, fields in FULL_ENTITY_FIELDS.items()
+    },
+}
+# Expected full-stream totals: projectile 14, actor 30, item 24, mover 22.
 
-# ── Item amount normalization table (model-side) ─────────────────
-# The C side emits raw e->amount (the engine's pickup magnitude — see
-# qnn_item_defs in qnn_store.c). The model-side normalization to a
-# [0, 1]-ish value is a per-subject affine: ``amount = raw × mult + const``.
-#
-# Two ways a subject is represented:
-#   - Raw-dependent (ammo, health, armor): mult = 1/divisor (with the
-#     armor type factor folded in), const = 0. Result depends on raw.
-#   - Constant (powerups, weapons): mult = 0, const = canonical value.
-#     Result ignores raw — the wire value is unused but harmless.
-# Subjects not in the table get (0, 0) → amount=0 (matches the C-side
-# `default: return 0.0f` from QNN_NormalizeItemAmount).
-#
-# Mirrors qnn_oracle.c:QNN_NormalizeItemAmount semantics exactly; the
-# C function is going away as soon as this is wired.
 
+# ── Item amount normalization table ──────────────────────────────
+# Item/mover tokens are NOT part of the wire.13 combat obs stream (the model
+# reads only actor/projectile — see model/transformer.py), but they remain
+# live engine entities: the C store/reward path populates item `amount`, and
+# the wire.11/wire.12 codecs (a24/a25/a26 models, supported in the same bin)
+# emit the full entity stream including items. This per-subject affine
+# (``amount = raw × mult + const``) is the value-semantics of that item
+# `amount` field — it mirrors qnn_onnx.c:w7_item_amount / the C
+# QNN_NormalizeItemAmount table. Kept here (and fingerprinted by
+# semantics_sig) so a silent drift is caught; subjects not in the table get
+# (0, 0) → amount = 0.
 from qnn.vocab import ENTITY_IDS, ENTITY_VOCAB_SIZE  # noqa: E402
 
 ITEM_AMOUNT_MULT  = np.zeros(ENTITY_VOCAB_SIZE, dtype=np.float32)
@@ -797,8 +816,8 @@ ITEM_AMOUNT_MULT[ENTITY_IDS["NAILS"]]         = 1.0 / MAX_NAILS
 ITEM_AMOUNT_MULT[ENTITY_IDS["ROCKETS"]]       = 1.0 / MAX_ROCKETS
 ITEM_AMOUNT_MULT[ENTITY_IDS["CELLS"]]         = 1.0 / MAX_CELLS
 
-# Constant per subject: powerup pickups (just "you got one") and
-# weapon pickups (the ammo bonus the weapon comes with).
+# Constant per subject: powerup pickups (just "you got one") and weapon
+# pickups (the ammo bonus the weapon comes with).
 for _s in ("QUAD", "PENT", "RING", "SUIT"):
     ITEM_AMOUNT_CONST[ENTITY_IDS[_s]] = 1.0
 ITEM_AMOUNT_CONST[ENTITY_IDS["SHOTGUN"]]           =  5.0 / MAX_SHELLS
@@ -809,18 +828,6 @@ ITEM_AMOUNT_CONST[ENTITY_IDS["GRENADE_LAUNCHER"]]  =  5.0 / MAX_ROCKETS
 ITEM_AMOUNT_CONST[ENTITY_IDS["ROCKET_LAUNCHER"]]   =  5.0 / MAX_ROCKETS
 ITEM_AMOUNT_CONST[ENTITY_IDS["THUNDERBOLT"]]       = 15.0 / MAX_CELLS
 del _s
-
-# Per-type scalar block byte totals (excluding common IDs / events).
-ENTITY_SCALAR_BYTES: dict[str, int] = {
-    name: sum(f.bytes_per_frame for f in fields)
-    for name, fields in ENTITY_FIELDS.items()
-}
-# Expected (the per-type difference is exactly what makes the wire
-# variable-length on the C side):
-#   projectile: 6 + 2 + 6 + 2 = 16
-#   actor:      6 + 6 + 2 + 6 + 6 + 2 + 2 + 1 + 1 + 1 + 2 = 35
-#   item:       6 + 6 + 2 + 6 + 2 + 2 + 1 + 2 + 2 = 29
-#   mover:      6 + 6 + 2 + 6 + 2 + 2 + 1 + 2 = 27
 
 
 # ── Action block ─────────────────────────────────────────────────
@@ -848,11 +855,12 @@ ACTION_FIELDS: Tuple[Field, ...] = (
                "and (T,) attack / jump streams.",
     ),
     Field(
-        name="act_weapon",
+        name="act_attack",
         dtype=np.uint8, shape=(),
         scale=None, transform="embedding",
-        source="Engine weapon byte 0..8 (0 = no weapon held, 1 = axe, "
-               "..., 8 = thunderbolt). Impulse-indexed (NOT ENTITY_IDS).",
+        source="Categorical effective attack 0..8 (0 = no attack, 1 = axe, "
+               "..., 8 = thunderbolt). Impulse-indexed (NOT ENTITY_IDS); "
+               "there is no parallel fire or action-side weapon label.",
     ),
     Field(
         name="act_look",
@@ -889,7 +897,8 @@ ACTION_FIELDS: Tuple[Field, ...] = (
 )
 
 ACTION_BLOCK_BYTES: int = sum(f.bytes_per_frame for f in ACTION_FIELDS)
-# Expected: 1 (move+fire) + 1 (weapon) + 6 (look) + 1 (op_input) = 9 bytes
+# Expected: 1 (move+raw attack press) + 1 (attack category) + 6 (look)
+# + 1 (op_input) = 9 bytes
 # (was 11 with sparse target_probs; 12 before fire was packed into move;
 # ~86 B in the original float32 layout: 1+1+1+6+68).  Note: this is the
 # CACHE block; the on-wire action struct (qnn.wire.ACTION_SIZE) stays 16 B

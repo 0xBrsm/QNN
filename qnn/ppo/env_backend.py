@@ -83,12 +83,19 @@ class EnvStepBatch:
                 raise ValueError(
                     f"{name} must have shape ({count},), got {values.shape}"
                 )
-        for name, values in self.obs.items():
-            if np.asarray(values).ndim < 1 or int(np.asarray(values).shape[0]) != count:
+        if isinstance(self.obs, list):
+            # Heterogeneous-seat form (per-lane obs dicts — cross-arch eval):
+            # one dict per lane, no dense field-major stacking possible.
+            if len(self.obs) != count:
                 raise ValueError(
-                    f"obs[{name!r}] must have leading dimension {count}, "
-                    f"got {np.asarray(values).shape}"
-                )
+                    f"obs list must contain {count} lane dicts, got {len(self.obs)}")
+        else:
+            for name, values in self.obs.items():
+                if np.asarray(values).ndim < 1 or int(np.asarray(values).shape[0]) != count:
+                    raise ValueError(
+                        f"obs[{name!r}] must have leading dimension {count}, "
+                        f"got {np.asarray(values).shape}"
+                    )
         if self.infos and len(self.infos) != count:
             raise ValueError(f"infos must contain {count} rows, got {len(self.infos)}")
 

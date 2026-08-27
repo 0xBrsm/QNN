@@ -75,8 +75,8 @@ class MoveHazardHead(nn.Module):
     """
 
     # Exposed so the Network can construct this head's input without importing
-    # a bench.a25 type directly — it reads ``self.move_hazard_head.Input`` off the
-    # built instance (the head owns its IO contract).
+    # this module's type directly — it reads ``self.move_hazard_head.Input`` off
+    # the built instance (the head owns its IO contract).
     Input = MoveHazardHeadInput
 
     def __init__(self, in_dim: int, d_hidden: int, activation: str) -> None:

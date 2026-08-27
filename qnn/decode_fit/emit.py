@@ -11,7 +11,7 @@ FAIL only labeled the report.
 
 Param assembly is ported from v1 ``emit_vector_decode_config``
 (qnn.eval.decode_fit_pipeline.py:2300); the emit base is the a25-native
-template ``decode.a25base.json`` (same role as the v1 ORACLE_TEMPLATE).
+template ``decode.base.json`` (same role as the v1 ORACLE_TEMPLATE).
 """
 from __future__ import annotations
 
@@ -22,12 +22,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from qnn.decode_fit.context import read_json, rel_to_repo
+from qnn.decode_fit.context import (CALIBRATION_FAMILIES, WEAPON_IMPULSE,
+                                    read_json, rel_to_repo)
 from qnn.decode_fit.response import WeaponPlan
 
 _REPO = Path(__file__).resolve().parents[3]
 # a25-native BASE template — the emit base (v1 ORACLE_TEMPLATE, pipeline:72).
-TEMPLATE = _REPO / "src" / "qnn" / "model" / "bench" / "templates" / "decode.a25base.json"
+TEMPLATE = _REPO / "src" / "qnn" / "model" / "bench" / "templates" / "decode.base.json"
 
 # Decode knobs the eval path honors but the deploy (ONNX) export path does NOT
 # thread into ExportWrapper. A non-noop value for any of these means the
@@ -238,6 +239,24 @@ def warm_start_style(ctx, staged: Path) -> Path | None:
               if k in src_cfg.get("params", {})}
     if not warmed:
         return None
+    fire = warmed.get("attack.fire_bias_vec")
+    if isinstance(fire, list) and len(fire) == 8:
+        fire = [float(v) for v in fire]
+        current = list((cfg.get("params") or {}).get(
+            "attack.fire_bias_vec") or [0.0] * 8)
+        source_is_family_fit = bool(
+            (src_cfg.get("provenance") or {}).get("calibration_families"))
+        for source, members in CALIBRATION_FAMILIES.items():
+            if len(members) == 1:
+                continue
+            idx = WEAPON_IMPULSE[source] - 1
+            # A legacy warm start may only have lifted the instrument member;
+            # never let it pull the new live-pin floor downward.
+            value = fire[idx] if source_is_family_fit else max(
+                fire[idx], float(current[idx]))
+            for member in members:
+                fire[WEAPON_IMPULSE[member] - 1] = value
+        warmed["attack.fire_bias_vec"] = fire
     cfg["params"].update(warmed)
     cfg.setdefault("provenance", {})["trim_warm_start"] = {
         "source": rel_to_repo(src), "keys": sorted(warmed)}

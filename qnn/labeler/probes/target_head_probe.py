@@ -211,9 +211,9 @@ def _load_split(
         escal = np.load(split_dir / f"{tag}_obs_entity_scalars_raw.npy", mmap_mode="r")
         s_scal = np.load(split_dir / f"{tag}_obs_self_scalars.npy", mmap_mode="r")
         mid = np.load(split_dir / f"{tag}_obs_self_movement_id.npy", mmap_mode="r")
-        wid = np.load(split_dir / f"{tag}_obs_self_weapon_id.npy", mmap_mode="r")
+        attack = np.load(split_dir / f"{tag}_act_attack.npy", mmap_mode="r")
         look = np.load(split_dir / f"{tag}_act_look.npy", mmap_mode="r")
-        fire = np.load(split_dir / f"{tag}_act_attack.npy", mmap_mode="r")
+        fire = np.asarray(attack > 0, dtype=np.uint8)
         target = np.load(split_dir / f"{tag}_act_target.npy", mmap_mode="r")
 
         token_keep = None
@@ -233,7 +233,7 @@ def _load_split(
             entity_ids=eids,
             self_scalars=s_scal,
             movement_id=mid,
-            weapon_id=wid,
+            weapon_id=attack,
             look=look,
             fire=fire,
             target=target,

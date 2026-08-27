@@ -64,8 +64,32 @@ _KEEP_MODULES = frozenset(
 
 # Sources whose edits bake into the resident VRAM tensors at preload and are
 # then skipped per step — i.e. silent staleness if reloaded against a kept
-# bundle. See module docstring for why this is scoped to dequant only.
-_DATA_LAYER_MODULES = ("qnn.model.dequant",)
+# bundle.
+#
+# Dequant is the obvious member. The label DERIVERS belong here too: the BC
+# preload materializes their output into the resident action tensors once (see
+# supervised_loop's `_precompute_derived` / the resident `gpu_actions` block)
+# and every later step just indexes those tensors. Editing a deriver and
+# reloading against a kept bundle therefore trains on the OLD labels with no
+# warning — and the derived columns do not enter
+# `container._source_compatibility_key` either, so nothing else catches it.
+# Cost of listing them: a deriver edit drops the bundle and the next submit
+# rebuilds the corpus (~50s), which is exactly the intended behaviour.
+#
+# ⚠ Editing THIS tuple does not take effect on a running daemon. This module is
+# in `_KEEP_MODULES` (it performs the reload, so purging it would pull the rug
+# out), and `ablation_daemon` binds `changed_data_layer` at import — so a
+# reload_code keeps the old list. A daemon restart is required to pick up a
+# change here. Two further wrinkles worth knowing: `_reload_code` evaluates the
+# staleness check BEFORE purging modules, so any list change would lag by one
+# reload anyway; and `changed_data_layer(None)` returns False, so a bundle built
+# before a fingerprint was captured is never considered stale.
+_DATA_LAYER_MODULES = (
+    "qnn.model.dequant",
+    "qnn.model.attack_future_bins",   # attack_future_bucket (a27 MTP aux label)
+    "qnn.model.hazard_labels",        # a25 move-hazard held/dwell/release/valid
+    "qnn.bc.loss_shaping",            # per_frame_distance_to_pos (attack/jump dist)
+)
 
 
 def _module_source_path(module_name: str) -> str | None:

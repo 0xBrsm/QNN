@@ -2,9 +2,9 @@
 
 Drops entity-token indices at train time via a MongoDB-style predicate,
 parallel to ``segment_mask`` (which acts on per-frame fields).  This
-replaces the deprecated collect-time ``--entity-filter pvs_actors`` flag:
-collects always emit the full 4-pool token stream, and any subsetting
-happens at train time via this mask.
+replaces the deprecated collect-time ``--entity-filter pvs_actors`` flag.
+A27 collects emit the two-pool actor/projectile combat stream, and any further
+subsetting happens at train time via this mask.
 
 Field paths in the per-token namespace:
 
@@ -14,14 +14,11 @@ Field paths in the per-token namespace:
     route_idx → entity_ids[:, :, 0]      uint8, multi-route alternative
 
 Token type IDs (qnn.vocab):
-    0 = PROJECTILE, 1 = ACTOR, 2 = ITEM, 3 = MOVER
+    0 = PROJECTILE, 1 = ACTOR
 
 Modality IDs (qnn_vocab.h):
-    0 = SIGHT       — visible in PVS (actors, items, projectiles, movers)
-    1 = PROXIMITY   — nearby & not LOS (items / projectiles / movers only;
-                      actors never use this modality)
-    2 = SOUND       — heard but not seen (actors only)
-    3 = MEMORY      — last-known position after sight loss (actors only)
+    0 = SIGHT       — current view cone plus unobstructed trace
+    1 = PROXIMITY   — current PVS state that did not qualify for SIGHT
 
 Indices where the predicate evaluates to False are zeroed in place:
 
@@ -40,8 +37,7 @@ Equivalent to the deprecated ``entity_filter=pvs_actors`` collect flag::
     token_mask = {
         "type":     1,                # TOKEN_ACTOR
         "pid":      {"$gt": 0},
-        "modality": 0,                # SIGHT — actors never get PROXIMITY,
-                                      #   and we drop SOUND/MEMORY here
+        "modality": 0,                # SIGHT actors only
     }
 """
 

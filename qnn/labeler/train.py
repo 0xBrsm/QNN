@@ -222,7 +222,6 @@ class ChunkedDataset(Dataset):
         for ep in episodes:
             feats = build_features(
                 ep.self_velocity, ep.self_movement_id, ep.look,
-                weapon_id=ep.weapon_id if ep.weapon_id is not None else None,
                 gbt_probs=ep.gbt_probs if ep.gbt_probs is not None else None,
                 spec=spec,
             ).astype(np.float16, copy=False)
@@ -509,8 +508,7 @@ def train(cfg: TrainConfig) -> None:
         saved_spec = ckpt.get("feat_spec")
         if saved_spec is not None:
             cur_spec = asdict(cfg.feat_spec)
-            for k in ("use_weapon_id",
-                      "use_baseline", "use_baseline_skip", "use_gbt_stack",
+            for k in ("use_baseline", "use_baseline_skip", "use_gbt_stack",
                       "clip_velocity", "baseline_skip_axes"):
                 if saved_spec.get(k) != cur_spec.get(k):
                     raise ValueError(
@@ -755,9 +753,6 @@ def main() -> None:
                          "applies when --use-baseline-skip is on).  'fb_lr' "
                          "(default): both axes.  'lr': lr only (fb head is "
                          "encoder-only).  'fb': fb only.")
-    ap.add_argument("--use-weapon-id", action="store_true",
-                    help="One-hot the server-held weapon_id (9 dims: 0=none, "
-                         "1..8 = axe..LG) and append to the encoder input.")
     ap.add_argument("--sanitize-targets", action="store_true",
                     help="Replace per-tick targets with ignore_index=-100 on "
                          "ticks where the player's input on that axis was "
@@ -777,7 +772,6 @@ def main() -> None:
     args = ap.parse_args()
 
     spec = FeatureSpec(
-        use_weapon_id=args.use_weapon_id,
         use_baseline=args.use_baseline,
         use_baseline_skip=args.use_baseline_skip,
         baseline_skip_axes=args.baseline_skip_axes,

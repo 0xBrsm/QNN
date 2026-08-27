@@ -275,6 +275,7 @@ void QNN_TraceStaticBlockers(const vec3_t start, const vec3_t end,
 /* Model view-cone aperture (total degrees, [0,360]); read by QNN_InFov,
  * registered via QNN_RegisterPerceptionCvars. See qnn_entity.c. */
 extern cvar_t qnn_fov;
+extern cvar_t qnn_los_clearance;
 void QNN_RegisterPerceptionCvars(void);
 
 qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const vec3_t target);

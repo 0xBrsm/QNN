@@ -36,6 +36,7 @@ class NativeWorldEnv:
         workdir: str | Path | None = None,
         map_pool: MapPool | None = None,
         procgen: dict | None = None,
+        declaration: object = None,
     ) -> None:
         self.max_steps = max_steps
         self.reward_weights = reward_weights
@@ -85,6 +86,7 @@ class NativeWorldEnv:
             extra_args=native_args,
             reset_options=self.options,
             training_format="binary_v1",
+            declaration=declaration,
         )
         map_id = self.adapter.map_id_snapshot()
         if map_id is None:
@@ -93,6 +95,12 @@ class NativeWorldEnv:
         self.map_id = map_id
         self._steps: int = -1
         self._frags: int = 0
+
+    @property
+    def layout(self):
+        """Negotiated obs layout (None = engine default plan); the eval's
+        batched raw receive sizes and parses frames by this."""
+        return self.adapter.process.layout
 
     _MAX_PROCGEN_RETRIES = 3
 

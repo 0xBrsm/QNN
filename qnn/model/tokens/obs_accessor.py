@@ -28,10 +28,7 @@ from typing import Iterator, Mapping
 
 import torch
 
-from qnn.model.tokens.obs_fields import (
-    SCALAR_FIELDS, VOCAB_FIELDS, WT_DAMAGE, WT_RADIUS,
-)
-from qnn.vocab import self_weapon_id_to_impulse
+from qnn.model.tokens.obs_fields import SCALAR_FIELDS, VOCAB_FIELDS
 
 
 def collect_powerup_ids(obs_dict: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
@@ -121,51 +118,11 @@ class ObsAccessor:
         raise KeyError(f"unknown aux signal {name!r}")
 
     # ── computed scalar fields ───────────────────────────────────────
-    def _impulse(self) -> torch.Tensor:
-        """ENTITY_IDS self_weapon_id → impulse byte (0..8), shape (B*,)."""
-        return self_weapon_id_to_impulse(
-            self.dq["self_weapon_id"].long().squeeze(-1)
-        )
-
-    def _weapon_static_table(self) -> torch.Tensor:
-        return _weapon_static_cpu().to(self.device)
-
-    def _compute_weapon_static(self) -> torch.Tensor:
-        table = self._weapon_static_table()
-        imp = self._impulse().clamp(0, table.shape[0] - 1)
-        return table[imp]                                       # (B*, 7)
-
-    def _compute_weapon_dmg_rad(self) -> torch.Tensor:
-        table = self._weapon_static_table()
-        imp = self._impulse().clamp(0, table.shape[0] - 1)
-        return table[imp][:, (WT_DAMAGE, WT_RADIUS)]            # (B*, 2)
-
-    def _compute_held_readiness(self) -> torch.Tensor:
-        imp = self._impulse()
-        readiness = self.readiness()                            # (B*, 8)
-        held_idx = (imp - 1).clamp_min(0).unsqueeze(-1)         # (B*, 1)
-        held = readiness.gather(1, held_idx)                    # (B*, 1)
-        has_weapon = (imp >= 1).to(readiness.dtype).unsqueeze(-1)
-        return held * has_weapon
-
     def _compute_engagement(self) -> torch.Tensor:
         e = self.aux("engagement")
         if e.dim() == 0:
             e = e.expand(self.batch)
         return e.unsqueeze(-1)                                  # (B*, 1)
-
-
-# Weapon static table is pure data (no params); cache one cpu copy and move
-# to the obs device on demand (9×7 — negligible).
-_WEAPON_STATIC_CACHE: torch.Tensor | None = None
-
-
-def _weapon_static_cpu() -> torch.Tensor:
-    global _WEAPON_STATIC_CACHE
-    if _WEAPON_STATIC_CACHE is None:
-        from qnn.bc.weapon_physics import build_model_weapon_scalars
-        _WEAPON_STATIC_CACHE = torch.from_numpy(build_model_weapon_scalars()).float()
-    return _WEAPON_STATIC_CACHE
 
 
 # ── forward-scoped accessor context ──────────────────────────────────

@@ -32,7 +32,7 @@ GROUND TRUTH (per demo, self / view entity)
 COLLECTED SIDE (shard NPYs + manifest, no env dumps)
   attack EVENTS = rising edges of ``act_move & 0x01``.
   jump   EVENTS = rising edges of ``act_move & 0x80`` (bit 7).
-  per-weapon attack via the stored ``act_weapon`` label (raw 1..8).
+  per-weapon attack via the stored categorical ``act_attack`` label (1..8).
 
 Usage:
   PYTHONPATH=src python -m qnn.bc.validate_labels <collect-dir> \\
@@ -202,7 +202,7 @@ def _detect_force_mvd_emit(collect_dir: Path) -> bool:
 def _iter_collected(split_dir: Path, force_mvd_emit: bool):
     """Yield (demo_idx, attack_events, jump_events, attack_per_weapon) per
     episode across all shards in a split. attack_per_weapon is a Counter-like
-    dict keyed by raw weapon class 1..8 from act_weapon at each attack edge.
+    dict keyed by attack class 1..8 at each effective attack.
 
     BOTH paths score the OPERATIVE attack — ``(act_move & 0x01) & (act_input_mask
     & 0x01)`` — i.e. only the un-masked inputs the model actually trains on. The
@@ -222,23 +222,22 @@ def _iter_collected(split_dir: Path, force_mvd_emit: bool):
         move_name = sh["actions"]["move"]
         base = move_name[: -len("_act_move.npy")]
         mv = np.load(split_dir / f"{base}_act_move.npy")
-        wp = np.load(split_dir / f"{base}_act_weapon.npy")
+        attack_labels = np.load(split_dir / f"{base}_act_attack.npy")
         im = np.load(split_dir / f"{base}_act_input_mask.npy")
         off = 0
         for ln, di in zip(sh["episode_lengths"], sh["demo_idxs"]):
             ep_mv = mv[off:off + ln]
-            ep_wp = wp[off:off + ln]
+            ep_attack_labels = attack_labels[off:off + ln]
             # OPERATIVE only (un-masked); no-op held frames excluded. Attack =
             # input_mask bit 0, jump = input_mask bit 7 (same bit layout as move).
             ep_im = im[off:off + ln]
             attack = ((ep_mv & 0x01) & (ep_im & 0x01)).astype(np.int8)
             jump = (((ep_mv >> 7) & 0x01) & ((ep_im >> 7) & 0x01)).astype(np.int8)
-            # attack rising edges, weapon attributed at the edge frame.
-            d = np.diff(np.concatenate([[0], attack, [0]]))
-            edges = np.where(d == 1)[0]
+            # Effective attack events and their directly encoded impulse class.
+            edges = np.flatnonzero(ep_attack_labels > 0)
             per_w: dict[int, int] = {}
             for s in edges:
-                cls = int(ep_wp[s])
+                cls = int(ep_attack_labels[s])
                 if 1 <= cls <= 8:
                     per_w[cls] = per_w.get(cls, 0) + 1
             yield int(di), len(edges), _rising_edges(jump), per_w
@@ -437,7 +436,7 @@ def validate_labels(
         # Known unexplained discrepancy: attack and jump both under-count their
         # demo-sound references by a similar ~few-percent margin. Ruled out:
         # resample rate (the gap is hz-stable, same at native tick), weapon
-        # attribution (act_weapon == qc engine weapon — same deviation either
+        # attribution (act_attack == QC-fired impulse — same deviation either
         # way), and attack feasibility false-negatives (~0.6% at fire frames).
         # Leading remaining suspect is cmd-window button0 press detection /
         # high-ping press->sound lead, but it's not been pinned down.
@@ -476,7 +475,7 @@ def _print_report(collect_dir: Path, ref_kind: str,
 
     cols = " ".join(f"{WNAME[c]:>5}" for c in WNAME)
     print("\n" + "=" * 88)
-    print("AGGREGATE per-weapon attack (collected attribution by stored act_weapon)")
+    print("AGGREGATE per-weapon attack (collected attribution by stored act_attack)")
     print("=" * 88)
     print(f"{'':14} {cols}  {'TOT':>6}")
     rrow = " ".join(f"{agg.ref_attack_per_w[c]:>5}" for c in WNAME)

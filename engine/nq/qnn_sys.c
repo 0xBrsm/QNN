@@ -182,12 +182,22 @@ void Sys_Sleep(void)
 {
 }
 
+/* stdin-is-protocol latch: binary-protocol processes (the arena
+ * server) own fd 0 for opcode frames — OP_ATTACH_DECL arrives WHILE
+ * the dedicated host pumps sign-on frames, so the console reader here
+ * must never race it for bytes.  Set once in main() before Host_Init;
+ * defaults off so stock dedicated consoles keep working. */
+qboolean qnn_stdin_is_protocol;
+
 char *Sys_ConsoleInput(void)
 {
 	static char text[256];
 	fd_set fdset;
 	struct timeval timeout;
 	ssize_t len;
+
+	if (qnn_stdin_is_protocol)
+		return NULL;
 
 	FD_ZERO(&fdset);
 	FD_SET(0, &fdset);

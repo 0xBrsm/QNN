@@ -349,6 +349,26 @@ int QNN_SubjectPickupCategory(int subject_id)
  * exec'd before the first QNN tick can set it). */
 cvar_t qnn_fov = {"qnn_fov", "120"};
 
+/* Playerclip-clearance veto on line of sight (dd8e6b8b).  1 = on, the
+ * shipped behaviour: a clear shot ray is additionally required to survive
+ * a hull-1 clearance probe, so the RA-map "invisible viewing barrier"
+ * geometry stops reading as visible.  0 = pre-dd8e6b8b, shot ray only.
+ *
+ * Gated because the veto's blast radius is far wider than the RA geometry
+ * it targets: on stock id1 maps (dm3 / e1m2) it removes 17.3% of in-LOS
+ * actor frames, which reproduces the whole a26-vs-a27 in-LOS gap
+ * (24.16% -> 19.98% of frames; corpora measure 24.58% -> 19.17%).  Its own
+ * comment anticipates the failure mode — "an ordinary small window also
+ * blocks hull 1 because the player bbox catches its frame, and must remain
+ * shootable" — so QNN_ClearanceHitHasShotSurface is very likely
+ * false-negative on ordinary apertures.
+ *
+ * Default stays ON: the veto fixed a real defect (models targeting actors
+ * through invisible walls) and is not being given up on a hypothesis.  The
+ * gate exists so a collect can be run both ways and the attack-skill
+ * regression attributed or cleared by measurement. */
+cvar_t qnn_los_clearance = {"qnn_los_clearance", "1"};
+
 /* Idempotent: a cvar set from a config keeps its value across re-calls
  * (QNN_IOInit re-runs per map load). Must run before any config exec
  * that sets qnn_fov — an unregistered cvar is "Unknown command" and the
@@ -357,6 +377,30 @@ void QNN_RegisterPerceptionCvars(void)
 {
 	if (Cvar_FindVar("qnn_fov") == NULL)
 		Cvar_RegisterVariable(&qnn_fov);
+	if (Cvar_FindVar("qnn_los_clearance") == NULL)
+	{
+		const char *env;
+		Cvar_RegisterVariable(&qnn_los_clearance);
+		/* Env seed so a collect can run the A/B without command-line
+		 * plumbing through the worker protocol.  Applied once, at first
+		 * registration only, so a later console set still wins. */
+		env = getenv("QNN_LOS_CLEARANCE");
+		if (env != NULL && env[0] != '\0')
+		{
+			Cvar_Set("qnn_los_clearance", (char *)env);
+			fprintf(stderr, "[qnn] qnn_los_clearance=%s (from env)\n", env);
+		}
+	}
+}
+
+/* Live read so it can be toggled at the console, and so a collect can set
+ * it via the worker's config exec.  Absent/unregistered reads as ON. */
+static qboolean QNN_LosClearanceEnabled(void)
+{
+	cvar_t *cv = Cvar_FindVar("qnn_los_clearance");
+	if (cv == NULL)
+		return true;
+	return (cv->value != 0.0f) ? true : false;
 }
 
 /*
@@ -472,7 +516,10 @@ qboolean QNN_InFov(const vec3_t player_origin, const vec3_t view_angles, const v
 	/* Reject a direct path cut by playerclip-only geometry (the large
 	 * invisible viewing barriers used by several RA maps).  If hull 1 only
 	 * caught real hull-0 geometry around a narrow aperture, the center shot
-	 * remains valid and the actor stays visible through the window. */
+	 * remains valid and the actor stays visible through the window.
+	 * Gated by qnn_los_clearance (see its declaration above). */
+	if (!QNN_LosClearanceEnabled())
+		return true;
 	memset(&clearance_trace, 0, sizeof(clearance_trace));
 	QNN_TraceClearance(player_origin, target, &clearance_trace);
 	if (clearance_trace.fraction >= 1.0f)

@@ -260,6 +260,7 @@ def compute_from_collect(
     fovea_power: float = DEFAULT_FOVEA_POWER,
     seed: int = 0,
     tick_hz: int | float | None = None,
+    resample_ratio: int = 1,
 ) -> dict:
     """Walk a collect's train-split look labels and build the ``look_grid``
     metadata block: θ histogram (sufficient stat), exact hold fraction, the
@@ -279,8 +280,20 @@ def compute_from_collect(
     counts = np.zeros(HIST_NBINS, dtype=np.int64)
     n_frames = 0
     hold_n = 0
+    ep_map = None
+    if resample_ratio > 1:
+        # Fit on the resampled (composed) turns so the grid covers the coarser
+        # rate's larger per-tick turns — episode-correct grouping via the manifest.
+        man = json.loads((collect_dir / "precomputed_train" / "manifest.json").read_text())
+        ep_map = {Path(sh["actions"]["look"]).name: sh["episode_lengths"]
+                  for sh in man["shards"]}
     for f in files:
-        theta = theta_from_look(np.load(f).astype(np.float32))
+        look = np.load(f).astype(np.float32)
+        if ep_map is not None:
+            from qnn.bc.resample import group_indices, aggregate_action
+            keep, _ = group_indices(ep_map[Path(f).name], resample_ratio)
+            look = aggregate_action("look", look, keep, resample_ratio).astype(np.float32)
+        theta = theta_from_look(look)
         counts += histogram_theta(theta)
         n_frames += theta.size
         hold_n += int((theta < hold_max).sum())

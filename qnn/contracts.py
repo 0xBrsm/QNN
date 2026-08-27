@@ -38,6 +38,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from qnn import engine_norm as _en
+from qnn.vocab import ENTITY_STREAM_COMBAT, ENTITY_STREAM_FULL, ENTITY_STREAMS
 
 __all__ = [
     "Contract",
@@ -79,7 +80,7 @@ def wire_sig_from_graph(model) -> str:
 def semantics_sig() -> str:
     """16-hex fingerprint of the SEMANTICS contract — normalization scales,
     per-field (scale, transform), item bit masks, item-amount tables, and the
-    vocab tables/sizes. See src/docs/contracts/semantics/semantics.1.md."""
+    vocab tables/sizes. See src/docs/contracts/semantics/semantics.2.md."""
     import hashlib
     from qnn import engine_norm as en
     from qnn import vocab as vb
@@ -96,6 +97,10 @@ def semantics_sig() -> str:
     for tname, tbl in tables:
         for f in tbl:
             parts.append(f"{tname}.{f.name}|scale={f.scale}|tf={f.transform}")
+    # Item `amount` value-semantics (engine_norm.ITEM_AMOUNT_*). Item/mover are
+    # not in the wire.13 model obs, but they stay live for rewards/store and for
+    # the wire.11/wire.12 codecs that share the bin, so their dequant is
+    # fingerprinted here — a silent drift stays catchable.
     parts.append("ITEM_AMOUNT_MULT=" + ",".join(f"{x:.8g}" for x in en.ITEM_AMOUNT_MULT))
     parts.append("ITEM_AMOUNT_CONST=" + ",".join(f"{x:.8g}" for x in en.ITEM_AMOUNT_CONST))
     # Spatial VALUE semantics: how depth-atlas codes map to world geometry.
@@ -111,12 +116,15 @@ def semantics_sig() -> str:
         f"ATLAS_RANGES={en.ATLAS_HORIZ_RANGE:.8g},{en.ATLAS_VERT_RANGE:.8g}"
     )
     for k in ("ENTITY_VOCAB_SIZE", "ACTION_VOCAB_SIZE", "MODALITY_VOCAB_SIZE",
-              "MAX_PLAYER_INDICES", "TOKEN_PROJECTILE", "TOKEN_ACTOR", "TOKEN_ITEM",
-              "TOKEN_MOVER", "PROJECTILE_SCALAR_DIM", "ACTOR_SCALAR_DIM",
+              "COMBAT_MODALITY_VOCAB_SIZE", "MAX_PLAYER_INDICES",
+              "TOKEN_PROJECTILE", "TOKEN_ACTOR", "TOKEN_ITEM", "TOKEN_MOVER",
+              "PROJECTILE_SCALAR_DIM", "ACTOR_SCALAR_DIM",
               "ITEM_SCALAR_DIM", "MOVER_SCALAR_DIM", "MAX_ENTITY_EVENTS",
               "MAX_TOKEN_OBJECTS"):
         parts.append(f"{k}={getattr(vb, k)}")
-    for vname in ("ENTITY_IDS", "ACTION_IDS", "MODALITY_IDS"):
+    for vname in (
+        "ENTITY_IDS", "ACTION_IDS", "MODALITY_IDS", "COMBAT_MODALITY_IDS",
+    ):
         tbl = getattr(vb, vname)
         parts.append(f"{vname}=" + ",".join(f"{k}:{v}" for k, v in tbl.items()))
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:16]
@@ -142,33 +150,40 @@ _ARCH_V22 = "v22"
 # engine_norm constants) so backfilling an archived checkpoint records what it
 # actually shipped with, not whatever the current HEAD happens to be.
 #
-#   modern / full_4head → wire.11 / semantics.1   (arch derived from ModelConfig)
+#   modern / full_4head → wire.13 / semantics.2   (arch derived from ModelConfig)
 #   v17, v22            → wire.7 / semantics.1
 #
-# wire.11 (the a24 in-graph MOVE+ATTACK-decode contract) is HEAD: the exporter
-# ALWAYS bakes the stateful move decode + the attack decode + their recurrent
-# state I/O into the graph (tools/export_onnx.py ExportWrapper), so a freshly-
-# trained / re-exported full_4head model IS a wire.11 graph (native 44-obs split +
-# the in-graph decided `move`/`attack` + the move_state/attack_state loop-back
-# pairs) and is stamped wire.11. wire.11 REPLACES wire.9 for this generation: the
-# a24-rc series re-exports (coordinated model+engine deploy); there is no
-# wire.9/wire.11 coexistence.
+# wire.13 is the A27 HEAD contract: wire.11 action decode plus the depth atlas
+# and the pure actor/projectile combat entity stream (semantics.2). The
+# exporter ALWAYS bakes the stateful move decode + the attack decode + their
+# recurrent state I/O into the graph (tools/export_onnx.py ExportWrapper), so a
+# freshly-trained / re-exported full_4head model IS a wire.13 graph (native
+# 29-obs split + the in-graph decided `move`/`attack` + the move_state/
+# attack_state loop-back pairs) and is stamped wire.13.
 #
 # RECLAIMED NUMBERS: an in-graph move shape was briefly wire.10 (vs engine-argmax
 # wire.9) during a24 dev; wire.10 was never released and stays BURNED (never
 # reuse). wire.9 (in-graph move, engine-side attack) was the a24 contract until the
-# attack decode moved in-graph → wire.11. Net live wire set: {wire.7, wire.11}.
+# attack decode moved in-graph → wire.11. a26's wire.12 (depth atlas + full
+# entity stream, semantics.1) reclaimed the number the A27 combat shape briefly
+# held; the combat shape moved to wire.13 to avoid the collision. The
+# in-development HEAD is wire.13; the bin's live codec set is
+# {wire.11, wire.12, wire.13} (wire.7 / wire.9 retired but recognized).
 #
 # (Older generations — wire.1–.6 — exist but the converter does not recognize
 #  them; they are deliberately absent here. recognize_generation returns None and
 #  backfill_contract refuses rather than guessing.)
 GENERATION_CONTRACTS: Dict[str, Contract] = {
-    # wire.12.2 = wire.11 + finalized 24x11 nibble-packed depth-atlas obs.
-    # (The a26 rc1 line's 72-wide unpacked atlas is wire.12.1; it is not a
+    # wire.13.2 = wire.11 action decode + finalized 24x11 nibble-packed
+    # depth-atlas obs + the A27 pure-combat entity stream (semantics.2).
+    # Distinct from a26's wire.12.x (same atlas, FULL entity stream,
+    # semantics.1); the bin runs wire.11/.12.x/.13.x side by side but this
+    # codebase only exports wire.13.x natively.
+    # (The a27 rc1 line's 72-wide unpacked atlas is wire.13.1; it is not a
     # GENERATION of its own — same modern ModelConfig — so it has no row
     # here. The exporter picks the id from the checkpoint's atlas width,
     # see tools/export_onnx.py:_native_obs_for_model.)
-    MODERN:  {"wire": "wire.12.2", "semantics": "semantics.1", "arch": "full_4head"},
+    MODERN:  {"wire": "wire.13.2", "semantics": "semantics.2", "arch": "full_4head"},
     GEN_V17: {"wire": "wire.7",  "semantics": "semantics.1", "arch": _ARCH_V17},
     GEN_V22: {"wire": "wire.7",  "semantics": "semantics.1", "arch": _ARCH_V22},
 }
@@ -187,6 +202,25 @@ assert GENERATION_CONTRACTS[MODERN]["semantics"] == _en.SEMANTICS_CONTRACT_ID, (
     f"engine_norm.SEMANTICS_CONTRACT_ID ({GENERATION_CONTRACTS[MODERN]['semantics']} "
     f"!= {_en.SEMANTICS_CONTRACT_ID})."
 )
+
+# The a26-line FULL entity-stream contract (recency dims, live item/mover
+# tokens, 4-way modality vocab — qnn.vocab.ENTITY_STREAM_FULL, the WS6 port).
+# NOT engine_norm.WIRE_CONTRACT_ID/SEMANTICS_CONTRACT_ID — those are this
+# line's COMBAT-stream ids; a26 owns its native wire/semantics ids on its own
+# branch (feat/a26) and this line only needs to STAMP them correctly on a
+# full-stream graph, not build the a26 codec. Pinned literally (like
+# WIRE_CONTRACT_ID_ATLAS_LEGACY) rather than derived, since there is no
+# live a26 engine_norm module on this branch to import the ids from.
+WIRE_CONTRACT_ID_FULL_STREAM = "wire.12.2"
+SEMANTICS_CONTRACT_ID_FULL_STREAM = "semantics.1"
+
+# entity_stream -> (wire, semantics) for a freshly-saved MODERN checkpoint.
+# Keyed on qnn.vocab.ENTITY_STREAMS so an unknown stream fails loud instead of
+# silently falling back to the combat pair.
+_ENTITY_STREAM_CONTRACT: Dict[str, tuple] = {
+    ENTITY_STREAM_COMBAT: (_en.WIRE_CONTRACT_ID, _en.SEMANTICS_CONTRACT_ID),
+    ENTITY_STREAM_FULL: (WIRE_CONTRACT_ID_FULL_STREAM, SEMANTICS_CONTRACT_ID_FULL_STREAM),
+}
 
 
 # ── Compact a/s/w version render (display / provenance only) ─────────────────
@@ -289,16 +323,30 @@ def arch_id_from_model_config(model_cfg: Dict[str, Any]) -> str:
     return "full_4head" if use_weapon else "3head"
 
 
-def current_contract(model_cfg: Optional[Dict[str, Any]] = None) -> Contract:
+def current_contract(
+    model_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    entity_stream: str = ENTITY_STREAM_COMBAT,
+) -> Contract:
     """The contract a freshly-saved MODERN checkpoint is born with.
 
-    wire/semantics come from the LIVE engine_norm constants (this is what the
-    running code produces); arch is derived from the ModelConfig when supplied,
-    else the canonical ``full_4head``.
+    wire/semantics are keyed on ``entity_stream`` (the checkpoint's
+    ``GraphSpec.entity_stream``, NOT inferred from anything else): combat gets
+    the LIVE engine_norm ids (what this line's exporter produces); full gets
+    the a26-line pair (``WIRE_CONTRACT_ID_FULL_STREAM`` /
+    ``SEMANTICS_CONTRACT_ID_FULL_STREAM``). A checkpoint built with
+    ``entity_stream="full"`` trains on full-stream data — stamping the combat
+    pair on it silently mismatched its actual training contract. arch is
+    derived from the ModelConfig when supplied, else the canonical
+    ``full_4head``.
     """
+    if entity_stream not in ENTITY_STREAMS:
+        raise ValueError(
+            f"unknown entity_stream {entity_stream!r}; allowed: {list(ENTITY_STREAMS)}")
     arch = arch_id_from_model_config(model_cfg) if isinstance(model_cfg, dict) else "full_4head"
+    wire, semantics = _ENTITY_STREAM_CONTRACT[entity_stream]
     return {
-        "wire": _en.WIRE_CONTRACT_ID,
-        "semantics": _en.SEMANTICS_CONTRACT_ID,
+        "wire": wire,
+        "semantics": semantics,
         "arch": arch,
     }

@@ -24,7 +24,8 @@ arch but not `wire.9`). Rough lineage, newest first:
 
 | Arch gen | Era | Notes | Wire |
 |----------|-----|-------|------|
-| `full_4head` | HEAD | HeldWeaponSplitObsEmbedding → CLS encoder → GRU → {move, look(polar), attack, weapon} + TargetPointer | `wire.9` |
+| `full_movearch` | A27 HEAD | Split self/combat tokens → CLS encoder → GRU → {move_seg, jump, look(polar), attack(9-way)} + TargetPointer | `wire.13` |
+| `full_4head` | a24 | HeldWeaponSplitObsEmbedding → CLS encoder → GRU → {move, look(polar), attack, weapon} + TargetPointer | `wire.11` |
 | native-split / subtoken | 0.20–0.21 | self → state/arsenal/motion subtokens + CLS; fire→attack; `qnn_action_t` 32→16 B | `wire.8`/`.9` |
 | v11 packed | 0.17 | 8-class weapon, move 3×3 categorical, TargetPointer; packed wire | `wire.7` |
 | v10 / v9 / v8 / cluster / flat | ≤0.15 | see [`wire/pre-v11.md`](../wire/pre-v11.md) + archived bundled docs | `wire.1`–`.6` |

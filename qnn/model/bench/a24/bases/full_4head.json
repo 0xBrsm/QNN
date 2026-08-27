@@ -3,9 +3,8 @@
   "tokens": {
     "cls": {"kind": "cls"},
     "state": {"scalars": ["health_armor"], "vocab": ["armor_type"], "vocab_sum": ["powerup_state"]},
-    "arsenal": {"readiness": true, "vocab_sum": ["powerup_arsenal"]},
+    "arsenal": {"scalars": ["attack_finished"], "readiness": true, "vocab_sum": ["powerup_arsenal"]},
     "motion": {"scalars": ["velocity", "view_pitch", "look_delta"], "vocab": ["movement_id"], "vocab_sum": ["powerup_motion"]},
-    "held_weapon": {"scalars": ["weapon_static", "attack_finished"], "vocab": ["weapon_id"]},
     "spatial": {"kind": "spatial"},
     "entities": {"kind": "entities"}
   },
@@ -16,6 +15,6 @@
     "move": {"type": "cls", "inputs": ["readout"], "d_hidden": 64, "activation": "gelu"},
     "look": {"type": "polar", "inputs": ["readout"], "d_hidden": 64, "activation": "gelu"},
     "attack": {"type": "cls", "inputs": ["readout"], "d_hidden": 64, "activation": "gelu"},
-    "weapon": {"type": "cls", "inputs": ["gru"], "d_hidden": 64, "activation": "gelu", "context_from_obs": false}
+    "weapon": {"type": "cls", "inputs": ["gru"], "d_hidden": 64, "activation": "gelu"}
   }
 }

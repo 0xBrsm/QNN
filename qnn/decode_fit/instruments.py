@@ -317,9 +317,11 @@ def _env_sig(spawn_face_away: int, fov: int, episodes_per_cell: int) -> dict:
             # built on the old global seed-42 anchor must not be resumed.
             "seed_scheme": "cells-hash-v1",
             # the aim statistic the fit consumes: window-sampled tracking at
-            # the frozen k (events.TRACKING_K). Waves without the window npz
-            # (pre-instrument) must not be resumed.
-            "aim_stat": "tracking-window-k4"}
+            # the frozen k (events.TRACKING_K), captured on the frozen
+            # asymmetric window (events.TRACKING_WINDOW_ENV). Waves without the
+            # window npz (pre-instrument) or on the old symmetric ±4 capture
+            # must not be resumed.
+            "aim_stat": "tracking-window-k16pre4post"}
 
 
 # Each PROCESS shard spawns its own full engine set (eval_num_envs pairs), so
@@ -525,8 +527,9 @@ def _run_wave(dst: Path) -> str:
     killed at EVAL_TIMEOUT_S so a stray bridge hang can't block the pool.
     Every pin wave runs the tracking-window instrument (the trigger-free aim
     statistic the fit consumes — events.TRACKING_K, part of the frozen
-    instrument definition; the env signature's aim_stat pins it)."""
-    from qnn.decode_fit.events import TRACKING_K
+    instrument definition; the env signature's aim_stat pins it) at the frozen
+    asymmetric capture geometry (events.TRACKING_WINDOW_ENV)."""
+    from qnn.decode_fit.events import TRACKING_WINDOW_ENV
     if _done(dst):
         return f"skip (done): {dst.name}"
     log = dst / "logs" / "decodefit.log"
@@ -537,7 +540,7 @@ def _run_wave(dst: Path) -> str:
                 stdout=lf, stderr=subprocess.STDOUT, timeout=EVAL_TIMEOUT_S,
                 cwd=_REPO,
                 env={**os.environ,
-                     "QNN_EVAL_INTERCEPT_WINDOW": str(TRACKING_K)})
+                     "QNN_EVAL_INTERCEPT_WINDOW": TRACKING_WINDOW_ENV})
     except subprocess.TimeoutExpired:
         return f"TIMEOUT: {dst.name}"
     return f"{'done' if _done(dst) else 'FAILED'}: {dst.name}"

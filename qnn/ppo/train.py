@@ -206,7 +206,7 @@ def run_native_ppo(
     # ── RL config ─────────────────────────────────────────────────────
     rl_head_weights = _head_weight_map(
         ppo_cfg.get("rl_head_weights"),
-        default={"attack": 1.0, "move": 1.0, "weapon": 1.0},
+        default={"attack": 1.0, "move": 1.0},
     )
     adapters = build_adapters(rl_head_weights)
     if not adapters:

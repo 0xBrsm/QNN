@@ -25,8 +25,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from qnn.model.bench.a25.decode import _BUCKET_HI, _BUCKET_LO
-from qnn.model.bench.a25.move_seg_head import N_BUCKETS, derive_segment_targets
+from qnn.model.decode_actions import _BUCKET_HI, _BUCKET_LO
+from qnn.model.move_seg_head import N_BUCKETS, derive_segment_targets
 
 AXES = ("fb", "lr")
 # expected duration of a uniform-in-bucket draw, per bucket

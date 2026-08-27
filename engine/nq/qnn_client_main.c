@@ -379,7 +379,10 @@ static qboolean QNN_BuildAndInfer(
 	QNN_DrainSounds(&snapshot);
 
 	QNN_IOUpdate(&snapshot, qnn_client_fixed_dt, reset_flag);
-	QNN_IOEmit(&snapshot, &result);
+	/* Emit through the loaded model's compiled obs plan (WS2): atlas
+	 * parameterization and oracle disclosure ride the plan, so the
+	 * engine computes EXACTLY this model's observation. */
+	QNN_IOEmitPlan(QNN_OnnxObsPlan(ctx), &snapshot, &result);
 
 	if (QNN_OnnxStep(ctx, &result, next_action) != 0) {
 		fprintf(stderr, "qnn_client: QNN_OnnxStep failed: %s\n", QNN_OnnxLastError());

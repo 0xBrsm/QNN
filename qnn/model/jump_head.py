@@ -101,6 +101,19 @@ class JumpHead(nn.Module):
             metrics["jumpdist_ce_sum"] = (bce * sm).sum().detach()
             metrics["jumpdist_n"] = n.detach()
             metrics["jumpdist_pos"] = (y * sm).sum().detach()
+            # DECISION-ONLY population → jump_op_skill. `scored = ~water`
+            # excludes water frames but NOT airborne ones, where a ground jump
+            # is impossible and `y` is therefore a deterministic 0. Measured on
+            # qwd_v5main val: 316,282 of 942,841 scored frames (33.6%) are
+            # ground-jump-infeasible and carry EXACTLY 0 positives, dragging the
+            # base rate 1.604% -> 1.066% and h_marg 0.0822 -> 0.0590.
+            # Emitted alongside, never replacing — the committed records were all
+            # measured on the wider population.
+            jump_feas = ((im >> 7) & 1) != 0          # input_mask bit 7
+            sm_op = (scored & jump_feas).to(term.dtype)
+            metrics["jumpdist_op_ce_sum"] = (bce * sm_op).sum().detach()
+            metrics["jumpdist_op_n"] = sm_op.sum().clamp_min(1).detach()
+            metrics["jumpdist_op_pos"] = (y * sm_op).sum().detach()
             with torch.no_grad():
                 p = torch.sigmoid(jl)
                 pred = (p > 0.5) & scored
@@ -124,7 +137,9 @@ from qnn.model.node_registry import register_head  # noqa: E402
 def _build_jump(head, dims, d_model):
     # Same readout-first prefix-slice contract as move_seg: dropping
     # target.feat from inputs shrinks the consumed prefix.
-    in_dim = dims["base_features_dim"]
+    # coord_features_dim == base_features_dim unless a shared attack-intent
+    # block is spliced in (network.slot_dims); this head is a CONSUMER of it.
+    in_dim = dims["coord_features_dim"]
     if "target.feat" not in head.inputs:
         in_dim -= d_model
     # Spec default pos_weight=0.0 means "unset" → no reweighting (1.0).

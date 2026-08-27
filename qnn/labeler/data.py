@@ -44,7 +44,6 @@ CORE_FEAT_DIM  = 9         # vel(3) + mid_oh(3) + look(3)
 BASELINE_DIM   = 6         # per-axis one-hot {neg, none, pos} for fb + lr
 BASELINE_EPS   = 0.01      # normalized 20 u/s — same threshold as the bakeoff B variant
 GBT_STACK_DIM  = 6         # per-axis softmax probs from GBT (fb 3 + lr 3) as TCN inputs
-WEAPON_OH_DIM  = 9         # one-hot of weapon_id ∈ {0..8} (0=none, 1=axe..8=LG)
 VEL_CLIP       = 1.0       # clip body-frame normalized vel to [-1, 1] (matches QW max ~700 u/s)
 
 N_CLASSES = 3              # {0: neg, 1: none, 2: pos}
@@ -52,7 +51,6 @@ N_CLASSES = 3              # {0: neg, 1: none, 2: pos}
 
 @dataclass(frozen=True)
 class FeatureSpec:
-    use_weapon_id:     bool = False   # one-hot of server-held weapon (9 dims)
     use_baseline:      bool = False   # per-frame sign(velocity) baseline concatenated into input
     use_baseline_skip: bool = False   # baseline bypasses encoder and adds directly to output logits
     # When use_baseline_skip is set, restrict the skip to specific axes.
@@ -64,7 +62,6 @@ class FeatureSpec:
     @property
     def dim(self) -> int:
         return (CORE_FEAT_DIM
-            + (WEAPON_OH_DIM if self.use_weapon_id else 0)
             + (BASELINE_DIM if self.use_baseline else 0)
             + (GBT_STACK_DIM if self.use_gbt_stack else 0))
 
@@ -84,7 +81,6 @@ def build_features(
     self_movement_id: np.ndarray,                   # (T,)
     look: np.ndarray,                               # (T, 3)
     *,
-    weapon_id: np.ndarray | None = None,            # (T,) uint8 ∈ {0..8}
     gbt_probs: np.ndarray | None = None,            # (T, 6) softmax probs (fb 3 + lr 3)
     spec: FeatureSpec | None = None,
 ) -> np.ndarray:
@@ -95,7 +91,6 @@ def build_features(
     """
     if spec is None:
         spec = FeatureSpec(
-            use_weapon_id=weapon_id is not None,
             use_gbt_stack=gbt_probs is not None,
         )
 
@@ -112,14 +107,6 @@ def build_features(
 
     parts: list[np.ndarray] = [vel, mid_oh, lk]
 
-    if spec.use_weapon_id:
-        if weapon_id is None:
-            raise ValueError("spec.use_weapon_id set but weapon_id is None")
-        wid = np.asarray(weapon_id, dtype=np.int32).reshape(-1)
-        wid = np.clip(wid, 0, WEAPON_OH_DIM - 1)
-        weapon_oh = np.zeros((wid.shape[0], WEAPON_OH_DIM), dtype=np.float32)
-        weapon_oh[np.arange(wid.shape[0]), wid] = 1.0
-        parts.append(weapon_oh)
     if spec.use_baseline:
         # Per-axis sign-of-velocity baseline (fb, lr) as 2x one-hot {neg, none, pos}.
         baseline = _baseline_classes_from_vel(vel, eps=BASELINE_EPS)  # (T, 2) {0,1,2}
@@ -171,7 +158,6 @@ class _EpisodeView:
     self_movement_id: np.ndarray
     look:             np.ndarray
     move:             np.ndarray
-    weapon_id:        np.ndarray | None
     gbt_probs:        np.ndarray | None
     # Per-tick operative-input bitmask emitted by the C worker (bit0=fb,
     # bit1=lr, bit2=ud, bit3=fire, bit4=impulse).  1 = engine acted on this
@@ -188,7 +174,7 @@ def _load_split(split_dir: Path) -> list[_EpisodeView]:
     The labeler corpus is a field-selected QOBS collect (see
     qnn.labeler.collect), so the on-disk field names are the QOBS-native
     ones written by qnn.bc.collect's ShardWriter:
-      obs  : vel (i16 ×3), self_movement_id (u8), self_weapon_id (u8)
+      obs  : vel (i16 ×3), self_movement_id (u8)
       act  : move (u8 press byte), look (f16 ×3), op_input (u8)
     """
     manifest_path = split_dir / "manifest.json"
@@ -209,8 +195,6 @@ def _load_split(split_dir: Path) -> list[_EpisodeView]:
         mid  = np.load(split_dir / obs["self_movement_id"], mmap_mode="r")
         look = np.load(split_dir / acts["look"], mmap_mode="r")
         move = np.load(split_dir / acts["move"])  # uint8, small — load fully
-        wid  = (np.load(split_dir / obs["self_weapon_id"], mmap_mode="r")
-                if "self_weapon_id" in obs else None)
         opi  = (np.load(split_dir / acts["op_input"], mmap_mode="r")
                 if "op_input" in acts else None)
         # GBT stacking probs are an optional sidecar written by
@@ -233,7 +217,6 @@ def _load_split(split_dir: Path) -> list[_EpisodeView]:
                 self_movement_id=mid[start:stop],
                 look            =look[start:stop],
                 move            =move[start:stop],
-                weapon_id       =wid[start:stop]  if wid  is not None else None,
                 gbt_probs       =gbt[start:stop]  if gbt  is not None else None,
                 op_input        =opi[start:stop] if opi  is not None else None,
                 n_frames        =stop - start,
@@ -394,7 +377,6 @@ def materialize_split(
             ep.self_velocity,
             ep.self_movement_id,
             ep.look,
-            weapon_id=ep.weapon_id if ep.weapon_id is not None else None,
             gbt_probs=ep.gbt_probs if ep.gbt_probs is not None else None,
             spec=spec,
         )

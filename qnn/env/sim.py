@@ -37,7 +37,7 @@ from qnn.schema import OBS_SCHEMA, SPATIAL_TOKEN_COUNT
 from qnn.vocab import (
     ACTION_IDS, ENTITY_IDS, MAX_TOKEN_OBJECTS,
     MODALITY_IDS, SPATIAL_BAND_IDS,
-    TOKEN_ACTOR, TOKEN_ITEM, TOKEN_MOVER, TOKEN_PROJECTILE,
+    TOKEN_ACTOR, TOKEN_PROJECTILE,
 )
 
 
@@ -56,46 +56,19 @@ _ACTOR_LAYOUT: Dict[str, Tuple[int, int]] = {
     "facing":      (15, 1),
     "team":        (16, 1),
     "score":       (17, 1),
-    "recency":     (18, 1),
-}
-_ITEM_LAYOUT: Dict[str, Tuple[int, int]] = {
-    "half_extents": (0, 3),
-    "rel":         (3, 3),
-    "dist":        (6, 1),
-    "path":        (7, 3),
-    "path_dist":   (10, 1),
-    "eta":         (11, 1),
-    "amount":      (12, 1),
-    "regen":       (13, 1),
-    "recency":     (14, 1),
-}
-_MOVER_LAYOUT: Dict[str, Tuple[int, int]] = {
-    "half_extents": (0, 3),
-    "rel":         (3, 3),
-    "dist":        (6, 1),
-    "path":        (7, 3),
-    "path_dist":   (10, 1),
-    "eta":         (11, 1),
-    "state":       (12, 1),
-    "recency":     (13, 1),
 }
 _PROJECTILE_LAYOUT: Dict[str, Tuple[int, int]] = {
     "rel":     (0, 3),
     "dist":    (3, 1),
     "vel":     (4, 3),
-    "recency": (7, 1),
 }
 _ENTITY_TYPE_NAMES = {
     "projectile": TOKEN_PROJECTILE,
     "actor":      TOKEN_ACTOR,
-    "item":       TOKEN_ITEM,
-    "mover":      TOKEN_MOVER,
 }
 _ENTITY_LAYOUTS = {
     TOKEN_PROJECTILE: _PROJECTILE_LAYOUT,
     TOKEN_ACTOR:      _ACTOR_LAYOUT,
-    TOKEN_ITEM:       _ITEM_LAYOUT,
-    TOKEN_MOVER:      _MOVER_LAYOUT,
 }
 
 _SELF_SCALAR_LAYOUT: Dict[str, int] = {
@@ -198,8 +171,6 @@ def _write_self_token(obs: Dict[str, np.ndarray], tok: Dict[str, Any]) -> None:
         if vel.size != 3:
             raise ValueError(f"self.vel must have 3 values, got {vel.size}")
         obs["self_scalars"][13:16] = vel
-    if "weapon_id" in tok:
-        obs["self_weapon_id"][0] = _lookup_vocab(tok["weapon_id"], ENTITY_IDS, "self.weapon_id")
     if "armor_type_id" in tok:
         obs["self_armor_type_id"][0] = _lookup_vocab(tok["armor_type_id"], ENTITY_IDS, "self.armor_type_id")
     if "powerup_ids" in tok:
@@ -447,7 +418,7 @@ def _tracking_cos(view_angles: Tuple[float, float], target_world: np.ndarray) ->
 _INT_KEYS = {
     "entity_types", "entity_ids",
     "entity_event_actions", "entity_event_sources", "entity_event_counts",
-    "self_weapon_id", "self_armor_type_id", "self_movement_id",
+    "self_armor_type_id", "self_movement_id",
     "self_state_powerup_ids", "self_arsenal_powerup_ids", "self_motion_powerup_ids",
 }
 
@@ -964,13 +935,9 @@ def main() -> int:
         use_gru=args.use_gru,
         d_gru=args.d_gru,
         use_weapon_head=False,
-        weapon_switch_confidence=0.65,
-        weapon_switch_margin=0.15,
         weapon_sources=("self_readout", "target_feat"),
-        weapon_context_from_obs=False,
         look_bypass_gru=False,
         d_target=args.d_model,
-        self_weapon_embed_in_self=False,
         d_move=0,
         d_look=0,
         d_attack=0,

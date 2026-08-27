@@ -36,7 +36,6 @@ from qnn.bc.target_labeler import (
 from qnn.bc.train import (
     _densify_obs_for_labeler,
     _materialize_padded_entity,
-    _unpack_attack_bit,
     _unpack_move_axes,
 )
 from qnn.vocab import MAX_TOKEN_OBJECTS
@@ -73,7 +72,6 @@ def _populate_one_shard(args: tuple) -> tuple[int, str, int]:
     if "move" in action_arrays:
         move_packed = action_arrays["move"]
         action_arrays["move"] = _unpack_move_axes(move_packed)
-        action_arrays["attack"] = _unpack_attack_bit(move_packed)
 
     # Pad + densify the entire shard (T_shard rows). Same path the
     # live train loader takes when target_probs isn't cached.

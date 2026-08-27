@@ -16,7 +16,7 @@ pipeline) with the agnostic field selection (refactor 9626c5de):
     the QWD usercmd decoder instead of ``QNN_MvdInferEmitMove`` while the obs
     distribution is MVD-ified.  (Mirrors the matched-emit MLOB co-emission.)
 
-  obs  keep = {vel, self_movement_id, self_weapon_id}
+  obs  keep = {vel, self_movement_id}
   act  keep = {move, look, op_input}
   spatial + entity blocks: COMPUTE-GATED OFF (skip_spatial / skip_entities
                            derived from the obs keep set — the worker skips
@@ -27,7 +27,6 @@ On-disk field names (QOBS-native, via the BC ShardWriter):
   obs/vel               i16  (T, 3)   view-frame velocity (MVD-domain
                                       origin-delta), raw Quake units
   obs/self_movement_id  u8   (T,)     0=ground 1=air 2..4=water
-  obs/self_weapon_id    u8   (T,)     subject-form weapon id (obs boundary)
   act/move              u8   (T,)     usercmd-truth press byte
                                       (QNN_PackInputMask layout):
                                       bit0=attack, bits1-6 = fb/lr/ud neg/pos,
@@ -80,7 +79,7 @@ from qnn.bc.collect import (
 # expensive spatial/entity blocks are compute-gated OFF because none of
 # their fields appear here — see _compute_gate_from_tokens in
 # qnn.bc.collect).
-_LABELER_TOKENS_KEEP = ("vel", "self_movement_id", "self_weapon_id")
+_LABELER_TOKENS_KEEP = ("vel", "self_movement_id")
 _LABELER_ACTIONS_KEEP = ("move", "look", "op_input")
 
 

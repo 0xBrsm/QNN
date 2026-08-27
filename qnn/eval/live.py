@@ -90,14 +90,12 @@ def _write_tick_record(fp: IO[str], tick: int, obs: Mapping[str, np.ndarray],
             "ammo_r":  int(obs["ammo_rockets"]),
             "ammo_c":  int(obs["ammo_cells"]),
             "vel":     vel,
-            "weapon_id": int(obs["self_weapon_id"]),
         },
         "n_entities": int(obs["entity_count"]),
         "action": {
             "move": list(action["move"]),
             "look": list(action["look"]),
             "attack": int(action["attack"]),
-            "weapon": int(action["weapon"]),
         },
     }
     fp.write(json.dumps(rec) + "\n")

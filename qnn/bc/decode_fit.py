@@ -105,7 +105,7 @@ def _forward_attack_with_logits(policy, source) -> np.ndarray:
     diag's _forward_weapon_logits, but reads the full (T, ATTACK_WITH_SIZE)
     head (the 8-way reshape there would raise on this head). Forwarded WITHOUT
     the bench side-channel — the live policy.act path teacher-forces nothing."""
-    from qnn.model.bench.a25.attack_with_head import ATTACK_WITH_SIZE
+    from qnn.model.attack_with_head import ATTACK_WITH_SIZE
     offsets = np.asarray(source.episode_offsets, dtype=np.int64)
     out = np.empty((int(offsets[-1]), ATTACK_WITH_SIZE), np.float32)
     for i in range(len(offsets) - 1):

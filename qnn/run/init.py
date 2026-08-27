@@ -37,7 +37,7 @@ _TEMPLATE_DIRS = {
     "ppo": Path(__file__).resolve().parent.parent / "ppo" / "templates",
     "pbt": Path(__file__).resolve().parent.parent / "ppo" / "templates",
     "optuna": Path(__file__).resolve().parent.parent / "ppo" / "templates",
-    "head_probe": Path(__file__).resolve().parent.parent / "model" / "bench" / "templates",
+    "bench": Path(__file__).resolve().parent.parent / "model" / "bench" / "templates",
 }
 
 
@@ -59,7 +59,7 @@ def _template_dir_for_mode(mode: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Initialize a training run directory")
     parser.add_argument("--name", required=True, help="Run directory name")
-    parser.add_argument("--mode", required=True, choices=["bc", "ppo", "pbt", "optuna", "head_probe"], help="Training mode")
+    parser.add_argument("--mode", required=True, choices=["bc", "ppo", "pbt", "optuna", "bench"], help="Training mode")
     parser.add_argument("--resume", choices=["true", "false"], help="Override run.json resume")
     parser.add_argument("--description", help="Override run.json description")
     parser.add_argument("--checkpoint-path", help="Override run.json checkpoint_path")
@@ -69,7 +69,7 @@ def main() -> None:
     parser.add_argument("--reward", help="Path to reward.json (overrides template)")
     parser.add_argument("--machine", help="Path to machine.json (overrides template)")
     parser.add_argument("--model", help="Path to model.json (overrides template)")
-    parser.add_argument("--probe", help="Path to probe.json (overrides template; head_probe mode)")
+    parser.add_argument("--probe", help="Path to probe.json (overrides template; bench mode)")
     # decode.json is NOT stamped by default any more (the a24rc4 silent-default
     # stamping is retired): a run's decode config arrives via the decode-fit
     # pipeline after training. --decode remains available for an EXPLICIT pin.
@@ -78,7 +78,12 @@ def main() -> None:
     args = parser.parse_args()
 
     template_dir = _template_dir_for_mode(args.mode)
-    run_dir = _RUNS_DIR / args.mode / args.name
+    # bench ablations live under runs/bc/bench/ (they ride the canonical BC
+    # pipeline — only the model graph differs); every other mode is runs/<mode>/.
+    if args.mode == "bench":
+        run_dir = _RUNS_DIR / "bc" / "bench" / args.name
+    else:
+        run_dir = _RUNS_DIR / args.mode / args.name
     if run_dir.exists():
         parser.error(f"Run directory already exists: {run_dir}")
 
@@ -156,7 +161,7 @@ def main() -> None:
     # Pin the look turn-delta grid for look-bearing modes: copy the corpus's
     # data-fit grid into config/look_grid.json so it lives with the model (no
     # implicit code default). The trainer installs it at job start.
-    if args.mode in ("bc", "head_probe"):
+    if args.mode in ("bc", "bench"):
         from qnn.human import look_grid as _look_grid
         machine = json.loads((config_dir / "machine.json").read_text())
         bc_data_dir = machine.get("bc_data_dir")
@@ -178,20 +183,6 @@ def main() -> None:
         (config_dir / "move_hazard.json").write_text(json.dumps(haz, indent=2) + "\n")
         print(f"  Move hazard pinned from corpus: {bc_data_dir} "
               f"(tick_hz {haz.get('tick_hz')}, edges {haz.get('edges')})")
-
-        # Pin the weapon WHEN-hazard table from the same corpus. Best-effort: corpora
-        # collected before weapon_hazard was added won't carry the block until
-        # recollected/backfilled — don't fail run-init over it during the transition.
-        try:
-            from qnn.human import weapon_hazard as _weapon_hazard
-            whaz = _weapon_hazard.pinned_hazard_from_collect(bc_data_dir)
-            whaz["git_commit"] = manifest["git_commit"]
-            whaz["created"] = manifest["created"]
-            (config_dir / "weapon_hazard.json").write_text(json.dumps(whaz, indent=2) + "\n")
-            print(f"  Weapon hazard pinned from corpus: {bc_data_dir} "
-                  f"(tick_hz {whaz.get('tick_hz')}, axes {whaz.get('axes')})")
-        except Exception as exc:  # noqa: BLE001 — transitional; recollect/backfill to enable
-            print(f"  Weapon hazard pin skipped: {exc}")
 
     # PPO carries the SEED's pinned look grid: the trainer installs
     # config/look_grid.json before any forward (no code default), so a

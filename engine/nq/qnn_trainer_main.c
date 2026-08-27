@@ -1,6 +1,7 @@
 #include "qnn.h"
 #include "qnn_fault.h"
 #include "qnn_io.h"
+#include "qnn_obs_shim.h"
 #include "qnn_tick.h"
 
 #include <stdlib.h>
@@ -488,7 +489,7 @@ static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, const qnn_action_
 	{
 		qboolean fire_window_active;
 
-		if (QNN_ActionAttack(current_action->move))
+		if (current_action->attack > 0)
 		{
 			shots_fired = 1;
 			damage_weapon_id = weapon_id > 0 ? weapon_id : qnn_runtime.last_fire_weapon_id;
@@ -519,7 +520,7 @@ static void QNN_CaptureSnapshotLocal(qnn_snapshot_t *snapshot, const qnn_action_
 		if (monster_kills > qnn_runtime.prev_monster_kills)
 			QNN_AddDeltaEvent(snapshot, "monster_kill", current_region_id, monster_kills - qnn_runtime.prev_monster_kills);
 
-		fire_window_active = QNN_ActionAttack(current_action->move) || qnn_runtime.recent_fire_steps > 0;
+		fire_window_active = current_action->attack > 0 || qnn_runtime.recent_fire_steps > 0;
 		if (fire_window_active && damage_weapon_id <= 0)
 			damage_weapon_id = qnn_runtime.last_fire_weapon_id > 0 ? qnn_runtime.last_fire_weapon_id : weapon_id;
 		if (fire_window_active)
@@ -587,7 +588,7 @@ static void QNN_CommitSnapshot(const qnn_snapshot_t *snapshot, const qnn_action_
 	qnn_runtime.prev_frags = QNN_CurrentFrags();
 	qnn_runtime.prev_monster_kills = QNN_CurrentMonsterKills();
 	qnn_runtime.done = snapshot->done;
-	if (QNN_ActionAttack(current_action->move))
+	if (current_action->attack > 0)
 		qnn_runtime.recent_fire_steps = 2;
 	else if (qnn_runtime.recent_fire_steps > 0)
 		qnn_runtime.recent_fire_steps -= 1;
@@ -786,15 +787,107 @@ static void QNN_WriteHelloResponse(void)
 	fflush(stdout);
 }
 
+/* This worker's compiled obs plan (OP_ATTACH_DECL after hello, before
+ * the first reset).  The worker is single-seat, so per-seat reduces to
+ * per-process.  No attach = the default plan — today's 864-byte frame,
+ * bit-identical (the legacy-driver contract). */
+static qnn_obs_plan_t qnn_worker_obs_plan;
+static qboolean qnn_worker_has_obs_plan;
+
+/* Consume + answer one OP_ATTACH_DECL (opcode byte already read):
+ * u8 seat_index (must be 0) | u32le JSON length | declaration JSON.
+ * Reply = one JSON line — the layout on success, or the error frame
+ * followed by a hard exit (fail loud: an unattachable driver must
+ * never silently fall back to the default plan). */
+static void QNN_WorkerHandleAttachDecl(void)
+{
+	uint8_t header[5];
+	int seat_index;
+	uint32_t json_len;
+	char *json;
+	char error[256];
+	static char reply[4096];
+	qnn_obs_decl_t decl;
+
+	if (fread(header, 1, sizeof(header), stdin) != sizeof(header))
+		Sys_Error("Worker stdin closed mid-attach-decl header");
+	seat_index = header[0];
+	json_len = (uint32_t)header[1] | ((uint32_t)header[2] << 8)
+		| ((uint32_t)header[3] << 16) | ((uint32_t)header[4] << 24);
+	if (json_len == 0 || json_len > QNN_OBS_DECL_JSON_MAX)
+		Sys_Error("Worker attach-decl length %u out of range (1..%d)",
+			json_len, QNN_OBS_DECL_JSON_MAX);
+	json = malloc(json_len + 1);
+	if (json == NULL)
+		Sys_Error("Worker attach-decl: out of memory (%u bytes)", json_len);
+	if (fread(json, 1, json_len, stdin) != json_len)
+		Sys_Error("Worker stdin closed mid-attach-decl JSON");
+	json[json_len] = 0;
+
+	if (seat_index != 0)
+	{
+		snprintf(error, sizeof(error),
+			"worker is single-seat: seat_index must be 0 (got %d)",
+			seat_index);
+		goto reject;
+	}
+	if (qnn_runtime.has_reset)
+	{
+		snprintf(error, sizeof(error),
+			"obs declaration arrived after reset — frames are already "
+			"flowing at the previous size; attach after hello, before "
+			"the first reset");
+		goto reject;
+	}
+	if (qnn_worker_has_obs_plan)
+	{
+		snprintf(error, sizeof(error),
+			"obs declaration was already attached for this worker");
+		goto reject;
+	}
+	if (!QNN_ObsDeclParseJson(json, (int)json_len, &decl,
+			error, sizeof(error))
+		|| !QNN_ObsPlanCompile(&decl, &qnn_worker_obs_plan,
+			error, sizeof(error)))
+		goto reject;
+	free(json);
+	qnn_worker_has_obs_plan = true;
+
+	if (!QNN_ObsLayoutReplyJson(&qnn_worker_obs_plan, reply, sizeof(reply),
+			error, sizeof(error)))
+		Sys_Error("Worker attach-decl reply failed: %s", error);
+	fprintf(stdout, "%s\n", reply);
+	fflush(stdout);
+	return;
+
+reject:
+	QNN_WriteError(error);
+	Sys_Error("Worker obs declaration rejected: %s", error);
+}
+
 static void QNN_WriteObsToStdout(const qnn_snapshot_t *snapshot)
 {
-	static uint8_t obs[QNN_OBS_BUFFER_SIZE];
+	/* Frame buffer sized for the largest plan seen — the attached plan
+	 * may exceed the default 864 (legacy 4096 fixed-frame shims). */
+	static uint8_t *obs;
+	static int obs_cap;
+	const qnn_obs_plan_t *plan = qnn_worker_has_obs_plan
+		? &qnn_worker_obs_plan : QNN_IODefaultObsPlan();
 	qnn_tick_result_t result;
-	QNN_IOEmit(snapshot, &result);
-	QNN_IOPackObsBuffer(obs, &result);
+
+	if (plan->frame_bytes > obs_cap)
+	{
+		obs = realloc(obs, (size_t)plan->frame_bytes);
+		if (obs == NULL)
+			Sys_Error("Worker obs: out of memory for a %d-byte frame",
+				plan->frame_bytes);
+		obs_cap = plan->frame_bytes;
+	}
+	QNN_IOEmitPlan(plan, snapshot, &result);
+	QNN_ObsPlanPack(plan, obs, plan->frame_bytes, &result);
 	if (QNN_IOPoseTailEnabled())
-		QNN_IOStashPoseTail(obs, snapshot);
-	fwrite(obs, 1, QNN_OBS_BUFFER_SIZE, stdout);
+		QNN_IOStashPoseTail(obs, plan->frame_bytes, snapshot);
+	fwrite(obs, 1, (size_t)plan->frame_bytes, stdout);
 	fflush(stdout);
 }
 
@@ -1020,9 +1113,11 @@ static int QNN_HandleStep(const char *line)
 		int fb_neg, fb_pos, lr_neg, lr_pos, up_neg, up_pos;
 		QNN_JsonExtractVec3(line, "\"move\"", move_vec);
 		QNN_JsonExtractVec3(line, "\"look\"", action.look);
-		attack_press = QNN_JsonExtractInt(line, "\"attack\"", 0) ? 1 : 0;
+		action.attack = (uint8_t)QNN_JsonExtractInt(line, "\"attack\"", 0);
+		if (action.attack > 8)
+			action.attack = 0;
+		attack_press = action.attack > 0;
 		jump_press = QNN_JsonExtractInt(line, "\"jump\"", 0) ? 1 : 0;
-		action.weapon = (uint8_t)QNN_JsonExtractInt(line, "\"weapon\"", 0);
 		fb_neg = (move_vec[0] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
 		fb_pos = (move_vec[0] >  QNN_SNAP_THRESHOLD) ? 1 : 0;
 		lr_neg = (move_vec[1] < -QNN_SNAP_THRESHOLD) ? 1 : 0;
@@ -1095,6 +1190,14 @@ int main(int argc, char **argv)
 				continue;
 			}
 			QNN_ProcessStep(&action);
+			continue;
+		}
+
+		if (first_byte == QNN_OBS_OP_ATTACH_DECL)
+		{
+			/* Obs declaration handshake (obs_api v1) — sent by the
+			   driver after hello, before the first reset. */
+			QNN_WorkerHandleAttachDecl();
 			continue;
 		}
 

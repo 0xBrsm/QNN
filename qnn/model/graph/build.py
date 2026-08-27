@@ -45,20 +45,27 @@ import qnn.model.weapon_head          # noqa: F401  weapon "canonical"
 import qnn.model.temporal             # noqa: F401  temporal "gru"
 import qnn.model.target               # noqa: F401  pointer "mlp"
 import qnn.model.transformer          # noqa: F401  encoder "transformer"
+import qnn.model.move_hazard_head  # noqa: F401  move_hazard "canonical"
+import qnn.model.move_seg_head     # noqa: F401  move_seg "canonical"
+import qnn.model.look_seg_head     # noqa: F401  look_seg "canonical"
+import qnn.model.jump_head         # noqa: F401  jump "canonical"
+import qnn.model.attack_with_head  # noqa: F401  weapon "attack_with"
+import qnn.model.attack_future_head  # noqa: F401  attack_future "canonical"
+# a24 is a retired arch kept ONLY for legacy-checkpoint reload — its node
+# types and base graphs (full_4head/full_5head) stay bench-scoped in
+# qnn.model.bench.a24, never imported from cross-gen code beyond this
+# registration bootstrap.
 import qnn.model.bench.a24.move_head     # noqa: F401  move "cls"
 import qnn.model.bench.a24.look_head     # noqa: F401  look "polar"
 import qnn.model.bench.a24.attack_head   # noqa: F401  attack "cls"
 import qnn.model.bench.a24.weapon_head   # noqa: F401  weapon "cls" / "cls_prior"
-import qnn.model.bench.a25.move_hazard_head  # noqa: F401  move_hazard "canonical"
-import qnn.model.bench.a25.move_seg_head     # noqa: F401  move_seg "canonical"
-import qnn.model.bench.a25.jump_head         # noqa: F401  jump "canonical"
-import qnn.model.bench.a25.attack_with_head  # noqa: F401  weapon "attack_with"
+import qnn.model.bench.a24.graphs  # noqa: F401  full_4head / full_5head
 import qnn.model.bench.inputs.preattn_encoder    # noqa: F401  encoder "passthrough"
 import qnn.model.bench.inputs.gt_target_pointer  # noqa: F401  pointer "gt"
-# Base-graph compositions — each generation registers its own (arch lives with
-# the generation, not here). base_graph_dict resolves names from the registry.
-import qnn.model.bench.a24.graphs  # noqa: F401  full_4head / full_5head
-import qnn.model.bench.a25.graphs  # noqa: F401  full_6head
+# Base-graph compositions — full_6head/full_movearch outlived a25 and are
+# promoted (qnn.model.graph.base_graphs); a24's retired-arch bases stay
+# bench-scoped above. base_graph_dict resolves names from the registry.
+import qnn.model.graph.base_graphs  # noqa: F401  full_6head / full_movearch
 
 
 def _build_head(head: HeadNodeSpec, dims: dict[str, int], d_model: int) -> nn.Module:
@@ -78,14 +85,16 @@ HEAD_TYPES: dict[str, dict[str, object]] = registry.head_type_table()
 
 
 def _weapon_sources(spec: GraphSpec) -> tuple[str, ...]:
-    """ModelConfig.weapon_sources from the weapon head's edges.
+    """ModelConfig selector sources from the categorical attack head's edges.
 
     When no weapon head is present, return the neutral placeholder the
     flat config schema requires (it is never consumed — slot_dims gets
     has_weapon_head=False).
     """
-    weapon = spec.head("weapon")
-    if weapon is None:
+    selector = spec.head("attack")
+    if selector is None or selector.type != "attack_with":
+        selector = spec.head("weapon")
+    if selector is None:
         return ("self_readout", "target_feat")
 
     def _edge_to_source(edge: str) -> str:
@@ -98,14 +107,14 @@ def _weapon_sources(spec: GraphSpec) -> tuple[str, ...]:
             return "scalar:" + _scalar_edge_name(edge)
         return WEAPON_EDGE_TO_SOURCE[edge]
 
-    return tuple(_edge_to_source(e) for e in weapon.inputs)
+    return tuple(_edge_to_source(e) for e in selector.inputs)
 
 
 def model_config_from_graph(spec: GraphSpec) -> ModelConfig:
     """The flat ModelConfig bridge — policy-layer flags for QNNPolicy/Network."""
     enc = spec.encoder
-    weapon = spec.head("weapon")
-    decode = dict(weapon.decode) if weapon else {}
+    attack = spec.head("attack")
+    selector = attack if attack is not None and attack.type == "attack_with" else spec.head("weapon")
     activation = spec.heads[0].activation if spec.heads else "none"
     pointer = spec.pointer
 
@@ -121,20 +130,14 @@ def model_config_from_graph(spec: GraphSpec) -> ModelConfig:
         attn_dropout=enc.attn_dropout,
         use_gru=spec.temporal is not None,
         d_gru=spec.temporal.d_gru if spec.temporal else 0,
-        use_weapon_head=weapon is not None,
-        weapon_switch_confidence=float(decode.get("sticky_confidence", 0.0)),
-        weapon_switch_margin=float(decode.get("sticky_margin", 0.0)),
+        use_weapon_head=selector is not None,
         weapon_sources=_weapon_sources(spec),
-        weapon_context_from_obs=bool(weapon.context_from_obs) if weapon else False,
         look_bypass_gru=False,
         d_target=pointer.d_target if (pointer and pointer.type == "mlp") else enc.d_model,
-        self_weapon_embed_in_self=any(
-            "weapon_id" in t.vocab for t in spec.self_tokens
-        ),
         d_move=d_hidden("move"),
         d_look=d_hidden("look"),
         d_attack=d_hidden("attack"),
-        d_weapon=d_hidden("weapon"),
+        d_weapon=selector.d_hidden if selector else 0,
         head_activation=activation,
     )
 
@@ -178,7 +181,8 @@ def build_network(obs_dim: int, spec: GraphSpec) -> Network:
         d_gru=spec.temporal.d_gru if spec.temporal else 0,
         has_temporal=spec.temporal is not None,
         has_target_pointer=pointer is not None,
-        has_weapon_head=spec.head("weapon") is not None,
+        has_weapon_head=(spec.head("attack") is not None and spec.head("attack").type == "attack_with")
+                        or spec.head("weapon") is not None,
         weapon_sources=model.weapon_sources,
     )
 
@@ -186,6 +190,8 @@ def build_network(obs_dim: int, spec: GraphSpec) -> Network:
         h = spec.head(name)
         return _build_head(h, dims, enc.d_model) if h else Off
 
+    attack_spec = spec.head("attack")
+    attack_is_selector = attack_spec is not None and attack_spec.type == "attack_with"
     return Network(
         obs_dim=obs_dim,
         model=model,
@@ -196,10 +202,18 @@ def build_network(obs_dim: int, spec: GraphSpec) -> Network:
         move_head=head_or_off("move"),
         look_head=head_or_off("look"),
         attack_head=head_or_off("attack"),
-        weapon_head=head_or_off("weapon"),
+        weapon_head=Off if attack_is_selector else head_or_off("weapon"),
         move_hazard_head=head_or_off("move_hazard"),
         move_seg_head=head_or_off("move_seg"),
+        look_seg_head=head_or_off("look_seg"),
         jump_head=head_or_off("jump"),
+        # LAST, deliberately: Network assigns modules in argument order and
+        # _init_weights walks self.modules() in registration order, so keeping
+        # the aux head last leaves every other module's xavier draw
+        # bit-identical to the control arm's. (The head's builder also restores
+        # the RNG across its own constructor draw — see network.py and
+        # qnn.model.attack_future_head.)
+        attack_future_head=head_or_off("attack_future"),
     )
 
 
@@ -222,7 +236,7 @@ def graph_from_model_config(cfg: ModelConfig) -> GraphSpec:
         )
     has_temporal = bool(cfg.use_gru and cfg.d_gru > 0)
     tokens = (
-        monolithic_self_token(cfg.self_weapon_embed_in_self),
+        monolithic_self_token(),
         TokenSpec(name="spatial", kind=TOKEN_KIND_SPATIAL),
         TokenSpec(name="entities", kind=TOKEN_KIND_ENTITIES),
     )
@@ -245,17 +259,9 @@ def graph_from_model_config(cfg: ModelConfig) -> GraphSpec:
             for s in cfg.weapon_sources
             if not (s == "gru" and not has_temporal)
         )
-        decode = {}
-        if cfg.weapon_switch_confidence or cfg.weapon_switch_margin:
-            decode = {
-                "sticky_confidence": float(cfg.weapon_switch_confidence),
-                "sticky_margin": float(cfg.weapon_switch_margin),
-            }
         heads.append(HeadNodeSpec(
             name="weapon", type="canonical", inputs=inputs,
             d_hidden=cfg.d_weapon, activation=cfg.head_activation,
-            context_from_obs=cfg.weapon_context_from_obs,
-            decode=decode,
         ))
     spec = GraphSpec(
         tokens=tokens,

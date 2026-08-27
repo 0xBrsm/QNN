@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 from qnn import filter_dsl
-from qnn.vocab import MAX_TOKEN_OBJECTS, TOKEN_ACTOR
+from qnn.vocab import ACTOR_SCALAR_DIM, MAX_TOKEN_OBJECTS, TOKEN_ACTOR
 
 
 def compile_bc_hot_path(model: "QNNPolicy", log: Callable[[str], None] = print) -> None:
@@ -420,6 +420,50 @@ def _epoch1_sanity_check(
     return False, ""
 
 
+def _label_validity_check(
+    val_metrics: Mapping[str, float],
+    head_loss_weights: Mapping[str, float],
+    *,
+    enabled: bool,
+) -> "tuple[bool, str]":
+    """Return (abort, reason) if a WEIGHTED head scored zero valid labels.
+
+    A head whose label derivation drops every frame to ignore_index still
+    produces a finite loss and a plausible-looking metric block — it just
+    learns nothing. That is not a slow start, it is a wiring error: the
+    head is weighted, so labels were expected, and none arrived.
+
+    This is the backstop for the a27 purecombat failure: the 9-class
+    selector was bound (by slot name) to the retired act_weapon column,
+    every positive became -100, and the run reported
+    ``n_weapon_valid: 0.0`` with ``loss_weapon`` 1.6e-07 and a finite
+    selection score. Nothing raised. The label contract registry
+    (qnn.model.action_labels) makes that binding explicit; this makes an
+    unsatisfied binding fatal at the first validation instead of after a
+    full schedule.
+
+    Only heads that actually publish an ``n_<head>_valid`` count are
+    judged — a head with no such metric is unverifiable here, not
+    presumed broken. Pure function → unit-testable.
+    """
+    if not enabled:
+        return False, ""
+    for head, weight in sorted(head_loss_weights.items()):
+        if float(weight) == 0.0:
+            continue
+        key = f"n_{head}_valid"
+        if key not in val_metrics:
+            continue
+        if float(val_metrics[key]) <= 0.0:
+            return True, (
+                f"{key}=0 while head_loss_weights[{head!r}]={float(weight):g} — "
+                f"every label for a weighted head was dropped to ignore_index. "
+                f"Check the head's action-label contract (heads[{head!r}].label) "
+                f"against the columns this corpus actually carries"
+            )
+    return False, ""
+
+
 def _autostop_decision(
     *,
     selection_metric: float,
@@ -523,8 +567,9 @@ def _unpack_move_axes(packed: np.ndarray) -> np.ndarray:
     pos_bit = bit 6 OR bit 7.  Both bits cleared → class=1 (none);
     only neg → 0; either pos → 2.
 
-    Attack and jump are extracted separately by ``_unpack_attack_bit`` and
-    ``_unpack_jump_bit``. Materializes a fresh array (no longer mmap-backed)
+    Jump is extracted separately by ``_unpack_jump_bit``. The categorical
+    attack label is a dedicated action field. Materializes a fresh array
+    (no longer mmap-backed)
     — fine because action labels are tiny relative to obs.
 
     The decode itself lives in :func:`qnn.actions.decode_move_pressbyte`
@@ -533,6 +578,7 @@ def _unpack_move_axes(packed: np.ndarray) -> np.ndarray:
     """
     from qnn.actions import decode_move_pressbyte
     return decode_move_pressbyte(packed)
+
 
 
 def _unpack_attack_bit(packed: np.ndarray) -> np.ndarray:
@@ -546,7 +592,6 @@ def _unpack_attack_bit(packed: np.ndarray) -> np.ndarray:
     if arr.ndim != 1:
         raise ValueError(f"expected (T,) packed move, got shape {arr.shape}")
     return np.ascontiguousarray(arr & 0x1)
-
 
 def _unpack_jump_bit(packed: np.ndarray) -> np.ndarray:
     """Extract the explicit jump press bit (bit 7) from the packed move byte.
@@ -577,14 +622,14 @@ def _densify_obs_for_labeler(obs_padded: dict[str, np.ndarray]) -> dict[str, np.
 
       - ``self_scalars[:, 0]`` (health, normalized by MAX_HEALTH) — for
         the dead-frame mask
-      - ``entity_scalars_raw[:, :, {HALFEXT, REL, VEL, TEAM, RECENCY}]``
+      - ``entity_scalars_raw[:, :, {HALFEXT, REL, VEL, TEAM}]``
         at the actor-layout offsets
       - ``entity_ids[:, :, {1=modality, 2=player_id}]``
       - ``entity_types``
 
     Non-actor entity indices are left as zero — the labeler masks to
     ``entity_types == TOKEN_ACTOR`` before reading any scalar offset, so
-    the projectile/item/mover branches of the full dequantizer would be
+    the projectile branch of the full dequantizer would be
     discarded anyway. Skipping them here saves ~600s of load time on
     the production corpus vs. running the full model-side dequantizers.
     """
@@ -605,22 +650,19 @@ def _densify_obs_for_labeler(obs_padded: dict[str, np.ndarray]) -> dict[str, np.
     #   [3:6]   rel           / DIST_SCALE
     #   [7:10]  vel           / MAX_VELOCITY
     #   [16]    team
-    #   [18]    recency       / TIME_SCALE
     # Non-actor indices are zeroed; labeler masks them out anyway.
-    entity_scalars = np.zeros((T, N, 19), dtype=np.float32)
+    entity_scalars = np.zeros((T, N, ACTOR_SCALAR_DIM), dtype=np.float32)
     half = np.asarray(obs_padded["entity_half_extents"]).astype(np.float32) / en.DIST_SCALE
     rel  = np.asarray(obs_padded["entity_rel"]).astype(np.float32) / en.DIST_SCALE
     vel  = np.asarray(obs_padded["entity_vel"]).astype(np.float32) / en.MAX_VELOCITY
     team = np.asarray(obs_padded["entity_team"]).astype(np.float32)
-    recency = np.asarray(obs_padded["entity_recency"]).astype(np.float32) / en.TIME_SCALE
     actor_mask = (et == TOKEN_ACTOR)
     if actor_mask.any():
         mask3 = actor_mask[..., None]
         entity_scalars[..., 0:3]  = np.where(mask3, half, 0.0)
         entity_scalars[..., 3:6]  = np.where(mask3, rel,  0.0)
         entity_scalars[..., 7:10] = np.where(mask3, vel,  0.0)
-        entity_scalars[..., 16]   = np.where(actor_mask, team,    0.0)
-        entity_scalars[..., 18]   = np.where(actor_mask, recency, 0.0)
+        entity_scalars[..., 16]   = np.where(actor_mask, team, 0.0)
 
     # entity_ids: labeler reads indices 1 (modality) and 2 (player_id).
     entity_ids = np.stack([
@@ -794,7 +836,7 @@ _NATIVE_ROW_INDEXED_OBS_FIELDS = frozenset({
     "health", "effective_armor",
     "ammo_shells", "ammo_nails", "ammo_rockets", "ammo_cells",
     "vel", "attack_finished",
-    "self_weapon_id", "self_movement_id", "self_items",
+    "self_movement_id", "self_items",
     "spatial_atlas",
     "entity_count",
 })
@@ -810,10 +852,8 @@ _NATIVE_TOKEN_INDEXED_OBS_FIELDS = frozenset({
 })
 
 # Sentinel for empty entity indices in the padded (T, MAX_TOKEN_OBJECTS,
-# ...) materialization. -1 in entity_types matches the ObsEmbedding's
-# `entity_mask = (entity_types == TOKEN_ACTOR)` semantics; the
-# ObsEmbedding key-padding mask flips on non-actor types so the
-# transformer simply ignores empty indices.
+# ...) materialization. A27 treats actor and projectile rows as valid
+# attention inputs; -1 is the explicit empty value masked by ObsEmbedding.
 _ENTITY_TYPES_EMPTY_SENTINEL = -1
 
 
@@ -830,8 +870,8 @@ def _materialize_padded_entity(
     not a re-write of the shard.
 
     ``entity_count`` (T,) drives the per-row valid-prefix; trailing
-    indices are zeroed (``entity_types`` gets -1 sentinels so the
-    ObsEmbedding's actor-only mask works unchanged).
+    indices are zeroed (``entity_types`` gets -1 sentinels so
+    ObsEmbedding masks the empty rows).
     """
     counts = obs.get("entity_count")
     if counts is None:
@@ -1378,7 +1418,7 @@ def run_behavior_cloning(
         _reg_violations = ckpt.get("_reg_violations", 0)
         _autostop_stall = ckpt.get("_autostop_stall", 0)
         _autostop_drift_ref = ckpt.get("_autostop_drift_ref", None)
-        # Optimizer state restored after first supervised step creates it.
+        # Restored eagerly just below the compile step, before any training.
         _resume_optimizer_state = ckpt.get("optimizer_state_dict")
         # Restore rng state so resume produces the same episode ordering
         # as a continuous run.
@@ -1415,6 +1455,24 @@ def run_behavior_cloning(
             mid_epoch_path.unlink(missing_ok=True)
 
     compile_bc_hot_path(model, log=_log)
+
+    # Resume: restore the optimizer BEFORE any training, not after the first
+    # epoch. The optimizer is created lazily inside supervised_step, so this
+    # forces it into existence first (same `model.parameters()` ordering that
+    # supervised_step uses, so the state_dict maps onto the right params; the
+    # lr passed here is irrelevant because _optimizer rewrites group["lr"] on
+    # every call). Previously the load happened after `_run_epoch` returned,
+    # i.e. the whole first epoch after a resume trained on a FRESH Adam —
+    # zeroed exp_avg/exp_avg_sq and step=0, so wrong bias correction and no
+    # momentum for ~724 steps. That made a resumed run diverge from a
+    # continuous one from its very first report (measured: epoch-4 window loss
+    # 2.6510 vs 3.7405, train_grad_norm_mean 841.9 vs 1817.7), which defeats
+    # the point of resume being a faithful continuation.
+    if _resume_optimizer_state is not None:
+        _bc_opt = model._optimizer("bc", model.model.parameters(), float(config.lr))
+        _bc_opt.load_state_dict(_resume_optimizer_state)
+        _resume_optimizer_state = None
+        _log("Resume: optimizer state restored before the first training step")
 
     # Per-step reporting: aggregate every ~1024 samples, then wall-clock gate
     # actual logging/flushes so perf runs do not spend most of their time
@@ -1524,12 +1582,17 @@ def run_behavior_cloning(
         # L2 drift from the end-of-last-epoch state as a "is the model still
         # actively changing?" signal.
         _epoch_start_weights = {k: v.detach().clone() for k, v in model.model.state_dict().items()}
-        # Hot-reload LR: drop {"lr": 0.001, "lr_min": 0.0003} into lr_override.json.
+        # Hot-reload LR: drop {"lr": 0.001, "lr_min": 0.0003} into
+        # <output>/lr_override.json (i.e. the run's checkpoints/ dir).
         _lr = config.lr
         _lr_min = config.lr_min
         if _lr_override_path.exists():
             try:
-                _ovr = _json.loads(_lr_override_path.read_text())
+                # Module-level `json`, not `_json` — the latter is only bound
+                # inside train_from_run_dir(), so this raised NameError here and
+                # the except reported it as "parse error". The whole hot-reload
+                # path was dead: any override file was silently ignored.
+                _ovr = json.loads(_lr_override_path.read_text())
                 _lr = float(_ovr.get("lr", _lr))
                 _lr_min = float(_ovr.get("lr_min", _lr_min))
                 _log(f"lr_override.json: lr={_lr}, lr_min={_lr_min}")
@@ -1592,11 +1655,6 @@ def run_behavior_cloning(
             _log(f"Cancellation requested — stopping mid-epoch {epoch + 1} "
                  f"(mid-epoch state kept for resume)")
             break
-        if _resume_optimizer_state is not None:
-            bc_opt = model._optimizers.get("bc")
-            if bc_opt is not None:
-                bc_opt.load_state_dict(_resume_optimizer_state)
-                _resume_optimizer_state = None
         _t_val_start = _time.monotonic()
         val_metrics = _run_epoch(
             model,
@@ -1667,7 +1725,13 @@ def run_behavior_cloning(
         # stay in bc_history.json for analysis. See research/head-metrics.md.
         _headline_keys = (
             "move_skill", "look_skill", "target_skill", "attack_skill", "weapon_skill",
-            "move_seg_skill", "jump_skill",
+            "move_seg_skill", "jump_skill", "look_seg_skill",
+            # Decision-only variants (feasible frames only) — the numbers that
+            # reflect actuatable decisions. See _attack_op_skill_from_sums.
+            "attack_op_skill", "jump_op_skill",
+            # a27 MTP aux head (training-only; never in the selection
+            # composite — _selection_score must stay arm-comparable).
+            "attack_future_skill", "attack_future_marg_skill",
         )
         skill_str = "  ".join(
             f"{k}={float(val_metrics[k]):.4f}"
@@ -1688,6 +1752,14 @@ def run_behavior_cloning(
             ceil=float(getattr(config, "epoch1_sanity_skill_ceil", 1000.0)),
             is_first_epoch=(epoch == 0),
         )
+        # Label-validity gate: a weighted head that scored zero valid labels is
+        # mis-wired, not slow. Judged every epoch (the condition is a wiring
+        # fact, not a convergence one) and shares the epoch-1 abort switch.
+        if not _epoch1_abort:
+            _epoch1_abort, _epoch1_reason = _label_validity_check(
+                val_metrics, head_loss_weights,
+                enabled=bool(getattr(config, "epoch1_sanity_abort", True)),
+            )
 
         # Weight drift: L2 of (weights now) - (weights at epoch start).
         # Non-zero drift in a plateau = model still reorganizing; zero = stuck.

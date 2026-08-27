@@ -138,7 +138,7 @@ def fit_crest(run_dir: Path, base_config: Path, *,
         raise FileNotFoundError(
             f"{ctx.waves_dir}: no botpin wave carries {events.TRACKING_WINDOWS_NPZ} "
             "— the crest arm has nothing to replay; re-run the waves with "
-            f"QNN_EVAL_INTERCEPT_WINDOW={events.TRACKING_K}")
+            f"QNN_EVAL_INTERCEPT_WINDOW={events.TRACKING_WINDOW_ENV}")
     _log(f"replaying {len(dirs)} botpin waves under {rel_to_repo(ctx.waves_dir)}")
     windows = events.load_waves_crest(dirs)
     tracking = events.load_waves_tracking(dirs)

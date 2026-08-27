@@ -7,8 +7,7 @@ Domains (Brian's framing — look / move / attack / jump):
            per-corpus placement anchors (qnn.human.intercept; skill-curves §16.3),
            ACQUISITION Fitts band (qnn.human.acquisition),
            engagement RANGE prior (qnn.human.aim_range)
-  move   — move-axis + weapon WHEN-hazard release tables (qnn.human.move_hazard /
-           qnn.human.weapon_hazard)
+  move   — move-axis dwell-hazard release table (qnn.human.move_hazard)
   attack — per-weapon OP-ATTACK rate + intervals (qnn.human.op_attack)
   jump   — no per-collect baseline artifact yet (qnn.human.jump; contextual, no rate
            calibration — feedback_jump_no_rate_calibration)
@@ -24,7 +23,7 @@ Artifact sinks, all per-collect:
     standalone docs under ``<collect_dir>/human_baseline/<name>.json`` + a
     ``human_baseline`` provenance block (schema + git + per-file sha256) in
     ``collect_metadata.json`` (``_ARTIFACTS``);
-  * the three cheap decode TABLES (look_grid / move_hazard / weapon_hazard) → top-level
+  * the two cheap decode TABLES (look_grid / move_hazard) → top-level
     blocks in ``collect_metadata.json``, the keys ``run.init`` pins into a run's config
     (``_TABLES``).
 The one exception is the human-band window bank (``qnn.human.band_bank``): also a
@@ -100,7 +99,6 @@ class _Table:
 _TABLES: tuple[_Table, ...] = (
     _Table("look_grid", "qnn.human.look_grid", "compute_from_collect"),
     _Table("move_hazard", "qnn.human.move_hazard", "compute_hazard_from_collect"),
-    _Table("weapon_hazard", "qnn.human.weapon_hazard", "compute_hazard_from_collect"),
 )
 
 
@@ -182,8 +180,8 @@ def _write_provenance(collect_dir: Path, paths: dict[str, Path]) -> None:
 def ensure_collect_tables(
     collect_dir: str | Path, *, force: bool = False,
 ) -> dict:
-    """Compute-if-missing the three cheap decode TABLES (look_grid / move_hazard /
-    weapon_hazard) and record them as top-level blocks in the collect's
+    """Compute-if-missing the two cheap decode TABLES (look_grid / move_hazard)
+    and record them as top-level blocks in the collect's
     ``collect_metadata.json`` — the keys ``run.init`` pins into a run's config.
 
     In-process, NumPy-only, best-effort per table: a label-less/empty corpus skips that

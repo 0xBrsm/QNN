@@ -1124,7 +1124,7 @@ def replay_crest(fwd: np.ndarray, cluster: np.ndarray, tick: np.ndarray,
     """The gated counterfactual for every discharge row: ``(offset, hbw,
     absorbed)``.
 
-    Mirrors ``qnn.model.bench.a25.decode.attack_crest_gate_step`` exactly at
+    Mirrors ``qnn.model.decode_actions.attack_crest_gate_step`` exactly at
     ``ready=True`` (the eval only logs a window for a discharge the engine
     honored, which is precisely the gate's ``ready`` condition):
 

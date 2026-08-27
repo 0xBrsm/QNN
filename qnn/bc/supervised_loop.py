@@ -11,7 +11,15 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+import gc as _gc
+import math
+from dataclasses import dataclass, field
+
+from qnn.vocab import MAX_TOKEN_OBJECTS
+
+_N_SLOTS = MAX_TOKEN_OBJECTS
+_EMPTY_TOKEN_SENTINEL = -1   # entity_types fill for empty slots
+
 from typing import Any, Dict, Protocol
 
 import heapq
@@ -19,6 +27,7 @@ import heapq
 import numpy as np
 import torch
 
+from qnn.model.attack_future_bins import derive_next_discharge_bucket
 from qnn.model.policy import QNNPolicy
 
 
@@ -42,9 +51,8 @@ _NATIVE_DEQUANT_INPUT_KEYS: tuple[str, ...] = (
     "entity_count",
     "entity_subject_id", "entity_modality_id", "entity_player_id",
     "entity_half_extents", "entity_rel", "entity_vel",
-    "entity_path", "entity_path_dist", "entity_eta", "entity_recency",
+    "entity_path", "entity_path_dist", "entity_eta",
     "entity_facing", "entity_team", "entity_score",
-    "entity_amount", "entity_regen", "entity_state",
     "entity_event_count",
 )
 
@@ -158,10 +166,22 @@ _RAW_SUM_METRIC_PREFIXES = (
     "lookdist_",  # binned-head distributional (human-likeness) sufficient stats
     "movedist_",  # move-head distributional (human-likeness) sufficient stats
     "movesegdist_",  # move_seg_skill sufficient stats (see research/head-metrics.md)
+    "looksegdist_",  # look_seg_skill sufficient stats (see research/head-metrics.md)
+    "looksegdirdist_",  # look_seg direction-skill sufficient stats (aux, non-gating)
     "jumpdist_",  # jump_skill sufficient stats (see research/head-metrics.md)
     "weapondist_",  # weapon_skill sufficient stats (see research/head-metrics.md)
     "attackdist_",  # attack_skill sufficient stats (see research/head-metrics.md)
+    "attackfuturedist_",  # attack_future_skill sufficient stats (5-way + op twin)
+    "attackfuturemargdist_",  # attack_future marginal P(fire<=horizon) suffstats
     "targetdist_",  # target_skill sufficient stats (see research/head-metrics.md)
+    # Per-optimizer-step clipped grad norm, summed over the report window (with
+    # its own count) so the STEP log carries gradient health, not just the
+    # epoch-level mean/max. Motivation: a run can be five orders of magnitude
+    # out of range and show no metric symptom at all, because max_grad_norm
+    # rescales the update — the 7/31 attack_future arm validated healthy (its
+    # BEST epoch) at grad_norm_max 4.9e5 and only died an epoch later. See
+    # agents/plans/cross-head-coordination.md §8.
+    "gradnormdist_",
 )
 _AVERAGED_METRIC_PREFIXES = (
     "acc_", "mae_", "f1_", "precision_", "recall_",
@@ -615,6 +635,43 @@ def _attack_skill_from_sums(result: Dict[str, float]) -> None:
     _skill_from_nll(result, "attack", nll, h_marg)
 
 
+def _attack_op_skill_from_sums(result: Dict[str, float]) -> None:
+    """attack_op_dll / attack_op_skill — the same binary-marginal ruler as
+    attack_skill, but scored ONLY on feasible frames (input_mask bit 0: the
+    engine would fire if the button were pressed this tick).
+
+    attack_skill's population includes infeasible frames, where the
+    engine-outcome label is a deterministic 0 and every prediction is free. On
+    qwd_v5main val that was 59.8% of scored frames, halving h_marg (0.409 ->
+    0.219). This variant is the decision-relevant number; both are reported so
+    records measured before it stay comparable."""
+    import numpy as _np
+    if "attackdist_op_n" not in result:
+        return
+    n = max(_f(result.pop("attackdist_op_n")), 1.0)
+    nll = _f(result.pop("attackdist_op_ce_sum")) / n
+    base = min(max(_f(result.pop("attackdist_op_pos")) / n, 1e-12), 1.0 - 1e-12)
+    h_marg = float(-(base * _np.log(base) + (1.0 - base) * _np.log(1.0 - base)))
+    _skill_from_nll(result, "attack_op", nll, h_marg)
+
+
+def _jump_op_skill_from_sums(result: Dict[str, float]) -> None:
+    """jump_op_dll / jump_op_skill — jump_skill restricted to
+    ground-jump-feasible frames (input_mask bit 7).
+
+    jump_skill's population excludes water but keeps airborne frames, where a
+    land jump is impossible and the label carries exactly 0 positives (316,282
+    frames on qwd_v5main val, 33.6% of the scored set)."""
+    import numpy as _np
+    if "jumpdist_op_n" not in result:
+        return
+    n = max(_f(result.pop("jumpdist_op_n")), 1.0)
+    nll = _f(result.pop("jumpdist_op_ce_sum")) / n
+    base = min(max(_f(result.pop("jumpdist_op_pos")) / n, 1e-12), 1.0 - 1e-12)
+    h_marg = float(-(base * _np.log(base) + (1.0 - base) * _np.log(1.0 - base)))
+    _skill_from_nll(result, "jump_op", nll, h_marg)
+
+
 def _target_skill_from_sums(result: Dict[str, float]) -> None:
     """target_dll / target_skill from the present-weighted CE sum + the
     present-weighted marginal target distribution over entity slots. Distinct
@@ -686,6 +743,82 @@ def _move_seg_skill_from_sums(result: Dict[str, float]) -> None:
                                        if h_marg_ud > 1e-12 else 0.0)
 
 
+def _look_seg_skill_from_sums(result: Dict[str, float]) -> None:
+    """look_seg_dll / look_seg_skill from the onset joint CE sum + joint-class
+    histogram. The look analogue of ``_move_seg_skill_from_sums`` (single joint
+    distribution, no fb/lr axes): dll = H_marg − NLL, skill = dll / H_marg on the
+    common head ruler (research/head-metrics.md), over the onset-frame
+    (onset-class × duration-bucket) joint. The A0 marginal predictor has skill 0
+    by construction, so ``look_seg_skill > 0`` is the binding offline bar
+    (runs/head_probe/_look_seg_baseline.json). The direction categorical
+    (stroke onsets only) is scored SEPARATELY and never gates."""
+    if "looksegdist_n" not in result:
+        return
+    n = max(_f(result.pop("looksegdist_n")), 1.0)
+    nll = _f(result.pop("looksegdist_ce_sum")) / n
+    h_keys = sorted(
+        (k for k in result if k.startswith("looksegdist_h_")),
+        key=lambda s: int(s.rsplit("_", 1)[1]),
+    )
+    h_marg = _entropy_from_hist([_f(result.pop(k)) for k in h_keys])
+    _skill_from_nll(result, "look_seg", nll, h_marg)
+    # Direction skill — derived SEPARATELY (stroke onsets only); its estimate
+    # must not fold into or gate the joint look_seg skill / selection.
+    if "looksegdirdist_n" in result:
+        n_d = max(_f(result.pop("looksegdirdist_n")), 1.0)
+        nll_d = _f(result.pop("looksegdirdist_ce_sum")) / n_d
+        dh_keys = sorted(
+            (k for k in result if k.startswith("looksegdirdist_h_")),
+            key=lambda s: int(s.rsplit("_", 1)[1]),
+        )
+        h_marg_d = _entropy_from_hist([_f(result.pop(k)) for k in dh_keys])
+        result["look_seg_dir_dll"] = h_marg_d - nll_d
+        result["look_seg_dir_skill"] = ((h_marg_d - nll_d) / h_marg_d
+                                        if h_marg_d > 1e-12 else 0.0)
+
+
+def _attack_future_skill_from_sums(result: Dict[str, float]) -> None:
+    """attack_future_dll / attack_future_skill from the 5-way censored
+    time-to-next-op-discharge CE sum + true-class histogram, on the common head
+    ruler (research/head-metrics.md). Two companions off the SAME softmax:
+
+    * ``attack_future_op_skill``   — the identical construction restricted to
+      operative frames (input_mask bit 0), the decision-relevant population.
+    * ``attack_future_marg_skill`` — the binary marginal P(fire ≤ horizon), the
+      rate the coordination analysis reads directly.
+
+    The scored population is right-censored at run ends (~13% of frames, and
+    non-random). That bias is identical in every probe arm, so these numbers
+    compare arm-to-arm only — never against an external base rate.
+    """
+    import numpy as _np
+    if "attackfuturedist_n" in result:
+        n = max(_f(result.pop("attackfuturedist_n")), 1.0)
+        nll = _f(result.pop("attackfuturedist_ce_sum")) / n
+        h_keys = sorted(
+            (k for k in result if k.startswith("attackfuturedist_h_")),
+            key=lambda s: int(s.rsplit("_", 1)[1]),
+        )
+        h_marg = _entropy_from_hist([_f(result.pop(k)) for k in h_keys])
+        _skill_from_nll(result, "attack_future", nll, h_marg)
+    if "attackfuturedist_op_n" in result:
+        n_op = max(_f(result.pop("attackfuturedist_op_n")), 1.0)
+        nll_op = _f(result.pop("attackfuturedist_op_ce_sum")) / n_op
+        h_keys_op = sorted(
+            (k for k in result if k.startswith("attackfuturedist_op_h_")),
+            key=lambda s: int(s.rsplit("_", 1)[1]),
+        )
+        h_marg_op = _entropy_from_hist([_f(result.pop(k)) for k in h_keys_op])
+        _skill_from_nll(result, "attack_future_op", nll_op, h_marg_op)
+    if "attackfuturemargdist_n" in result:
+        n_m = max(_f(result.pop("attackfuturemargdist_n")), 1.0)
+        nll_m = _f(result.pop("attackfuturemargdist_ce_sum")) / n_m
+        base = min(max(_f(result.pop("attackfuturemargdist_pos")) / n_m, 1e-12),
+                   1.0 - 1e-12)
+        h_marg_m = float(-(base * _np.log(base) + (1.0 - base) * _np.log(1.0 - base)))
+        _skill_from_nll(result, "attack_future_marg", nll_m, h_marg_m)
+
+
 def _apply_stable_epoch_metrics(result: Dict[str, float]) -> None:
     if "tp_attack" in result and "fp_attack" in result and "fn_attack" in result:
         _stable_binary_metrics_from_counts(result, prefix="attack")
@@ -698,9 +831,13 @@ def _apply_stable_epoch_metrics(result: Dict[str, float]) -> None:
     _move_distribution_metrics_from_sums(result)
     _weapon_skill_from_sums(result)
     _attack_skill_from_sums(result)
+    _attack_op_skill_from_sums(result)
     _target_skill_from_sums(result)
     _move_seg_skill_from_sums(result)
+    _look_seg_skill_from_sums(result)
     _jump_skill_from_sums(result)
+    _jump_op_skill_from_sums(result)
+    _attack_future_skill_from_sums(result)
 
 
 def _apply_global_length_bucketing(
@@ -840,14 +977,56 @@ class ResidentSource:
     device: torch.device
     prefetch_depth: int = 0
     n_workers: int = 0
+    # Token-PACKED obs fields: (total_tokens, *per_token_shape) instead of
+    # (n_rows, MAX_TOKEN_OBJECTS, *per_token_shape). `tok_indptr` (n_rows+1,)
+    # locates each frame's tokens. Padding to the fixed slot width happens
+    # per batch in gather/gather_into — the model's (B, N, D) contract and the
+    # engine's fixed-width wire are unchanged.
+    #
+    # Why: the padded layout charges every frame the full 16 slots regardless
+    # of how many tokens it has. a27's two-pool stream averages 1.24
+    # tokens/frame, so entity_scalars_raw at 35M frames is
+    # 35M x 16 x 18 x 4B = 37.53 GiB of which ~92% is zeros — it cannot be
+    # allocated on a 63.9 GiB device. Packed it is ~2.9 GiB.
+    packed_obs: dict[str, torch.Tensor] = field(default_factory=dict)
+    tok_indptr: torch.Tensor | None = None
+    n_slots: int = MAX_TOKEN_OBJECTS
 
     @property
     def n_total_rows(self) -> int:
         return int(self.episode_offsets[-1])
 
+    def _expand_packed(self, indices: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Rebuild the padded (B, n_slots, ...) view for packed fields.
+
+        Torch equivalent of train.py's `_pad_entity_rows` gather: for each
+        gathered row take its token prefix and write it into slots
+        0..count-1, filling the rest (entity_types gets the -1 empty
+        sentinel so ObsEmbedding masks those slots).
+        """
+        if not self.packed_obs or self.tok_indptr is None:
+            return {}
+        start = self.tok_indptr.index_select(0, indices)
+        stop = self.tok_indptr.index_select(0, indices + 1)
+        counts = (stop - start).clamp_(max=self.n_slots)
+        ar = torch.arange(self.n_slots, device=indices.device, dtype=torch.int64)
+        valid = ar.unsqueeze(0) < counts.unsqueeze(1)              # (B, n_slots)
+        gidx = torch.where(valid, start.unsqueeze(1) + ar.unsqueeze(0), 0)
+        flat_idx = gidx.reshape(-1)
+        out: dict[str, torch.Tensor] = {}
+        for key, packed in self.packed_obs.items():
+            rows = packed.index_select(0, flat_idx)
+            rows = rows.reshape(indices.shape[0], self.n_slots, *packed.shape[1:])
+            mask = valid.reshape(valid.shape + (1,) * (rows.dim() - 2))
+            fill = -1 if key == "entity_types" else 0
+            out[key] = torch.where(mask, rows, rows.new_full((), fill))
+        return out
+
     def gather(self, indices: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        obs = {k: v.index_select(0, indices) for k, v in self.obs.items()}
+        obs.update(self._expand_packed(indices))
         return (
-            {k: v.index_select(0, indices) for k, v in self.obs.items()},
+            obs,
             {k: v.index_select(0, indices) for k, v in self.actions.items()},
         )
 
@@ -862,6 +1041,13 @@ class ResidentSource:
             torch.index_select(value, 0, indices, out=obs_out[key])
         for key, value in self.actions.items():
             torch.index_select(value, 0, indices, out=actions_out[key])
+        # Packed token fields are rebuilt (not index_select'd) — copy into the
+        # caller's buffers so shape stability for torch.compile is preserved.
+        for key, value in self._expand_packed(indices).items():
+            if key in obs_out:
+                obs_out[key].copy_(value)
+            else:
+                obs_out[key] = value
 
     def attack_pos_neg_counts(self, *, op_only: bool = False) -> tuple[int, int]:
         """Return (pos, neg) attack-frame counts.
@@ -889,6 +1075,8 @@ class ResidentSource:
     def release_device_tensors(self) -> None:
         self.obs.clear()
         self.actions.clear()
+        self.packed_obs.clear()
+        self.tok_indptr = None
 
     def head(self, n_episodes: int) -> "ResidentSource":
         """View of the first ``n_episodes`` episodes; shares device tensors."""
@@ -900,6 +1088,11 @@ class ResidentSource:
             device=self.device,
             prefetch_depth=self.prefetch_depth,
             n_workers=self.n_workers,
+            # Rows are addressed absolutely, so tok_indptr stays valid under an
+            # episode-prefix view — share it rather than reslicing.
+            packed_obs=self.packed_obs,
+            tok_indptr=self.tok_indptr,
+            n_slots=self.n_slots,
         )
 
 
@@ -1099,7 +1292,12 @@ def make_resident_source(
             # spatial_scalars is 4× the native packed bytes. The atlas stays
             # resident nibble-packed; the
             # ObsEmbedding's SpatialDequantizer derives scalars per batch.
-            gpu_obs = EntityDequantizer().to(device)(
+            # The cache declares its entity stream: a26-era (full) caches
+            # carry entity_recency; a27 combat caches do not. The dequant's
+            # raw layout must match the stream the MODEL was built for, and
+            # the model's stream is sniffed from the same corpus lineage.
+            _stream = "full" if "entity_recency" in gpu_obs else "combat"
+            gpu_obs = EntityDequantizer(entity_stream=_stream).to(device)(
                 SelfDequantizer().to(device)(gpu_obs)
             )
             if (
@@ -1157,13 +1355,21 @@ def make_resident_source(
         # val F1/precision/recall still use the original ``attack`` label).
         # See _compute_attack_shifted for the recurrence.
         att_shift_arrays: list[np.ndarray] = []
+        # a27 MTP aux label: censored time-to-next-op-discharge bucket, derived
+        # PER EPISODE (run breaks are structural — no cross-run leak, no
+        # chunk-edge cases). Derived UNCONDITIONALLY wherever attack+input_mask
+        # exist, so the column does not enter _source_compatibility_key and both
+        # probe arms share one resident source under the ablation daemon.
+        att_future_arrays: list[np.ndarray] = []
         for ep in episodes:
             attack = np.asarray(ep.actions["attack"]).reshape(-1).astype(np.uint8)
             op = (np.asarray(ep.actions["input_mask"]).reshape(-1).astype(np.uint8) & 0x1) != 0
             eng_arrays.append(_compute_engagement_ema(attack, op, alpha=engagement_ema_alpha))
             att_shift_arrays.append(_compute_attack_shifted(attack, op))
+            att_future_arrays.append(derive_next_discharge_bucket(attack, op))
         gpu_actions["engagement_ema"] = _concat_arrays(eng_arrays)
         gpu_actions["attack_shifted"] = _concat_arrays(att_shift_arrays)
+        gpu_actions["attack_future_bucket"] = _concat_arrays(att_future_arrays)
     if "move" in episodes[0].actions:
         # move is (T, 3) uint8 with axes [fb, lr, ud]; ud=2 is the jump axis.
         # MOVE_CLASS_POS = 2 (neg/none/pos = 0/1/2). Build a 0/1 stream then
@@ -1223,15 +1429,47 @@ class StreamingSource:
         n_workers: int = 1,
         engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
         needs_move_hazard: bool = False,
+        resample_ratio: int = 1,
     ) -> None:
         self._ll = ll
         self.device = device
+        self._resample_ratio = int(resample_ratio)
+        self._resampled_cache: dict[int, Any] = {}
         self._engagement_ema_alpha = float(engagement_ema_alpha)
         # a25 move-hazard (WHEN-law) opt-in. When False (every run that doesn't
         # train the hazard head) the derivation + injection are skipped entirely
         # — byte-identical to before.
         self._needs_move_hazard = bool(needs_move_hazard)
-        self.episodes: list[Any] = list(ll.episodes)
+        orig_eps = list(ll.episodes)
+        if self._resample_ratio > 1:
+            # Load-time temporal resample (qnn.bc.resample): remap each episode to
+            # its group-count length; _open_shard returns the resampled shard, so
+            # the derived-column precompute + gather all see the resampled rate.
+            from collections import defaultdict as _dd
+            from qnn.bc.streaming_source import EpisodeRef as _ER
+            r = self._resample_ratio
+            by_shard: dict[int, list] = _dd(list)
+            for ep in orig_eps:
+                by_shard[int(ep.shard_idx)].append(ep)
+            self._shard_ep_slices: dict[int, list] = {}
+            remap: dict[int, Any] = {}
+            for s, eps in by_shard.items():
+                eps_sorted = sorted(eps, key=lambda e: int(e.row_start))
+                self._shard_ep_slices[s] = [(int(e.row_start), int(e.row_end)) for e in eps_sorted]
+                cursor = 0
+                for e in eps_sorted:
+                    n10 = int(e.n_samples) // r
+                    if n10 == 0:
+                        continue  # episode shorter than one output tick — drop it
+                    # token_start/token_end are unused by this source (gather uses
+                    # the resampled shard's recomputed indptr); sort_key preserves
+                    # the original lane ordering.
+                    remap[id(e)] = _ER(shard_idx=s, row_start=cursor, row_end=cursor + n10,
+                                       token_start=0, token_end=0, sort_key=e.sort_key)
+                    cursor += n10
+            self.episodes: list[Any] = [remap[id(e)] for e in orig_eps if id(e) in remap]
+        else:
+            self.episodes = orig_eps
         self.prefetch_depth = int(prefetch_depth)
         self.n_workers = int(n_workers)
 
@@ -1269,6 +1507,9 @@ class StreamingSource:
         self._look_delta: torch.Tensor | None = None
         self._engagement_ema: torch.Tensor | None = None
         self._attack_shifted: torch.Tensor | None = None
+        # a27 MTP aux label (censored time-to-next-op-discharge bucket), derived
+        # per episode alongside the other attack-derived columns.
+        self._attack_future: torch.Tensor | None = None
         # a25 hazard columns (held_class/dwell_age → obs, release/valid → act),
         # per-frame and indexed by the same global order as self._jump_dist.
         self._hz_held: torch.Tensor | None = None
@@ -1290,15 +1531,39 @@ class StreamingSource:
         defer until first access — once per shard per thread, then cached
         in the (mutable) ``ShardView``.
         """
-        view = self._ll.open_shard(shard_idx)
-        if "move" in view.actions and "attack" not in view.actions:
+        view = (self._resampled_shard(shard_idx) if self._resample_ratio > 1
+                else self._ll.open_shard(shard_idx))
+        if "move" in view.actions:
             move_raw = view.actions["move"]
             if np.asarray(move_raw).ndim == 1:
-                from qnn.bc.train import _unpack_move_axes, _unpack_attack_bit
+                from qnn.bc.train import _unpack_attack_bit, _unpack_move_axes
                 actions = dict(view.actions)
                 actions["move"] = _unpack_move_axes(move_raw)
-                actions["attack"] = _unpack_attack_bit(move_raw)
+                if "attack" not in actions:
+                    # The fire bit rides the packed move byte; the weapon-slot
+                    # attack_with loss (a26-line graphs) reads it as its own
+                    # channel.
+                    actions["attack"] = _unpack_attack_bit(move_raw)
                 view.actions = actions
+        return view
+
+    def _resampled_shard(self, shard_idx: int):
+        """Materialize a temporally-resampled ShardView (packed ``move``), cached.
+        Resamples per-episode so the outer episode remap's row ranges line up."""
+        cached = self._resampled_cache.get(shard_idx)
+        if cached is not None:
+            return cached
+        from qnn.bc.resample import resample_shard
+        from qnn.bc.streaming_source import ShardView, _build_indptr
+        from qnn.bc.train import _NATIVE_TOKEN_INDEXED_OBS_FIELDS as _TOK
+        orig = self._ll.open_shard(shard_idx)
+        new_obs, new_act, _ = resample_shard(
+            dict(orig.obs), dict(orig.actions), self._shard_ep_slices[shard_idx],
+            self._resample_ratio, token_obs_keys=set(_TOK),
+        )
+        indptr = _build_indptr(new_obs["entity_count"]) if "entity_count" in new_obs else None
+        view = ShardView(obs=new_obs, actions=new_act, indptr=indptr, token_keep=None)
+        self._resampled_cache[shard_idx] = view
         return view
 
     def _precompute_distances(self) -> None:
@@ -1314,11 +1579,13 @@ class StreamingSource:
         look_delta_parts: list[np.ndarray] = []
         eng_parts: list[np.ndarray] = []
         att_shift_parts: list[np.ndarray] = []
+        att_future_parts: list[np.ndarray] = []
         any_attack = False
         any_move = False
         any_look = False
         any_engagement = False
         any_attack_shifted = False
+        any_attack_future = False
         for ep in self.episodes:
             view = self._open_shard(int(ep.shard_idx))
             row_lo = int(ep.row_start)
@@ -1342,6 +1609,13 @@ class StreamingSource:
                     any_attack_shifted = True
                     att_shift_parts.append(
                         _compute_attack_shifted(attack.astype(np.uint8), op_bool)
+                    )
+                    # a27 MTP aux label — derived unconditionally (see the
+                    # resident path's note: keeps _source_compatibility_key
+                    # unchanged so both probe arms share one source bundle).
+                    any_attack_future = True
+                    att_future_parts.append(
+                        derive_next_discharge_bucket(attack.astype(np.uint8), op_bool)
                     )
             if "move" in view.actions:
                 any_move = True
@@ -1368,6 +1642,8 @@ class StreamingSource:
             self._engagement_ema = torch.from_numpy(np.concatenate(eng_parts, axis=0)).to(self.device)
         if any_attack_shifted:
             self._attack_shifted = torch.from_numpy(np.concatenate(att_shift_parts, axis=0)).to(self.device)
+        if any_attack_future:
+            self._attack_future = torch.from_numpy(np.concatenate(att_future_parts, axis=0)).to(self.device)
 
     def _precompute_move_hazard(self) -> None:
         """a25: derive the per-frame move-hazard columns from act_move, episode
@@ -1377,9 +1653,9 @@ class StreamingSource:
         held_class/dwell_age describe the semi-Markov decode state entering each
         frame; release is the binary switch-next-tick target; valid masks the
         episode start (no prior frame). See
-        qnn.model.bench.a25.hazard_labels.derive_hazard_labels.
+        qnn.model.hazard_labels.derive_hazard_labels.
         """
-        from qnn.model.bench.a25.hazard_labels import derive_hazard_labels
+        from qnn.model.hazard_labels import derive_hazard_labels
         held_parts: list[np.ndarray] = []
         dwell_parts: list[np.ndarray] = []
         release_parts: list[np.ndarray] = []
@@ -1403,10 +1679,13 @@ class StreamingSource:
         from qnn.model.dequant import (
             SelfDequantizer, SpatialDequantizer, EntityDequantizer,
         )
+        # Stream per the cache's own fields (see the resident preload note).
+        _keys = getattr(self, "_obs_keys", None) or ()
+        _stream = "full" if "entity_recency" in _keys else "combat"
         self._dequant_chain = (
             SelfDequantizer().to(self.device).eval(),
             SpatialDequantizer().to(self.device).eval(),
-            EntityDequantizer().to(self.device).eval(),
+            EntityDequantizer(entity_stream=_stream).to(self.device).eval(),
         )
 
     @property
@@ -1428,9 +1707,6 @@ class StreamingSource:
             lo, hi = int(ep.row_start), int(ep.row_end)
             if "attack" in view.actions:
                 arr = np.asarray(view.actions["attack"][lo:hi]).reshape(-1)
-            elif "move" in view.actions:
-                from qnn.bc.train import _unpack_attack_bit
-                arr = _unpack_attack_bit(view.actions["move"][lo:hi]).reshape(-1)
             else:
                 continue
             if op_only and "input_mask" in view.actions:
@@ -1537,6 +1813,8 @@ class StreamingSource:
             act_t["engagement_ema"] = self._engagement_ema.index_select(0, indices)
         if self._attack_shifted is not None:
             act_t["attack_shifted"] = self._attack_shifted.index_select(0, indices)
+        if self._attack_future is not None:
+            act_t["attack_future_bucket"] = self._attack_future.index_select(0, indices)
         if self._hz_held is not None:
             # a25 hazard: held_class/dwell_age feed the head (obs); release/valid
             # are its loss labels (act). Same global indexing as _jump_dist.
@@ -1592,6 +1870,7 @@ class StreamingSource:
         self._look_delta = None
         self._engagement_ema = None
         self._attack_shifted = None
+        self._attack_future = None
         self._dequant_chain = ()
 
     def head(self, n_episodes: int) -> "StreamingSource":
@@ -1624,6 +1903,9 @@ class StreamingSource:
         view._attack_shifted = (
             self._attack_shifted[:n_rows_head] if self._attack_shifted is not None else None
         )
+        view._attack_future = (
+            self._attack_future[:n_rows_head] if self._attack_future is not None else None
+        )
         view._needs_move_hazard = self._needs_move_hazard
         view._hz_held = self._hz_held[:n_rows_head] if self._hz_held is not None else None
         view._hz_dwell = self._hz_dwell[:n_rows_head] if self._hz_dwell is not None else None
@@ -1642,6 +1924,7 @@ def make_streaming_source(
     n_workers: int = 1,
     engagement_ema_alpha: float = _ENGAGEMENT_EMA_ALPHA,
     needs_move_hazard: bool = False,
+    resample_ratio: int = 1,
 ) -> StreamingSource:
     """Build a :class:`StreamingSource` from a sharded BC cache directory."""
     from qnn.bc.streaming_source import StreamingSource as _LowLevel
@@ -1652,6 +1935,7 @@ def make_streaming_source(
         n_workers=n_workers,
         engagement_ema_alpha=engagement_ema_alpha,
         needs_move_hazard=needs_move_hazard,
+        resample_ratio=resample_ratio,
     )
 
 
@@ -1666,6 +1950,7 @@ def make_resident_source_from_cache(
     compact_dequantized: bool = True,
     progress_interval_seconds: float = 5.0,
     needs_move_hazard: bool = False,
+    resample_ratio: int = 1,
 ) -> ResidentSource:
     """Materialize a device-resident source directly from sharded cache files.
 
@@ -1686,6 +1971,7 @@ def make_resident_source_from_cache(
         n_workers=0,
         engagement_ema_alpha=engagement_ema_alpha,
         needs_move_hazard=needs_move_hazard,
+        resample_ratio=resample_ratio,
     )
     n_rows = streaming.n_total_rows
     if n_rows <= 0:
@@ -1701,6 +1987,8 @@ def make_resident_source_from_cache(
     chunk_rows = max(1, int(chunk_rows))
     obs_out: dict[str, torch.Tensor] | None = None
     act_out: dict[str, torch.Tensor] | None = None
+    packed_chunks: list[dict[str, torch.Tensor]] = []
+    count_chunks: list[torch.Tensor] = []
     t0 = _time.monotonic()
     last_report = t0
     copied = 0
@@ -1723,6 +2011,33 @@ def make_resident_source_from_cache(
         obs_chunk = _drop_dequant_inputs(
             obs_chunk, enabled=compact_dequantized, keep=("spatial_atlas",),
         )
+
+        # Split token-slot fields off before allocating anything full-length.
+        # Their padded form is (n_rows, n_slots, ...) — 1152 B/frame for
+        # entity_scalars_raw alone, ~92% zeros on a sparse two-pool stream, and
+        # 37.5 GiB at 35M frames. Compact each chunk to its valid tokens and
+        # keep only those; the padded view is rebuilt per batch in
+        # ResidentSource._expand_packed.
+        tok_chunk = {
+            key: value for key, value in obs_chunk.items()
+            if value.dim() >= 2 and value.shape[1] == _N_SLOTS
+        }
+        if tok_chunk:
+            if "entity_types" not in obs_chunk:
+                raise RuntimeError(
+                    "resident token packing needs entity_types to derive the "
+                    f"per-frame token count; got {sorted(obs_chunk)}"
+                )
+            # entity_count is dropped by _drop_dequant_inputs, so the valid
+            # prefix comes from the -1 empty sentinel the padder writes.
+            valid_chunk = obs_chunk["entity_types"] != _EMPTY_TOKEN_SENTINEL
+            cnt_chunk = valid_chunk.sum(dim=1).to(torch.int64)
+            for key in tok_chunk:
+                obs_chunk.pop(key)
+            packed_chunks.append(
+                {key: value[valid_chunk] for key, value in tok_chunk.items()}
+            )
+            count_chunks.append(cnt_chunk)
 
         if obs_out is None:
             obs_out = {
@@ -1754,12 +2069,52 @@ def make_resident_source_from_cache(
 
     streaming.release_device_tensors()
     obs_out = _compact_resident_event_slots(obs_out or {})
+
+    # Stitch the per-chunk packed token fields and build the row -> token
+    # index. tok_indptr[i]:tok_indptr[i+1] is frame i's token span.
+    packed_obs: dict[str, torch.Tensor] = {}
+    tok_indptr: torch.Tensor | None = None
+    if packed_chunks:
+        keys = list(packed_chunks[0].keys())
+        for key in keys:
+            packed_obs[key] = torch.cat([c[key] for c in packed_chunks], dim=0)
+        for c in packed_chunks:
+            c.clear()
+        packed_chunks.clear()
+        counts = torch.cat(count_chunks, dim=0)
+        count_chunks.clear()
+        tok_indptr = torch.zeros(
+            counts.numel() + 1, dtype=torch.int64, device=streaming.device)
+        torch.cumsum(counts, dim=0, out=tok_indptr[1:])
+        n_tok = int(tok_indptr[-1])
+        if n_tok != int(packed_obs[keys[0]].shape[0]):
+            raise RuntimeError(
+                f"resident token packing mismatch: indptr total {n_tok} vs "
+                f"{int(packed_obs[keys[0]].shape[0])} packed rows"
+            )
+        if counts.numel() != n_rows:
+            raise RuntimeError(
+                f"resident token packing mismatch: {counts.numel()} count rows "
+                f"vs {n_rows} frames"
+            )
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(
+            f"  [bc/preload] token-packed {n_tok:,} tokens over {n_rows:,} frames "
+            f"({n_tok / max(n_rows, 1):.2f} tok/frame; padded would be "
+            f"{n_rows * _N_SLOTS:,} slots)",
+            flush=True,
+        )
+
     return ResidentSource(
         obs=obs_out,
         actions=act_out or {},
         episodes=list(streaming.episodes),
         episode_offsets=streaming.episode_offsets.copy(),
         device=streaming.device,
+        packed_obs=packed_obs,
+        tok_indptr=tok_indptr,
     )
 
 
@@ -2016,6 +2371,12 @@ def train_on_batches(
                     grad_norm_sum_t.add_(_gn)
                     torch.maximum(grad_norm_max_t, _gn, out=grad_norm_max_t)
                     grad_norm_n += 1
+                    # Ride the raw-sum metric path into the STEP report so
+                    # gradient health is visible per report window, not only per
+                    # epoch. Device-side only — the sum is synced at the report
+                    # cadence that already syncs, so this adds no per-step sync.
+                    metrics["gradnormdist_sum"] = _gn
+                    metrics["gradnormdist_n"] = torch.ones_like(_gn)
                 model.bc_step()
                 model.bc_zero_grad()
                 opt_steps += 1
@@ -2624,6 +2985,31 @@ def lane_packed_batches(
                         step_metrics[key] = synced[key] / md
                     for key in _report["raw"]:
                         step_metrics[key] = synced[key]
+                    # Fail loud on a non-finite training loss, at the report that
+                    # first sees it. A NaN/Inf loss means the backward already
+                    # wrote non-finite gradients, clipping cannot rescue them
+                    # (a clipped NaN is still NaN) and the optimizer has put NaN
+                    # into every parameter — the run is dead, not struggling.
+                    # Without this it limps to the end of the epoch and aborts
+                    # via the epoch-1 sanity rule, whose message points at
+                    # epoch 1 and hides both the real epoch and the step.
+                    # Costs no extra sync: `synced` is already on the host.
+                    _loss_v = step_metrics["loss"]
+                    if not math.isfinite(float(_loss_v)):
+                        _gnd = step_metrics.get("gradnormdist_sum")
+                        _gnn = step_metrics.get("gradnormdist_n")
+                        raise RuntimeError(
+                            f"non-finite training loss ({_loss_v}) at opt_step "
+                            f"{opt_steps} (report window of {report_every} steps, "
+                            f"{_report['rows']} rows). Gradients were already "
+                            f"non-finite before the clip. grad-norm sum over this "
+                            f"window={_gnd} over n={_gnn} steps. Per-head losses: "
+                            + ", ".join(
+                                f"{k}={step_metrics[k]}"
+                                for k in sorted(step_metrics)
+                                if k.startswith("loss_")
+                            )
+                        )
                     step_callback(step_metrics)
                     _report["rows"] = 0
                     _report["metric_rows"] = 0

@@ -138,7 +138,7 @@ def _wave_substrate(ctx: FitContext) -> dict[str, Any]:
     stand until the live-pins round bakes its fitted bias vector (no offline
     pins: qnn.decode_fit.live_pins)."""
     template = Path(__file__).resolve().parents[2] / "qnn" / "model" / "bench" \
-        / "templates" / "decode.a25base.json"
+        / "templates" / "decode.base.json"
     base = read_json(template)
     base.setdefault("params", {})
     base["params"]["look.aim_prior_gain"] = 0.0

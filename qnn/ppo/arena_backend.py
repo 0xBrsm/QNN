@@ -20,8 +20,11 @@ from qnn.env.world import NativeWorldEnv
 from qnn.ppo.arena import ArenaTopology
 from qnn.ppo.env_backend import EnvStepBatch, EpisodeResult
 from qnn.run.metrics import EpisodeStatAccumulator
+from qnn.obs_api import coerce_declaration, compile_layout
 from qnn.wire import (
     OBS_BUFFER_SIZE,
+    unpack_frame,
+    unpack_frame_batch,
     unpack_obs_buffer_native,
     unpack_obs_buffer_native_batch,
 )
@@ -89,6 +92,7 @@ class ArenaGridBackend:
         scenario_id: str = "arena-grid-1v1",
         scenario_ids: Sequence[str] | None = None,
         weapon_config: Mapping[str, object] | None = None,
+        declarations: Sequence[object] | None = None,
     ) -> None:
         if int(fixed_tick_hz) != 20:
             raise ValueError("arena_grid currently requires fixed_tick_hz=20")
@@ -98,12 +102,48 @@ class ArenaGridBackend:
             seat_mode=str(seat_mode),
         )
         self.num_lanes = self.topology.num_lanes
+        # Optional per-lane obs declarations (obs_api v1). The dense
+        # (B, frame_bytes) drain + one batched unpack requires every
+        # lane on ONE layout, so this backend accepts a homogeneous
+        # declaration set only; heterogeneous seats are an
+        # arena_bridge-level capability for drivers with per-seat
+        # unpack paths (the cross-arch H2H harness). None (the
+        # default) = legacy default plan, nothing sent on the wire.
+        self._declarations: tuple[object, ...] | None = None
+        self._layout = None
+        self._frame_bytes = OBS_BUFFER_SIZE
+        self._lane_layouts: list[object | None] = [None] * int(num_lanes)
+        self._hetero = False
+        if declarations is not None:
+            parsed = [coerce_declaration(value) for value in declarations]
+            if len(parsed) != self.num_lanes:
+                raise ValueError(
+                    f"declarations has {len(parsed)} entries but the arena "
+                    f"has {self.num_lanes} lanes"
+                )
+            distinct = {declaration.to_json() if declaration else None for declaration in parsed}
+            self._declarations = tuple(parsed)
+            self._lane_layouts = [
+                None if decl is None else compile_layout(decl)
+                for decl in parsed
+            ]
+            if len(distinct) == 1:
+                # Homogeneous: keep the dense (B, frame_bytes) drain + one
+                # batched unpack (the PPO hot path).
+                if parsed[0] is not None:
+                    self._layout = compile_layout(parsed[0])
+                    self._frame_bytes = self._layout.frame_bytes
+            else:
+                # Heterogeneous seats (the cross-arch H2H consumer): per-lane
+                # frame sizes; obs materialize as ONE DICT PER LANE (grouped
+                # batched unpack below) instead of a dense field-major dict.
+                self._hetero = True
         self._timings: dict[str, float] = {}
         self._started = False
         self._closed = False
         self._inflight: dict[int, Future[list[tuple[bytes, TrustedTrainingExtrasV1]]]] | None = None
         self._inflight_episode_ids: np.ndarray | None = None
-        self._latest_raws: np.ndarray | None = None
+        self._latest_raws: list[bytes] | None = None
 
         reward_json = json.dumps(
             {"reward_weights": asdict(reward_weights)}, separators=(",", ":")
@@ -137,6 +177,10 @@ class ArenaGridBackend:
                 env=process_env,
                 workdir=workdir,
                 weapon_config=weapon_config,
+                declarations=(
+                    None if self._declarations is None
+                    else [self._declarations[int(env_id)] for env_id in env_ids]
+                ),
             ))
 
         self._executor = ThreadPoolExecutor(
@@ -175,9 +219,40 @@ class ArenaGridBackend:
     def _time_add(self, key: str, started: float) -> None:
         self._timings[key] = self._timings.get(key, 0.0) + (time.perf_counter() - started)
 
-    @staticmethod
-    def _raw_batch(raws: np.ndarray) -> dict[str, np.ndarray]:
-        return unpack_obs_buffer_native_batch(raws)
+    def _lane_frame_bytes(self, lane: int) -> int:
+        layout = self._lane_layouts[int(lane)]
+        return int(layout.frame_bytes) if layout is not None else (
+            self._frame_bytes if not self._hetero else OBS_BUFFER_SIZE)
+
+    def _raw_batch(self, raws: "np.ndarray | list[bytes]"):
+        """Materialize obs: dense field-major dict (homogeneous) or one dict
+        per lane (heterogeneous, grouped batched unpack per distinct layout)."""
+        if not self._hetero:
+            if isinstance(raws, list):
+                raws = np.stack(
+                    [np.frombuffer(raw, dtype=np.uint8) for raw in raws])
+            if self._layout is not None:
+                return unpack_frame_batch(raws, self._layout)
+            return unpack_obs_buffer_native_batch(raws)
+        rows: list[dict | None] = [None] * self.num_lanes
+        groups: dict[int, list[int]] = {}
+        for lane in range(self.num_lanes):
+            groups.setdefault(id(self._lane_layouts[lane]), []).append(lane)
+        for lanes in groups.values():
+            layout = self._lane_layouts[lanes[0]]
+            stack = np.stack(
+                [np.frombuffer(raws[lane], dtype=np.uint8) for lane in lanes])
+            batch = (unpack_frame_batch(stack, layout) if layout is not None
+                     else unpack_obs_buffer_native_batch(stack))
+            for i, lane in enumerate(lanes):
+                rows[lane] = {k: np.asarray(v[i]) for k, v in batch.items()}
+        return rows
+
+    def _unpack_row(self, raw: bytes, lane: int = 0) -> dict[str, np.ndarray]:
+        layout = self._lane_layouts[int(lane)] if self._hetero else self._layout
+        if layout is not None:
+            return unpack_frame(raw, layout)
+        return unpack_obs_buffer_native(raw)
 
     def _scatter_group_transitions(
         self,
@@ -186,14 +261,19 @@ class ArenaGridBackend:
         ],
     ) -> tuple[np.ndarray, list[TrustedTrainingExtrasV1]]:
         """Restore server-grouped transitions to dense environment order."""
-        raws = np.empty((self.num_lanes, OBS_BUFFER_SIZE), dtype=np.uint8)
+        raws: list[bytes | None] = [None] * self.num_lanes
         extras: list[TrustedTrainingExtrasV1 | None] = [None] * self.num_lanes
         for server_id, transitions in transitions_by_server.items():
             env_ids = self._server_env_ids[server_id]
             if len(transitions) != len(env_ids):
                 raise RuntimeError("arena group returned the wrong number of seats")
             for env_id, (raw, training) in zip(env_ids, transitions, strict=True):
-                raws[int(env_id)] = np.frombuffer(raw, dtype=np.uint8)
+                expected = self._lane_frame_bytes(int(env_id))
+                if len(raw) != expected:
+                    raise RuntimeError(
+                        f"arena seat {env_id} returned {len(raw)} obs bytes, "
+                        f"expected {expected} for its layout")
+                raws[int(env_id)] = bytes(raw)
                 extras[int(env_id)] = training
         if any(value is None for value in extras):
             raise RuntimeError("arena group omitted a trajectory")
@@ -233,7 +313,7 @@ class ArenaGridBackend:
                 for server_id, group in enumerate(self._groups)
             }
             raws, _ = self._collect_group_transitions(futures)
-        self._latest_raws = raws.copy()
+        self._latest_raws = list(raws)
         for state in self._states:
             state.reset_episode()
             state.stats = EpisodeStatAccumulator()
@@ -263,7 +343,7 @@ class ArenaGridBackend:
             masks[seat.server_id] = masks.get(seat.server_id, 0) | (1 << seat.match_id)
             selected_matches.add((seat.server_id, seat.match_id))
         if not masks:
-            return self._raw_batch(self._latest_raws.copy())
+            return self._raw_batch(list(self._latest_raws))
 
         futures = {
             server_id: self._executor.submit(
@@ -276,7 +356,7 @@ class ArenaGridBackend:
             for env_id, (raw, _training) in zip(
                 self._server_env_ids[server_id], transitions, strict=True
             ):
-                self._latest_raws[int(env_id)] = np.frombuffer(raw, dtype=np.uint8)
+                self._latest_raws[int(env_id)] = bytes(raw)
         for env_id, state in enumerate(self._states):
             seat = self.topology.seat_for_env(env_id)
             if (seat.server_id, seat.match_id) in selected_matches:
@@ -284,7 +364,7 @@ class ArenaGridBackend:
                 state.stats = EpisodeStatAccumulator()
                 state.length = 0
                 state.return_value = 0.0
-        return self._raw_batch(self._latest_raws.copy())
+        return self._raw_batch(list(self._latest_raws))
 
     def submit(self, action_batch: Mapping[str, np.ndarray]) -> None:
         if not self._started:
@@ -335,7 +415,7 @@ class ArenaGridBackend:
         started = time.perf_counter()
         for env_id, (raw_row, training) in enumerate(zip(raws, extras, strict=True)):
             _, reward, done, info = self._states[env_id].book(
-                raw_row.tobytes(), training
+                raw_row, training
             )
             is_truncated = bool(done and info.get("done_reason") == "timeout")
             rewards[env_id] = float(reward)
@@ -347,7 +427,7 @@ class ArenaGridBackend:
                 reset_masks[seat.server_id] = (
                     reset_masks.get(seat.server_id, 0) | (1 << seat.match_id)
                 )
-                final_raws[env_id] = raw_row.tobytes()
+                final_raws[env_id] = raw_row
 
         # Timeout is a match boundary, so reset both seats exactly once.  The
         # engine returns a live spawn observation for every external seat.
@@ -363,14 +443,14 @@ class ArenaGridBackend:
                 for env_id, (raw, _) in zip(
                     self._server_env_ids[server_id], transitions, strict=True
                 ):
-                    raws[int(env_id)] = np.frombuffer(raw, dtype=np.uint8)
+                    raws[int(env_id)] = bytes(raw)
         self._time_add("book_s", started)
 
         started = time.perf_counter()
         obs = self._raw_batch(raws)
-        self._latest_raws = raws.copy()
+        self._latest_raws = list(raws)
         final_obs_rows = [
-            (env_id, unpack_obs_buffer_native(raw))
+            (env_id, self._unpack_row(raw, env_id))
             for env_id, raw in final_raws.items()
         ]
         self._time_add("unpack_s", started)

@@ -42,12 +42,9 @@ from qnn.schema import (
     WEAPON_HEAD_SIZE,
 )
 from qnn.vocab import (
-    ENTITY_IDS,
     MAX_ENTITY_EVENTS,
     MAX_TOKEN_OBJECTS,
     TOKEN_ACTOR,
-    TOKEN_ITEM,
-    TOKEN_MOVER,
     TOKEN_PROJECTILE,
 )
 
@@ -86,7 +83,6 @@ def make_obs_dict(batch: int, *, seed: int = 0) -> dict[str, torch.Tensor]:
         "self_state_scalars":   torch.randn(batch, SELF_STATE_SCALAR_DIM,   generator=gen),
         "self_arsenal_scalars": torch.randn(batch, SELF_ARSENAL_SCALAR_DIM, generator=gen),
         "self_motion_scalars":  torch.randn(batch, SELF_MOTION_SCALAR_DIM,  generator=gen),
-        "self_weapon_id": torch.full((batch, 1), ENTITY_IDS["NAILGUN"], dtype=torch.long),
         "self_weapon_readiness": torch.rand(batch, WEAPON_HEAD_SIZE, generator=gen),
         "self_ammo_pools": torch.rand(batch, 4, generator=gen),
         "self_armor_type_id": torch.zeros(batch, 1, dtype=torch.long),
@@ -104,14 +100,12 @@ def make_obs_dict(batch: int, *, seed: int = 0) -> dict[str, torch.Tensor]:
         "spatial_scalars": torch.randn(batch, SPATIAL_TOKEN_COUNT, SPATIAL_SCALAR_DIM, generator=gen) * 0.1,
         "action_history": torch.zeros(batch, 8, 8),
     }
-    # Populate one slot per token type so every type-specific projection
+    # Populate one slot per A27 combat token type so every projection
     # in ObsEmbedding sees a live input (otherwise gradient tests think
     # those Linears are dead). At least one actor with a forward rel
     # offset so downstream pointer/look math has signal.
     obs["entity_types"][:, 0] = TOKEN_ACTOR
     obs["entity_types"][:, 1] = TOKEN_PROJECTILE
-    obs["entity_types"][:, 2] = TOKEN_ITEM
-    obs["entity_types"][:, 3] = TOKEN_MOVER
     obs["entity_scalars_raw"][:, 0, 3:6] = torch.tensor([0.5, 0.0, 0.0])
     # Give at least one entity event so action_embed and event-projection
     # paths get exercised.
@@ -130,7 +124,7 @@ def make_encoder_input(
     instance.
     """
     obs_embedding = ObsEmbedding(
-        d_model=d_model, self_weapon_embed_in_self=False, include_spatial=include_spatial,
+        d_model=d_model, include_spatial=include_spatial,
     ).eval()
     return obs_embedding(make_obs_dict(batch, seed=seed))
 
@@ -214,7 +208,6 @@ def make_attack_head_input(
     return AttackHeadInput(
         features=torch.randn(batch, in_dim, generator=gen),
         look_prior=look_prior,
-        weapon_id=torch.full((batch,), ENTITY_IDS["NAILGUN"], dtype=torch.long),
         target_logits=_masked_logits(batch, n_entities, actor_mask, gen),
         entity_scalars=torch.randn(batch, n_entities, actor_scalar_dim, generator=gen) * 0.1,
         actor_mask=actor_mask,
@@ -231,7 +224,6 @@ def make_weapon_head_input(
     gen = _gen(seed)
     return WeaponHeadInput(
         selector=torch.randn(batch, selector_dim, generator=gen),
-        obs_weapon_id=torch.full((batch,), ENTITY_IDS["NAILGUN"], dtype=torch.long),
     )
 
 

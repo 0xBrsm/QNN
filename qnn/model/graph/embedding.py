@@ -67,13 +67,11 @@ class GraphObsEmbedding(ObsEmbedding):
         )
         super().__init__(
             d_model=spec.encoder.d_model,
-            self_weapon_embed_in_self=any(
-                "weapon_id" in t.vocab for t in self_specs if t.kind == TOKEN_KIND_FIELDS
-            ),
             include_spatial=spec.has_spatial,
             spatial_source=spatial.source if spatial is not None else "ego",
             spatial_k=spatial.k if spatial is not None else 0,
             probe_bands=spatial.probe_bands if spatial is not None else (),
+            entity_stream=spec.entity_stream,
         )
 
     def _init_self_components(self) -> None:

@@ -47,6 +47,7 @@
 #include "qnn.h"
 #include "qnn_io.h"
 #include "qnn_object.h"
+#include "qnn_obs_shim.h"
 #include "qnn_onnx.h"
 
 
@@ -82,6 +83,12 @@
  * the load set; the atlas contracts (wire.12.1 / wire.12.2) use the
  * 34-input set above, wire.9 / wire.11 the 44-input set here. */
 #define QNN_ONNX_N_OBS_INPUTS_W11  44
+/* wire.13.1 / wire.13.2 (A27 pure-combat, semantics.2) obs count: the 34-input
+ * atlas set MINUS the 5 FULL-only inputs — self_weapon_id (the combat self has
+ * no equipped-weapon id) and entity_recency / entity_amount / entity_regen /
+ * entity_state (no recency, no item/mover rows). 12 self + 1 atlas +
+ * 16 entity = 29. */
+#define QNN_ONNX_N_OBS_INPUTS_W13  29
 /* wire.7 (legacy packed-float scalars) obs count — 12 inputs. */
 #define QNN_ONNX_N_OBS_INPUTS_W7   12
 /* The codec binds ONLY the obs inputs. Every recurrent state input (the GRU
@@ -98,6 +105,9 @@
  * loop-back engine reads them by name and threads them back generically, so they
  * never appear in a codec's output_names. */
 #define QNN_ONNX_N_OUTPUTS   4
+/* wire.13.x action set — move + look + one 9-way categorical `attack`. NO
+ * `weapon` head: the A27 attack class IS the select-and-fire decision. */
+#define QNN_ONNX_N_OUTPUTS_W13   3
 
 /* Canonical action-head slot order (the slots in ctx->out_present and the index
  * decode reads each head from). Mirrors a codec's output_names array. */
@@ -161,7 +171,15 @@ typedef struct {
 #define QNN_VERSION_KEY             "version"   /* compact a{arch}.s{sem}.w{wire} */
 #define QNN_STATE_LOOPBACK_KEY      "state.loopback"  /* recurrent-state declaration */
 #define QNN_TICK_HZ_KEY             "tick_hz"   /* REQUIRED policy decision cadence (Hz) */
+/* obs_api v1 declaration JSON (agents/plans/obs-api.md), stamped by the
+ * exporter on new models. Preferred over the wire-identity shim when
+ * present; parsed by qnn_obs_shim.c. */
+#define QNN_OBS_DECLARATION_KEY     "obs_declaration"
 #define QNN_SEMANTICS_CONTRACT_ID   "semantics.1"
+/* A27 moved the MEANING of the obs (combat entity stream, no held-weapon id,
+ * categorical attack), so the wire.13.x codecs assume their own semantics
+ * contract. Both are live in this bin — the stamp picks. */
+#define QNN_SEMANTICS_CONTRACT_ID_A27  "semantics.2"
 
 /* Upper bounds for the ORT bind arrays in QNN_OnnxStep. Inputs = the widest
  * obs block (wire.11, 44) + the loop-back inputs (≤ QNN_LB_MAX_ENTRIES).
@@ -229,6 +247,27 @@ typedef struct qnn_obs_spec {
 	 * it to the io emit layer (QNN_IOSetSpatialMode) AND to pack_scratch,
 	 * so the engine computes and packs EXACTLY this block per tick. */
 	qnn_spatial_mode_t          spatial;
+	/* Which ENTITY stream this spec's defs read — the same kind of fact as
+	 * `spatial`, one axis over: FULL (projectile/actor/item/mover with recency
+	 * and the sight/proximity/sound/memory ladder) for wire.9/.11/.12.x, COMBAT
+	 * (current-frame actor/projectile only) for wire.13.x. The load path pushes
+	 * it to the oracle + packer (QNN_IOSetEntityMode), exactly as it pushes
+	 * `spatial`.
+	 *
+	 * It lives HERE and not on the codec because it is an OBSERVATION fact: the
+	 * combat stream is precisely why the wire.13 defs table drops entity_recency
+	 * / entity_amount / entity_regen / entity_state. defs and entity must agree
+	 * or the engine fills rows the table never binds (or worse, binds rows the
+	 * oracle never produced). On the codec, two codecs sharing one spec could
+	 * declare different entity streams over the SAME obs table — the exact drift
+	 * this indirection exists to make unrepresentable. */
+	qnn_entity_mode_t           entity;
+	/* Atlas parameterization this spec's defs read (valid when
+	 * `spatial` == QNN_SPATIAL_MODE_ATLAS; zeroed for raycast specs).
+	 * WS2: replaces the retired ATLAS_LEGACY mode — pack_scratch keys
+	 * packed-vs-72-unpacked on this, and the load path validates the
+	 * model's compiled obs plan carries EXACTLY these params. */
+	qnn_obs_atlas_params_t      atlas_params;
 	/* tick result → ctx scratch, for the fields `defs` point at. */
 	void (*pack)(qnn_onnx_ctx_t *ctx, const qnn_tick_result_t *result);
 } qnn_obs_spec_t;
@@ -298,6 +337,16 @@ struct qnn_onnx_ctx
 	 * fills. Mirrors what the load path pushed to QNN_IOSetSpatialMode, so
 	 * pack and emit can never disagree about which block is live. */
 	qnn_spatial_mode_t spatial_mode;
+
+	/* The model's compiled OBS PLAN (WS2) — from its `obs_declaration`
+	 * metadata prop when stamped (new models), else the wire-identity
+	 * shim table (stamped wire.12.x/.13.x fleet), else the built-in
+	 * raycast-era compute declaration (wire.7/.9/.11, whose spatial
+	 * block is outside the registry). Drives the live client's emit
+	 * (QNN_IOEmitPlan): atlas parameterization and oracle disclosure
+	 * ride the plan; validated at load to agree with the codec's obs
+	 * spec so pack_scratch and the plan can never diverge. */
+	qnn_obs_plan_t obs_plan;
 
 	/* Policy decision cadence (Hz) from the model's REQUIRED `tick_hz` stamp.
 	 * The live client runs inference at this rate (sets qnn_client_fixed_dt =
@@ -646,6 +695,11 @@ int QNN_OnnxTickHz(const qnn_onnx_ctx_t *ctx)
 	return ctx ? ctx->tick_hz : 0;
 }
 
+const qnn_obs_plan_t *QNN_OnnxObsPlan(const qnn_onnx_ctx_t *ctx)
+{
+	return ctx != NULL ? &ctx->obs_plan : NULL;
+}
+
 
 /* ════════════════════════════════════════════════════════════════════
  *  wire.9 codec — native split, 44 obs + in-graph MOVE decode (current;
@@ -850,18 +904,24 @@ static void pack_scratch(qnn_onnx_ctx_t *ctx, const qnn_tick_result_t *r)
 
 	/* ---- Spatial block ----
 	 * ONLY the loaded contract's block is packed. The engine already
-	 * emits just that block (QNN_IOSetSpatialMode at load, driven by the
-	 * same spec field), so the other representations hold stale/zero data
-	 * by construction — packing them would be pure per-tick waste. */
+	 * emits just that block (the compiled obs plan's atlas params /
+	 * the raycast residue mode), so the other representations hold
+	 * stale/zero data by construction — packing them would be pure
+	 * per-tick waste. Packed-vs-72-unpacked follows the codec spec's
+	 * atlas parameterization (validated at load to equal the plan's). */
 	switch (ctx->spatial_mode) {
 	case QNN_SPATIAL_MODE_ATLAS:
-		for (i = 0; i < QNN_OBS_ATLAS_ELEVS; ++i)
-			QNN_AtlasPackRow(ctx->spatial_atlas[i], r->spatial_atlas[i]);
-		break;
-	case QNN_SPATIAL_MODE_ATLAS_LEGACY:
-		for (i = 0; i < QNN_OBS_ATLAS_ELEVS; ++i)
-			for (j = 0; j < QNN_OBS_ATLAS_YAWS_LEGACY; ++j)
-				ctx->spatial_atlas_legacy[i][j] = r->spatial_atlas[i][j];
+		if (ctx->codec->obs->atlas_params.packed)
+		{
+			for (i = 0; i < QNN_OBS_ATLAS_ELEVS; ++i)
+				QNN_AtlasPackRow(ctx->spatial_atlas[i], r->spatial_atlas[i]);
+		}
+		else
+		{
+			for (i = 0; i < QNN_OBS_ATLAS_ELEVS; ++i)
+				for (j = 0; j < QNN_OBS_ATLAS_YAWS_LEGACY; ++j)
+					ctx->spatial_atlas_legacy[i][j] = r->spatial_atlas[i][j];
+		}
 		break;
 	case QNN_SPATIAL_MODE_RAYCAST_V1:
 		for (i = 0; i < QNN_SPATIAL_TOKEN_COUNT; ++i) {
@@ -912,12 +972,20 @@ struct qnn_onnx_input_def {
 #define _OFFS(field)     offsetof(qnn_onnx_ctx_t, field)
 #define _SIZE_OF(field)  sizeof(((qnn_onnx_ctx_t *)0)->field)
 
-/* The self and entity blocks are IDENTICAL across every native-split
- * contract (wire.9 / wire.11 / wire.12.x) — only the spatial block
- * differs.  They are written ONCE here and spliced into each obs table,
- * so a self/entity field can never be added to one contract's table and
- * forgotten in another's. */
-#define QNN_OBS_ROWS_SELF                                                                                                                                     \
+/* The self and entity blocks are shared across every native-split contract
+ * (wire.9 / wire.11 / wire.12.x / wire.13.x); the spatial block differs, and
+ * A27's pure-combat obs (wire.13.x) additionally DROPS five rows. They are
+ * written ONCE here and spliced into each obs table, so a self/entity field
+ * can never be added to one contract's table and forgotten in another's.
+ *
+ * The FULL rows are composed from the combat core plus the rows only the FULL
+ * stream carries, so "combat is FULL minus five rows" is a fact of the table
+ * layout rather than a comment on two copies that can drift:
+ *
+ *   SELF   = SELF_CORE + SELF_WEAPON_ID + SELF_TAIL
+ *   ENTITY = ENTITY_CORE + ENTITY_RECENCY + ENTITY_IDENT + ENTITY_ITEM
+ *   (combat = the same lists with WEAPON_ID / RECENCY / ITEM omitted) */
+#define QNN_OBS_ROWS_SELF_CORE                                                                                                                                \
 	{ "self_health",          _OFFS(self_health),          {1}, 1, _SIZE_OF(self_health),          ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },                     \
 	{ "self_effective_armor", _OFFS(self_effective_armor), {1}, 1, _SIZE_OF(self_effective_armor), ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },                     \
 	{ "self_ammo_shells",     _OFFS(self_ammo_shells),     {1}, 1, _SIZE_OF(self_ammo_shells),     ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },                     \
@@ -925,14 +993,32 @@ struct qnn_onnx_input_def {
 	{ "self_ammo_rockets",    _OFFS(self_ammo_rockets),    {1}, 1, _SIZE_OF(self_ammo_rockets),    ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },                     \
 	{ "self_ammo_cells",      _OFFS(self_ammo_cells),      {1}, 1, _SIZE_OF(self_ammo_cells),      ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },                     \
 	{ "self_vel",             _OFFS(self_vel),             {1, 3}, 2, _SIZE_OF(self_vel),          ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16 },                     \
-	{ "self_attack_finished", _OFFS(self_attack_finished), {1}, 1, _SIZE_OF(self_attack_finished), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 },                   \
-	{ "self_weapon_id",       _OFFS(self_weapon_id),       {1}, 1, _SIZE_OF(self_weapon_id),       ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },                     \
+	{ "self_attack_finished", _OFFS(self_attack_finished), {1}, 1, _SIZE_OF(self_attack_finished), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 }
+
+/* FULL-stream only: the equipped-weapon id. The A27 combat self has none —
+ * the 9-way attack head IS the select-and-fire decision, so the held weapon
+ * is not an input. */
+#define QNN_OBS_ROWS_SELF_WEAPON_ID                                                                                                                           \
+	{ "self_weapon_id",       _OFFS(self_weapon_id),       {1}, 1, _SIZE_OF(self_weapon_id),       ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 }
+
+#define QNN_OBS_ROWS_SELF_TAIL                                                                                                                                \
 	{ "self_movement_id",     _OFFS(self_movement_id),     {1}, 1, _SIZE_OF(self_movement_id),     ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },                     \
 	{ "self_items",           _OFFS(self_items),           {1}, 1, _SIZE_OF(self_items),           ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 },                     \
 	{ "view_pitch",           _OFFS(self_view_pitch),      {1}, 1, _SIZE_OF(self_view_pitch),      ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 },                      \
 	{ "look_delta",           _OFFS(self_look_delta),      {1, 3}, 2, _SIZE_OF(self_look_delta),   ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 }
 
-#define QNN_OBS_ROWS_ENTITY                                                                                                                                   \
+/* Self block, 13 rows (wire.9 / wire.11 / wire.12.x). */
+#define QNN_OBS_ROWS_SELF                                                                                                                                     \
+	QNN_OBS_ROWS_SELF_CORE,                                                                                                                                   \
+	QNN_OBS_ROWS_SELF_WEAPON_ID,                                                                                                                              \
+	QNN_OBS_ROWS_SELF_TAIL
+
+/* Self block, 12 rows (wire.13.x) — the same rows without self_weapon_id. */
+#define QNN_OBS_ROWS_SELF_COMBAT                                                                                                                              \
+	QNN_OBS_ROWS_SELF_CORE,                                                                                                                                   \
+	QNN_OBS_ROWS_SELF_TAIL
+
+#define QNN_OBS_ROWS_ENTITY_CORE                                                                                                                              \
 	{ "entity_types",          _OFFS(entity_types),          {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_types),          ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 },    \
 	{ "entity_subject_id",     _OFFS(entity_subject_id),     {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_subject_id),     ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },   \
 	{ "entity_modality_id",    _OFFS(entity_modality_id),    {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_modality_id),    ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },   \
@@ -945,14 +1031,38 @@ struct qnn_onnx_input_def {
 	{ "entity_vel",            _OFFS(entity_vel),            {1, QNN_MAX_TOKEN_OBJECTS, 3},                  3, _SIZE_OF(entity_vel),            ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16 },   \
 	{ "entity_path",           _OFFS(entity_path),           {1, QNN_MAX_TOKEN_OBJECTS, 3},                  3, _SIZE_OF(entity_path),           ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16 },   \
 	{ "entity_path_dist",      _OFFS(entity_path_dist),      {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_path_dist),      ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 },   \
-	{ "entity_eta",            _OFFS(entity_eta),            {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_eta),            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 }, \
-	{ "entity_recency",        _OFFS(entity_recency),        {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_recency),        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 }, \
+	{ "entity_eta",            _OFFS(entity_eta),            {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_eta),            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 }
+
+/* FULL-stream only: how stale a remembered token is. The COMBAT stream is
+ * current-frame by construction, so there is nothing to age. */
+#define QNN_OBS_ROWS_ENTITY_RECENCY                                                                                                                           \
+	{ "entity_recency",        _OFFS(entity_recency),        {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_recency),        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 }
+
+/* Actor-identity rows — carried by both streams. */
+#define QNN_OBS_ROWS_ENTITY_IDENT                                                                                                                             \
 	{ "entity_facing",         _OFFS(entity_facing),         {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_facing),         ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },   \
 	{ "entity_team",           _OFFS(entity_team),           {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_team),           ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },   \
-	{ "entity_score",          _OFFS(entity_score),          {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_score),          ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },   \
+	{ "entity_score",          _OFFS(entity_score),          {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_score),          ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 }
+
+/* FULL-stream only: the item / mover rows. The COMBAT stream emits actors and
+ * projectiles only, so these can never be non-zero under it. */
+#define QNN_OBS_ROWS_ENTITY_ITEM                                                                                                                              \
 	{ "entity_amount",         _OFFS(entity_amount),         {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_amount),         ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 },   \
 	{ "entity_regen",          _OFFS(entity_regen),          {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_regen),          ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 }, \
 	{ "entity_state",          _OFFS(entity_state),          {1, QNN_MAX_TOKEN_OBJECTS},                     2, _SIZE_OF(entity_state),          ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 }
+
+/* Entity block, 20 rows — the FULL stream (wire.9 / wire.11 / wire.12.x). */
+#define QNN_OBS_ROWS_ENTITY                                                                                                                                   \
+	QNN_OBS_ROWS_ENTITY_CORE,                                                                                                                                 \
+	QNN_OBS_ROWS_ENTITY_RECENCY,                                                                                                                              \
+	QNN_OBS_ROWS_ENTITY_IDENT,                                                                                                                                \
+	QNN_OBS_ROWS_ENTITY_ITEM
+
+/* Entity block, 16 rows — the A27 COMBAT stream (wire.13.x): the same rows
+ * without recency and without the item/mover trio. */
+#define QNN_OBS_ROWS_ENTITY_COMBAT                                                                                                                            \
+	QNN_OBS_ROWS_ENTITY_CORE,                                                                                                                                 \
+	QNN_OBS_ROWS_ENTITY_IDENT
 
 /* Spatial block, one row — the finalized 24-cell atlas nibble-packed to
  * 12 bytes per band row (wire.12.2). */
@@ -991,6 +1101,22 @@ static const qnn_onnx_input_def_t QNN_OBS_DEFS_ATLAS_LEGACY[QNN_ONNX_N_OBS_INPUT
 	QNN_OBS_ROWS_SELF,
 	QNN_OBS_ROWS_ATLAS_LEGACY,
 	QNN_OBS_ROWS_ENTITY,
+};
+
+/* wire.13.2 obs table — the A27 pure-combat set: the packed-atlas table with
+ * the FULL-only self/entity rows dropped (29 inputs). Same per-field ctx
+ * scratch as wire.12.x — the combat contract simply binds fewer rows. */
+static const qnn_onnx_input_def_t QNN_OBS_DEFS_COMBAT_ATLAS_PACKED[QNN_ONNX_N_OBS_INPUTS_W13] = {
+	QNN_OBS_ROWS_SELF_COMBAT,
+	QNN_OBS_ROWS_ATLAS_PACKED,
+	QNN_OBS_ROWS_ENTITY_COMBAT,
+};
+
+/* wire.13.1 obs table — identical but for the 72-wide unpacked atlas. */
+static const qnn_onnx_input_def_t QNN_OBS_DEFS_COMBAT_ATLAS_LEGACY[QNN_ONNX_N_OBS_INPUTS_W13] = {
+	QNN_OBS_ROWS_SELF_COMBAT,
+	QNN_OBS_ROWS_ATLAS_LEGACY,
+	QNN_OBS_ROWS_ENTITY_COMBAT,
 };
 
 /* wire.9 / wire.11 obs table — self + 11 raycast scalars + entity (44). */
@@ -1037,6 +1163,13 @@ static const char *QNN_ONNX_OUTPUT_NAMES_W11[QNN_ONNX_N_OUTPUTS] = {
 };
 static const char *QNN_ONNX_OUTPUT_NAMES_W7[QNN_ONNX_N_OUTPUTS] = {
 	"move_logits", "look", "fire_logit", "weapon_logits",
+};
+/* wire.13.x (A27 pure-combat): move + look + one 9-way categorical `attack`
+ * (0 = no attack, 1..8 = select-and-fire that impulse). NO `weapon` head. The
+ * `attack` tensor sits in the FIRE slot (index 2 == QNN_ONNX_OUT_FIRE) and is
+ * read by qnn_onnx_extract_core as an int64 class (wire_major >= 11). */
+static const char *QNN_ONNX_OUTPUT_NAMES_W13[QNN_ONNX_N_OUTPUTS_W13] = {
+	"move", "look", "attack",
 };
 
 
@@ -1348,6 +1481,23 @@ static int wire9_decode(qnn_onnx_ctx_t *ctx, OrtValue *const *out_values,
 	return 0;
 }
 
+/* wire.13.x decode — A27 pure-combat. move + look are decided in-graph (shared
+ * core); the single 9-way categorical `attack` (int64 class 0..8) is read from
+ * the FIRE slot by qnn_onnx_extract_core into ctx->attack_decided. decode_core
+ * (wire_major >= 11) ORs a fire press into `move` bit 0 when the class is
+ * nonzero; here we also surface the class in out->attack, which the runtime
+ * uses as select-and-fire. No `weapon` head — the class IS the selection. */
+static int wire13_decode(qnn_onnx_ctx_t *ctx, OrtValue *const *out_values,
+                         const qnn_tick_result_t *result, qnn_action_t *out)
+{
+	(void)result;   /* held weapon not needed: the attack class selects it */
+	if (qnn_onnx_extract_core(ctx, out_values)) return 1;
+	qnn_onnx_decode_core(ctx, out);
+	out->attack = ctx->out_present[QNN_ONNX_OUT_FIRE]
+		? (uint8_t)ctx->attack_decided : 0;
+	return 0;
+}
+
 /* wire.7 decode: weapon is raw `weapon_logits` float[8] — run the engine-side
  * sticky controller (thresholds from ctx, stamped or legacy default). Fully
  * independent of wire.9 (own output table + own weapon path). */
@@ -1372,16 +1522,18 @@ static int wire7_decode(qnn_onnx_ctx_t *ctx, OrtValue *const *out_values,
 
 /* ── Obs specs — the observation half of each contract, as data ──────
  *
- * Three native-split specs; wire.9 and wire.11 SHARE one (they differ
+ * Five native-split specs; wire.9 and wire.11 SHARE one (they differ
  * only in ACTION outputs), which is precisely the drift this indirection
- * removes. Each names the spatial block it needs, so the load path can
- * tell the engine what to compute and pack_scratch what to fill from one
- * declaration instead of three agreeing conditionals. */
+ * removes. Each names the spatial block AND the entity stream it needs, so
+ * the load path can tell the engine what to compute and pack_scratch what to
+ * fill from one declaration instead of several agreeing conditionals. */
 
 static const qnn_obs_spec_t QNN_OBS_SPEC_RAYCAST_V1 = {
 	"raycast-v1 (9 sectors x 13 scalars)",
 	QNN_OBS_DEFS_RAYCAST_V1, QNN_ONNX_N_OBS_INPUTS_W11,
 	QNN_SPATIAL_MODE_RAYCAST_V1,
+	QNN_ENTITY_MODE_FULL,
+	{ 0, 0, false },   /* no atlas */
 	pack_scratch,
 };
 
@@ -1389,13 +1541,38 @@ static const qnn_obs_spec_t QNN_OBS_SPEC_ATLAS_PACKED = {
 	"depth atlas 11x24, nibble-packed to 12 B/row",
 	QNN_OBS_DEFS_ATLAS_PACKED, QNN_ONNX_N_OBS_INPUTS,
 	QNN_SPATIAL_MODE_ATLAS,
+	QNN_ENTITY_MODE_FULL,
+	{ QNN_OBS_ATLAS_YAWS, QNN_OBS_ATLAS_ELEVS, true },
 	pack_scratch,
 };
 
 static const qnn_obs_spec_t QNN_OBS_SPEC_ATLAS_LEGACY = {
-	"depth atlas 11x72, unpacked 1 code/byte (a26 rc1)",
+	"depth atlas 11x72, unpacked 1 code/byte (rc1)",
 	QNN_OBS_DEFS_ATLAS_LEGACY, QNN_ONNX_N_OBS_INPUTS,
-	QNN_SPATIAL_MODE_ATLAS_LEGACY,
+	QNN_SPATIAL_MODE_ATLAS,
+	QNN_ENTITY_MODE_FULL,
+	{ QNN_OBS_ATLAS_YAWS_LEGACY, QNN_OBS_ATLAS_ELEVS, false },
+	pack_scratch,
+};
+
+/* The two A27 pure-combat specs. Same atlas blocks as the pair above; the
+ * delta is the COMBAT entity stream, which is exactly why their defs tables
+ * drop self_weapon_id and the recency/item/mover rows. */
+static const qnn_obs_spec_t QNN_OBS_SPEC_COMBAT_ATLAS_PACKED = {
+	"combat + depth atlas 11x24, nibble-packed to 12 B/row",
+	QNN_OBS_DEFS_COMBAT_ATLAS_PACKED, QNN_ONNX_N_OBS_INPUTS_W13,
+	QNN_SPATIAL_MODE_ATLAS,
+	QNN_ENTITY_MODE_COMBAT,
+	{ QNN_OBS_ATLAS_YAWS, QNN_OBS_ATLAS_ELEVS, true },
+	pack_scratch,
+};
+
+static const qnn_obs_spec_t QNN_OBS_SPEC_COMBAT_ATLAS_LEGACY = {
+	"combat + depth atlas 11x72, unpacked 1 code/byte (a27 rc1)",
+	QNN_OBS_DEFS_COMBAT_ATLAS_LEGACY, QNN_ONNX_N_OBS_INPUTS_W13,
+	QNN_SPATIAL_MODE_ATLAS,
+	QNN_ENTITY_MODE_COMBAT,
+	{ QNN_OBS_ATLAS_YAWS_LEGACY, QNN_OBS_ATLAS_ELEVS, false },
 	pack_scratch,
 };
 
@@ -1457,6 +1634,33 @@ static const qnn_obs_codec_t QNN_CODEC_WIRE_12_2 = {
 	&QNN_OBS_SPEC_ATLAS_PACKED,
 	QNN_ONNX_OUTPUT_NAMES_W11, QNN_ONNX_N_OUTPUTS,
 	wire9_decode,
+};
+
+/* wire.13.1 — the a27 rc1 line (the DEPLOYED a27rc1a): the A27 pure-combat
+ * obs on the 72-wide unpacked atlas, under semantics.2. Exactly the wire.12.1
+ * situation one contract later, and split for the same reason: both a27 atlas
+ * families were stamped bare `wire.13` while the frontier was in flight, so
+ * the bare id cannot select a codec without inspecting tensor shapes. Giving
+ * each family its own id makes selection a table lookup on the stamp again.
+ * A REAL contract with a deployed artifact, not a compatibility shim. */
+static const qnn_obs_codec_t QNN_CODEC_WIRE_13_1 = {
+	"wire.13.1",
+	QNN_SEMANTICS_CONTRACT_ID_A27,
+	&QNN_OBS_SPEC_COMBAT_ATLAS_LEGACY,
+	QNN_ONNX_OUTPUT_NAMES_W13, QNN_ONNX_N_OUTPUTS_W13,
+	wire13_decode,
+};
+
+/* wire.13.2 — the A27 pure-combat contract on the finalized atlas frontier
+ * (24 yaw cells per band, nibble-packed). Same names, action set and value
+ * semantics as wire.13.1; the grid resolution and packing differ, which is a
+ * wire-axis change and so earns its own id. HEAD for new a27 exports. */
+static const qnn_obs_codec_t QNN_CODEC_WIRE_13_2 = {
+	"wire.13.2",
+	QNN_SEMANTICS_CONTRACT_ID_A27,
+	&QNN_OBS_SPEC_COMBAT_ATLAS_PACKED,
+	QNN_ONNX_OUTPUT_NAMES_W13, QNN_ONNX_N_OUTPUTS_W13,
+	wire13_decode,
 };
 
 
@@ -1768,6 +1972,8 @@ static const qnn_obs_spec_t QNN_OBS_SPEC_W7 = {
 	"packed float32 scalars (v17/v22)",
 	QNN_OBS_DEFS_W7, QNN_ONNX_N_OBS_INPUTS_W7,
 	QNN_SPATIAL_MODE_RAYCAST_V1,
+	QNN_ENTITY_MODE_FULL,
+	{ 0, 0, false },   /* no atlas */
 	wire7_pack_scratch,
 };
 
@@ -1795,7 +2001,8 @@ static const qnn_obs_codec_t QNN_CODEC_WIRE_7 = {
 
 /* THE load set. Every contract with a surviving artifact is registered,
  * so one bin serves the whole history: v17/v22 (wire.7), a24 (wire.9),
- * a24/a25 (wire.11), and both a26 atlas families (wire.12.1 / wire.12.2).
+ * a24/a25 (wire.11), both a26 atlas families (wire.12.1 / wire.12.2) and
+ * both a27 pure-combat atlas families (wire.13.1 / wire.13.2).
  *
  * Selection is a lookup on the model's REQUIRED `wire_contract` stamp and
  * nothing else — no shape sniffing, no name-match guessing. A model
@@ -1809,6 +2016,8 @@ static const qnn_obs_codec_t QNN_CODEC_WIRE_7 = {
  * To add a contract: write its obs spec (+ defs table) and decode, add a
  * qnn_obs_codec_t, and list it here. Init/Step need no change. */
 static const qnn_obs_codec_t *const QNN_CODECS[] = {
+	&QNN_CODEC_WIRE_13_2,
+	&QNN_CODEC_WIRE_13_1,
 	&QNN_CODEC_WIRE_12_2,
 	&QNN_CODEC_WIRE_12_1,
 	&QNN_CODEC_WIRE_11,
@@ -1824,6 +2033,10 @@ static const qnn_obs_codec_t *const QNN_CODECS[] = {
  * cannot select a codec without inspecting tensor shapes, which is the
  * guessing this registry exists to forbid. Refuse it with the fix.
  *
+ * `wire.13` (bare) is the same story one contract later: both a27 atlas
+ * families were stamped with it, including the deployed a27rc1a. Same
+ * refusal, same fix — re-stamp, do not sniff.
+ *
  * `wire.10` was distinguished briefly during a24 development and never
  * finalized as a release; the number stays burned. */
 typedef struct {
@@ -1838,6 +2051,12 @@ static const qnn_retired_wire_t QNN_RETIRED_WIRES[] = {
 	  "Re-stamp the model with its actual family — wire.12.1 for the "
 	  "72-wide rc1 line, wire.12.2 for the packed frontier: "
 	  "tools/stamp_onnx.py --wire wire.12.1|wire.12.2" },
+	{ "wire.13",
+	  "ambiguous: it was stamped on both the a27 rc1 atlas (72 unpacked "
+	  "codes/row — this is what a27rc1a carries) and the finalized atlas "
+	  "(24 cells, nibble-packed). Re-stamp the model with its actual family "
+	  "— wire.13.1 for the 72-wide rc1 line, wire.13.2 for the packed "
+	  "frontier: tools/stamp_onnx.py --wire wire.13.1|wire.13.2" },
 	{ "wire.10",
 	  "burned: never finalized as a release. Re-export the checkpoint." },
 };
@@ -2395,11 +2614,132 @@ static int qnn_onnx_select_codec(qnn_onnx_ctx_t *ctx)
 	if (qnn_loopback_resolve(ctx, alloc, in_names, n_in, out_names, n_out) != 0)
 		goto cleanup;
 
+	/* (7) Resolve the model's OBS PLAN (WS2 — agents/plans/obs-api.md).
+	 * Source order: the `obs_declaration` metadata prop when stamped
+	 * (new models declare); else the wire-identity shim table for the
+	 * stamped wire.12.x/.13.x fleet; else the built-in raycast-era
+	 * compute declaration for wire.7/.9/.11 (their spatial block is
+	 * outside the registry — the plan carries state + entities only
+	 * and the raycast residue mode keeps the scalars flowing). A
+	 * declaration that fails to parse/compile, or that disagrees with
+	 * the codec the wire stamp selected, refuses the load. */
+	{
+		char decl_error[256];
+		qnn_obs_decl_t decl;
+		char *decl_stamp =
+			qnn_onnx_metadata_lookup(ctx, alloc, QNN_OBS_DECLARATION_KEY);
+
+		if (decl_stamp != NULL)
+		{
+			qboolean parsed = QNN_ObsDeclParseJson(decl_stamp, -1, &decl,
+				decl_error, sizeof(decl_error));
+
+			(void)ort->AllocatorFree(alloc, decl_stamp);
+			if (!parsed)
+			{
+				qnn_onnx_set_error(
+					"model `obs_declaration` is invalid — refusing: %s",
+					decl_error);
+				goto cleanup;
+			}
+		}
+		else if (codec->obs->spatial == QNN_SPATIAL_MODE_RAYCAST_V1)
+		{
+			/* Raycast-era compute declaration: the default plan minus
+			 * the atlas, entity policy v1 (the FULL ladder these
+			 * contracts trained on). Never used for flat frames. */
+			QNN_ObsDeclDefault(&decl);
+			decl.atlas_requested = false;
+			snprintf(decl.entities.policy, sizeof(decl.entities.policy),
+				"%s", "v1");
+		}
+		else
+		{
+			const char *shim_semantics = NULL;
+
+			if (!QNN_ObsShimDeclForWire(wire_stamp, &decl,
+					&shim_semantics, decl_error, sizeof(decl_error)))
+			{
+				qnn_onnx_set_error(
+					"wire_contract=%s: %s", wire_stamp, decl_error);
+				goto cleanup;
+			}
+			if (strcmp(shim_semantics, codec->semantics_contract) != 0)
+			{
+				qnn_onnx_set_error(
+					"wire-shim table pairs %s with %s but codec '%s' "
+					"assumes %s (table drift — refusing)",
+					wire_stamp, shim_semantics, codec->id,
+					codec->semantics_contract);
+				goto cleanup;
+			}
+		}
+		if (!QNN_ObsPlanCompile(&decl, &ctx->obs_plan, decl_error,
+				sizeof(decl_error)))
+		{
+			qnn_onnx_set_error(
+				"model obs declaration failed to compile — refusing: %s",
+				decl_error);
+			goto cleanup;
+		}
+
+		/* Plan ↔ codec-spec coherence: the plan drives what the engine
+		 * COMPUTES, the spec's defs drive what pack_scratch BINDS —
+		 * they must name the same observation or the model reads
+		 * stale/foreign scratch. */
+		if (codec->obs->spatial == QNN_SPATIAL_MODE_ATLAS)
+		{
+			if (!ctx->obs_plan.wants_atlas
+				|| ctx->obs_plan.atlas.yaw != codec->obs->atlas_params.yaw
+				|| ctx->obs_plan.atlas.packed != codec->obs->atlas_params.packed)
+			{
+				qnn_onnx_set_error(
+					"obs declaration atlas %s{yaw:%d, packed:%d} disagrees "
+					"with codec '%s' (expects {yaw:%d, packed:%d}) — "
+					"stale/foreign declaration, refusing",
+					ctx->obs_plan.wants_atlas ? "" : "(absent) ",
+					ctx->obs_plan.wants_atlas ? ctx->obs_plan.atlas.yaw : 0,
+					ctx->obs_plan.wants_atlas ? (int)ctx->obs_plan.atlas.packed : 0,
+					codec->id, codec->obs->atlas_params.yaw,
+					(int)codec->obs->atlas_params.packed);
+				goto cleanup;
+			}
+		}
+		else if (ctx->obs_plan.wants_atlas)
+		{
+			qnn_onnx_set_error(
+				"obs declaration requests the atlas but codec '%s' reads "
+				"the v1 raycast scalars — stale/foreign declaration, "
+				"refusing", codec->id);
+			goto cleanup;
+		}
+		{
+			const char *want_policy =
+				(codec->obs->entity == QNN_ENTITY_MODE_FULL) ? "v1" : "v3";
+
+			if (!ctx->obs_plan.wants_entities
+				|| strcmp(ctx->obs_plan.entities.policy, want_policy) != 0)
+			{
+				qnn_onnx_set_error(
+					"obs declaration entity policy \"%s\" disagrees with "
+					"codec '%s' (expects \"%s\") — stale/foreign "
+					"declaration, refusing",
+					ctx->obs_plan.wants_entities
+						? ctx->obs_plan.entities.policy : "(absent)",
+					codec->id, want_policy);
+				goto cleanup;
+			}
+		}
+	}
+
 	ctx->codec = codec;
-	/* Drive the io emit layer from the selected codec so QNN_IOEmit
-	 * produces EXACTLY this contract's spatial obs block (and skips the
-	 * other's compute) every tick. */
+	/* Drive the io emit layer from the selected codec's OBS SPEC so the
+	 * engine produces EXACTLY this contract's observation every tick.
+	 * Post-WS2 the spatial mode carries ONLY the raycast residue (atlas
+	 * parameterization rides ctx->obs_plan) and the entity mode serves
+	 * the ACTION path (oracle disclosure rides the plan's policy). */
 	QNN_IOSetSpatialMode(codec->obs->spatial);
+	QNN_IOSetEntityMode(codec->obs->entity);
 	ctx->spatial_mode = codec->obs->spatial;
 	rc = 0;
 

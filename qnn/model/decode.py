@@ -14,12 +14,12 @@ generation's policy/export has needed them in the same form:
 What does NOT live here:
   * The gen-SPECIFIC decode — the polar-look hybrid, the aim-prior blend, the
     a25 move commitment + attack_with joint decode — lives in the generation's
-    OWN facade (:mod:`qnn.model.bench.a25.decode`). Those are generation CHOICES,
+    OWN facade (:mod:`qnn.model.decode_actions`). Those are generation CHOICES,
     not cross-gen invariants; a future generation replaces that module. (The a24
     sticky/hazard/switch-back stack and its facade were retired with the a24 arch.)
   * The polar GEOMETRY (``tangent_expmap`` / ``MAG_CENTERS`` / ``DIR_CENTERS``)
     lives in :mod:`qnn.model.look_bins`; the lead/aim primitives in
-    :mod:`qnn.model.bench.a25.lead_aim`. This module imports neither — it is pure readout.
+    :mod:`qnn.model.lead_aim`. This module imports neither — it is pure readout.
 
 EXPORT note: the export path decodes in-graph via the a25 facade;
 :func:`decode_attack_bit` / :func:`decode_move_axes` are called by

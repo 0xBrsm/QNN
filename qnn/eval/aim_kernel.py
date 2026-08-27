@@ -41,33 +41,33 @@ MAX_ENTITY_SLOTS   = 16        # entity_count dtype is uint8, max value seen
 
 _DIST_SCALE = 1000.0
 _VEL_SCALE  = 2000.0
-_WT_V_HORIZ = 2                # column index in weapon_static (9, 7)
+_WT_V_HORIZ = 2                # column index in weapon physics table (9, 7)
 
 # One 20 Hz tick expressed in MODULE distance-units: rel is /_DIST_SCALE and vel is
 # /_VEL_SCALE, so a frame of lead (vel·dt) lands in rel-units after ×(_VEL_SCALE/_DIST_SCALE).
 # The single source of truth for the lead-cap unit conversion — the a25 lead module
-# (qnn.model.bench.a25.lead_aim) and the human intercept baseline both import it from here.
+# (qnn.model.lead_aim) and the human intercept baseline both import it from here.
 TICK_DT_MODULE: float = 0.05 * _VEL_SCALE / _DIST_SCALE
 
 # Actor hitbox half-width in game units — the fixed Quake player bbox (±16u;
 # confirmed CONSTANT for actor tokens across the QWD corpus). The single source
 # of truth for the hbw ruler's angular hitbox radius atan(halfw/range): the
 # eval's _intercept_hbw (qnn.eval.run) and the a25 crest-gate decode
-# (qnn.model.bench.a25.decode) both import it from here.
+# (qnn.model.decode_actions) both import it from here.
 ACTOR_HALFW_U: float = 16.0
 
 
 def _lead_aim_angle_deg_live(
     rel: np.ndarray,     # (M, N, 3) view-frame rel pos, /DIST_SCALE (forward=+x)
     vel: np.ndarray,     # (M, N, 3) view-frame ABSOLUTE actor vel, /VEL_SCALE
-    imp: np.ndarray,     # (M,)      held-weapon impulse 0..8 per frame
-    weapon_static: np.ndarray,  # (9, 7) build_model_weapon_scalars
+    imp: np.ndarray,     # (M,)      action-weapon context, impulse 0..8
+    weapon_physics: np.ndarray, # (9, 7) build_model_weapon_scalars
     lead_hold_cap: "float | None" = None,         # TANGENTIAL hold cap (MODULE units); None = OFF
     lead_hold_cap_radial: "float | None" = None,  # RADIAL hold cap (MODULE units); None = OFF
 ) -> np.ndarray:
     """Crosshair→lead-point angle (degrees), (M, N), via the LIVE aim prior.
 
-    Calls ``qnn.model.bench.a25.lead_aim.held_weapon_trajectory`` (which applies
+    Calls ``qnn.model.lead_aim.weapon_trajectory`` (which applies
     the hitscan ×100 boost so instant-fire weapons fabricate no lead) and
     ``compute_lead_aim`` (the intercept quadratic + per-weapon z-anchor). The
     only thing computed here is the trivial forward-axis angle to the aim point —
@@ -81,14 +81,14 @@ def _lead_aim_angle_deg_live(
     against the SAME dwell-capped lead point the deployed decode uses.
     """
     import torch
-    from qnn.model.bench.a25.lead_aim import compute_lead_aim, held_weapon_trajectory
+    from qnn.model.lead_aim import compute_lead_aim, weapon_trajectory
 
     rel_t = torch.from_numpy(np.ascontiguousarray(rel, dtype=np.float32))   # (M,N,3)
     vel_t = torch.from_numpy(np.ascontiguousarray(vel, dtype=np.float32))   # (M,N,3)
-    ws_t  = torch.from_numpy(np.ascontiguousarray(weapon_static, dtype=np.float32))
+    ws_t  = torch.from_numpy(np.ascontiguousarray(weapon_physics, dtype=np.float32))
     imp_t = torch.from_numpy(np.ascontiguousarray(imp, dtype=np.int64))     # (M,)
 
-    v_horiz, drop_const, drop_rate = held_weapon_trajectory(ws_t, imp_t)    # (M,) each
+    v_horiz, drop_const, drop_rate = weapon_trajectory(ws_t, imp_t)         # (M,) each
     aim = compute_lead_aim(rel_t, vel_t, v_horiz, drop_const, drop_rate,
                            lead_hold_cap, lead_hold_cap_radial)             # (M,N,3)
 
@@ -97,23 +97,42 @@ def _lead_aim_angle_deg_live(
     return torch.rad2deg(torch.arccos(cos_a)).numpy()                       # (M,N)
 
 
-def _build_physics_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (weapon_static, aim_z_drop, wid_to_impulse) as numpy arrays.
+def _build_physics_tables() -> tuple[np.ndarray, np.ndarray]:
+    """Return (weapon physics, aim_z_drop) as impulse-keyed numpy arrays.
 
-    weapon_static (9, 7) normalized weapon scalars — same as the model uses.
+    weapon physics (9, 7) normalized scalars — same as live aim uses.
     aim_z_drop    (9, 2) z-anchor (drop_const, drop_rate) per impulse.
-    wid_to_impulse (256,) lookup: entity-id wid (uint8) → impulse 0..8.
     """
     from qnn.bc.weapon_physics import build_model_weapon_scalars
-    from qnn.model.bench.a25.lead_aim import AIM_Z_DROP
-    from qnn.vocab import self_weapon_id_to_impulse
-    import torch
+    from qnn.model.lead_aim import AIM_Z_DROP
 
     ws  = build_model_weapon_scalars().astype(np.float32)       # (9, 7)
     zdrop = np.array(AIM_Z_DROP, dtype=np.float32)              # (9, 2)
-    wid_t = self_weapon_id_to_impulse(torch.arange(256, dtype=torch.long))
-    wid_to_imp = wid_t.numpy().astype(np.int32)                 # (256,)
-    return ws, zdrop, wid_to_imp
+    return ws, zdrop
+
+
+def action_attack_context(action: np.ndarray) -> np.ndarray:
+    """Nearest-discharge weapon context for corpus-only human measurements.
+
+    A27 labels ``action.attack`` only when a discharge actually occurs. Human aim
+    references still need a ballistic ruler on the frames leading into and out of
+    that discharge, so this analysis helper assigns each frame the nearest nonzero
+    attack label within its episode. It is never an observation, model input,
+    decoder state, or exported runtime value.
+    """
+    attack = np.asarray(action, dtype=np.int64).reshape(-1)
+    out = np.where((attack >= 1) & (attack <= 8), attack, 0)
+    nonzero = np.flatnonzero(out)
+    if not len(nonzero):
+        return out.astype(np.int8)
+    ticks = np.arange(len(out))
+    right_pos = np.searchsorted(nonzero, ticks, side="left")
+    left_pos = np.clip(right_pos - 1, 0, len(nonzero) - 1)
+    right_pos = np.clip(right_pos, 0, len(nonzero) - 1)
+    left = nonzero[left_pos]
+    right = nonzero[right_pos]
+    nearest = np.where(ticks - left < right - ticks, left, right)
+    return out[nearest].astype(np.int8)
 
 
 # ── Core per-episode computation ────────────────────────────────────────────
@@ -166,7 +185,25 @@ def iter_shard_episodes(sh, data_dir, obs=(), acts=()):
     dd = Path(data_dir)
     arr = {"entity_count": np.load(dd / sh["obs"]["entity_count"], mmap_mode="r")}
     for k in obs:
-        arr[k] = np.load(dd / sh["obs"][k], mmap_mode="r")
+        path = sh["obs"].get(k)
+        if path is not None:
+            arr[k] = np.load(dd / path, mmap_mode="r")
+            continue
+        if k != "entity_recency":
+            raise KeyError(k)
+        # A27 has no recency feature: every combat row is current-frame.
+        # Older human-analysis kernels use recency==0 only as their LOS mask,
+        # so derive that analysis-only compatibility array from the A27
+        # modality without putting recency back into the collect or model.
+        modality_path = sh["obs"].get("entity_modality_id")
+        if modality_path is None:
+            raise KeyError(
+                "entity_recency is absent and entity_modality_id is unavailable"
+            )
+        modality = np.load(dd / modality_path, mmap_mode="r")
+        arr[k] = np.where(
+            modality == 0, 0.0, np.finfo(np.float16).max
+        ).astype(np.float16)
     for k in acts:
         arr[k] = np.load(dd / sh["actions"][k], mmap_mode="r")
     rows = sh["rows"]
@@ -186,11 +223,10 @@ def _process_episode(
     ep_vel:     np.ndarray,   # (E, 3)  int16 raw velocities (u/s)
     ep_typ:     np.ndarray,   # (E,)    int8  entity types
     ep_rec:     np.ndarray,   # (E,)    f16   recency (0 = in LOS this tick)
-    ep_wid:     np.ndarray,   # (T,)    uint8 self_weapon_id
+    ep_attack:  np.ndarray,   # (T,)    action.attack (nonzero on discharge)
     ep_engaged: np.ndarray,   # (T,)    bool  target_probs argmax > 0
     weapon_np:  np.ndarray,   # (9, 7)  normalized weapon scalars
     zdrop_np:   np.ndarray,   # (9, 2)  z-anchor (drop_const, drop_rate)
-    wid_to_imp: np.ndarray,   # (256,)  wid → impulse
 ) -> dict[str, Any]:
     T = len(ep_cnt)
     ent_off = np.concatenate([[0], ep_cnt.cumsum()])
@@ -226,13 +262,13 @@ def _process_episode(
         vel = all_vel[eng_idx]
         los = all_los[eng_idx]                    # (M, 16) bool
 
-        # Held-weapon impulse per engaged frame; the v_horiz/z-anchor (incl. the
-        # hitscan ×100 boost) come from the LIVE held_weapon_trajectory inside
-        # the call below — no hand-built per-weapon params here.
-        imp = wid_to_imp[ep_wid[eng_idx]]         # (M,) int32
+        # Analysis-only action-weapon context per engaged frame. The v_horiz /
+        # z-anchor (including the hitscan ×100 boost) still come from the live
+        # trajectory implementation; no equipped-weapon observation is involved.
+        imp = action_attack_context(ep_attack)[eng_idx]
 
         # Vectorised lead-corrected angle — (M, 16) frames × entity slots — via
-        # the LIVE aim-prior geometry (compute_lead_aim/held_weapon_trajectory),
+        # the LIVE aim-prior geometry (compute_lead_aim/weapon_trajectory),
         # the same physics the deployed prior and the model-side coherence metric
         # use. Per-frame weapon impulse broadcasts across the 16 slots.
         angles = _lead_aim_angle_deg_live(rel, vel, imp, weapon_np)   # (M, 16)
@@ -273,7 +309,7 @@ def _process_episode(
 # ── Shard worker (runs in a subprocess) ─────────────────────────────────────
 
 def _worker(args: tuple) -> list[dict]:
-    si, sh, data_dir_str, weapon_np, zdrop_np, wid_to_imp, min_eng = args
+    si, sh, data_dir_str, weapon_np, zdrop_np, min_eng = args
     data_dir = Path(data_dir_str)
     ep_lens   = [int(x) for x in sh["episode_lengths"]]
     demo_idxs = sh.get("demo_idxs", [0] * len(ep_lens))
@@ -284,8 +320,17 @@ def _worker(args: tuple) -> list[dict]:
     rel = np.load(data_dir / sh["obs"]["entity_rel"],     mmap_mode="r")
     vel = np.load(data_dir / sh["obs"]["entity_vel"],     mmap_mode="r")
     typ = np.load(data_dir / sh["obs"]["entity_types"],   mmap_mode="r")
-    rec = np.load(data_dir / sh["obs"]["entity_recency"], mmap_mode="r")
-    wid = np.load(data_dir / sh["obs"]["self_weapon_id"], mmap_mode="r")
+    rec_path = sh["obs"].get("entity_recency")
+    if rec_path is not None:
+        rec = np.load(data_dir / rec_path, mmap_mode="r")
+    else:
+        modality = np.load(
+            data_dir / sh["obs"]["entity_modality_id"], mmap_mode="r"
+        )
+        rec = np.where(
+            modality == 0, 0.0, np.finfo(np.float16).max
+        ).astype(np.float16)
+    attack = np.load(data_dir / sh["actions"]["attack"], mmap_mode="r")
     tp  = np.load(data_dir / sh["actions"]["target_probs"], mmap_mode="r")
 
     rows          = sh["rows"]
@@ -308,11 +353,10 @@ def _worker(args: tuple) -> list[dict]:
             ep_vel=np.asarray(vel[es:ee]),
             ep_typ=np.asarray(typ[es:ee]),
             ep_rec=np.asarray(rec[es:ee]),
-            ep_wid=np.asarray(wid[fs:fe]),
+            ep_attack=np.asarray(attack[fs:fe]),
             ep_engaged=ep_engaged,
             weapon_np=weapon_np,
             zdrop_np=zdrop_np,
-            wid_to_imp=wid_to_imp,
         )
         stats["shard_idx"]   = si
         stats["episode_idx"] = ei
@@ -328,7 +372,6 @@ def _run_split(
     split: str,
     weapon_np: np.ndarray,
     zdrop_np: np.ndarray,
-    wid_to_imp: np.ndarray,
     n_workers: int,
 ) -> list[dict]:
     data_dir = collect_dir / f"precomputed_{split}"
@@ -336,7 +379,7 @@ def _run_split(
     shards   = manifest["shards"]
 
     tasks = [
-        (si, sh, str(data_dir), weapon_np, zdrop_np, wid_to_imp, MIN_ENGAGED_FRAMES)
+        (si, sh, str(data_dir), weapon_np, zdrop_np, MIN_ENGAGED_FRAMES)
         for si, sh in enumerate(shards)
     ]
 
@@ -371,12 +414,12 @@ def run(
         )
     }
 
-    weapon_np, zdrop_np, wid_to_imp = _build_physics_tables()
+    weapon_np, zdrop_np = _build_physics_tables()
 
     all_episodes: list[dict] = []
     for split in splits:
         all_episodes.extend(
-            _run_split(collect_dir, split, weapon_np, zdrop_np, wid_to_imp, n_workers))
+            _run_split(collect_dir, split, weapon_np, zdrop_np, n_workers))
 
     print(f"\nTotal: {len(all_episodes)} episodes across {splits}")
 

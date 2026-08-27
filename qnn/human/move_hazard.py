@@ -81,9 +81,12 @@ def _accum(rel: np.ndarray, tot: np.ndarray, axis_idx: int, c: np.ndarray, edges
     np.add.at(rel, (axis_idx, held, bucket), switched)
 
 
-def tabulate_hazard(collect_dir: str | Path, edges: list[int]) -> dict:
+def tabulate_hazard(collect_dir: str | Path, edges: list[int],
+                    resample_ratio: int = 1) -> dict:
     """Walk a collect's train-split move labels and tabulate the dwell-hazard
-    release table against ``edges``. Returns {edges, fb, lr, counts, n_frames}."""
+    release table against ``edges``. Returns {edges, fb, lr, counts, n_frames}.
+    ``resample_ratio`` > 1 groups the packed move to the coarser rate first so the
+    dwell counts match the ``edges`` chosen for that rate."""
     collect_dir = Path(collect_dir)
     man_path = collect_dir / "precomputed_train" / "manifest.json"
     man = json.loads(man_path.read_text())
@@ -96,9 +99,14 @@ def tabulate_hazard(collect_dir: str | Path, edges: list[int]) -> dict:
         mv = sh.get("actions", {}).get("move")
         path = collect_dir / "precomputed_train" / (mv or f"shard{si:06d}_act_move.npy")
         v = np.asarray(np.load(path, mmap_mode="r"))
+        ep_lengths = sh.get("episode_lengths", [])
+        if resample_ratio > 1:
+            from qnn.bc.resample import group_indices, aggregate_action
+            keep, ep_lengths = group_indices(ep_lengths, resample_ratio)
+            v = aggregate_action("move", v, keep, resample_ratio)
         fb, lr = unpack_move(v)
         off = 0
-        for n in sh.get("episode_lengths", []):
+        for n in ep_lengths:
             n = int(n)
             if n <= 0:
                 continue
@@ -343,7 +351,7 @@ def lognorm_hazard_from_collect(collect_dir: str | Path,
 
 def compute_hazard_from_collect(collect_dir: str | Path, tick_hz: int | float | None = None,
                                 method: str = "empirical", noncombat: bool = False,
-                                combat: bool = False) -> dict:
+                                combat: bool = False, resample_ratio: int = 1) -> dict:
     """Build the ``move_hazard`` metadata block for a collect: tick-aware bucket
     edges, the fb/lr release tables, and a statue-mode tail diagnostic (long-dwell
     'none' release must be > 0, else a no-contact bot can freeze).
@@ -366,7 +374,7 @@ def compute_hazard_from_collect(collect_dir: str | Path, tick_hz: int | float | 
         if meta_path.exists():
             tick_hz = json.loads(meta_path.read_text()).get("tick_hz")
     edges = default_edges(tick_hz)
-    tab = tabulate_hazard(collect_dir, edges)
+    tab = tabulate_hazard(collect_dir, edges, resample_ratio=resample_ratio)
     fb = np.asarray(tab["fb"]); lr = np.asarray(tab["lr"])
     return {
         "schema": "move_hazard_v1",

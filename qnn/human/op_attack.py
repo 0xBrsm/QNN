@@ -1,12 +1,12 @@
-"""Per-held-weapon OP-ATTACK RATE + inter-shot intervals (HUMAN, model-agnostic).
+"""Per-action-weapon OP-ATTACK RATE + inter-shot intervals (HUMAN).
 
 The world-results attack reference for decode-fit stage 6: what a human's
-attack DELIVERS per engaged-LOS second on each held weapon, counted at
+attack DELIVERS per engaged-LOS second for each attack-with weapon, counted at
 decision granularity (op-attack frames), not button hygiene (press runs).
 
-  operative attack = (move_bit0 & 1) & (input_mask_bit0 & 1)   [op-filter trap]
+  effective attack = action.attack in 1..8
   engaged-LOS      = target_probs argmax>0 AND >=1 LOS actor (recency==0)
-  held weapon      = self_weapon_id (raw 1..8) -> self_weapon_id_to_impulse
+  attack context   = nearest nonzero ``action.attack`` category in the episode
 
 Same conventions as attack_discipline_byweapon.py; no lead kernel needed
 (rates are alignment-unconditional -- alignment discipline stays that
@@ -15,8 +15,8 @@ re-entries) are engine-owned on BOTH human and bot sides and excluded on
 both, so the pair stays commensurate with the eval's per-LOS-tick
 engine_los_attack tables.
 
-Intervals are gaps between consecutive op-attack frames within an unbroken
-(engaged-LOS AND same held weapon) run -- the within-engagement refire
+Intervals are gaps between consecutive effective-attack frames within an
+unbroken (engaged-LOS AND same attack context) run -- the within-engagement refire
 texture ("histogram the results"), right-censoring dropped with the run.
 
 Output (<collect>/human_baseline/_op_attack_rate_byweapon.json):
@@ -39,7 +39,7 @@ from typing import Any
 
 import numpy as np
 
-from qnn.eval import aim_kernel as A   # shared shard-walk + wid→impulse physics table
+from qnn.eval import aim_kernel as A
 
 IMPULSE_NAME = {1: "Axe", 2: "SG", 3: "SSG", 4: "NG", 5: "SNG",
                 6: "GL", 7: "RL", 8: "LG"}
@@ -50,10 +50,7 @@ HZ = 20.0
 INTERVAL_BINS = np.arange(0.0, 3.0 + 1e-9, 0.05)   # right-censor bucket appended
 
 
-_WI = A._build_physics_tables()[2]        # (256,) wid → impulse 0..8 (shared kernel table)
-
-
-def _episode(cnt, typ, rec, wid, tp, im, mv):
+def _episode(cnt, typ, rec, attack, tp):
     """Per-weapon (eng_ticks, op_ticks) [8,2] + interval samples {imp: [sec]}."""
     T = len(cnt)
     off = np.concatenate([[0], np.asarray(cnt).cumsum()]).astype(np.int64)
@@ -64,9 +61,9 @@ def _episode(cnt, typ, rec, wid, tp, im, mv):
             has[t] = bool(((typ[es:ee] == TOKEN_ACTOR) & (rec[es:ee] == 0.0)).any())
     eng = (np.asarray(tp).argmax(1) > 0) & has
 
-    imp = _WI[np.asarray(wid).astype(np.int64).clip(0, 255)]
-    fire = ((np.asarray(mv).astype(np.uint8) & 1)
-            & (np.asarray(im).astype(np.uint8) & 1)).astype(bool)
+    attack = np.asarray(attack, dtype=np.int64).reshape(-1)
+    imp = A.action_attack_context(attack)
+    fire = (attack >= 1) & (attack <= 8)
 
     counts = np.zeros((NW, 2), np.int64)
     ivals: dict[int, list[float]] = {}
@@ -96,15 +93,14 @@ def _worker(args):
     res: dict[int, tuple] = {}
     for _ei, dmi, fsl, esl, arr in A.iter_shard_episodes(
             sh, dd,
-            obs=("entity_types", "entity_recency", "self_weapon_id"),
-            acts=("target_probs", "input_mask", "move")):
+            obs=("entity_types", "entity_recency"),
+            acts=("target_probs", "attack")):
         tp = np.asarray(arr["target_probs"][fsl])
         if int((tp.argmax(1) > 0).sum()) < MIN_ENGAGED_FRAMES_EP:
             continue
         counts, ivals = _episode(
             np.asarray(arr["entity_count"][fsl], np.int32), np.asarray(arr["entity_types"][esl]),
-            np.asarray(arr["entity_recency"][esl]), np.asarray(arr["self_weapon_id"][fsl]),
-            tp, np.asarray(arr["input_mask"][fsl]), np.asarray(arr["move"][fsl]))
+            np.asarray(arr["entity_recency"][esl]), np.asarray(arr["attack"][fsl]), tp)
         if int(dmi) not in res:
             res[int(dmi)] = (np.zeros((NW, 2), np.int64), {})
         rc, rv = res[int(dmi)]
@@ -175,7 +171,7 @@ def run(collect_dir: Path, splits: list[str], out_path: Path, n_workers: int) ->
     out = {
         "_meta": {
             "contract": ("op-attack = (move_bit0 & input_mask_bit0) on engaged-LOS "
-                         "frames (target argmax>0 & >=1 LOS actor), per held weapon "
+                         "frames (target argmax>0 & >=1 LOS actor), per attack-with weapon "
                          "(raw->impulse). Rates are decision-granularity world "
                          "results; commensurate with eval "
                          "engine_los_attack_by_lead_angle tables. Intervals within "

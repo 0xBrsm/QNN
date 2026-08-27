@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.30.0
+
+### Added
+
+- Demand-driven observation API: a model carries an `obs_declaration` — state fields, parameterized sensors, and a versioned entity-percept policy — which the engine validates against a field registry and compiles into a per-seat emit plan. Nothing outside a seat's plan is computed. `OP_ATTACH_DECL` negotiates the layout per seat, so seats with different declarations share one world, and the live ONNX client compiles the same plans from the model's stamped declaration.
+- Gate suite for the observation API: default-plan bit-parity against the previous emitter; a served-what-you-trained-on corpus-replay gate (`qnn.obs_api_gate`, the deploy precondition that replaces wire-generation stamps); demand-driven and heterogeneous-seat isolation proofs.
+
+### Changed
+
+- `wire.py`'s pinned frame-offset tables are replaced by one generic layout-driven codec compiled from the negotiated layout; the existing entry points keep byte-identical behavior on the default layout.
+
+### Fixed
+
+- The python bridges packed a 16-byte action payload against the engine's 20-byte action struct, hanging every closed-loop step on this line; both packers now mirror the struct exactly, agree byte-for-byte, and are pinned by tests.
+- The dedicated arena server's console-input loop consumed protocol bytes arriving during the sign-on pump; protocol servers now disable console stdin.
+
 ## 0.29.0
 
 ### Added

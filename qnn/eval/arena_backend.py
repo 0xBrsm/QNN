@@ -36,6 +36,7 @@ class ArenaEvalPool:
         scenario_id: str,
         scenario_ids: Sequence[str] | None = None,
         weapon_config: Mapping[str, object] | None = None,
+        declarations: Sequence[object] | None = None,
     ) -> None:
         self.num_lanes = int(num_lanes)
         self._backend = ArenaGridBackend(
@@ -57,6 +58,7 @@ class ArenaEvalPool:
             scenario_id=scenario_id,
             scenario_ids=scenario_ids,
             weapon_config=weapon_config,
+            declarations=declarations,
         )
         self._obs: dict[str, np.ndarray] | None = None
         self._fresh_lanes: set[int] = set()
@@ -93,15 +95,13 @@ class ArenaEvalPool:
         look = np.zeros((self.num_lanes, 3), dtype=np.float32)
         look[:, 0] = 1.0
         attack = np.zeros(self.num_lanes, dtype=np.int64)
-        weapon = np.zeros(self.num_lanes, dtype=np.int64)
         for lane, action in zip(lanes, actions, strict=True):
             lane = int(lane)
             move[lane] = np.asarray(action.get("move", (0.0, 0.0, 0.0)), dtype=np.float32)
             look[lane] = np.asarray(action.get("look", (1.0, 0.0, 0.0)), dtype=np.float32)
             attack[lane] = int(action.get("attack", 0))
-            weapon[lane] = int(action.get("weapon", 0))
         batch = self._backend.step_many(
-            {"move": move, "look": look, "attack": attack, "weapon": weapon}
+            {"move": move, "look": look, "attack": attack}
         )
         self._obs = batch.obs
         return [

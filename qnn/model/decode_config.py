@@ -34,6 +34,37 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # Entry points a guard adapter MUST expose — the bit-for-bit eval/export contract.
 _GUARD_REQUIRED = ("guard_attack_logit_for_export", "policy_decode_action_postprocess")
 
+# Historical decode_module/guard_module dotted paths → their current core home.
+# 2026-07-27 bench/a25 promotion (generation-scoped bench code must never be
+# cross-gen-imported; a25's decode/guard facade outlived the generation, so it
+# was promoted out of qnn.model.bench.a25 into qnn.model directly). Decode
+# configs on disk are immutable (runs/decode_fit/*.json, deployed provenance) —
+# they still name the old dotted paths and are never rewritten. This is an
+# EXPLICIT rename table, not a generic alias mechanism: an unrecognized
+# qnn.model.bench.a25.* path fails loud (no silent pass-through) so a typo or a
+# module this table doesn't know about surfaces immediately instead of a bare
+# ModuleNotFoundError three frames down.
+_LEGACY_MODULE_RENAME: dict[str, str] = {
+    "qnn.model.bench.a25.decode": "qnn.model.decode_actions",
+    "qnn.model.bench.a25.guard": "qnn.model.guard",
+}
+
+
+def resolve_module_name(name: str) -> str:
+    """Historical dotted path -> current core path (see _LEGACY_MODULE_RENAME),
+    else passed through unchanged. Any other qnn.model.bench.a25.* path is
+    unrecognized and fails loud rather than silently resolving or falling
+    through to importlib's ModuleNotFoundError."""
+    if name in _LEGACY_MODULE_RENAME:
+        return _LEGACY_MODULE_RENAME[name]
+    if name.startswith("qnn.model.bench.a25."):
+        raise ValueError(
+            f"{name!r}: unrecognized legacy qnn.model.bench.a25.* module path — "
+            "add it to _LEGACY_MODULE_RENAME (qnn.model.decode_config) if it "
+            "should resolve to a promoted core module, or fix the config if "
+            "this is a typo.")
+    return name
+
 # Eval regime names → their bundled decode-config JSON. a24 is a RETIRED arch:
 # its entries were pruned with its decode modules (a24 template JSONs remain on
 # disk as history only — they name modules that no longer exist and will fail
@@ -42,7 +73,7 @@ _GUARD_REQUIRED = ("guard_attack_logit_for_export", "policy_decode_action_postpr
 _TEMPLATES = _REPO_ROOT / "src/qnn/model/bench/templates"
 REGIME_CONFIGS: dict[str, Path] = {
     "a25rc1": _TEMPLATES / "decode.a25rc1.json",   # a25-owned template (seg-commitment move + 9-way attack-with): names a25 decode/guard modules so a25 decode-fit + export emit a25 refs
-    "a25base": _TEMPLATES / "decode.a25base.json",  # a25-native BASE template (decode-fit emit base): a25 module pointers + only LIVE param keys, neutral placeholder values
+    "a25base": _TEMPLATES / "decode.base.json",  # a25-native BASE template (decode-fit emit base): promoted-core module pointers + only LIVE param keys, neutral placeholder values
 }
 
 
@@ -96,7 +127,7 @@ REQUIRED_PARAM_KEYS: tuple[str, ...] = (
 #                          through (a25base set true, a25rc1 had OMITTED it → a live
 #                          inconsistency this promotion closes).
 MODULE_REQUIRED_PARAM_KEYS: dict[str, tuple[str, ...]] = {
-    "qnn.model.bench.a25.decode": (
+    "qnn.model.decode_actions": (
         "move.commitment",
         "look.hold_passthrough",
     ),
@@ -348,7 +379,7 @@ DECODE_PARAMS: tuple[DecodeParam, ...] = (
     # weapon); attack.crest_hold_ticks = shared max hold H in ticks (0 = OFF
     # globally). Both OFF = bit-identical; the countdown latch rides the
     # existing attack_state wire slot (no wire bump). See
-    # qnn.model.bench.a25.decode.attack_crest_gate_step.
+    # qnn.model.decode_actions.attack_crest_gate_step.
     DecodeParam("attack.crest_theta_vec", "attack_crest_theta_vec",
                 _float_vec_or_none, None, doc="(8,) per-weapon crest θ_w (hbw)"),
     DecodeParam("attack.crest_hold_ticks", "attack_crest_hold_ticks", int, 0,
@@ -449,13 +480,15 @@ def resolve_decode_config(
     """
     p = Path(path)
     cfg = load_decode_config(p)
-    decode_mod = importlib.import_module(cfg["decode_module"])
+    decode_name = resolve_module_name(cfg["decode_module"])
+    decode_mod = importlib.import_module(decode_name)
     params = dict(cfg.get("params", {}))
-    _validate_required_params(p, params, cfg["decode_module"])
+    _validate_required_params(p, params, decode_name)
     _validate_attack_vectors(p, params)
     guard_name = cfg["guard_module"]
     guard_mod = None
     if guard_name and guard_name != "none":
+        guard_name = resolve_module_name(guard_name)
         mod = importlib.import_module(guard_name)
         if not hasattr(mod, "make_guard"):
             raise ValueError(

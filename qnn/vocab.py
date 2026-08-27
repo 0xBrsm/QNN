@@ -98,6 +98,15 @@ MODALITY_IDS: Dict[str, int] = {
 
 MODALITY_VOCAB_SIZE = 4
 
+# A27 combat tokens deliberately expose only these two channels. SOUND and
+# MEMORY remain in the engine-wide vocabulary for event/store compatibility,
+# but are invalid model inputs for the combat graph.
+COMBAT_MODALITY_IDS: Dict[str, int] = {
+    "SIGHT": MODALITY_IDS["SIGHT"],
+    "PROXIMITY": MODALITY_IDS["PROXIMITY"],
+}
+COMBAT_MODALITY_VOCAB_SIZE = len(COMBAT_MODALITY_IDS)
+
 MAX_PLAYER_INDICES = 32
 
 # Spatial atlas elevation bands (spatial-tokens-v2 rev 8). Band index =
@@ -118,7 +127,8 @@ SPATIAL_BAND_IDS: Dict[str, int] = {
     "Elev_p75": 10,
 }
 
-# Token type tags (wire format)
+# A27 combat token type tags (wire format). ITEM/MOVER retain their historical
+# constants for offline tooling, but the A27 producer/parser accepts only 0/1.
 TOKEN_PROJECTILE = 0
 TOKEN_ACTOR = 1
 TOKEN_ITEM = 2
@@ -134,10 +144,25 @@ TOKEN_MOVER = 3
 OWN_FIRE_DIST_U = 120.0
 
 # Per-type scalar dimensions (includes dist after rel[3], path_dist after path[3])
-PROJECTILE_SCALAR_DIM = 8
-ACTOR_SCALAR_DIM = 19
+PROJECTILE_SCALAR_DIM = 7
+ACTOR_SCALAR_DIM = 18
 ITEM_SCALAR_DIM = 15
 MOVER_SCALAR_DIM = 14
+
+# Entity-stream selector. "combat" is the A27 stream (actor/projectile only,
+# no recency); "full" is the a26-line stream (recency on every type, live
+# item/mover tokens, 4-way modality vocab). Selected per checkpoint at load
+# (see QNNPolicy.load) so a26-line models forward bit-faithfully on this line.
+ENTITY_STREAM_COMBAT = "combat"
+ENTITY_STREAM_FULL = "full"
+ENTITY_STREAMS = (ENTITY_STREAM_COMBAT, ENTITY_STREAM_FULL)
+
+# Full-stream (a26) per-type scalar dims: combat dims + the trailing recency
+# scalar on projectile/actor; item/mover carry recency already (their dims
+# are shared with the combat constants above, which kept them for offline
+# tooling when the A27 stream dropped the token types).
+FULL_PROJECTILE_SCALAR_DIM = PROJECTILE_SCALAR_DIM + 1  # 8
+FULL_ACTOR_SCALAR_DIM = ACTOR_SCALAR_DIM + 1            # 19
 
 # Per-type ID counts
 PROJECTILE_ID_DIM = 2  # subject_id, modality_id
